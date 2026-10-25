@@ -475,3 +475,86 @@ fn canvas_shadow_color_ignores_unparseable_values() {
     );
     assert_eq!(run(&script), "#ff0000");
 }
+
+#[test]
+fn source_in_composites_the_whole_bitmap_and_clears_what_it_does_not_cover() {
+    // WPT 2d.composite.uncovered.fill.source-in: the fill's shape is the
+    // source; every destination pixel outside it goes transparent black.
+    let script = format!(
+        "{SETUP} c.width = 100; c.height = 50; \
+         ctx.fillStyle = 'rgba(0, 255, 0, 0.5)'; ctx.fillRect(0, 0, 100, 50); \
+         ctx.globalCompositeOperation = 'source-in'; \
+         ctx.fillStyle = 'rgba(0, 0, 255, 0.75)'; \
+         ctx.fillRect(0, 50, 100, 50); \
+         [{}, {}, {}].join('|')",
+        pixel(50, 25),
+        pixel(50, 10),
+        pixel(50, 49)
+    );
+    // The fill lies entirely below y=50, so every pixel above is cleared;
+    // inside the fill the half-green destination survives weighted by the
+    // source-in coefficients: dst keeps its alpha only where src covers.
+    assert_eq!(run(&script), "0,0,0,0|0,0,0,0|0,0,0,0");
+}
+
+#[test]
+fn copy_replaces_every_pixel_the_fill_does_not_cover_too() {
+    // WPT 2d.composite.uncovered.fill.copy: 'copy' clears everything outside
+    // the fill's shape and paints the fill where it is.
+    let script = format!(
+        "{SETUP} c.width = 100; c.height = 50; \
+         ctx.fillStyle = '#0f0'; ctx.fillRect(0, 0, 100, 50); \
+         ctx.globalCompositeOperation = 'copy'; \
+         ctx.fillStyle = '#f00'; ctx.fillRect(20, 20, 10, 10); \
+         [{}, {}, {}].join('|')",
+        pixel(25, 25),
+        pixel(5, 5),
+        pixel(50, 25)
+    );
+    assert_eq!(run(&script), "255,0,0,255|0,0,0,0|0,0,0,0");
+}
+
+#[test]
+fn destination_over_paints_under_the_existing_bitmap() {
+    let script = format!(
+        "{SETUP} c.width = 100; c.height = 50; \
+         ctx.fillStyle = 'rgba(255, 0, 0, 1)'; ctx.fillRect(0, 0, 100, 50); \
+         ctx.globalCompositeOperation = 'destination-over'; \
+         ctx.fillStyle = 'rgba(0, 255, 0, 1)'; ctx.fillRect(0, 0, 100, 50); \
+         [{}, {}, {}].join('|')",
+        pixel(10, 10),
+        pixel(50, 25),
+        pixel(90, 40)
+    );
+    // The destination already covers everything, so nothing changes.
+    assert_eq!(run(&script), "255,0,0,255|255,0,0,255|255,0,0,255");
+}
+
+#[test]
+fn lighter_adds_source_and_destination() {
+    let script = format!(
+        "{SETUP} c.width = 100; c.height = 50; \
+         ctx.fillStyle = 'rgba(128, 0, 0, 1)'; ctx.fillRect(0, 0, 100, 50); \
+         ctx.globalCompositeOperation = 'lighter'; \
+         ctx.fillStyle = 'rgba(128, 0, 0, 1)'; ctx.fillRect(0, 0, 100, 50); \
+         {}",
+        pixel(50, 25)
+    );
+    assert_eq!(run(&script), "255,0,0,255");
+}
+
+#[test]
+fn tmp_gco_probe() {
+    println!(
+        "GCO: {}",
+        run(&format!(
+            "{SETUP} ctx.globalCompositeOperation = 'source-in'; ctx.globalCompositeOperation"
+        ))
+    );
+    println!(
+        "GCO_VALID: {}",
+        run(&format!(
+            "{SETUP} ctx.globalCompositeOperation = 'destination-over'; ctx.globalCompositeOperation"
+        ))
+    );
+}

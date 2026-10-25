@@ -127,6 +127,34 @@ impl Bitmap {
         }
     }
 
+    /// Composites the source over the whole bitmap in `mode` (HTML
+    /// §4.12.5.1.3): unlike `source-over`, the modes are defined for every
+    /// destination pixel - outside the fill's coverage the source alpha is
+    /// zero, which is what makes `copy` and `source-in` clear what they do
+    /// not cover. The sampler runs once per bitmap pixel.
+    pub fn fill_composited(
+        &mut self,
+        coverage: Option<&Coverage>,
+        clip: Option<&ClipMask>,
+        mode: CompositeMode,
+        sample: impl Fn(u32, u32) -> Source,
+    ) {
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let clip_amount = clip.map_or(1.0, |mask| mask.at(x, y));
+                if clip_amount <= 0.0 {
+                    continue;
+                }
+                let mut source = sample(x, y);
+                let covered = coverage.map_or(0.0, |coverage| coverage.at(x, y));
+                source.alpha = (source.alpha * covered).clamp(0.0, 1.0);
+                let index = self.index(x, y);
+                let destination = self.pixels[index];
+                self.pixels[index] = composite_pixel(destination, source, mode);
+            }
+        }
+    }
+
     /// Clears the pixels of `coverage` that `clip` admits, by the coverage.
     pub fn clear(&mut self, coverage: &Coverage, clip: Option<&ClipMask>) {
         let (x0, y0) = coverage.origin();
@@ -289,6 +317,97 @@ fn composite_over(destination: [u8; 4], source: Source, alpha: f32) -> [u8; 4] {
     }
     let alpha_value = alpha + f32::from(destination[3]) / 255.0 * inverse;
     out[3] = round_byte(alpha_value * 255.0);
+    out
+}
+
+/// The Porter-Duff compositing of one source pixel onto one destination
+/// pixel (HTML §4.12.5.1.3 "compositing"): the source and destination
+/// weights the mode names, applied to premultiplied colours and an alpha
+/// that adds the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompositeMode {
+    Copy,
+    Destination,
+    DestinationAtop,
+    DestinationIn,
+    DestinationOut,
+    DestinationOver,
+    Lighter,
+    SourceAtop,
+    SourceIn,
+    SourceOut,
+    SourceOver,
+    Xor,
+}
+
+impl CompositeMode {
+    /// The mode a `globalCompositeOperation` keyword names. The separable
+    /// blend modes are not here yet: they parse but paint as `source-over`,
+    /// which is a stated gap.
+    #[must_use]
+    pub fn parse(keyword: &str) -> Option<Self> {
+        let mode = match keyword {
+            "copy" => Self::Copy,
+            "destination" => Self::Destination,
+            "destination-atop" => Self::DestinationAtop,
+            "destination-in" => Self::DestinationIn,
+            "destination-out" => Self::DestinationOut,
+            "destination-over" => Self::DestinationOver,
+            "lighter" => Self::Lighter,
+            "source-atop" => Self::SourceAtop,
+            "source-in" => Self::SourceIn,
+            "source-out" => Self::SourceOut,
+            // The separable and nonseparable blend modes: the state accepts
+            // them, the paint does not apply them yet, so they parse as the
+            // source-over painting they currently fall back to.
+            "source-over" | "multiply" | "screen" | "overlay" | "darken" | "lighten"
+            | "color-dodge" | "color-burn" | "hard-light" | "soft-light" | "difference"
+            | "exclusion" | "hue" | "saturation" | "color" | "luminosity" => Self::SourceOver,
+            "xor" => Self::Xor,
+            _ => return None,
+        };
+        Some(mode)
+    }
+
+    fn coefficients(self, source_alpha: f32, destination_alpha: f32) -> (f32, f32) {
+        match self {
+            Self::Copy => (1.0, 0.0),
+            Self::Destination => (0.0, 1.0),
+            Self::DestinationAtop => (1.0 - destination_alpha, source_alpha),
+            Self::DestinationIn => (0.0, source_alpha),
+            Self::DestinationOut => (0.0, 1.0 - source_alpha),
+            Self::DestinationOver => (1.0 - destination_alpha, 1.0),
+            Self::Lighter => (1.0, 1.0),
+            Self::SourceAtop => (destination_alpha, 1.0 - source_alpha),
+            Self::SourceIn => (destination_alpha, 0.0),
+            Self::SourceOut => (1.0 - destination_alpha, 0.0),
+            Self::SourceOver => (1.0, 1.0 - source_alpha),
+            Self::Xor => (1.0 - destination_alpha, 1.0 - source_alpha),
+        }
+    }
+}
+
+/// One Porter-Duff composite of `source` (its alpha already carries the
+/// coverage) onto `destination` in `mode`.
+fn composite_pixel(destination: [u8; 4], source: Source, mode: CompositeMode) -> [u8; 4] {
+    let source_alpha = source.alpha.clamp(0.0, 1.0);
+    let destination_alpha = f32::from(destination[3]) / 255.0;
+    let (source_weight, destination_weight) = mode.coefficients(source_alpha, destination_alpha);
+    let output_alpha =
+        (source_alpha * source_weight + destination_alpha * destination_weight).min(1.0);
+    if output_alpha <= 0.0 {
+        return [0; 4];
+    }
+    let mut out = [0_u8; 4];
+    for channel in 0..3 {
+        let source_colour = f32::from([source.red, source.green, source.blue][channel])
+            * source_alpha
+            * source_weight;
+        let destination_colour =
+            f32::from(destination[channel]) * destination_alpha * destination_weight;
+        out[channel] = round_byte((source_colour + destination_colour) / output_alpha);
+    }
+    out[3] = round_byte(output_alpha * 255.0);
     out
 }
 

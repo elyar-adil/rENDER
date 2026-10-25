@@ -56,7 +56,7 @@ use render_js::canvas::{
 
 use crate::paint::coverage::{contains, polygon_coverage};
 
-use bitmap::{Bitmap, ClipMask, Source};
+use bitmap::{Bitmap, ClipMask, CompositeMode, Source};
 use path::{
     IDENTITY, Matrix, Path, Point, apply, arc_points, arc_to_geometry, invert, multiply,
     sweep_points,
@@ -273,12 +273,61 @@ impl Canvas {
         paint: SurfacePaint,
         gradient: Option<&Gradient>,
     ) {
-        let Some(coverage) =
-            polygon_coverage(polygons, rule, self.bitmap.width(), self.bitmap.height())
-        else {
+        let global_alpha = self.state.global_alpha;
+        let mode = CompositeMode::parse(&self.state.global_composite_operation)
+            .unwrap_or(CompositeMode::SourceOver);
+        // A composite other than source-over is defined for every destination
+        // pixel: outside the fill's coverage the source alpha is zero, so a
+        // fill entirely off the bitmap still clears (or keeps) the whole
+        // canvas per the mode. The coverage check therefore cannot run first.
+        let coverage = polygon_coverage(polygons, rule, self.bitmap.width(), self.bitmap.height());
+        if mode != CompositeMode::SourceOver {
+            let sampler: Box<dyn Fn(u32, u32) -> Source> = match paint {
+                SurfacePaint::Solid(colour) => {
+                    let colour_alpha = f64::from(colour.alpha) * global_alpha;
+                    Box::new(move |_x: u32, _y: u32| Source {
+                        red: colour.red,
+                        green: colour.green,
+                        blue: colour.blue,
+                        alpha: colour_alpha as f32,
+                    })
+                }
+                SurfacePaint::Gradient(_) => {
+                    let Some(gradient) = gradient else {
+                        return;
+                    };
+                    if gradient.stops.is_empty() {
+                        return;
+                    }
+                    let Some(inverse) = invert(self.state.transform) else {
+                        return;
+                    };
+                    let geometry = gradient.kind;
+                    let stops = gradient.stops.clone();
+                    Box::new(move |x: u32, y: u32| {
+                        let user = apply(inverse, (f64::from(x) + 0.5, f64::from(y) + 0.5));
+                        let (red, green, blue, alpha) =
+                            gradient_at(&geometry, &stops, user.0, user.1);
+                        Source {
+                            red,
+                            green,
+                            blue,
+                            alpha: (f64::from(alpha) * global_alpha) as f32,
+                        }
+                    })
+                }
+            };
+            self.bitmap.fill_composited(
+                coverage.as_ref(),
+                self.state.clip.as_deref(),
+                mode,
+                sampler,
+            );
+            return;
+        }
+        let Some(coverage) = coverage else {
             return;
         };
-        let global_alpha = self.state.global_alpha;
         match paint {
             SurfacePaint::Solid(colour) => {
                 let source = Source {
