@@ -87,7 +87,7 @@ struct PendingWriteScript {
 }
 
 /// The state of one `document.write` session.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(in crate::runtime) struct WriteSession {
     stream: WriteStream,
     /// Every written string, concatenated in call order.
@@ -101,21 +101,6 @@ pub(in crate::runtime) struct WriteSession {
     /// deterministic parser keeps the discovered prefix stable, so an index
     /// counts as a cursor.
     executed: usize,
-}
-
-/// A placeholder that keeps `write_sessions` occupied while a session is
-/// taken out to be worked on. Never observable: the index is only held across
-/// statements that cannot re-enter.
-impl Default for WriteSession {
-    fn default() -> Self {
-        Self {
-            stream: WriteStream::BodyTail,
-            text: String::new(),
-            inserted: Vec::new(),
-            scripts: Vec::new(),
-            executed: 0,
-        }
-    }
 }
 
 impl JsRuntime {
@@ -230,7 +215,7 @@ impl JsRuntime {
         else {
             return Ok(JsValue::Undefined);
         };
-        let mut session = std::mem::take(&mut self.write_sessions[index]);
+        let mut session = self.write_sessions[index].clone();
         self.run_pending_session_scripts(dom, &mut session)?;
         self.write_sessions.remove(index);
         self.set_document_ready_state(DocumentReadyState::Complete);
@@ -370,7 +355,9 @@ impl JsRuntime {
                 self.write_sessions.len() - 1
             }
         };
-        let mut session = std::mem::take(&mut self.write_sessions[index]);
+        // Work on a copy so a script the re-parse runs can write recursively
+        // without the table holding a half-updated session under its slot.
+        let mut session = self.write_sessions[index].clone();
         session.text.push_str(text);
         // An `open()` a written script calls resets every stream. The epoch
         // tells this one apart from an undisturbed return: a session that
@@ -378,13 +365,20 @@ impl JsRuntime {
         let epoch = self.write_stream_epoch;
         let result = self.reparse_session(dom, &mut session);
         if self.write_stream_epoch == epoch {
-            match self
+            if self
+                .write_sessions
+                .get(index)
+                .is_some_and(|open| open.stream == session.stream)
+            {
+                self.write_sessions[index] = session;
+            } else if let Some(slot) = self
                 .write_sessions
                 .iter()
                 .position(|open| open.stream == session.stream)
             {
-                Some(slot) => self.write_sessions[slot] = session,
-                None => self.write_sessions.push(session),
+                self.write_sessions[slot] = session;
+            } else {
+                self.write_sessions.push(session);
             }
         }
         result
@@ -429,46 +423,73 @@ impl JsRuntime {
         session: &mut WriteSession,
     ) -> Result<(), JsError> {
         let document = self.active_document_node()?;
+        // Where this session's nodes live, and where the fresh parse replaces
+        // them. A write from a script in the head makes the parser leave the
+        // head at the first token the head cannot hold (HTML 13.2.6 "in
+        // head": "anything else" pops the head and switches to in-body), so
+        // such a stream lands in the body, ahead of the markup that follows
+        // the script in the source - WPT's `document-write/001.html` asserts
+        // exactly that. The engine's tree is already parsed, so "ahead of the
+        // markup that follows" is the start of the body.
+        let parent = match session.stream {
+            WriteStream::AfterScript(owner) => match dom.parent(owner) {
+                Some(ancestor) if Self::is_head_element(dom, ancestor) => {
+                    let Some(body) = find_body_node(dom, document) else {
+                        return Ok(());
+                    };
+                    body
+                }
+                Some(parent) => parent,
+                // The executing script element was removed (an `open()` during
+                // load does this). The stream lands at the end of the body
+                // when there is one, and is dropped otherwise.
+                None => match find_body_node(dom, document) {
+                    Some(body) => body,
+                    None => return Ok(()),
+                },
+            },
+            WriteStream::BodyTail | WriteStream::WholeDocument => match session.stream {
+                WriteStream::BodyTail => match find_body_node(dom, document) {
+                    Some(body) => body,
+                    None => return Ok(()),
+                },
+                WriteStream::WholeDocument => document,
+                WriteStream::AfterScript(_) => unreachable!("matched above"),
+            },
+        };
         // Remove the nodes the previous parse contributed, then import the
         // new ones at the same place. A node that moved elsewhere in the
         // meantime (the page adopted it) stays where its new parent put it.
-        let expected_parent = match session.stream {
-            WriteStream::AfterScript(owner) => dom.parent(owner),
-            WriteStream::BodyTail => find_body_node(dom, document),
-            WriteStream::WholeDocument => Some(document),
-        };
         for node in std::mem::take(&mut session.inserted) {
-            if dom.parent(node) == expected_parent
-                && let Some(parent) = expected_parent
-            {
+            if dom.parent(node) == Some(parent) {
                 dom.remove_child(parent, node)?;
             }
         }
         session.inserted.clear();
+        // The reference node is computed after the removal: for a script
+        // stream it is the node the script's previous write contributed, and
+        // that node is gone by now.
+        let before = match session.stream {
+            WriteStream::AfterScript(owner)
+                if dom
+                    .parent(owner)
+                    .is_some_and(|ancestor| Self::is_head_element(dom, ancestor)) =>
+            {
+                dom.children(parent).and_then(<[NodeId]>::first).copied()
+            }
+            WriteStream::AfterScript(owner) => dom.next_sibling(owner),
+            WriteStream::BodyTail | WriteStream::WholeDocument => None,
+        };
         match session.stream {
             WriteStream::AfterScript(owner) => {
-                let Some(parent) = dom.parent(owner) else {
-                    // The executing script element was removed (an `open()`
-                    // during load does this). The stream lands in the body
-                    // when there is one, and is dropped otherwise.
-                    let Some(body) = find_body_node(dom, document) else {
-                        return Ok(());
-                    };
-                    let parsed = render_html::parse_html_fragment_with_scripting(
-                        &session.text,
-                        &FragmentContext::html("body"),
-                        true,
-                    );
-                    return self.import_parse_roots(
-                        dom,
-                        session,
-                        &parsed.dom,
-                        parsed.dom.children(parsed.fragment).unwrap_or_default(),
-                        body,
-                        None,
-                    );
+                let context = if dom
+                    .parent(owner)
+                    .is_some_and(|ancestor| Self::is_head_element(dom, ancestor))
+                {
+                    FragmentContext::html("body")
+                } else {
+                    fragment_context_for(dom, owner)
                 };
-                let context = fragment_context_for(dom, owner);
                 let parsed =
                     render_html::parse_html_fragment_with_scripting(&session.text, &context, true);
                 self.import_parse_roots(
@@ -477,13 +498,10 @@ impl JsRuntime {
                     &parsed.dom,
                     parsed.dom.children(parsed.fragment).unwrap_or_default(),
                     parent,
-                    Some(owner),
+                    before,
                 )?;
             }
             WriteStream::BodyTail => {
-                let Some(body) = find_body_node(dom, document) else {
-                    return Ok(());
-                };
                 let parsed = render_html::parse_html_fragment_with_scripting(
                     &session.text,
                     &FragmentContext::html("body"),
@@ -494,7 +512,7 @@ impl JsRuntime {
                     session,
                     &parsed.dom,
                     parsed.dom.children(parsed.fragment).unwrap_or_default(),
-                    body,
+                    parent,
                     None,
                 )?;
             }
@@ -508,7 +526,7 @@ impl JsRuntime {
                         .dom
                         .children(parsed.dom.document())
                         .unwrap_or_default(),
-                    document,
+                    parent,
                     None,
                 )?;
             }
@@ -521,8 +539,20 @@ impl JsRuntime {
         self.run_pending_session_scripts(dom, session)
     }
 
-    /// Import `roots` of a parse output under `parent`, in order, right after
-    /// `cursor` when given.
+    /// Whether `node` is the document's `head` element, whose context a write
+    /// always leaves for the body.
+    fn is_head_element(dom: &Dom, node: NodeId) -> bool {
+        matches!(
+            dom.node(node).map(Node::kind),
+            Some(NodeKind::Element(element))
+                if element.namespace == Namespace::Html && element.local_name == "head"
+        )
+    }
+
+    /// Import `roots` of a parse output under `parent`, in order, before
+    /// `before` (appending when it is `None`). Every root takes the same
+    /// reference, so the list keeps its order and the anchor stays fixed
+    /// across a session's re-parses.
     fn import_parse_roots(
         &mut self,
         dom: &mut Dom,
@@ -530,13 +560,11 @@ impl JsRuntime {
         source: &Dom,
         roots: &[NodeId],
         parent: NodeId,
-        cursor: Option<NodeId>,
+        before: Option<NodeId>,
     ) -> Result<(), JsError> {
         let document = self.active_document_node()?;
-        let mut cursor = cursor;
         for root in roots {
-            let imported = self.import_write_node(dom, source, *root, document, parent, cursor)?;
-            cursor = imported;
+            let imported = self.import_write_node(dom, source, *root, document, parent, before)?;
             if let Some(imported) = imported {
                 session.inserted.push(imported);
             }
@@ -544,8 +572,8 @@ impl JsRuntime {
         Ok(())
     }
 
-    /// Import one node from a parsed document under `parent`, right after
-    /// `cursor` when given, and return the imported node.
+    /// Import one node from a parsed document under `parent`, before
+    /// `before` (appending when it is `None`), and return the imported node.
     ///
     /// Unlike `import_dom_subtree`, this preserves the element's namespace
     /// (a written `<svg>` must not become an HTML element), imports
@@ -558,7 +586,7 @@ impl JsRuntime {
         node: NodeId,
         document: NodeId,
         parent: NodeId,
-        cursor: Option<NodeId>,
+        before: Option<NodeId>,
     ) -> Result<Option<NodeId>, JsError> {
         if self.dom_nodes_created >= self.limits.max_dom_nodes_created {
             return Err(JsError::resource("DOM node creation limit exceeded"));
@@ -622,20 +650,13 @@ impl JsRuntime {
             _ => return Ok(None),
         };
         dom.set_node_document(imported, document);
-        let before = cursor.and_then(|cursor| dom.next_sibling(cursor));
         dom.insert_before(parent, imported, before)?;
         if let Some(children) = source.children(node) {
             let children = children.to_vec();
-            // The children import into `imported`, whose sibling order is
-            // unrelated to the cursor's: they append, then chain after each
-            // other.
-            let mut child_cursor: Option<NodeId> = None;
+            // The children import into the freshly created `imported`, whose
+            // children are empty, so appending preserves the source order.
             for child in children {
-                if let Some(imported_child) =
-                    self.import_write_node(dom, source, child, document, imported, child_cursor)?
-                {
-                    child_cursor = Some(imported_child);
-                }
+                self.import_write_node(dom, source, child, document, imported, None)?;
             }
         }
         Ok(Some(imported))
