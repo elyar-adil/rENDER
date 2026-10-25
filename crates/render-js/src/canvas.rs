@@ -30,14 +30,32 @@ pub enum FillRule {
 /// A `CanvasRenderingContext2D` attribute that holds a plain value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Attribute {
+    Direction,
     FillStyle,
-    StrokeStyle,
+    Filter,
+    Font,
+    FontKerning,
+    FontStretch,
+    FontVariantCaps,
     GlobalAlpha,
+    GlobalCompositeOperation,
+    ImageSmoothingEnabled,
+    ImageSmoothingQuality,
+    LetterSpacing,
     LineCap,
     LineDashOffset,
     LineJoin,
     LineWidth,
     MiterLimit,
+    ShadowBlur,
+    ShadowColor,
+    ShadowOffsetX,
+    ShadowOffsetY,
+    StrokeStyle,
+    TextAlign,
+    TextBaseline,
+    TextRendering,
+    WordSpacing,
 }
 
 /// A style value: a colour in its CSS text form, or a gradient the host

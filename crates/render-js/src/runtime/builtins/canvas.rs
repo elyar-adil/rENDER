@@ -134,6 +134,59 @@ const CONTEXT_ATTRIBUTES: &[(&str, Attribute, AttributeKind)] = &[
     ("lineCap", Attribute::LineCap, AttributeKind::Text),
     ("lineJoin", Attribute::LineJoin, AttributeKind::Text),
     ("miterLimit", Attribute::MiterLimit, AttributeKind::Number),
+    // HTML §4.12.5.1.12-13: the text and shadow state. The enumerated ones
+    // validate their keywords host-side, where an unknown value means the
+    // assignment is ignored; the string ones round-trip exactly what was set.
+    ("direction", Attribute::Direction, AttributeKind::Text),
+    ("filter", Attribute::Filter, AttributeKind::Text),
+    ("font", Attribute::Font, AttributeKind::Text),
+    ("fontKerning", Attribute::FontKerning, AttributeKind::Text),
+    ("fontStretch", Attribute::FontStretch, AttributeKind::Text),
+    (
+        "fontVariantCaps",
+        Attribute::FontVariantCaps,
+        AttributeKind::Text,
+    ),
+    (
+        "globalCompositeOperation",
+        Attribute::GlobalCompositeOperation,
+        AttributeKind::Text,
+    ),
+    (
+        "imageSmoothingEnabled",
+        Attribute::ImageSmoothingEnabled,
+        AttributeKind::Boolean,
+    ),
+    (
+        "imageSmoothingQuality",
+        Attribute::ImageSmoothingQuality,
+        AttributeKind::Text,
+    ),
+    (
+        "letterSpacing",
+        Attribute::LetterSpacing,
+        AttributeKind::Text,
+    ),
+    ("shadowBlur", Attribute::ShadowBlur, AttributeKind::Number),
+    ("shadowColor", Attribute::ShadowColor, AttributeKind::Text),
+    (
+        "shadowOffsetX",
+        Attribute::ShadowOffsetX,
+        AttributeKind::Number,
+    ),
+    (
+        "shadowOffsetY",
+        Attribute::ShadowOffsetY,
+        AttributeKind::Number,
+    ),
+    ("textAlign", Attribute::TextAlign, AttributeKind::Text),
+    ("textBaseline", Attribute::TextBaseline, AttributeKind::Text),
+    (
+        "textRendering",
+        Attribute::TextRendering,
+        AttributeKind::Text,
+    ),
+    ("wordSpacing", Attribute::WordSpacing, AttributeKind::Text),
     (
         "lineDashOffset",
         Attribute::LineDashOffset,
@@ -147,6 +200,7 @@ enum AttributeKind {
     Number,
     Text,
     Style,
+    Boolean,
 }
 
 impl JsRuntime {
@@ -762,6 +816,7 @@ impl JsRuntime {
                     AttributeKind::Number => {
                         CanvasValue::Number(self.to_number_value(dom, &value)?)
                     }
+                    AttributeKind::Boolean => CanvasValue::Bool(value.is_truthy()),
                     // A style accepts a gradient object itself; anything else
                     // converts as a string, which the host parses as a colour
                     // (HTML §4.12.5.1.3).

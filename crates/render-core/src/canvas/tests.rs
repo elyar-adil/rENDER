@@ -411,3 +411,67 @@ fn round_rect_three_radii_repeat_the_second() {
         "255,0,0,255|0,255,0,255|0,255,0,255|0,255,0,255"
     );
 }
+
+#[test]
+fn canvas_state_attributes_round_trip_and_reset() {
+    // WPT 2d.reset.state.*: every state attribute reads back what was set,
+    // and ctx.reset() restores the default it reported before.
+    let script = format!(
+        "{SETUP} c.width = 100; c.height = 50; \
+         var defaults = [ctx.font, ctx.direction, ctx.textAlign, ctx.shadowColor, \
+                         ctx.globalCompositeOperation, ctx.letterSpacing, \
+                         ctx.shadowOffsetX, ctx.imageSmoothingEnabled].join('|'); \
+         ctx.font = '16px sans-serif'; ctx.direction = 'rtl'; ctx.textAlign = 'end'; \
+         ctx.shadowColor = '#ff0000'; ctx.globalCompositeOperation = 'destination-over'; \
+         ctx.letterSpacing = '12px'; ctx.shadowOffsetX = 10.0; \
+         ctx.imageSmoothingEnabled = false; \
+         var set = [ctx.font, ctx.direction, ctx.textAlign, ctx.shadowColor, \
+                    ctx.globalCompositeOperation, ctx.letterSpacing, \
+                    ctx.shadowOffsetX, ctx.imageSmoothingEnabled].join('|'); \
+         ctx.reset(); \
+         var after = [ctx.font, ctx.direction, ctx.textAlign, ctx.shadowColor, \
+                      ctx.globalCompositeOperation, ctx.letterSpacing, \
+                      ctx.shadowOffsetX, ctx.imageSmoothingEnabled].join('|'); \
+         [set, after === defaults].join('@@')"
+    );
+    let result = run(&script);
+    let (set, resets) = result.split_once("@@").expect("two halves");
+    assert_eq!(
+        set,
+        "16px sans-serif|rtl|end|#ff0000|destination-over|12px|10|false"
+    );
+    assert_eq!(resets, "true");
+}
+
+#[test]
+fn canvas_state_survives_save_and_restores_through_restore() {
+    // The new state rides the same save/restore stack as the rest.
+    let script = format!(
+        "{SETUP} ctx.save(); ctx.font = '16px sans-serif'; ctx.textAlign = 'center'; \
+         ctx.shadowOffsetX = 4; ctx.restore(); \
+         [ctx.font, ctx.textAlign, ctx.shadowOffsetX].join('|')"
+    );
+    assert_eq!(run(&script), "10px sans-serif|start|0");
+}
+
+#[test]
+fn canvas_enumerated_attributes_ignore_unknown_keywords() {
+    // HTML §4.12.5.1.12: an unrecognized keyword leaves the attribute alone.
+    let script = format!(
+        "{SETUP} ctx.textAlign = 'center'; ctx.textAlign = 'sideways'; \
+         ctx.globalCompositeOperation = 'destination-over'; \
+         ctx.globalCompositeOperation = 'nonsense'; \
+         ctx.direction = 'bogus'; ctx.direction = 'rtl'; \
+         [ctx.textAlign, ctx.globalCompositeOperation, ctx.direction].join('|')"
+    );
+    assert_eq!(run(&script), "center|destination-over|rtl");
+}
+
+#[test]
+fn canvas_shadow_color_ignores_unparseable_values() {
+    let script = format!(
+        "{SETUP} ctx.shadowColor = '#ff0000'; ctx.shadowColor = 'not-a-colour'; \
+         ctx.shadowColor"
+    );
+    assert_eq!(run(&script), "#ff0000");
+}

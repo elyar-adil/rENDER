@@ -111,6 +111,27 @@ struct DrawingState {
     dash: Vec<f64>,
     dash_offset: f64,
     clip: Option<Arc<ClipMask>>,
+    // The text, shadow and raster-quality state (HTML §4.12.5.1.12-13). The
+    // enumerated attributes hold their validated keyword; the string ones
+    // hold exactly what was last set and accepted.
+    direction: String,
+    filter: String,
+    font: String,
+    font_kerning: String,
+    font_stretch: String,
+    font_variant_caps: String,
+    global_composite_operation: String,
+    image_smoothing_enabled: bool,
+    image_smoothing_quality: String,
+    letter_spacing: String,
+    shadow_blur: f64,
+    shadow_color: String,
+    shadow_offset_x: f64,
+    shadow_offset_y: f64,
+    text_align: String,
+    text_baseline: String,
+    text_rendering: String,
+    word_spacing: String,
 }
 
 impl Default for DrawingState {
@@ -127,6 +148,24 @@ impl Default for DrawingState {
             dash: Vec::new(),
             dash_offset: 0.0,
             clip: None,
+            direction: "inherit".to_owned(),
+            filter: "none".to_owned(),
+            font: "10px sans-serif".to_owned(),
+            font_kerning: "auto".to_owned(),
+            font_stretch: "normal".to_owned(),
+            font_variant_caps: "normal".to_owned(),
+            global_composite_operation: "source-over".to_owned(),
+            image_smoothing_enabled: true,
+            image_smoothing_quality: "low".to_owned(),
+            letter_spacing: "0px".to_owned(),
+            shadow_blur: 0.0,
+            shadow_color: "rgba(0, 0, 0, 0)".to_owned(),
+            shadow_offset_x: 0.0,
+            shadow_offset_y: 0.0,
+            text_align: "start".to_owned(),
+            text_baseline: "alphabetic".to_owned(),
+            text_rendering: "auto".to_owned(),
+            word_spacing: "0px".to_owned(),
         }
     }
 }
@@ -306,6 +345,30 @@ impl Canvas {
             Attribute::LineWidth => CanvasValue::Number(self.state.line_width),
             Attribute::MiterLimit => CanvasValue::Number(self.state.miter_limit),
             Attribute::LineDashOffset => CanvasValue::Number(self.state.dash_offset),
+            Attribute::Direction => CanvasValue::Text(self.state.direction.clone()),
+            Attribute::Filter => CanvasValue::Text(self.state.filter.clone()),
+            Attribute::Font => CanvasValue::Text(self.state.font.clone()),
+            Attribute::FontKerning => CanvasValue::Text(self.state.font_kerning.clone()),
+            Attribute::FontStretch => CanvasValue::Text(self.state.font_stretch.clone()),
+            Attribute::FontVariantCaps => CanvasValue::Text(self.state.font_variant_caps.clone()),
+            Attribute::GlobalCompositeOperation => {
+                CanvasValue::Text(self.state.global_composite_operation.clone())
+            }
+            Attribute::ImageSmoothingEnabled => {
+                CanvasValue::Bool(self.state.image_smoothing_enabled)
+            }
+            Attribute::ImageSmoothingQuality => {
+                CanvasValue::Text(self.state.image_smoothing_quality.clone())
+            }
+            Attribute::LetterSpacing => CanvasValue::Text(self.state.letter_spacing.clone()),
+            Attribute::ShadowBlur => CanvasValue::Number(self.state.shadow_blur),
+            Attribute::ShadowColor => CanvasValue::Text(self.state.shadow_color.clone()),
+            Attribute::ShadowOffsetX => CanvasValue::Number(self.state.shadow_offset_x),
+            Attribute::ShadowOffsetY => CanvasValue::Number(self.state.shadow_offset_y),
+            Attribute::TextAlign => CanvasValue::Text(self.state.text_align.clone()),
+            Attribute::TextBaseline => CanvasValue::Text(self.state.text_baseline.clone()),
+            Attribute::TextRendering => CanvasValue::Text(self.state.text_rendering.clone()),
+            Attribute::WordSpacing => CanvasValue::Text(self.state.word_spacing.clone()),
             Attribute::LineCap => CanvasValue::Text(self.state.line_cap.keyword().to_owned()),
             Attribute::LineJoin => CanvasValue::Text(self.state.line_join.keyword().to_owned()),
         }
@@ -360,6 +423,75 @@ impl Canvas {
                     self.state.line_join = join;
                 }
             }
+            // The enumerated text/composite/raster attributes: an
+            // unrecognized keyword leaves the attribute unchanged (HTML
+            // §4.12.5.1.12: "return without updating").
+            (
+                Attribute::Direction
+                | Attribute::FontKerning
+                | Attribute::FontStretch
+                | Attribute::FontVariantCaps
+                | Attribute::GlobalCompositeOperation
+                | Attribute::ImageSmoothingQuality
+                | Attribute::TextAlign
+                | Attribute::TextBaseline
+                | Attribute::TextRendering,
+                CanvasValue::Text(keyword),
+            ) if keyword_is_valid(attribute, &keyword) => {
+                self.set_state_text(attribute, keyword);
+            }
+            // The string attributes round-trip exactly what was set; a shadow
+            // colour must parse as a colour first (HTML §4.12.5.1.13).
+            (
+                Attribute::Font
+                | Attribute::Filter
+                | Attribute::LetterSpacing
+                | Attribute::WordSpacing,
+                CanvasValue::Text(text),
+            ) => {
+                self.set_state_text(attribute, text);
+            }
+            (Attribute::ShadowColor, CanvasValue::Text(text)) if parse_paint(&text).is_some() => {
+                self.state.shadow_color = text;
+            }
+            (Attribute::ShadowBlur, CanvasValue::Number(value))
+                if value.is_finite() && value >= 0.0 =>
+            {
+                self.state.shadow_blur = value;
+            }
+            (Attribute::ShadowOffsetX, CanvasValue::Number(value)) if value.is_finite() => {
+                self.state.shadow_offset_x = value;
+            }
+            (Attribute::ShadowOffsetY, CanvasValue::Number(value)) if value.is_finite() => {
+                self.state.shadow_offset_y = value;
+            }
+            (Attribute::ImageSmoothingEnabled, CanvasValue::Bool(flag)) => {
+                self.state.image_smoothing_enabled = flag;
+            }
+            _ => {}
+        }
+    }
+
+    /// Writes one of the text-typed state fields, by attribute.
+    fn set_state_text(&mut self, attribute: Attribute, value: String) {
+        match attribute {
+            Attribute::Direction => self.state.direction = value,
+            Attribute::Filter => self.state.filter = value,
+            Attribute::Font => self.state.font = value,
+            Attribute::FontKerning => self.state.font_kerning = value,
+            Attribute::FontStretch => self.state.font_stretch = value,
+            Attribute::FontVariantCaps => self.state.font_variant_caps = value,
+            Attribute::GlobalCompositeOperation => {
+                self.state.global_composite_operation = value;
+            }
+            Attribute::ImageSmoothingQuality => {
+                self.state.image_smoothing_quality = value;
+            }
+            Attribute::LetterSpacing => self.state.letter_spacing = value,
+            Attribute::TextAlign => self.state.text_align = value,
+            Attribute::TextBaseline => self.state.text_baseline = value,
+            Attribute::TextRendering => self.state.text_rendering = value,
+            Attribute::WordSpacing => self.state.word_spacing = value,
             _ => {}
         }
     }
@@ -1011,6 +1143,83 @@ fn normalise_span(origin: f64, length: f64) -> (i64, i64) {
 
 fn clamp_u32(value: i64) -> u32 {
     u32::try_from(value.max(0)).unwrap_or(u32::MAX)
+}
+
+/// Whether `keyword` is one the enumerated attribute accepts (HTML
+/// §4.12.5.1.12-13). An unrecognized keyword means the assignment is ignored,
+/// which is why the caller asks rather than pattern-matching later.
+fn keyword_is_valid(attribute: Attribute, keyword: &str) -> bool {
+    let (list,): (&[&str],) = match attribute {
+        Attribute::Direction => (&["ltr", "rtl", "inherit"],),
+        Attribute::FontKerning => (&["auto", "normal", "none"],),
+        Attribute::FontStretch => (&[
+            "ultra-condensed",
+            "extra-condensed",
+            "condensed",
+            "semi-condensed",
+            "normal",
+            "semi-expanded",
+            "expanded",
+            "extra-expanded",
+            "ultra-expanded",
+        ],),
+        Attribute::FontVariantCaps => (&[
+            "normal",
+            "small-caps",
+            "all-small-caps",
+            "petite-caps",
+            "all-petite-caps",
+            "unicase",
+            "titling-caps",
+        ],),
+        Attribute::GlobalCompositeOperation => (&[
+            "source-over",
+            "source-in",
+            "source-out",
+            "source-atop",
+            "destination-over",
+            "destination-in",
+            "destination-out",
+            "destination-atop",
+            "lighter",
+            "copy",
+            "xor",
+            "multiply",
+            "screen",
+            "overlay",
+            "darken",
+            "lighten",
+            "color-dodge",
+            "color-burn",
+            "hard-light",
+            "soft-light",
+            "difference",
+            "exclusion",
+            "hue",
+            "saturation",
+            "color",
+            "luminosity",
+        ],),
+        Attribute::ImageSmoothingQuality => (&["low", "medium", "high"],),
+        Attribute::TextAlign => (&["start", "end", "left", "right", "center"],),
+        Attribute::TextBaseline => (&[
+            "alphabetic",
+            "top",
+            "hanging",
+            "middle",
+            "ideographic",
+            "bottom",
+        ],),
+        Attribute::TextRendering => (&[
+            "auto",
+            "optimizeSpeed",
+            "optimizeLegibility",
+            "geometricPrecision",
+        ],),
+        _ => return false,
+    };
+    list.iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(keyword))
 }
 
 fn index_size(message: &str) -> CanvasError {
