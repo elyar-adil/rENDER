@@ -26,8 +26,12 @@ use crate::canvas::{
     Attribute, CanvasError, CanvasErrorKind, CanvasHost, CanvasId, CanvasOp, CanvasStyle,
     CanvasValue, FillRule, MAX_IMAGE_PIXELS, PixelBuffer,
 };
+use std::f64::consts::FRAC_PI_2;
+use std::f64::consts::PI;
+
 use crate::runtime::JsRuntime;
 use crate::runtime::builtins::dom_exception::DomExceptionName;
+use crate::runtime::convert::to_number;
 use crate::value::{
     JsObject, NativeFunction, ObjectHost, PropertyDescriptor, TypedArrayKind, TypedBuffer,
 };
@@ -86,6 +90,7 @@ pub(crate) enum CanvasMethod {
     Arc,
     ArcTo,
     Ellipse,
+    RoundRect,
     BezierCurveTo,
     QuadraticCurveTo,
     Fill,
@@ -345,6 +350,15 @@ impl JsRuntime {
                         counter_clockwise,
                     },
                 )
+            }
+            CanvasMethod::RoundRect => {
+                let x = self.canvas_number(dom, arguments, 0)?;
+                let y = self.canvas_number(dom, arguments, 1)?;
+                let width = self.canvas_number(dom, arguments, 2)?;
+                let height = self.canvas_number(dom, arguments, 3)?;
+                let radii = self.round_rect_radii(dom, arguments.get(4))?;
+                self.round_rect_path(dom, receiver, x, y, width, height, radii)?;
+                Ok(JsValue::Undefined)
             }
             CanvasMethod::BezierCurveTo => {
                 let cp1x = self.canvas_number(dom, arguments, 0)?;
@@ -977,6 +991,348 @@ impl JsRuntime {
         arguments.get(index).is_some_and(JsValue::is_truthy)
     }
 
+    /// Whether every value is finite, the gate every canvas method applies
+    /// before it draws (HTML §4.12.5.1.1: a nonfinite argument draws nothing).
+    fn all_finite(values: &[f64]) -> bool {
+        values.iter().all(|value| value.is_finite())
+    }
+
+    /// The radii of `roundRect`, normalized per HTML §4.12.5.1.4: a missing
+    /// argument is `0`; a number is one radius for both axes; an object is a
+    /// `DOMPointInit` read through `x` and `y` with the dictionary default of
+    /// `0` (so `{ foo: "bar" }` and `[[]]` are all-zero radii, and a `BigInt`
+    /// member is a `TypeError`); an array is a sequence of those, whose length
+    /// must be one to four.
+    fn round_rect_radii(
+        &mut self,
+        dom: &mut Dom,
+        value: Option<&JsValue>,
+    ) -> Result<Vec<(f64, f64)>, JsError> {
+        let value = match value {
+            None | Some(JsValue::Undefined) => return Ok(vec![(0.0, 0.0)]),
+            Some(value) => value,
+        };
+        let sequence = matches!(value, JsValue::Object(_)) && self.is_array_value(value)?;
+        let items: Vec<JsValue> = if sequence {
+            self.iterate_values(dom, value)?
+        } else {
+            vec![value.clone()]
+        };
+        if sequence && !(1..=4).contains(&items.len()) {
+            return Err(self.range_error(
+                "Failed to execute 'roundRect' on 'CanvasRenderingContext2D': \
+                 the radii sequence must hold one to four items",
+            ));
+        }
+        let mut radii = Vec::with_capacity(items.len());
+        for item in &items {
+            radii.push(self.round_rect_radius_item(dom, item)?);
+        }
+        for (radius_x, radius_y) in &radii {
+            if *radius_x < 0.0 || *radius_y < 0.0 {
+                return Err(self.range_error(
+                    "Failed to execute 'roundRect' on 'CanvasRenderingContext2D': \
+                     the radii must be non-negative",
+                ));
+            }
+        }
+        Ok(radii)
+    }
+
+    /// One `roundRect` radius item: the union `(unrestricted double or
+    /// DOMPointInit)`. A number is circular; an object (an array included) is
+    /// a `DOMPointInit`; `undefined` and `null` are the empty dictionary;
+    /// everything else converts as a double, where a `BigInt` is a
+    /// `TypeError`.
+    fn round_rect_radius_item(
+        &mut self,
+        dom: &mut Dom,
+        value: &JsValue,
+    ) -> Result<(f64, f64), JsError> {
+        match value {
+            JsValue::Number(number) => Ok((*number, *number)),
+            JsValue::Object(_) => {
+                let x = self.round_rect_point_member(dom, value, "x")?;
+                let y = self.round_rect_point_member(dom, value, "y")?;
+                Ok((x, y))
+            }
+            JsValue::Undefined | JsValue::Null => Ok((0.0, 0.0)),
+            other => {
+                let radius = to_number(other)?;
+                Ok((radius, radius))
+            }
+        }
+    }
+
+    /// One `DOMPointInit` member: `undefined` is the dictionary default `0`,
+    /// and everything present converts as an `unrestricted double`.
+    fn round_rect_point_member(
+        &mut self,
+        dom: &mut Dom,
+        value: &JsValue,
+        member: &str,
+    ) -> Result<f64, JsError> {
+        let JsValue::Object(object) = value else {
+            return Ok(0.0);
+        };
+        match self.get_value(dom, *object, member)? {
+            JsValue::Undefined => Ok(0.0),
+            present => to_number(&present),
+        }
+    }
+
+    /// Build the `roundRect` path (HTML §4.12.5.1.4) from the primitives the
+    /// path model already has: one `moveTo`, four straight edges and four
+    /// elliptical arcs, closed. Nonfinite geometry draws nothing, as every
+    /// canvas method with a nonfinite argument does.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the method's own signature is x, y, width, height plus the radii list"
+    )]
+    fn round_rect_path(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        mut radii: Vec<(f64, f64)>,
+    ) -> Result<(), JsError> {
+        if !Self::all_finite(&[x, y, width, height]) {
+            return Ok(());
+        }
+        while radii.len() < 4 {
+            let last = radii.last().copied().unwrap_or((0.0, 0.0));
+            radii.push(last);
+        }
+        let mut corners = match radii.as_slice() {
+            [tl, tr, br, bl] => [*tl, *tr, *br, *bl],
+            [single] => [*single; 4],
+            [first, second] => [*first, *second, *first, *second],
+            [first, second, third] => [*first, *second, *third, *second],
+            _ => [(0.0, 0.0); 4],
+        };
+        // A negative width or height flips the rectangle, so the corners the
+        // names refer to swap with it.
+        if width < 0.0 {
+            corners.swap(0, 1);
+            corners.swap(2, 3);
+        }
+        if height < 0.0 {
+            corners.swap(0, 3);
+            corners.swap(1, 2);
+        }
+        // Scale every radius by the one factor that keeps adjacent corners of
+        // an edge from overlapping.
+        let edge_width = width.abs();
+        let edge_height = height.abs();
+        let mut factor: f64 = 1.0;
+        for (sum, length) in [
+            (corners[0].0 + corners[1].0, edge_width),
+            (corners[2].0 + corners[3].0, edge_width),
+            (corners[0].1 + corners[3].1, edge_height),
+            (corners[1].1 + corners[2].1, edge_height),
+        ] {
+            if sum > length && sum > 0.0 {
+                factor = factor.min(length / sum);
+            }
+        }
+        for corner in &mut corners {
+            corner.0 *= factor;
+            corner.1 *= factor;
+        }
+        let [tl, tr, br, bl] = corners;
+        // Both dimensions of one sign traverse clockwise; mixed signs reverse.
+        let clockwise = (width >= 0.0) == (height >= 0.0);
+        // A negative width or height puts the named origin outside the shape:
+        // the edges are the axis-aligned extremes, and the swapped corners
+        // belong to them.
+        let left = x.min(x + width);
+        let top = y.min(y + height);
+        let right = x.max(x + width);
+        let bottom = y.max(y + height);
+        // A corner with no radii contributes no arc: the straight edges meet,
+        // and a zero-radius ellipse would add a stray point.
+        let arc = |runtime: &mut Self,
+                   center: (f64, f64),
+                   radii: (f64, f64),
+                   start: f64,
+                   end: f64,
+                   dom: &mut Dom,
+                   receiver: ObjectId|
+         -> Result<(), JsError> {
+            if radii.0 == 0.0 && radii.1 == 0.0 {
+                return Ok(());
+            }
+            runtime
+                .canvas_run(
+                    dom,
+                    receiver,
+                    CanvasOp::Ellipse {
+                        x: center.0,
+                        y: center.1,
+                        radius_x: radii.0,
+                        radius_y: radii.1,
+                        rotation: 0.0,
+                        start,
+                        end,
+                        counter_clockwise: !clockwise,
+                    },
+                )
+                .map(|_| ())
+        };
+        self.canvas_run(
+            dom,
+            receiver,
+            CanvasOp::MoveTo {
+                x: left + tl.0,
+                y: top,
+            },
+        )?;
+        if clockwise {
+            self.canvas_run(
+                dom,
+                receiver,
+                CanvasOp::LineTo {
+                    x: right - tr.0,
+                    y: top,
+                },
+            )?;
+            arc(
+                self,
+                (right - tr.0, top + tr.1),
+                tr,
+                -FRAC_PI_2,
+                0.0,
+                dom,
+                receiver,
+            )?;
+            self.canvas_run(
+                dom,
+                receiver,
+                CanvasOp::LineTo {
+                    x: right,
+                    y: bottom - br.1,
+                },
+            )?;
+            arc(
+                self,
+                (right - br.0, bottom - br.1),
+                br,
+                0.0,
+                FRAC_PI_2,
+                dom,
+                receiver,
+            )?;
+            self.canvas_run(
+                dom,
+                receiver,
+                CanvasOp::LineTo {
+                    x: left + bl.0,
+                    y: bottom,
+                },
+            )?;
+            arc(
+                self,
+                (left + bl.0, bottom - bl.1),
+                bl,
+                FRAC_PI_2,
+                PI,
+                dom,
+                receiver,
+            )?;
+            self.canvas_run(
+                dom,
+                receiver,
+                CanvasOp::LineTo {
+                    x: left,
+                    y: top + tl.1,
+                },
+            )?;
+            arc(
+                self,
+                (left + tl.0, top + tl.1),
+                tl,
+                PI,
+                PI + FRAC_PI_2,
+                dom,
+                receiver,
+            )?;
+        } else {
+            self.canvas_run(
+                dom,
+                receiver,
+                CanvasOp::LineTo {
+                    x: left,
+                    y: top + tl.1,
+                },
+            )?;
+            arc(
+                self,
+                (left + tl.0, top + tl.1),
+                tl,
+                -FRAC_PI_2,
+                -PI,
+                dom,
+                receiver,
+            )?;
+            self.canvas_run(
+                dom,
+                receiver,
+                CanvasOp::LineTo {
+                    x: left,
+                    y: bottom - bl.1,
+                },
+            )?;
+            arc(
+                self,
+                (left + bl.0, bottom - bl.1),
+                bl,
+                PI,
+                FRAC_PI_2,
+                dom,
+                receiver,
+            )?;
+            self.canvas_run(
+                dom,
+                receiver,
+                CanvasOp::LineTo {
+                    x: right - br.0,
+                    y: bottom,
+                },
+            )?;
+            arc(
+                self,
+                (right - br.0, bottom - br.1),
+                br,
+                FRAC_PI_2,
+                0.0,
+                dom,
+                receiver,
+            )?;
+            self.canvas_run(
+                dom,
+                receiver,
+                CanvasOp::LineTo {
+                    x: right,
+                    y: top + tr.1,
+                },
+            )?;
+            arc(
+                self,
+                (right - tr.0, top + tr.1),
+                tr,
+                0.0,
+                -FRAC_PI_2,
+                dom,
+                receiver,
+            )?;
+        }
+        self.canvas_run(dom, receiver, CanvasOp::ClosePath)
+            .map(|_| ())
+    }
+
     /// The four numbers of a rectangle method, each required.
     fn canvas_rect_args(
         &mut self,
@@ -1250,6 +1606,7 @@ const CONTEXT_METHODS: &[(&str, CanvasMethod)] = &[
     ("arc", CanvasMethod::Arc),
     ("arcTo", CanvasMethod::ArcTo),
     ("ellipse", CanvasMethod::Ellipse),
+    ("roundRect", CanvasMethod::RoundRect),
     ("bezierCurveTo", CanvasMethod::BezierCurveTo),
     ("quadraticCurveTo", CanvasMethod::QuadraticCurveTo),
     ("fill", CanvasMethod::Fill),

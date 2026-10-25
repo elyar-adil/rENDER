@@ -176,3 +176,113 @@ fn a_negative_dash_is_ignored_and_a_valid_one_is_read_back() {
     );
     assert_eq!(run(&script), "1,2");
 }
+
+#[test]
+fn round_rect_one_radius_rounds_every_corner() {
+    // WPT 2d.path.roundrect.1.radius.double, at its own size: the corner
+    // pixels the radius cuts away stay red, the middle is green.
+    let script = format!(
+        "{SETUP} c.width = 100; c.height = 50;          ctx.fillStyle = '#f00'; ctx.fillRect(0, 0, 100, 50);          ctx.beginPath(); ctx.roundRect(0, 0, 100, 50, [20]);          ctx.fillStyle = '#0f0'; ctx.fill();          [{}, {}, {}, {}, {}].join('|')",
+        pixel(1, 1),
+        pixel(98, 1),
+        pixel(98, 48),
+        pixel(1, 48),
+        pixel(50, 25)
+    );
+    assert_eq!(
+        run(&script),
+        "255,0,0,255|255,0,0,255|255,0,0,255|255,0,0,255|0,255,0,255"
+    );
+}
+
+#[test]
+fn round_rect_four_radii_round_only_the_named_corners() {
+    // WPT 2d.path.roundrect.4.radii.3.double: [0, 0, 20, 0] rounds only the
+    // bottom-right corner.
+    let script = format!(
+        "{SETUP} c.width = 100; c.height = 50;          ctx.fillStyle = '#f00'; ctx.fillRect(0, 0, 100, 50);          ctx.beginPath(); ctx.roundRect(0, 0, 100, 50, [0, 0, 20, 0]);          ctx.fillStyle = '#0f0'; ctx.fill();          [{}, {}, {}, {}].join('|')",
+        pixel(1, 1),
+        pixel(98, 1),
+        pixel(98, 48),
+        pixel(1, 48)
+    );
+    assert_eq!(
+        run(&script),
+        "0,255,0,255|0,255,0,255|255,0,0,255|0,255,0,255"
+    );
+}
+
+#[test]
+fn round_rect_radii_scales_when_edges_cannot_hold_them() {
+    // WPT 2d.path.roundrect.radius.intersecting.2: adjacent radii wider than
+    // the edge scale down by the one factor, so the shape stays a rectangle.
+    let script = format!(
+        "{SETUP} c.width = 100; c.height = 50;          ctx.fillStyle = '#f00'; ctx.fillRect(0, 0, 100, 50);          ctx.beginPath(); ctx.roundRect(0, 0, 100, 50, [40, 40]);          ctx.fillStyle = '#0f0'; ctx.fill();          [{}, {}, {}, {}].join('|')",
+        pixel(1, 1),
+        pixel(98, 1),
+        pixel(98, 48),
+        pixel(1, 48)
+    );
+    // 40 + 40 = 80 > 50 (the height), so every radius scales by 25/40: the
+    // corners still cut, just shallower.
+    assert_eq!(
+        run(&script),
+        "255,0,0,255|255,0,0,255|255,0,0,255|255,0,0,255"
+    );
+}
+
+#[test]
+fn round_rect_negative_sizes_flip_their_corners() {
+    // WPT 2d.path.roundrect.negative: a negative width or height draws the
+    // same shape as the positive one with the corners swapped.
+    let script = format!(
+        "{SETUP} c.width = 100; c.height = 50;          ctx.fillStyle = '#f00'; ctx.fillRect(0, 0, 100, 50);          ctx.beginPath();          ctx.roundRect(0, 0, 50, 25, [10, 0, 0, 0]);          ctx.roundRect(100, 0, -50, 25, [10, 0, 0, 0]);          ctx.fillStyle = '#0f0'; ctx.fill();          [{}, {}, {}, {}].join('|')",
+        pixel(1, 1),
+        pixel(48, 1),
+        pixel(51, 1),
+        pixel(98, 1)
+    );
+    // Both subpaths cut their geometric top-left corner: rect 1 names it
+    // directly, and rect 2's named top-left radius mirrors onto its
+    // geometric top-right corner because its width is negative.
+    assert_eq!(
+        run(&script),
+        "255,0,0,255|0,255,0,255|0,255,0,255|255,0,0,255"
+    );
+}
+
+#[test]
+fn round_rect_with_zero_height_strokes_a_line() {
+    // WPT 2d.path.roundrect.zero.1: a zero-height rect still adds its straight
+    // edges, and stroking one paints them.
+    let script = format!(
+        "{SETUP} c.width = 100; c.height = 50;          ctx.fillStyle = '#f00'; ctx.fillRect(0, 0, 100, 50);          ctx.strokeStyle = '#0f0'; ctx.lineWidth = 100; ctx.beginPath();          ctx.roundRect(0, 50, 100, 0, [0]); ctx.stroke();          [{}, {}, {}].join('|')",
+        pixel(2, 25),
+        pixel(98, 25),
+        pixel(2, 2)
+    );
+    // A 100-pixel line on a 50-pixel canvas covers every pixel.
+    assert_eq!(run(&script), "0,255,0,255|0,255,0,255|0,255,0,255");
+}
+
+#[test]
+fn round_rect_rejects_bad_radius_shapes() {
+    // WPT 2d.path.roundrect.radius.toomany, .none and .negative, and the
+    // union's TypeError on a BigInt: a sequence that does not hold one to
+    // four items and a negative radius are RangeErrors.
+    let script = format!(
+        "{SETUP} var names = [];          for (var call of [function () {{ ctx.roundRect(0, 0, 100, 50, [0, 0, 0, 0, 0]); }},                            function () {{ ctx.roundRect(0, 0, 100, 50, []); }},                            function () {{ ctx.roundRect(0, 0, 100, 50, [-1]); }},                            function () {{ ctx.roundRect(0, 0, 100, 50, 0n); }}]) {{              try {{ call(); }} catch (e) {{ names.push(e.name); }}          }}          names.join(',')"
+    );
+    assert_eq!(run(&script), "RangeError,RangeError,RangeError,TypeError");
+}
+
+#[test]
+fn round_rect_accepts_the_dictionary_shapes_bad_input_produces() {
+    // WPT 2d.path.roundrect.badinput: objects without x or y are all-zero
+    // DOMPointInit dictionaries, and an absent radii argument is zero, so
+    // every call here is a plain rectangle and none throws.
+    let script = format!(
+        "{SETUP} c.width = 100; c.height = 50;          ctx.roundRect(0, 0, 100, 50, {{ foo: 'bar' }});          ctx.roundRect(0, 0, 100, 50, undefined);          ctx.roundRect(0, 0, 100, 50, [[]]);          ctx.roundRect(0, 0, 100, 50, [undefined]);          ctx.roundRect(0, 0, 100, 50);          ctx.isPointInPath(50, 25) + ',' + ctx.isPointInPath(-1, -1)"
+    );
+    assert_eq!(run(&script), "true,false");
+}

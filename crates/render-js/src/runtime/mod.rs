@@ -1394,7 +1394,7 @@ impl JsRuntime {
     }
 
     /// Surface a throw-ready `RangeError` instance with the given message.
-    fn range_error(&mut self, message: &str) -> JsError {
+    pub(in crate::runtime) fn range_error(&mut self, message: &str) -> JsError {
         self.native_error("RangeError", ErrorKind::RangeError, message)
     }
 
