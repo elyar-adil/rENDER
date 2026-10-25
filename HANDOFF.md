@@ -1,3 +1,34 @@
+# 交接文档 (2026-10-25, 续四) — canvas 状态属性 + Porter-Duff 合成
+
+接续同日 geometry 会话,继续"对正常使用影响大的核心功能"。
+
+## 本轮已完成(2 个提交)
+
+| 提交 | 内容 |
+|---|---|
+| `75f9567` | **canvas 文本/阴影/栅格质量状态**(HTML §4.12.5.1.12-13):font、direction、filter、fontKerning、fontStretch、fontVariantCaps、globalCompositeOperation、imageSmoothingEnabled/Quality、letterSpacing、shadowBlur/Color/OffsetX/Y、textAlign、textBaseline、textRendering、wordSpacing 共 17 项,全部进入既有 DrawingState(save/restore/reset 免费)。枚举属性关键字校验,未知值"return without updating";字符串属性**原串往返**(WPT 断言 get == set 的原样,不做序列化);shadowColor 先 parse 后存原串。绘制效果(真画文本/阴影)是下一层缺口,状态本身完整可观测——38 个 state-reset 测试测的就是状态语义 |
+| `dba9cab` | **Porter-Duff 合成**(globalCompositeOperation 的绘制):12 个模式(copy/src-in/out/atop/over、dst-in/out/atop/over、xor、lighter、destination)按标准系数对在预乘空间合成,反预乘时**输出 alpha 先钳到 1**——'lighter' 的 alpha 相加超 1、颜色在预乘空间相加,这是它需要的关键。**与 source-over 不同,这些模式对每个目标像素都有定义**:覆盖区外源 alpha 为 0,合成跑整张位图,完全离位的 fill 也会按模式清空/保留画布——WPT 的 uncovered.fill 系列断言的就是这个,coverage 早退不能跑在 mode 判断之前。可分离混合模式(multiply 等)暂按 source-over 绘制,已声明缺口 |
+
+## 测量(逐步)
+
+| 步 | pass | 符合率 |
+|---|---|---|
+| + geometry/roundRect 修复 | 1343 | 29.9% |
+| + 状态属性 | 1423 | 31.7% |
+| + Porter-Duff | **1456** | **32.4%** |
+
+compositing 集群 43 → 77 pass。dom 29.2%,html 32.8%。
+
+## 下一步候选
+
+1. drawImage(10+,把位图/元素画进 canvas——图像解码集成)。
+2. canvas 文本绘制(fillText 家族——需要嵌入方字形栅格,架构级)。
+3. 可分离混合模式 multiply/screen/...(状态已有,绘制待做)。
+4. ::backdrop + top layer(75+ reftest)。
+5. 嵌套浏览上下文(630+,总闸)。
+
+---
+
 # 交接文档 (2026-10-25, 续三) — roundRect 展开 bug + DOMPoint/DOMRect
 
 接续同日渐变会话。主题:优先修对正常页面影响大的核心功能。
