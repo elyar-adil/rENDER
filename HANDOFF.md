@@ -1,3 +1,33 @@
+# 交接文档 (2026-10-25, 续二) — canvas 渐变
+
+接续同日 dialog/roundRect 会话。
+
+## 本轮已完成(1 个提交)
+
+| 提交 | 内容 |
+|---|---|
+| `1959901` | **canvas 渐变**(HTML §4.12.5.1.3):createLinearGradient/createRadialGradient/addColorStop + 渐变填充与描边。**定义经 CanvasHost::define_gradient 注册表操作传给宿主**而非装进样式——因为渐变对象是活的(WPT 先赋 fillStyle 再 addColorStop,下一次 fill 必须生效);注册表属于宿主而非单个 canvas(跨 canvas 可用)。样式只携带 id,fillStyle getter 把 id 映回**同一个**对象(object-current 测试)。**paint 按覆盖像素逐点采样**,经当前变换的逆矩阵映射回用户空间(渐变坐标属于绘制时的空间,不是创建时的);线性=线段投影,径向=圆族二次方程取大根;stops 按 offset 排序、直通 alpha 插值;无 stop 什么都不画。addColorStop 越界抛 IndexSizeError、颜色不可解析抛 SyntaxError。CanvasHost::define_gradient 带默认 no-op(无渐变的宿主零改动)。install_interface 现在写原型的 @@toStringTag(ImageData/OffscreenCanvas 实例的 toString 从 [object Object] 变为接口名)。render-core canvas 测试 35→40 |
+
+## 测量(逐步)
+
+| 步 | pass | 符合率 |
+|---|---|---|
+| document.write 会话结束 | 1192 | 26.1% |
+| + dialog | 1204 | 26.6% |
+| + roundRect | 1261 | 28.0% |
+| + gradients | **1303** | **29.0%** |
+
+2d.gradient 集群 38 pass(此前 0)。dom 29.2%,html 29.0%。
+
+## 下一步候选
+
+1. createPattern(与渐变同族)+ fillText(需 canvas 字体管线)。
+2. canvas/img 内在尺寸进 layout(22,"Parsing of non-negative integers")。
+3. ::backdrop + top layer(解锁 75+ showModal/showPopover reftest)。
+4. 嵌套浏览上下文(630+,css/ 区 26k 测试的总闸)。
+
+---
+
 # 交接文档 (2026-10-25, 续) — dialog + canvas roundRect
 
 接续同日 document.write 会话。主题:按最新失败聚类继续推进 WPT 通过率。
