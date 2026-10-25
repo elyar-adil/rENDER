@@ -1643,6 +1643,7 @@ dependencies = [
 name = "render-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "cssparser",
  "encoding_rs",
  "entities",

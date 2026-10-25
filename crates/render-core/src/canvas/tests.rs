@@ -22,6 +22,8 @@
     clippy::single_match_else
 )]
 
+use base64::Engine as _;
+use image_codec::GenericImageView as _;
 use render_js::{JsRuntime, JsValue};
 
 use super::CanvasHandle;
@@ -677,4 +679,187 @@ fn xor_blends_both_halves_with_their_own_weights() {
             "channel {channel} is more than 5 away from {target}"
         );
     }
+}
+
+/// The payload of a `data:` URL, decoded with the format its prefix names.
+fn decode_data_url(url: &str) -> image_codec::DynamicImage {
+    let (prefix, payload) = url.split_once(',').expect("a data URL has a comma");
+    assert!(prefix.ends_with(";base64"), "{url} is not base64 encoded");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .expect("the payload is base64");
+    let format = image_codec::guess_format(&bytes).expect("the payload has a known format");
+    image_codec::load_from_memory_with_format(&bytes, format).expect("the payload decodes")
+}
+
+#[test]
+fn to_data_url_defaults_to_a_png_of_the_bitmap() {
+    let script = format!(
+        "{SETUP} c.width = 4; c.height = 2; \
+         ctx.fillStyle = 'rgba(10, 20, 30, 0.5)'; ctx.fillRect(0, 0, 2, 2); \
+         c.toDataURL()"
+    );
+    let url = run(&script);
+    assert!(url.starts_with("data:image/png;base64,"), "{url}");
+    let image = decode_data_url(&url);
+    assert_eq!(image.dimensions(), (4, 2));
+    let pixels = image.to_rgba8();
+    assert_eq!(pixels.get_pixel(0, 0).0, [10, 20, 30, 128]);
+    assert_eq!(pixels.get_pixel(3, 0).0, [0, 0, 0, 0]);
+}
+
+#[test]
+fn to_data_url_of_a_zero_size_canvas_is_empty() {
+    for (dimension, value) in [("width", 0), ("height", 0)] {
+        let script =
+            format!("var c = document.getElementById('c'); c.{dimension} = {value}; c.toDataURL()");
+        assert_eq!(run(&script), "data:,", "{dimension} = {value}");
+    }
+}
+
+#[test]
+fn to_data_url_encodes_the_requested_type_ascii_case_insensitively() {
+    assert_eq!(
+        run("var c = document.getElementById('c'); \
+             c.toDataURL('ImAgE/JpEg').slice(0, 23)"),
+        "data:image/jpeg;base64,"
+    );
+    assert_eq!(
+        run("var c = document.getElementById('c'); \
+             c.toDataURL('image/jpeg').slice(0, 23)"),
+        "data:image/jpeg;base64,"
+    );
+}
+
+#[test]
+fn to_data_url_falls_back_to_png_for_unencodable_types() {
+    // HTML §4.12.5.3: an unrecognised or unsupported type is PNG. `image/jpg`
+    // and the Turkish dotted I are not ASCII case-insensitive matches for
+    // `image/png` or `image/jpeg`; WebP has no encoder backend here.
+    for mime_type in [
+        "'bogus'",
+        "'image/jpg'",
+        "'image/example'",
+        "'\\u0130mage/png'",
+        "'image/webp'",
+        "null",
+    ] {
+        let script =
+            format!("var c = document.getElementById('c'); c.toDataURL({mime_type}).slice(0, 21)");
+        assert_eq!(run(&script), "data:image/png;base64", "type {mime_type}");
+    }
+}
+
+#[test]
+fn to_data_url_jpeg_composites_transparent_pixels_onto_black() {
+    // WPT toDataURL.jpeg.alpha: rgba(128, 255, 128, 0.5) is stored
+    // premultiplied, so a format without alpha must encode (64, 128, 64).
+    let script = format!(
+        "{SETUP} c.width = 100; c.height = 50; \
+         ctx.fillStyle = 'rgba(128, 255, 128, 0.5)'; ctx.fillRect(0, 0, 100, 50); \
+         c.toDataURL('image/jpeg')"
+    );
+    let url = run(&script);
+    assert!(url.starts_with("data:image/jpeg;base64,"), "{url}");
+    let pixels = decode_data_url(&url).to_rgb8();
+    let pixel = pixels.get_pixel(50, 25).0;
+    for (actual, expected) in pixel.into_iter().zip([64, 128, 64]) {
+        assert!(
+            i32::from(actual).abs_diff(expected) <= 8,
+            "JPEG pixel {pixel:?} is not within 8 of [64, 128, 64]"
+        );
+    }
+}
+
+#[test]
+fn to_data_url_jpeg_quality_changes_the_encoding() {
+    let base = format!(
+        "{SETUP} c.width = 100; c.height = 50; \
+         ctx.fillStyle = '#00f'; ctx.fillRect(0, 0, 100, 50); \
+         ctx.fillStyle = '#0ff'; ctx.fillRect(0, 3, 100, 1); \
+         c.toDataURL('image/jpeg', "
+    );
+    let high = run(&format!("{base}0.99)"));
+    let low = run(&format!("{base}0.01)"));
+    assert!(
+        high.len() > low.len(),
+        "quality 0.99 ({}) is not larger than quality 0.01 ({})",
+        high.len(),
+        low.len()
+    );
+    let best = run(&format!("{base}1)"));
+    let nearly_best = run(&format!("{base}0.9)"));
+    assert!(best.len() >= nearly_best.len());
+    let worst = run(&format!("{base}0)"));
+    let nearly_worst = run(&format!("{base}0.1)"));
+    assert!(worst.len() <= nearly_worst.len());
+}
+
+#[test]
+fn to_data_url_ignores_non_number_and_out_of_range_quality() {
+    // WPT toDataURL.jpeg.quality.notnumber and .outsiderange: anything that
+    // is not a number in 0..=1 leaves the default encoding untouched.
+    let base = format!(
+        "{SETUP} c.width = 100; c.height = 50; \
+         ctx.fillStyle = '#00f'; ctx.fillRect(0, 0, 100, 50); \
+         c.toDataURL('image/jpeg'"
+    );
+    let default = run(&format!("{base})"));
+    for argument in [
+        "'bogus'",
+        "{}",
+        "null",
+        "undefined",
+        "true",
+        "'0.01'",
+        "10",
+        "-10",
+        "1.01",
+        "-0.01",
+    ] {
+        assert_eq!(
+            run(&format!("{base}, {argument})")),
+            default,
+            "quality {argument} changed the default encoding"
+        );
+    }
+}
+
+#[test]
+fn to_data_url_works_before_a_context_and_ignores_extra_arguments() {
+    // WPT toDataURL.nocontext: the bitmap is the element's, whether or not a
+    // context object has been requested; an invisible fill changes nothing.
+    let script = "var c = document.getElementById('c'); var before = c.toDataURL(); \
+         var ctx = c.getContext('2d'); ctx.rect(0, 0, 10, 10); \
+         ctx.fillStyle = 'rgba(0, 0, 0, 0)'; ctx.fill(); \
+         String(before === c.toDataURL())";
+    assert_eq!(run(script), "true");
+
+    // WPT toDataURL.arguments.1-3: extra arguments are ignored.
+    assert_eq!(
+        run("var c = document.getElementById('c'); \
+             c.toDataURL('image/png', 'another argument', 'and another') === \
+             c.toDataURL('image/png') ? 'same' : 'different'"),
+        "same"
+    );
+    assert_eq!(
+        run("var c = document.getElementById('c'); \
+             c.toDataURL('image/png', null, null, null).slice(0, 21)"),
+        "data:image/png;base64"
+    );
+}
+
+#[test]
+fn to_data_url_requires_a_canvas_element_receiver() {
+    assert_eq!(
+        run("var name = 'none'; \
+             try { HTMLCanvasElement.prototype.toDataURL.call({}); } \
+             catch (e) { name = e.name; } name"),
+        "TypeError"
+    );
+    assert_eq!(
+        run("var ctx = document.getElementById('c').getContext('2d'); \
+             typeof ctx.toDataURL"),
+        "undefined"
+    );
 }

@@ -108,6 +108,7 @@ pub(crate) enum CanvasMethod {
     GetImageData,
     PutImageData,
     CreateImageData,
+    ToDataUrl,
 }
 
 /// The accessors of the canvas surface, dispatched by
@@ -555,6 +556,7 @@ impl JsRuntime {
                 }
             }
             CanvasMethod::PutImageData => self.canvas_put_image_data(dom, receiver, arguments),
+            CanvasMethod::ToDataUrl => self.canvas_to_data_url(dom, receiver, arguments),
             CanvasMethod::CreateImageData => {
                 let width = self.canvas_unsigned_long(dom, arguments, 0)?;
                 let height = self.canvas_unsigned_long(dom, arguments, 1)?;
@@ -617,6 +619,45 @@ impl JsRuntime {
             Err(id) => id,
         };
         self.context_object(id, receiver)
+    }
+
+    /// `HTMLCanvasElement.prototype.toDataURL(type, quality)`: the element's
+    /// bitmap as a `data:` URL (HTML §4.12.5.3).
+    fn canvas_to_data_url(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let Some(ObjectHost::Node(node)) = self.realm.host(receiver) else {
+            return Err(JsError::type_error("Illegal invocation"));
+        };
+        if !is_html_canvas(dom, node) {
+            return Err(JsError::type_error("Illegal invocation"));
+        }
+        // The type is a `DOMString` with a default: an absent or `undefined`
+        // argument is `image/png`, while `null` converts to `"null"` and so
+        // falls back to PNG like any other unrecognised type.
+        let mime_type = match arguments.first() {
+            None | Some(JsValue::Undefined) => "image/png".to_owned(),
+            Some(value) => self.canvas_to_string(dom, value)?,
+        };
+        // `quality` is `any`: only a JavaScript number is a quality. Every
+        // other value means the implementation's default encoding.
+        let quality = match arguments.get(1) {
+            Some(JsValue::Number(value)) => Some(*value),
+            _ => None,
+        };
+        let Some(mut host) = self.canvas_host.take() else {
+            return Ok(JsValue::String("data:,".into()));
+        };
+        let id = host.canvas_for(dom, node);
+        let result = host.execute(dom, id, CanvasOp::ToDataUrl { mime_type, quality });
+        self.canvas_host = Some(host);
+        match result.map_err(|error| self.canvas_error(error))? {
+            CanvasValue::Text(text) => Ok(JsValue::String(text.into())),
+            _ => Err(JsError::type_error("toDataURL returned no data URL")),
+        }
     }
 
     /// The `CanvasRenderingContext2DSettings` dictionary of `getContext`, converted
@@ -1767,7 +1808,10 @@ pub(crate) fn install_canvas(
             objects,
             canvas_prototype,
             function_prototype,
-            &[("getContext", CanvasMethod::GetContext)],
+            &[
+                ("getContext", CanvasMethod::GetContext),
+                ("toDataURL", CanvasMethod::ToDataUrl),
+            ],
         );
     }
 }

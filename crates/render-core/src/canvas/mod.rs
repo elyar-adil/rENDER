@@ -28,6 +28,7 @@
 )]
 
 mod bitmap;
+mod export;
 mod path;
 mod stroke;
 mod style;
@@ -862,6 +863,13 @@ impl Canvas {
             } => {
                 self.put_image_data(&pixels, x, y, (dirty_x, dirty_y, dirty_width, dirty_height));
             }
+            CanvasOp::ToDataUrl { mime_type, quality } => {
+                return Ok(CanvasValue::Text(export::data_url(
+                    &self.bitmap,
+                    &mime_type,
+                    quality,
+                )));
+            }
         }
         Ok(CanvasValue::Undefined)
     }
@@ -1122,6 +1130,7 @@ fn is_read(op: &CanvasOp) -> bool {
             | CanvasOp::IsPointInPath { .. }
             | CanvasOp::IsPointInStroke { .. }
             | CanvasOp::GetImageData { .. }
+            | CanvasOp::ToDataUrl { .. }
     )
 }
 

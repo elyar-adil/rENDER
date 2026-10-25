@@ -193,6 +193,18 @@ impl Bitmap {
         self.read_straight(0, 0, self.width, self.height)
     }
 
+    /// The whole bitmap as premultiplied RGB8: each pixel's colour
+    /// composited onto opaque black. This is the colour a format without an
+    /// alpha channel, such as JPEG, encodes.
+    #[must_use]
+    pub fn premultiplied_rgb(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(pixel_count(self.width, self.height) * 3);
+        for pixel in &self.pixels {
+            out.extend_from_slice(&pixel[..3]);
+        }
+        out
+    }
+
     /// Writes straight-alpha RGBA8 `source` (`source_width` by
     /// `source_height`) so that its pixel `(sx, sy)` lands at `(dx + sx, dy + sy)`,
     /// replacing the destination pixels without compositing.

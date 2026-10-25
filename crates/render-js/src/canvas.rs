@@ -211,6 +211,13 @@ pub enum CanvasOp {
         dirty_width: f64,
         dirty_height: f64,
     },
+    /// `HTMLCanvasElement.prototype.toDataURL`: a `data:` URL of the bitmap
+    /// encoded in `mime_type`, with `quality` when it is a usable number
+    /// (HTML §4.12.5.3).
+    ToDataUrl {
+        mime_type: String,
+        quality: Option<f64>,
+    },
 }
 
 /// A failure that the script sees as a `DOMException` of the named kind.
