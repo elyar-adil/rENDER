@@ -1,3 +1,34 @@
+# 交接文档 (2026-10-25) — document.write 端到端 + WPT 重测
+
+本轮主题:git pull 后重测 WPT 基线,然后实现 HTML §8.4 动态标记插入(document.write/writeln/open/close + currentScript)——WPT 失败聚类的最大单因(~50 个直接测试 + 156 个测试引用它),也是真实遗留页面的硬依赖。
+
+## 基线(本轮开始时)
+
+- pull 带入:命名访问(HTML 7.4.4)、shadow DOM 核心、document.forms/form.elements/表单控件命名访问、Window interface object、WPT reftest 评分器。
+- 重测 dom+html walk:**21.6% → 24.8%**(1099 → 1154 / 4653)。dom 23.5%→29.1%,html 21.4%→24.4%。即近期 DOM 面工作已在旧结果之上净增 55 pass。
+
+## 本轮已完成(3 个提交)
+
+| 提交 | 内容 |
+|---|---|
+| `c555f2a` | **document.write/writeln/open/close + currentScript**。核心模型:`runtime/document_write.rs` 的写入会话——(a) 解析器脚本执行中的 write → 流按脚本分流,fragment 解析(上下文=脚本父元素)后插到脚本之后;(b) 其余 write → 隐式 open:清空文档(含 window/document 的 on* 属性与监听器)后整文档重解析。无活解析器,故**每次 write 重解析累计流**并整体替换上次导入的节点,可观测 DOM 与增量分词器一致。**写入脚本的"完整性判定"**:每次解析配一次"流+哨兵字符"解析——完整脚本的源不变,被 EOF 截断的脚本会吞掉哨兵;只有过哨兵的脚本执行。内联脚本同步按序执行;外链脚本经 DocumentLoader 同步取;**写入的 async/defer/module 脚本是已声明的缺口**(发现并跳过,不静默)。module 中的 write 按规范静默忽略(WPT 断言无 error 事件);XML 文档 write 抛 InvalidStateError。接线:`execute_parser_script`/`execute_parser_compiled_script`(嵌入方传 script 元素 owner)、`PageTask::ParserScript/CompiledParserScript`(浏览器路径带 owner)、WPT 适配器 RunScript 带 owner。currentScript 安装为 document 原型 accessor。render-js 1116→1139 测试 |
+| `1861677` | **两个 WPT 语料才抓得到的缺陷**:① head 里的脚本 write——规范行为是解析器离开 head(13.2.6 "anything else"),流落进 body 且在后续标记之前(001.html 断言的就是这个);原实现按 head 上下文解析+插在脚本后,文本进不了 body。现 head 上下文的 write 用 body 上下文解析、插 body 开头。② 导入子树时兄弟顺序颠倒(before 语义变更后内部还在链 cursor),两个写入脚本执行顺序错。子节点对新建元素直接追加。另:会话改为克隆出来处理(槽位不再泄漏 default 占位)、插入参照点在移除旧节点之后计算 |
+| `82abe97` | **document.open() 清除 window 与 document 的事件处理器**(HTML 8.4.2;WPT event-listeners.window.js 断言)。这也是防无限递归的规范本身:Range-insertNode-multiple-document-children-crash.html 的 onload 里 open()+close(),close() 再触发 load,第二次分发必须找不到处理器——否则分发递归溢出 64MB 测试栈,**杀死整个 runner 进程**。该测试此前在 insertCell-undefined 处早退,是 document.write 实现后才走到的深水区 |
+
+## 测量(修完三个提交后,dom+html walk)
+
+**24.8% → 26.1%**(1154 → **1192** / 4569)。document-write 集群:1 pass → **34 pass**。剩余失败大头:iframe 类(嵌套浏览上下文缺口)、module 类(同样 iframe)、以及少量内容形状断言。**教训(重演)**:后台跑 walk 期间若 source 在变或 run.ps1 的 cargo run 失败,**结果文件根本不更新而 tail 日志仍显示 "== results"**——三次"重跑"都逐位复读旧结果。测量前先核对 `tools/wpt/results/wpt-results.jsonl` 的 mtime。runner 的单测试栈溢出(Rust 无法捕获)会 abort 整个进程并丢掉整轮 dom+html 结果——进程级隔离(每测试一子进程)是待做项。
+
+## 下一步候选
+
+1. document.write 剩余:写入的 async/defer/module 脚本调度(需要嵌入方资源管线协作);open() 的 session history 细节(ignore-destructive-writes 计数、unload 补偿)。
+2. WPT wrong-value 聚类(1184 个,引擎缺陷桶)按新排名读;canvas 像素类失败占大头(fillText/roundRect/toDataURL 缺失)。
+3. document.parseHTMLUnsafe(4+ 测试,真实站点在用)、表单校验属性(validity/validationMessage/willValidate,~12 测试)。
+4. showPopover/showModal(~49 reftest 因它们失败)。
+5. 嵌套浏览上下文仍是最大 harness 限制(630+),也是 css/ 区 26k 测试的阻塞项。
+
+---
+
 # 交接文档 (2026-09-27, 进行中) — 视觉保真专项:UA 样式表 / 字体轴 / 内联 SVG / 文字装饰
 
 本轮主题:用户报告"真实网页效果都非常糟糕,没有网页可以完美渲染"。做法:先用穷举 grep 建立**可验证的证据**（哪些 CSS 属性真的有消费者、哪些值算出来被丢弃),再按文件归属切分并行 agent,避免互相踩踏。
