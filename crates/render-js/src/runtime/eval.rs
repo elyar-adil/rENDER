@@ -2851,11 +2851,12 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         match self.realm.get_descriptor(object, key) {
             Some(descriptor) if descriptor.is_accessor() => {
-                let getter = match descriptor.getter {
-                    Some(getter) => getter,
-                    None => return Ok(JsValue::Undefined),
-                };
-                self.call_with_this(dom, getter, &[], JsValue::Object(object))
+                // A setter without a getter defers to the parent chain, per
+                // `OrdinaryGet`; the getter may live on an ancestor.
+                match self.realm.getter_on_chain(object, key) {
+                    Some(getter) => self.call_with_this(dom, getter, &[], JsValue::Object(object)),
+                    None => Ok(JsValue::Undefined),
+                }
             }
             Some(descriptor) => Ok(descriptor.value),
             None => Ok(JsValue::Undefined),

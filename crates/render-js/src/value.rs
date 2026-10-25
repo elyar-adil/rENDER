@@ -11075,6 +11075,34 @@ impl Realm {
     /// chain): the raw descriptor, accessor slots included. Pure reads that
     /// must not run user code stay on `get_property`; accessor invocation
     /// belongs to the runtime's [[Get]]/[[Set]] layer.
+    /// The getter a `key`'s accessor chain ends in: the nearest accessor,
+    /// continuing past a setter without a getter the way `ECMA-262`
+    /// `OrdinaryGet` does ("if `rec.[[Get]]` is `undefined`, set parent to
+    /// `O.[[GetPrototypeOf]]()` and repeat"). A data property anywhere on the
+    /// chain ends the search with no getter.
+    pub(crate) fn getter_on_chain(&self, object: ObjectId, key: &str) -> Option<ObjectId> {
+        let mut candidate = Some(object);
+        let mut visited = 0usize;
+        while let Some(id) = candidate {
+            let current = self.objects.get(id.0)?;
+            if let Some(descriptor) = current.properties.get(key) {
+                if descriptor.is_accessor() {
+                    if let Some(getter) = descriptor.getter {
+                        return Some(getter);
+                    }
+                } else {
+                    return None;
+                }
+            }
+            candidate = current.prototype;
+            visited = visited.saturating_add(1);
+            if visited > self.objects.len() {
+                return None;
+            }
+        }
+        None
+    }
+
     pub(crate) fn get_descriptor(&self, object: ObjectId, key: &str) -> Option<PropertyDescriptor> {
         if let Some(export) = self.namespace_export(object, key) {
             return Some(namespace_export_descriptor(export));

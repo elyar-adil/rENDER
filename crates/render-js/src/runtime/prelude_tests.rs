@@ -384,3 +384,75 @@ fn typed_array_prototype_methods() {
         "5,4,3,5,4"
     );
 }
+
+#[test]
+fn dom_point_holds_its_values_and_defaults_w_to_one() {
+    assert_eq!(
+        eval(
+            "var p = new DOMPoint(3, 4); \
+             [p.x, p.y, p.z, p.w, DOMPoint.fromPoint({x: 7}).x].join()"
+        )
+        .expect("point"),
+        "3,4,0,1,7"
+    );
+}
+
+#[test]
+fn dom_point_writes_go_through_and_dom_point_read_only_stays_read_only() {
+    assert_eq!(
+        eval(
+            "var p = new DOMPoint(); p.x = 5; \
+             var ro = new DOMPointReadOnly(1, 2); \
+             var frozen = Object.getOwnPropertyDescriptor(DOMPointReadOnly.prototype, 'x'); \
+             [p.x, ro.x, String(frozen.set === undefined)].join()"
+        )
+        .expect("point write"),
+        "5,1,true"
+    );
+}
+
+#[test]
+fn dom_rect_derived_edges_use_min_and_max() {
+    // Geometry Specification §2: top/left/right/bottom are the min/max forms,
+    // so a negative width flips which edge is which.
+    assert_eq!(
+        eval(
+            "var r = new DOMRectReadOnly(1, 2, 10, 20); \
+             var n = new DOMRect(5, 5, -3, 4); \
+             [r.top, r.right, r.bottom, r.left, n.left, n.right].join()"
+        )
+        .expect("rect"),
+        "2,11,22,1,2,5"
+    );
+}
+
+#[test]
+fn dom_rect_instances_answer_to_their_interfaces() {
+    assert_eq!(
+        eval(
+            "var r = new DOMRect(0, 0, 1, 1); \
+             [Object.prototype.toString.call(r), \
+              String(r instanceof DOMRectReadOnly), \
+              Object.keys(r).length].join()"
+        )
+        .expect("rect interfaces"),
+        "[object DOMRect],true,0"
+    );
+}
+
+#[test]
+fn get_bounding_client_rect_returns_a_dom_rect_read_only() {
+    let mut dom = parse_document("<!doctype html><body><p id=p>x</p></body>").dom;
+    let mut runtime = JsRuntime::new(&dom);
+    let value = runtime
+        .execute(
+            &mut dom,
+            "var rect = document.getElementById('p').getBoundingClientRect(); \
+             [typeof rect.top, String(rect instanceof DOMRectReadOnly)].join()",
+        )
+        .expect("rect")
+        .value
+        .to_js_string()
+        .to_lossy();
+    assert_eq!(value, "number,true");
+}

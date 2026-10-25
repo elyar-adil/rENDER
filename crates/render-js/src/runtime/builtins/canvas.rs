@@ -1215,15 +1215,13 @@ impl JsRuntime {
         y: f64,
         width: f64,
         height: f64,
-        mut radii: Vec<(f64, f64)>,
+        radii: Vec<(f64, f64)>,
     ) -> Result<(), JsError> {
         if !Self::all_finite(&[x, y, width, height]) {
             return Ok(());
         }
-        while radii.len() < 4 {
-            let last = radii.last().copied().unwrap_or((0.0, 0.0));
-            radii.push(last);
-        }
+        // The match expands one, two and three radii to the four corners per
+        // the standard's own rule; an empty list is the all-zero rectangle.
         let mut corners = match radii.as_slice() {
             [tl, tr, br, bl] => [*tl, *tr, *br, *bl],
             [single] => [*single; 4],

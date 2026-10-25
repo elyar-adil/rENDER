@@ -746,6 +746,102 @@
     return new NodeIterator(root, whatToShow, filter);
   });
 
+  // ------------------------------------------------- DOMPoint, DOMRect
+  // Geometry Specification §1-2: the point and rect interfaces are pure
+  // data. The values live in one hidden own slot per instance (browsers
+  // hold them as internal slots: `Object.keys(new DOMPoint())` is empty and
+  // the accessors live on the prototypes), and the rect's derived edges use
+  // the min/max form, which is what a negative width or height means.
+  class DOMPointReadOnly {
+    constructor(x = 0, y = 0, z = 0, w = 1) {
+      defineProperty(this, '__pointValues', {
+        value: [Number(x), Number(y), Number(z), Number(w)]
+      });
+    }
+    static fromPoint(init) {
+      var source = init || {};
+      return new DOMPoint(
+        source.x === undefined ? 0 : source.x,
+        source.y === undefined ? 0 : source.y,
+        source.z === undefined ? 0 : source.z,
+        source.w === undefined ? 1 : source.w
+      );
+    }
+    get x() { return this.__pointValues ? this.__pointValues[0] : NaN; }
+    get y() { return this.__pointValues ? this.__pointValues[1] : NaN; }
+    get z() { return this.__pointValues ? this.__pointValues[2] : NaN; }
+    get w() { return this.__pointValues ? this.__pointValues[3] : NaN; }
+    toJSON() { return { x: this.x, y: this.y, z: this.z, w: this.w }; }
+  }
+  defineProperty(DOMPointReadOnly.prototype, Symbol.toStringTag, {
+    value: 'DOMPointReadOnly', configurable: true
+  });
+
+  class DOMPoint extends DOMPointReadOnly {
+    set x(v) { if (this.__pointValues) this.__pointValues[0] = Number(v); }
+    set y(v) { if (this.__pointValues) this.__pointValues[1] = Number(v); }
+    set z(v) { if (this.__pointValues) this.__pointValues[2] = Number(v); }
+    set w(v) { if (this.__pointValues) this.__pointValues[3] = Number(v); }
+  }
+  defineProperty(DOMPoint.prototype, Symbol.toStringTag, {
+    value: 'DOMPoint', configurable: true
+  });
+
+  class DOMRectReadOnly {
+    constructor(x = 0, y = 0, width = 0, height = 0) {
+      defineProperty(this, '__rectValues', {
+        value: [Number(x), Number(y), Number(width), Number(height)]
+      });
+    }
+    static fromRect(init) {
+      var source = init || {};
+      return new DOMRect(
+        source.x === undefined ? 0 : source.x,
+        source.y === undefined ? 0 : source.y,
+        source.width === undefined ? 0 : source.width,
+        source.height === undefined ? 0 : source.height
+      );
+    }
+    get x() { return this.__rectValues ? this.__rectValues[0] : NaN; }
+    get y() { return this.__rectValues ? this.__rectValues[1] : NaN; }
+    get width() { return this.__rectValues ? this.__rectValues[2] : NaN; }
+    get height() { return this.__rectValues ? this.__rectValues[3] : NaN; }
+    get top() {
+      return Math.min(this.y, this.y + this.height);
+    }
+    get right() {
+      return Math.max(this.x, this.x + this.width);
+    }
+    get bottom() {
+      return Math.max(this.y, this.y + this.height);
+    }
+    get left() {
+      return Math.min(this.x, this.x + this.width);
+    }
+    toJSON() {
+      return { x: this.x, y: this.y, width: this.width, height: this.height,
+               top: this.top, right: this.right, bottom: this.bottom, left: this.left };
+    }
+  }
+  defineProperty(DOMRectReadOnly.prototype, Symbol.toStringTag, {
+    value: 'DOMRectReadOnly', configurable: true
+  });
+
+  class DOMRect extends DOMRectReadOnly {
+    set x(v) { if (this.__rectValues) this.__rectValues[0] = Number(v); }
+    set y(v) { if (this.__rectValues) this.__rectValues[1] = Number(v); }
+    set width(v) { if (this.__rectValues) this.__rectValues[2] = Number(v); }
+    set height(v) { if (this.__rectValues) this.__rectValues[3] = Number(v); }
+  }
+  defineProperty(DOMRect.prototype, Symbol.toStringTag, {
+    value: 'DOMRect', configurable: true
+  });
+
+  define(global, 'DOMPointReadOnly', DOMPointReadOnly);
+  define(global, 'DOMPoint', DOMPoint);
+  define(global, 'DOMRectReadOnly', DOMRectReadOnly);
+  define(global, 'DOMRect', DOMRect);
+
   // ------------------------------------------------------------------ window
   define(global, 'devicePixelRatio', 1);
   define(global, 'name', '');

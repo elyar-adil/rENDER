@@ -14,6 +14,7 @@
 )]
 
 use crate::JsError;
+use crate::JsObject;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
@@ -995,6 +996,34 @@ impl JsRuntime {
     }
 
     pub(in crate::runtime) fn rect_value(&mut self, rect: ElementRect) -> JsValue {
+        // A real `DOMRectReadOnly` when the prelude has one: the values are
+        // the same, but the object answers `instanceof DOMRectReadOnly` and
+        // carries the interface's toStringTag, as the platform's does.
+        if let Some(JsValue::Object(constructor)) = self.realm.global("DOMRectReadOnly")
+            && let Some(JsValue::Object(prototype)) =
+                self.realm.get_property(constructor, "prototype")
+        {
+            // A heap that cannot take one more object falls back to the
+            // plain object below, which reads the same for every property.
+            if self.ensure_heap_capacity(1).is_ok() {
+                let object = self
+                    .realm
+                    .allocate(JsObject::with_host(Some(prototype), ObjectHost::Ordinary));
+                for (name, value) in [
+                    ("x", rect.x),
+                    ("y", rect.y),
+                    ("width", rect.width),
+                    ("height", rect.height),
+                ] {
+                    self.realm.set_property(
+                        object,
+                        name.to_owned(),
+                        JsValue::Number(f64::from(value)),
+                    );
+                }
+                return JsValue::Object(object);
+            }
+        }
         let object = self.realm.create_ordinary_object();
         for (name, value) in [
             ("x", rect.x),

@@ -377,3 +377,37 @@ fn a_gradient_usable_across_canvases_and_empty_paints_nothing() {
     // this canvas kept its bitmap untouched by the stopless gradient.
     assert_eq!(run(&script), "0,0|0");
 }
+
+#[test]
+fn round_rect_two_radii_apply_to_opposite_corner_pairs() {
+    // WPT 2d.path.roundrect.2.radii.1.double: [20, 0] rounds the top-left and
+    // bottom-right corners, leaves the other two square.
+    let script = format!(
+        "{SETUP} c.width = 100; c.height = 50;          ctx.fillStyle = '#f00'; ctx.fillRect(0, 0, 100, 50);          ctx.beginPath(); ctx.roundRect(0, 0, 100, 50, [20, 0]);          ctx.fillStyle = '#0f0'; ctx.fill();          [{}, {}, {}, {}].join('|')",
+        pixel(1, 1),
+        pixel(98, 1),
+        pixel(98, 48),
+        pixel(1, 48)
+    );
+    assert_eq!(
+        run(&script),
+        "255,0,0,255|0,255,0,255|255,0,0,255|0,255,0,255"
+    );
+}
+
+#[test]
+fn round_rect_three_radii_repeat_the_second() {
+    // WPT 2d.path.roundrect.3.radii.1.double: [20, 0, 0] names tl, tr, br and
+    // repeats the second for bl, so only the top-left corner is round.
+    let script = format!(
+        "{SETUP} c.width = 100; c.height = 50;          ctx.fillStyle = '#f00'; ctx.fillRect(0, 0, 100, 50);          ctx.beginPath(); ctx.roundRect(0, 0, 100, 50, [20, 0, 0]);          ctx.fillStyle = '#0f0'; ctx.fill();          [{}, {}, {}, {}].join('|')",
+        pixel(1, 1),
+        pixel(98, 1),
+        pixel(98, 48),
+        pixel(1, 48)
+    );
+    assert_eq!(
+        run(&script),
+        "255,0,0,255|0,255,0,255|0,255,0,255|0,255,0,255"
+    );
+}
