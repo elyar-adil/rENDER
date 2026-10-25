@@ -390,10 +390,38 @@ impl JsRuntime {
     fn open_document_stream(&mut self, dom: &mut Dom, document: NodeId) -> Result<(), JsError> {
         self.write_sessions.clear();
         self.write_stream_epoch = self.write_stream_epoch.wrapping_add(1);
+        // document.open() removes every event listener and event handler
+        // (HTML 8.4.2; WPT's event-listeners.window.js asserts it). Besides
+        // being the spec, this is what stops a load handler that calls
+        // open()+close() from re-entering forever: close() fires load again,
+        // and the second dispatch must find no handler. The crashtest
+        // Range-insertNode-multiple-document-children-crash.html does
+        // exactly that.
         let wiped = descendants_of_children(dom, document);
         for node in wiped {
             self.event_listeners.remove(&node);
             self.event_handlers.remove(&node);
+        }
+        self.event_listeners.remove(&document);
+        self.event_handlers.remove(&document);
+        for realm in 0..self.window_event_handlers.len() {
+            self.window_event_handlers[realm].clear();
+        }
+        // The on-properties of the window and the document are ordinary
+        // properties holding the handlers; clearing them ends them too.
+        for owner in [self.realm.global_object(), self.realm.document_object()] {
+            let on_keys: Vec<String> = {
+                let objects = self.realm.objects();
+                objects[owner.0]
+                    .properties
+                    .keys()
+                    .filter(|key| key.starts_with("on") && key.len() > 2)
+                    .cloned()
+                    .collect()
+            };
+            for key in on_keys {
+                self.realm.set_property(owner, key, JsValue::Undefined);
+            }
         }
         let children = dom.children(document).unwrap_or_default().to_vec();
         for child in children {

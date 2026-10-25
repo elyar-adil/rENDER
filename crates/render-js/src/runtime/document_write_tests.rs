@@ -402,3 +402,46 @@ fn debug_two_writes_tmp() {
         .to_lossy();
     eprintln!("doc html: {v3}");
 }
+
+#[test]
+fn open_from_a_load_handler_ends_that_handler() {
+    // WPT's Range-insertNode-multiple-document-children-crash.html: a load
+    // handler calls open() and close(). close() fires load again, and the
+    // second dispatch must find no handler — open() removed it — or the
+    // dispatch recursion never ends.
+    let mut dom = parse_document(PAGE).dom;
+    let mut runtime = JsRuntime::new(&dom);
+    runtime.set_document_ready_state(crate::DocumentReadyState::Complete);
+    runtime
+        .execute(
+            &mut dom,
+            "window.onload = function () { \
+                 document.open(); document.write('<i id=loop>W</i>'); document.close(); \
+                 window.reentries = (window.reentries || 0) + 1; \
+             };",
+        )
+        .expect("handler");
+    runtime.dispatch_page_load(&mut dom).expect("load");
+    assert_eq!(
+        runtime
+            .execute(&mut dom, "String(window.reentries)")
+            .expect("read")
+            .value
+            .to_js_string()
+            .to_lossy(),
+        "1"
+    );
+    // The written content survived as the document, and the handler is gone.
+    assert_eq!(
+        runtime
+            .execute(
+                &mut dom,
+                "[document.body.firstChild.id, String(window.onload === undefined || window.onload === null)].join()"
+            )
+            .expect("read")
+            .value
+            .to_js_string()
+            .to_lossy(),
+        "loop,true"
+    );
+}
