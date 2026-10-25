@@ -295,8 +295,10 @@ pub(super) fn mark_host(
             crate::runtime::builtins::canvas::CanvasObject::ImageData { data, .. } => {
                 mark_object(runtime, marked, work, marked_environments, *data);
             }
+            // A gradient names a host registry entry; it holds no objects.
             crate::runtime::builtins::canvas::CanvasObject::Constructor(_)
-            | crate::runtime::builtins::canvas::CanvasObject::OffscreenCanvas(_) => {}
+            | crate::runtime::builtins::canvas::CanvasObject::OffscreenCanvas(_)
+            | crate::runtime::builtins::canvas::CanvasObject::Gradient(_) => {}
         },
         ObjectHost::WrappedFunction(target) => {
             mark_object(runtime, marked, work, marked_environments, *target);

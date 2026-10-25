@@ -40,10 +40,15 @@ pub enum Attribute {
     MiterLimit,
 }
 
-/// A style value: a colour in its CSS text form.
+/// A style value: a colour in its CSS text form, or a gradient the host
+/// holds by id (HTML §4.12.5.1.3). The id is the registry key both sides
+/// agreed on when the gradient was created; the definition itself travels
+/// through [`GradientOp`], so a later `addColorStop` reaches the paint the
+/// same way the creation did.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CanvasStyle {
     Color(String),
+    Gradient(u64),
 }
 
 /// Straight-alpha RGBA8 pixels, row-major, `4 * width * height` bytes.
@@ -203,6 +208,8 @@ pub enum CanvasErrorKind {
     IndexSize,
     /// A size the implementation will not allocate; reported as a `RangeError`.
     Range,
+    /// A colour that does not parse; reported as a `SyntaxError`.
+    Syntax,
 }
 
 /// The host side of the 2D canvas seam.
@@ -233,4 +240,47 @@ pub trait CanvasHost: std::fmt::Debug {
         canvas: CanvasId,
         op: CanvasOp,
     ) -> Result<CanvasValue, CanvasError>;
+
+    /// Creates or amends a gradient in the host's registry (HTML
+    /// §4.12.5.1.3). Gradients are context-independent: a gradient made on
+    /// one canvas paints on another, so the registry is the host's own, not
+    /// one canvas's state.
+    ///
+    /// The default is a host that has no gradient support.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `DOMException` the operation raises: an `IndexSizeError`
+    /// for an offset outside `0..=1`, a `SyntaxError` for a colour that does
+    /// not parse.
+    fn define_gradient(&mut self, op: GradientOp) -> Result<(), CanvasError> {
+        let _ = op;
+        Ok(())
+    }
+}
+
+/// One gradient registry operation.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GradientOp {
+    Create { id: u64, kind: GradientKind },
+    AddColorStop { id: u64, offset: f64, color: String },
+}
+
+/// The geometry of a gradient, in the user space of the paint that uses it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GradientKind {
+    Linear {
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+    },
+    Radial {
+        x0: f64,
+        y0: f64,
+        r0: f64,
+        x1: f64,
+        y1: f64,
+        r1: f64,
+    },
 }

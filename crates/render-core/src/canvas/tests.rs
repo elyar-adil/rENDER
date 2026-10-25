@@ -286,3 +286,94 @@ fn round_rect_accepts_the_dictionary_shapes_bad_input_produces() {
     );
     assert_eq!(run(&script), "true,false");
 }
+
+#[test]
+fn a_linear_gradient_interpolates_between_its_stops() {
+    // WPT 2d.gradient.linear.transform.3 shape: a left-to-right gradient from
+    // red to green over exactly the canvas width. The samples read each
+    // pixel's centre, so t is 0.025, 0.505 and 0.975 - the blend the
+    // interpolation actually produces there.
+    let script = format!(
+        "{SETUP} c.width = 100; c.height = 50; \
+         var g = ctx.createLinearGradient(0, 0, 100, 0); \
+         g.addColorStop(0, '#f00'); g.addColorStop(1, '#0f0'); \
+         ctx.fillStyle = g; ctx.fillRect(0, 0, 100, 50); \
+         [{}, {}, {}].join('|')",
+        pixel(2, 25),
+        pixel(50, 25),
+        pixel(98, 25)
+    );
+    assert_eq!(run(&script), "249,6,0,255|126,129,0,255|4,251,0,255");
+}
+
+#[test]
+fn a_gradient_stays_live_after_fillstyle_assignment() {
+    // WPT 2d.gradient.object.update: addColorStop after the assignment still
+    // changes what the next fill paints. The samples are pixel centres, so
+    // t = 0.025 lands at 95% red on the red-to-green half, and t = 0.505
+    // just past the green middle.
+    let script = format!(
+        "{SETUP} c.width = 100; c.height = 50; \
+         var g = ctx.createLinearGradient(0, 0, 100, 0); \
+         g.addColorStop(0, '#f00'); g.addColorStop(1, '#f00'); \
+         ctx.fillStyle = g; ctx.fillRect(0, 0, 100, 50); \
+         g.addColorStop(0.5, '#0f0'); \
+         ctx.fillRect(0, 0, 100, 50); \
+         [{}, {}].join('|')",
+        pixel(2, 25),
+        pixel(50, 25)
+    );
+    assert_eq!(run(&script), "242,13,0,255|3,252,0,255");
+}
+
+#[test]
+fn fillstyle_reads_back_the_same_gradient_object() {
+    // WPT 2d.gradient.object.current/return: the getter returns the object
+    // that was assigned, and createLinearGradient returns a new one each time.
+    let script = format!(
+        "{SETUP} var g = ctx.createLinearGradient(0, 0, 1, 0); \
+         ctx.fillStyle = g; \
+         [String(ctx.fillStyle === g), \
+          String(ctx.createLinearGradient(0, 0, 1, 0) !== g), \
+          Object.prototype.toString.call(ctx.fillStyle)].join('|')"
+    );
+    assert_eq!(run(&script), "true|true|[object CanvasGradient]");
+}
+
+#[test]
+fn add_color_stop_rejects_bad_offsets_and_colours() {
+    // WPT 2d.gradient.object.invalidoffset/invalidcolor: an offset outside
+    // 0..=1 is an IndexSizeError, an unparseable colour a SyntaxError.
+    let script = format!(
+        "{SETUP} var names = []; var g = ctx.createLinearGradient(0, 0, 1, 0); \
+         for (var call of [function () {{ g.addColorStop(-0.1, '#f00'); }}, \
+                           function () {{ g.addColorStop(1.5, '#f00'); }}, \
+                           function () {{ g.addColorStop(0.5, 'not-a-colour'); }}, \
+                           function () {{ g.addColorStop(0.5, '#f00'); }}]) {{ \
+             try {{ call(); }} catch (e) {{ names.push(e.name); }} \
+         }} \
+         names.join(',')"
+    );
+    // The fourth call succeeds and names nothing.
+    assert_eq!(run(&script), "IndexSizeError,IndexSizeError,SyntaxError");
+}
+
+#[test]
+fn a_gradient_usable_across_canvases_and_empty_paints_nothing() {
+    // WPT 2d.gradient.object.crosscanvas: a gradient made on one canvas paints
+    // on another. A gradient with no stops paints nothing (transparent black).
+    let script = format!(
+        "{SETUP} var g = ctx.createLinearGradient(0, 0, 10, 0); \
+         var c2 = document.createElement('canvas'); c2.width = 10; c2.height = 10; \
+         var ctx2 = c2.getContext('2d'); \
+         ctx2.fillStyle = g; ctx2.fillRect(0, 0, 10, 10); \
+         var empty = ctx.createLinearGradient(0, 0, 10, 0); \
+         ctx.fillStyle = empty; ctx.fillRect(0, 0, 10, 10); \
+         var d2 = ctx2.getImageData(5, 5, 1, 1).data; \
+         var d1 = ctx.getImageData(5, 5, 1, 1).data; \
+         [d2[0] + ',' + d2[1], d1[3]].join('|')"
+    );
+    // The other canvas got the black-to-transparent gradient's mid colour;
+    // this canvas kept its bitmap untouched by the stopless gradient.
+    assert_eq!(run(&script), "0,0|0");
+}

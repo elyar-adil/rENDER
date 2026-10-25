@@ -97,6 +97,36 @@ impl Bitmap {
         }
     }
 
+    /// Fills the pixels of `coverage` that `clip` admits, sampling the source
+    /// once per covered pixel at its centre. A gradient is the reason this
+    /// exists: its colour varies over the bitmap, so one `Source` cannot
+    /// describe the fill.
+    pub fn fill_where(
+        &mut self,
+        coverage: &Coverage,
+        clip: Option<&ClipMask>,
+        sample: impl Fn(u32, u32) -> Source,
+    ) {
+        let (x0, y0) = coverage.origin();
+        let (width, height) = coverage.size();
+        for y in y0..y0 + height {
+            for x in x0..x0 + width {
+                let amount = coverage.at(x, y) * clip.map_or(1.0, |mask| mask.at(x, y));
+                if amount <= 0.0 {
+                    continue;
+                }
+                let source = sample(x, y);
+                let alpha = (source.alpha * amount).clamp(0.0, 1.0);
+                if alpha <= 0.0 {
+                    continue;
+                }
+                let index = self.index(x, y);
+                let destination = self.pixels[index];
+                self.pixels[index] = composite_over(destination, source, alpha);
+            }
+        }
+    }
+
     /// Clears the pixels of `coverage` that `clip` admits, by the coverage.
     pub fn clear(&mut self, coverage: &Coverage, clip: Option<&ClipMask>) {
         let (x0, y0) = coverage.origin();
@@ -289,6 +319,6 @@ fn premultiply(pixel: [u8; 4]) -> [u8; 4] {
 }
 
 /// Rounds a `0.0..=255.0` channel value to the nearest byte.
-fn round_byte(value: f32) -> u8 {
+pub(crate) fn round_byte(value: f32) -> u8 {
     value.round().clamp(0.0, 255.0) as u8
 }

@@ -33,7 +33,7 @@ use crate::runtime::JsRuntime;
 use crate::runtime::builtins::dom_exception::DomExceptionName;
 use crate::runtime::convert::to_number;
 use crate::value::{
-    JsObject, NativeFunction, ObjectHost, PropertyDescriptor, TypedArrayKind, TypedBuffer,
+    JsObject, JsSymbol, NativeFunction, ObjectHost, PropertyDescriptor, TypedArrayKind, TypedBuffer,
 };
 use crate::{JsError, JsValue, ObjectId};
 use render_dom::{Dom, Namespace, NodeId, NodeKind};
@@ -42,6 +42,7 @@ use render_dom::{Dom, Namespace, NodeId, NodeKind};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CanvasInterface {
     Context2d,
+    Gradient,
     OffscreenCanvas,
     ImageData,
 }
@@ -56,6 +57,9 @@ pub(crate) enum CanvasObject {
     Context { id: CanvasId, canvas: ObjectId },
     /// An `OffscreenCanvas`.
     OffscreenCanvas(CanvasId),
+    /// A `CanvasGradient` (HTML §4.12.5.1.3): its registry id, which names
+    /// the definition the host holds and the stops `addColorStop` amends.
+    Gradient(u64),
     /// An `ImageData`: its size and its `Uint8ClampedArray` of RGBA bytes.
     ImageData {
         width: u32,
@@ -91,6 +95,9 @@ pub(crate) enum CanvasMethod {
     ArcTo,
     Ellipse,
     RoundRect,
+    CreateLinearGradient,
+    CreateRadialGradient,
+    GradientAddColorStop,
     BezierCurveTo,
     QuadraticCurveTo,
     Fill,
@@ -192,6 +199,9 @@ impl JsRuntime {
                 Ok(JsValue::Object(object))
             }
             CanvasInterface::ImageData => self.image_data_construct(dom, arguments),
+            // HTML §4.12.5.1.3: `new CanvasGradient()` is not how gradients
+            // are made; the interface object exists for `instanceof`.
+            CanvasInterface::Gradient => Err(JsError::type_error("Illegal constructor")),
         }
     }
 
@@ -350,6 +360,62 @@ impl JsRuntime {
                         counter_clockwise,
                     },
                 )
+            }
+            CanvasMethod::CreateLinearGradient | CanvasMethod::CreateRadialGradient => {
+                let radial = matches!(method, CanvasMethod::CreateRadialGradient);
+                let numbers = self.canvas_numbers(dom, arguments, if radial { 6 } else { 4 })?;
+                if !Self::all_finite(&numbers) {
+                    // HTML §4.12.5.1.3: a nonfinite argument returns without
+                    // creating anything.
+                    return Ok(JsValue::Undefined);
+                }
+                let id = self.next_gradient_id;
+                self.next_gradient_id += 1;
+                let kind = if radial {
+                    crate::canvas::GradientKind::Radial {
+                        x0: numbers[0],
+                        y0: numbers[1],
+                        r0: numbers[2],
+                        x1: numbers[3],
+                        y1: numbers[4],
+                        r1: numbers[5],
+                    }
+                } else {
+                    crate::canvas::GradientKind::Linear {
+                        x0: numbers[0],
+                        y0: numbers[1],
+                        x1: numbers[2],
+                        y1: numbers[3],
+                    }
+                };
+                self.canvas_host
+                    .as_mut()
+                    .ok_or_else(|| JsError::type_error("the canvas surface is not available"))?
+                    .define_gradient(crate::canvas::GradientOp::Create { id, kind })
+                    .map_err(|error| self.canvas_error(error))?;
+                self.gradient_object(id)
+            }
+            CanvasMethod::GradientAddColorStop => {
+                let id = match self.realm.host(receiver) {
+                    Some(ObjectHost::Canvas(
+                        crate::runtime::builtins::canvas::CanvasObject::Gradient(id),
+                    )) => id,
+                    _ => return Err(JsError::type_error("Illegal invocation")),
+                };
+                let offset = arguments
+                    .first()
+                    .ok_or_else(missing_argument)
+                    .and_then(|value| self.to_number_value(dom, value))?;
+                let color = arguments
+                    .get(1)
+                    .ok_or_else(missing_argument)
+                    .map(|value| self.canvas_to_string(dom, value))??;
+                self.canvas_host
+                    .as_mut()
+                    .ok_or_else(|| JsError::type_error("the canvas surface is not available"))?
+                    .define_gradient(crate::canvas::GradientOp::AddColorStop { id, offset, color })
+                    .map_err(|error| self.canvas_error(error))?;
+                Ok(JsValue::Undefined)
             }
             CanvasMethod::RoundRect => {
                 let x = self.canvas_number(dom, arguments, 0)?;
@@ -555,6 +621,22 @@ impl JsRuntime {
         Ok(JsValue::Object(object))
     }
 
+    /// The gradient object of `id`, created on first request. Later reads of
+    /// `fillStyle` return the same object, which the specification requires.
+    fn gradient_object(&mut self, id: u64) -> Result<JsValue, JsError> {
+        if let Some(existing) = self.canvas_gradient_objects.get(&id) {
+            return Ok(JsValue::Object(*existing));
+        }
+        let prototype = self.canvas_prototype("CanvasGradient");
+        self.ensure_heap_capacity(1)?;
+        let object = self.realm.allocate(JsObject::with_host(
+            prototype,
+            ObjectHost::Canvas(CanvasObject::Gradient(id)),
+        ));
+        self.canvas_gradient_objects.insert(id, object);
+        Ok(JsValue::Object(object))
+    }
+
     /// Runs an operation whose receiver is a context and returns its value.
     fn canvas_run(
         &mut self,
@@ -596,6 +678,7 @@ impl JsRuntime {
         let name = match error.kind {
             CanvasErrorKind::IndexSize => DomExceptionName::IndexSize,
             CanvasErrorKind::Range => return self.range_error(&error.message),
+            CanvasErrorKind::Syntax => DomExceptionName::Syntax,
         };
         match self.construct_dom_exception(name, &error.message) {
             Ok(value) => JsError::thrown(value),
@@ -679,9 +762,25 @@ impl JsRuntime {
                     AttributeKind::Number => {
                         CanvasValue::Number(self.to_number_value(dom, &value)?)
                     }
-                    AttributeKind::Text | AttributeKind::Style => {
-                        CanvasValue::Text(self.canvas_to_string(dom, &value)?)
+                    // A style accepts a gradient object itself; anything else
+                    // converts as a string, which the host parses as a colour
+                    // (HTML §4.12.5.1.3).
+                    AttributeKind::Style => {
+                        let gradient = match &value {
+                            JsValue::Object(object) => match self.realm.host(*object) {
+                                Some(ObjectHost::Canvas(
+                                    crate::runtime::builtins::canvas::CanvasObject::Gradient(id),
+                                )) => Some(id),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        match gradient {
+                            Some(id) => CanvasValue::Style(CanvasStyle::Gradient(id)),
+                            None => CanvasValue::Text(self.canvas_to_string(dom, &value)?),
+                        }
                     }
+                    AttributeKind::Text => CanvasValue::Text(self.canvas_to_string(dom, &value)?),
                 };
                 self.canvas_execute(dom, id, CanvasOp::Set(attribute, converted))?;
                 Ok(JsValue::Undefined)
@@ -912,6 +1011,13 @@ impl JsRuntime {
                 }
             }
             CanvasValue::Style(CanvasStyle::Color(text)) => JsValue::String(text.into()),
+            // The getter returns the gradient object itself, so `fillStyle`
+            // reads back as what was assigned (HTML §4.12.5.1.3).
+            CanvasValue::Style(CanvasStyle::Gradient(id)) => self
+                .canvas_gradient_objects
+                .get(&id)
+                .map(|object| JsValue::Object(*object))
+                .unwrap_or(JsValue::Undefined),
             // Pixels are wrapped into an ImageData by `getImageData` before they
             // reach this conversion, so no operation returns them through here.
             CanvasValue::Pixels(_) => JsValue::Undefined,
@@ -945,6 +1051,18 @@ impl JsRuntime {
             Some(value) => self.to_number_value(dom, value),
             None => Err(missing_argument()),
         }
+    }
+
+    /// The first `count` arguments as `WebIDL` doubles, each required.
+    fn canvas_numbers(
+        &mut self,
+        dom: &mut Dom,
+        arguments: &[JsValue],
+        count: usize,
+    ) -> Result<Vec<f64>, JsError> {
+        (0..count)
+            .map(|index| self.canvas_number(dom, arguments, index))
+            .collect()
     }
 
     /// The `index`th argument as a `WebIDL` `long`.
@@ -1564,6 +1682,25 @@ pub(crate) fn install_canvas(
         image_data_prototype,
     );
 
+    // HTML §4.12.5.1.3: `CanvasGradient` has no constructor of its own; its
+    // instances come from the context's `createLinearGradient` and
+    // `createRadialGradient`.
+    let gradient_prototype = new_prototype(objects, object_prototype);
+    install_methods(
+        objects,
+        gradient_prototype,
+        function_prototype,
+        &[("addColorStop", CanvasMethod::GradientAddColorStop)],
+    );
+    install_interface(
+        objects,
+        global,
+        function_prototype,
+        "CanvasGradient",
+        CanvasInterface::Gradient,
+        gradient_prototype,
+    );
+
     if let Some(JsValue::Object(canvas_constructor)) = objects[global.0]
         .properties
         .get("HTMLCanvasElement")
@@ -1607,6 +1744,8 @@ const CONTEXT_METHODS: &[(&str, CanvasMethod)] = &[
     ("arcTo", CanvasMethod::ArcTo),
     ("ellipse", CanvasMethod::Ellipse),
     ("roundRect", CanvasMethod::RoundRect),
+    ("createLinearGradient", CanvasMethod::CreateLinearGradient),
+    ("createRadialGradient", CanvasMethod::CreateRadialGradient),
     ("bezierCurveTo", CanvasMethod::BezierCurveTo),
     ("quadraticCurveTo", CanvasMethod::QuadraticCurveTo),
     ("fill", CanvasMethod::Fill),
@@ -1710,6 +1849,22 @@ fn install_interface(
     objects[prototype.0].properties.insert(
         "constructor".to_owned(),
         PropertyDescriptor::builtin(JsValue::Object(constructor)),
+    );
+    // WebIDL §2.7.2: the interface prototype's @@toStringTag names the
+    // interface, which is what `Object.prototype.toString` reads.
+    let tag = JsSymbol::well_known("@@toStringTag");
+    crate::value::define_symbol_property_on(
+        objects,
+        prototype,
+        &tag,
+        PropertyDescriptor {
+            getter: None,
+            setter: None,
+            value: JsValue::String((name.to_owned()).into()),
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        },
     );
     objects[global.0].properties.insert(
         name.to_owned(),

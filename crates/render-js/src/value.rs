@@ -12115,6 +12115,21 @@ impl Realm {
     }
 }
 
+/// The bootstrap-time form of `Realm::define_symbol_property`, for the
+/// installers that build the object graph directly and hold no realm.
+pub(crate) fn define_symbol_property_on(
+    objects: &mut [JsObject],
+    object: ObjectId,
+    symbol: &JsSymbol,
+    descriptor: PropertyDescriptor,
+) {
+    if let Some(target) = objects.get_mut(object.0) {
+        target
+            .symbols
+            .insert(symbol.id(), (symbol.clone(), descriptor));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{JsValue, PropertyDescriptor, Realm};

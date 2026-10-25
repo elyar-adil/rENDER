@@ -301,6 +301,10 @@ pub struct JsRuntime {
     /// The `CanvasRenderingContext2D` object of each canvas, so that repeated
     /// `getContext` calls return the same object. Rooted for the collector.
     canvas_contexts: BTreeMap<crate::canvas::CanvasId, ObjectId>,
+    /// The gradient object of each host registry id, so `fillStyle` reads
+    /// back the same `CanvasGradient` that was assigned (HTML §4.12.5.1.3).
+    canvas_gradient_objects: BTreeMap<u64, ObjectId>,
+    next_gradient_id: u64,
 }
 
 impl From<DomError> for JsError {
@@ -450,6 +454,8 @@ impl JsRuntime {
             mutation_seen_revision: dom.revision(),
             canvas_host: None,
             canvas_contexts: BTreeMap::new(),
+            canvas_gradient_objects: BTreeMap::new(),
+            next_gradient_id: 1,
             limits,
         }
     }

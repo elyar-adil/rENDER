@@ -51,7 +51,7 @@ use std::sync::Arc;
 use render_dom::{Dom, NodeId};
 use render_js::canvas::{
     Attribute, CanvasError, CanvasErrorKind, CanvasHost, CanvasId, CanvasOp, CanvasStyle,
-    CanvasValue, FillRule, MAX_IMAGE_PIXELS, PixelBuffer,
+    CanvasValue, FillRule, GradientKind, GradientOp, MAX_IMAGE_PIXELS, PixelBuffer,
 };
 
 use crate::paint::coverage::{contains, polygon_coverage};
@@ -62,7 +62,7 @@ use path::{
     sweep_points,
 };
 use stroke::{StrokeStyle, stroke_polygons};
-use style::{LineCap, LineJoin, Paint, parse_paint, serialize_paint};
+use style::{LineCap, LineJoin, Paint, gradient_at, parse_paint, serialize_paint};
 
 /// The width and height of a `<canvas>` with no valid `width` or `height`.
 const DEFAULT_WIDTH: u32 = 300;
@@ -76,12 +76,33 @@ const MAX_DIMENSION: u32 = 32_767;
 /// 64 MiB of premultiplied RGBA8).
 const MAX_PIXELS: u64 = 1 << 24;
 
+/// What the context fills and strokes with: a solid colour, or a gradient
+/// of the host's registry, named by the id both sides agreed on (HTML
+/// §4.12.5.1.3).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SurfacePaint {
+    Solid(Paint),
+    Gradient(u64),
+}
+
+impl SurfacePaint {
+    const BLACK: Self = Self::Solid(Paint::BLACK);
+}
+
+/// One registered gradient: its geometry in user space and its colour stops
+/// in the order `addColorStop` added them.
+#[derive(Clone, Debug)]
+struct Gradient {
+    kind: GradientKind,
+    stops: Vec<(f64, Paint)>,
+}
+
 /// The state the context saves and restores (HTML §4.12.5.1.19).
 #[derive(Clone, Debug)]
 struct DrawingState {
     transform: Matrix,
-    fill: Paint,
-    stroke: Paint,
+    fill: SurfacePaint,
+    stroke: SurfacePaint,
     global_alpha: f64,
     line_width: f64,
     line_cap: LineCap,
@@ -96,8 +117,8 @@ impl Default for DrawingState {
     fn default() -> Self {
         Self {
             transform: IDENTITY,
-            fill: Paint::BLACK,
-            stroke: Paint::BLACK,
+            fill: SurfacePaint::BLACK,
+            stroke: SurfacePaint::BLACK,
             global_alpha: 1.0,
             line_width: 1.0,
             line_cap: LineCap::Butt,
@@ -190,21 +211,74 @@ impl Canvas {
             .collect()
     }
 
-    /// Paints `polygons` (device coordinates) with a solid colour under `rule`.
-    fn paint(&mut self, polygons: &[Vec<Point>], rule: FillRule, colour: Paint) {
+    /// Paints `polygons` (device coordinates) under `rule` with the context's
+    /// paint: a solid colour everywhere, or a gradient evaluated per pixel in
+    /// the user space the current transform maps the bitmap to (HTML
+    /// §4.12.5.1.3: the gradient's coordinates live in the space current when
+    /// the painting happens).
+    /// The registered gradient a paint names, if it names one.
+    fn gradient_of<'a>(
+        paint: &SurfacePaint,
+        gradients: &'a BTreeMap<u64, Gradient>,
+    ) -> Option<&'a Gradient> {
+        match paint {
+            SurfacePaint::Solid(_) => None,
+            SurfacePaint::Gradient(id) => gradients.get(id),
+        }
+    }
+
+    fn paint(
+        &mut self,
+        polygons: &[Vec<Point>],
+        rule: FillRule,
+        paint: SurfacePaint,
+        gradient: Option<&Gradient>,
+    ) {
         let Some(coverage) =
             polygon_coverage(polygons, rule, self.bitmap.width(), self.bitmap.height())
         else {
             return;
         };
-        let source = Source {
-            red: colour.red,
-            green: colour.green,
-            blue: colour.blue,
-            alpha: (f64::from(colour.alpha) * self.state.global_alpha) as f32,
-        };
-        self.bitmap
-            .fill(&coverage, self.state.clip.as_deref(), source);
+        let global_alpha = self.state.global_alpha;
+        match paint {
+            SurfacePaint::Solid(colour) => {
+                let source = Source {
+                    red: colour.red,
+                    green: colour.green,
+                    blue: colour.blue,
+                    alpha: (f64::from(colour.alpha) * global_alpha) as f32,
+                };
+                self.bitmap
+                    .fill(&coverage, self.state.clip.as_deref(), source);
+            }
+            SurfacePaint::Gradient(_) => {
+                let Some(gradient) = gradient else {
+                    return;
+                };
+                if gradient.stops.is_empty() {
+                    // A gradient with no stops paints nothing (HTML
+                    // §4.12.5.1.3: it must be fully transparent black).
+                    return;
+                }
+                let Some(inverse) = invert(self.state.transform) else {
+                    return;
+                };
+                let geometry = gradient.kind;
+                let stops = gradient.stops.clone();
+                self.bitmap
+                    .fill_where(&coverage, self.state.clip.as_deref(), |x, y| {
+                        let user = apply(inverse, (f64::from(x) + 0.5, f64::from(y) + 0.5));
+                        let (red, green, blue, alpha) =
+                            gradient_at(&geometry, &stops, user.0, user.1);
+                        Source {
+                            red,
+                            green,
+                            blue,
+                            alpha: (f64::from(alpha) * global_alpha) as f32,
+                        }
+                    });
+            }
+        }
     }
 
     fn clear(&mut self, polygons: &[Vec<Point>]) {
@@ -220,12 +294,14 @@ impl Canvas {
 
     fn attribute(&self, attribute: Attribute) -> CanvasValue {
         match attribute {
-            Attribute::FillStyle => {
-                CanvasValue::Style(CanvasStyle::Color(serialize_paint(self.state.fill)))
-            }
-            Attribute::StrokeStyle => {
-                CanvasValue::Style(CanvasStyle::Color(serialize_paint(self.state.stroke)))
-            }
+            Attribute::FillStyle => CanvasValue::Style(match self.state.fill {
+                SurfacePaint::Solid(paint) => CanvasStyle::Color(serialize_paint(paint)),
+                SurfacePaint::Gradient(id) => CanvasStyle::Gradient(id),
+            }),
+            Attribute::StrokeStyle => CanvasValue::Style(match self.state.stroke {
+                SurfacePaint::Solid(paint) => CanvasStyle::Color(serialize_paint(paint)),
+                SurfacePaint::Gradient(id) => CanvasStyle::Gradient(id),
+            }),
             Attribute::GlobalAlpha => CanvasValue::Number(self.state.global_alpha),
             Attribute::LineWidth => CanvasValue::Number(self.state.line_width),
             Attribute::MiterLimit => CanvasValue::Number(self.state.miter_limit),
@@ -242,13 +318,19 @@ impl Canvas {
         match (attribute, value) {
             (Attribute::FillStyle, CanvasValue::Text(text)) => {
                 if let Some(paint) = parse_paint(&text) {
-                    self.state.fill = paint;
+                    self.state.fill = SurfacePaint::Solid(paint);
                 }
             }
             (Attribute::StrokeStyle, CanvasValue::Text(text)) => {
                 if let Some(paint) = parse_paint(&text) {
-                    self.state.stroke = paint;
+                    self.state.stroke = SurfacePaint::Solid(paint);
                 }
+            }
+            (Attribute::FillStyle, CanvasValue::Style(CanvasStyle::Gradient(id))) => {
+                self.state.fill = SurfacePaint::Gradient(id);
+            }
+            (Attribute::StrokeStyle, CanvasValue::Style(CanvasStyle::Gradient(id))) => {
+                self.state.stroke = SurfacePaint::Gradient(id);
             }
             (Attribute::GlobalAlpha, CanvasValue::Number(value))
                 if value.is_finite() && (0.0..=1.0).contains(&value) =>
@@ -340,7 +422,11 @@ impl Canvas {
         );
     }
 
-    fn run(&mut self, op: CanvasOp) -> Result<CanvasValue, CanvasError> {
+    fn run(
+        &mut self,
+        op: CanvasOp,
+        gradients: &BTreeMap<u64, Gradient>,
+    ) -> Result<CanvasValue, CanvasError> {
         let matrix = self.state.transform;
         match op {
             CanvasOp::Save => self.saved.push(self.state.clone()),
@@ -389,7 +475,8 @@ impl Canvas {
             } => {
                 if all_finite(&[x, y, width, height]) && width != 0.0 && height != 0.0 {
                     let polygon = to_device(matrix, &rectangle(x, y, width, height));
-                    self.paint(&[polygon], FillRule::NonZero, self.state.fill);
+                    let gradient = Self::gradient_of(&self.state.fill, gradients);
+                    self.paint(&[polygon], FillRule::NonZero, self.state.fill, gradient);
                 }
             }
             CanvasOp::ClearRect {
@@ -417,7 +504,8 @@ impl Canvas {
                         .iter()
                         .map(|polygon| to_device(matrix, polygon))
                         .collect();
-                    self.paint(&polygons, FillRule::NonZero, self.state.stroke);
+                    let gradient = Self::gradient_of(&self.state.stroke, gradients);
+                    self.paint(&polygons, FillRule::NonZero, self.state.stroke, gradient);
                 }
             }
             CanvasOp::BeginPath => self.path.clear(),
@@ -540,11 +628,13 @@ impl Canvas {
             }
             CanvasOp::Fill(rule) => {
                 let polygons = self.path.polygons();
-                self.paint(&polygons, rule, self.state.fill);
+                let gradient = Self::gradient_of(&self.state.fill, gradients);
+                self.paint(&polygons, rule, self.state.fill, gradient);
             }
             CanvasOp::Stroke => {
                 let polygons = self.stroke_path_device();
-                self.paint(&polygons, FillRule::NonZero, self.state.stroke);
+                let gradient = Self::gradient_of(&self.state.stroke, gradients);
+                self.paint(&polygons, FillRule::NonZero, self.state.stroke, gradient);
             }
             CanvasOp::Clip(rule) => self.clip(rule),
             CanvasOp::IsPointInPath { x, y, rule } => {
@@ -652,9 +742,60 @@ pub struct CanvasEngine {
     elements: BTreeMap<NodeId, CanvasId>,
     next_id: u64,
     dirty: BTreeSet<CanvasId>,
+    /// The gradients every canvas of this engine can paint with, by the id
+    /// the script side chose (HTML §4.12.5.1.3: a gradient is not tied to
+    /// the context that made it).
+    gradients: BTreeMap<u64, Gradient>,
 }
 
 impl CanvasEngine {
+    /// Creates or amends one gradient of the registry (HTML §4.12.5.1.3).
+    ///
+    /// # Errors
+    ///
+    /// An `IndexSizeError` for an offset outside `0..=1`, a `SyntaxError`
+    /// for a colour that does not parse.
+    fn define_gradient(&mut self, op: GradientOp) -> Result<(), CanvasError> {
+        match op {
+            GradientOp::Create { id, kind } => {
+                self.gradients.insert(
+                    id,
+                    Gradient {
+                        kind,
+                        stops: Vec::new(),
+                    },
+                );
+                Ok(())
+            }
+            GradientOp::AddColorStop { id, offset, color } => {
+                if !offset.is_finite() || !(0.0..=1.0).contains(&offset) {
+                    return Err(index_size(
+                        "Failed to execute 'addColorStop' on 'CanvasGradient':                          The provided value is outside the range (0, 1).",
+                    ));
+                }
+                let Some(paint) = parse_paint(&color) else {
+                    return Err(CanvasError {
+                        kind: CanvasErrorKind::Syntax,
+                        message: format!(
+                            "Failed to execute 'addColorStop' on 'CanvasGradient':                              '{color}' is not a valid colour."
+                        ),
+                    });
+                };
+                let gradient = self.gradients.entry(id).or_insert_with(|| Gradient {
+                    kind: GradientKind::Linear {
+                        x0: 0.0,
+                        y0: 0.0,
+                        x1: 0.0,
+                        y1: 0.0,
+                    },
+                    stops: Vec::new(),
+                });
+                gradient.stops.push((offset, paint));
+                Ok(())
+            }
+        }
+    }
+
     fn create(&mut self, element: Option<NodeId>, width: u32, height: u32) -> CanvasId {
         let id = CanvasId(self.next_id);
         self.next_id += 1;
@@ -703,7 +844,7 @@ impl CanvasEngine {
         let Some(canvas) = self.canvases.get_mut(&id) else {
             return Ok(CanvasValue::Undefined);
         };
-        let result = canvas.run(op);
+        let result = canvas.run(op, &self.gradients);
         if !reads_only && result.is_ok() {
             self.dirty.insert(id);
         }
@@ -784,6 +925,10 @@ impl CanvasHost for CanvasHandle {
         op: CanvasOp,
     ) -> Result<CanvasValue, CanvasError> {
         self.0.borrow_mut().execute(dom, canvas, op)
+    }
+
+    fn define_gradient(&mut self, op: GradientOp) -> Result<(), CanvasError> {
+        self.0.borrow_mut().define_gradient(op)
     }
 }
 
