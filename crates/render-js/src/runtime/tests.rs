@@ -458,7 +458,7 @@ fn for_in_enumerates_prototypes_and_delete_honors_descriptors() {
             .expect("for-in and delete should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("fixed,own,inherited,true,false,undefined,4".into())
+        JsValue::String("own,fixed,inherited,true,false,undefined,4".into())
     );
 }
 
@@ -1129,6 +1129,49 @@ fn script_inner_html_is_serialized_as_raw_text() {
     assert_eq!(
         value,
         JsValue::String("if (1 < 2 && 3 > 2) { var s = \"a&b\"; }".into())
+    );
+}
+
+#[test]
+fn for_in_uses_first_insertion_order_not_alphabetical_order() {
+    // Bing's RMS loader reads the module key with `for (var k in map)` and
+    // takes the first one. A BTreeMap-order `for...in` yields the `d` option
+    // instead of the module URL and silently loads nothing.
+    let value = evaluate_script(
+        "
+        var map = { 'rms:answers:AutoSuggest:AutoSug': '/rp/autosuggest.js', d: 1 };
+        var keys = [];
+        for (var key in map) keys.push(key);
+        keys.join(',')
+        ",
+    );
+    assert_eq!(
+        value,
+        JsValue::String("rms:answers:AutoSuggest:AutoSug,d".into())
+    );
+}
+
+#[test]
+fn assigning_an_elements_style_forwards_to_css_text() {
+    // CSSOM: `ElementCSSInlineStyle.style` is `[PutForwards=cssText]`. A page
+    // (or a virtual DOM) may assign a string; it must become inline
+    // declarations, not an own data property that shadows the accessor.
+    let value = evaluate_script(
+        "
+        var element = document.createElement('div');
+        element.style = 'height: 16px; width: 16px; color: red';
+        [
+            element.getAttribute('style'),
+            typeof element.style,
+            element.style.height,
+            element.style.width,
+            element.style.color
+        ].join('|')
+        ",
+    );
+    assert_eq!(
+        value,
+        JsValue::String("height: 16px; width: 16px; color: red;|object|16px|16px|red".into())
     );
 }
 

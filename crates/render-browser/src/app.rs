@@ -1017,7 +1017,8 @@ impl BrowserApp {
             return;
         };
         let dom = page.page.document().dom();
-        for (node, candidate) in dom.nodes() {
+        let scripts = env::var_os("RENDER_DEBUG_SCRIPTS").is_some();
+        for (node, candidate) in dom.nodes().filter(|_| scripts) {
             if let render_core::dom::NodeKind::Element(element) = candidate.kind()
                 && element.local_name == "script"
             {
@@ -1072,7 +1073,10 @@ impl BrowserApp {
                 .ok()
                 .flatten()
                 .unwrap_or_default();
-            if id_attr.is_empty() && class.is_empty() {
+            if id_attr.is_empty()
+                && class.is_empty()
+                && element.namespace != render_core::dom::Namespace::Svg
+            {
                 continue;
             }
             let rect = page.geometry.get(&node.as_u64());
@@ -1090,8 +1094,26 @@ impl BrowserApp {
                 .take_while(|(index, _)| *index < 80)
                 .map(|(_, character)| character)
                 .collect::<String>();
+            let svg_extra = if element.namespace == render_core::dom::Namespace::Svg {
+                let view_box = dom
+                    .attribute(node, "viewBox")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let intrinsic = page
+                    .images
+                    .get_for_node(node)
+                    .map(|image| image.image.intrinsic_size());
+                let parent = dom
+                    .parent(node)
+                    .and_then(|parent| dom.attribute(parent, "class").ok().flatten())
+                    .unwrap_or_default();
+                format!(" viewBox={view_box:?} parentclass={parent:?} intrinsic={intrinsic:?}")
+            } else {
+                String::new()
+            };
             eprintln!(
-                "layout <{}> id={} class={} rect={:?} display={} position={} z={} opacity={} visibility={} top={} left={} right={} bottom={} width={} height={} margin={} float={} transform={} overflow={} bg={} bgimg={}",
+                "layout <{}> id={} class={} rect={:?} display={} position={} z={} opacity={} visibility={} top={} left={} right={} bottom={} width={} height={} margin={} float={} transform={} overflow={} bg={} bgimg={}{}",
                 element.local_name,
                 id_attr,
                 class,
@@ -1113,6 +1135,7 @@ impl BrowserApp {
                 property("overflow"),
                 background,
                 background_image,
+                svg_extra,
             );
         }
         self.debug_paint_dump(dom);
@@ -1165,8 +1188,8 @@ impl BrowserApp {
                 DisplayCommand::PushClip(_) => Some("push-clip".to_owned()),
                 DisplayCommand::PopClip => Some("pop-clip".to_owned()),
                 DisplayCommand::PushStackingContext(context) => Some(format!(
-                    "stacking opacity={} reason={:?}",
-                    context.opacity, context.reason
+                    "stacking opacity={} reason={:?} transform={:?}",
+                    context.opacity, context.reason, context.transform
                 )),
                 DisplayCommand::PopStackingContext => Some("pop-stacking".to_owned()),
                 _ => None,

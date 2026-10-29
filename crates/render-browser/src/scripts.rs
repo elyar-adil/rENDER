@@ -421,18 +421,40 @@ fn apply_response(
         ));
         return;
     }
+    // HTML "prepare the script element": a classic script's MIME type is
+    // enforced only under strict MIME checking, which the transport opts into
+    // with `X-Content-Type-Options: nosniff`. Without it Chrome/Edge execute a
+    // script served as `application/json` or `text/plain` (Bing's Rewards
+    // widget is served as `application/json` by its CDN).
+    let nosniff = response.headers.iter().any(|header| {
+        header.name.eq_ignore_ascii_case("x-content-type-options")
+            && String::from_utf8_lossy(&header.value)
+                .trim()
+                .eq_ignore_ascii_case("nosniff")
+    });
     match response.content_type.as_ref() {
         Some(content_type) if !is_javascript_mime(&content_type.media_type) => {
+            if nosniff {
+                preparation.diagnostics.push(resource_diagnostic(
+                    resource,
+                    ScriptResourceSeverity::Error,
+                    ScriptResourceDiagnosticCode::UnsupportedContentType,
+                    format!(
+                        "script response has unsupported content type '{}' under nosniff",
+                        content_type.media_type
+                    ),
+                ));
+                return;
+            }
             preparation.diagnostics.push(resource_diagnostic(
                 resource,
-                ScriptResourceSeverity::Error,
+                ScriptResourceSeverity::Warning,
                 ScriptResourceDiagnosticCode::UnsupportedContentType,
                 format!(
-                    "script response has unsupported content type '{}'",
+                    "script response has non-JavaScript content type '{}'; executing because nosniff is absent",
                     content_type.media_type
                 ),
             ));
-            return;
         }
         None => preparation.diagnostics.push(resource_diagnostic(
             resource,
@@ -581,7 +603,7 @@ mod tests {
     use render_net::{BatchOptions, CancelToken, FetchConfig, HttpTransport, Url};
 
     use super::{
-        SCRIPT_ACCEPT, ScriptResourceDiagnosticCode, plan_classic_scripts,
+        SCRIPT_ACCEPT, ScriptResourceDiagnosticCode, ScriptResourceSeverity, plan_classic_scripts,
         plan_unstarted_classic_scripts, prepare_script_batch,
     };
 
@@ -919,5 +941,72 @@ mod tests {
         .into_bytes();
         response.extend_from_slice(body);
         response
+    }
+
+    fn response_with_headers(
+        status: &str,
+        content_type: &str,
+        extra_headers: &str,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    #[test]
+    fn a_classic_script_runs_with_a_non_javascript_type_unless_nosniff_forbids_it() {
+        let (base, server) = serve(2, |path| match path {
+            "/json.js" => response_with_headers("200 OK", "application/json", "", b"order += 'J';"),
+            "/json-nosniff.js" => response_with_headers(
+                "200 OK",
+                "application/json",
+                "X-Content-Type-Options: nosniff\r\n",
+                b"order += 'N';",
+            ),
+            _ => response("404 Not Found", Some("text/javascript"), b""),
+        });
+        let mut document = Document::parse(
+            "<script>var order = '';</script>\
+             <script src=json.js></script>\
+             <script src=json-nosniff.js></script>",
+        );
+        let plan = plan_classic_scripts(&document, &base, ScriptDiscoveryLimits::default());
+        let transport = HttpTransport::new(FetchConfig {
+            timeout: Duration::from_secs(2),
+            ..FetchConfig::default()
+        });
+        let results = transport.fetch_batch(
+            plan.requests(),
+            &BatchOptions::default(),
+            &CancelToken::default(),
+        );
+        let preparation =
+            prepare_script_batch(&document, &plan, results, &RuntimeLimits::default());
+        server.join().expect("server thread");
+
+        assert!(
+            preparation.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == ScriptResourceDiagnosticCode::UnsupportedContentType
+                    && diagnostic.severity == ScriptResourceSeverity::Error
+                    && diagnostic.source_order == Some(2)
+            }),
+            "{:?}",
+            preparation.diagnostics
+        );
+        let mut runtime = JsRuntime::new(document.dom());
+        for script in preparation.scripts {
+            runtime
+                .execute_compiled(document.dom_mut(), &script.compiled)
+                .expect("prepared scripts execute");
+        }
+        let outcome = runtime
+            .execute(document.dom_mut(), "order;")
+            .expect("reads order");
+        assert_eq!(outcome.value.to_js_string(), "J");
     }
 }

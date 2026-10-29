@@ -25,6 +25,7 @@ use crate::solver::TextStyle;
 use crate::solver::block::inline_float_band;
 use crate::solver::is_word_separator;
 use crate::solver::resolve::count_as_f32;
+use crate::tree::FormattingContextKind;
 use crate::tree::FormattingNodeId;
 use crate::tree::FormattingNodeKind;
 use render_css::computed::ComputedStyle;
@@ -1070,6 +1071,12 @@ impl<'a> Solver<'a> {
                 .advance;
         }
         let mut width = 0.0;
+        if std::env::var_os("RENDER_DEBUG_TEXT").is_some() {
+            eprintln!(
+                "intrinsic_text text={text:?} size={} width_before={width}",
+                style.style.font_size
+            );
+        }
         let mut pending_space = false;
         let mut has_content = false;
         let mut previous: Option<PreviousUnit<'a>> = None;
@@ -1095,6 +1102,9 @@ impl<'a> Solver<'a> {
                 atomic: false,
             });
             has_content = true;
+        }
+        if std::env::var_os("RENDER_DEBUG_TEXT").is_some() {
+            eprintln!("intrinsic_text done text={text:?} width={width}");
         }
         width
     }
@@ -1589,6 +1599,34 @@ impl<'a> Solver<'a> {
             FormattingNodeKind::AnonymousBlock | FormattingNodeKind::Inline
         ) {
             return self.inline_sequence_max_content_width(&node.children, 0);
+        }
+        // A flex container's content is its items along the main axis, not its
+        // block children stacked vertically. A row container is as wide as the
+        // sum of its items (Bing's `换一批` button measured as its widest child
+        // and then wrapped the label inside the too-narrow button).
+        if matches!(
+            node.kind,
+            FormattingNodeKind::BlockContainer {
+                context: FormattingContextKind::Flex
+            }
+        ) {
+            let style = node
+                .style_source
+                .and_then(|source| self.styles.get(&source));
+            let row = style
+                .and_then(|style| style.get("flex-direction"))
+                .is_none_or(|direction| {
+                    matches!(direction.css_text().trim(), "" | "row" | "row-reverse")
+                });
+            if row {
+                return self.flex_intrinsic_size(
+                    node_id,
+                    true,
+                    self.options.viewport.width,
+                    0,
+                    false,
+                );
+            }
         }
         node.children
             .into_iter()

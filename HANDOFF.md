@@ -1,3 +1,61 @@
+# 交接文档 (2026-10-31, 续十一) — Bing 图标、语言切换、Rewards 与建议下拉
+
+接续 RMS 延迟脚本会话。用 Edge CDP 在**同一视口(1180×684, DPR 2)**采集 Bing 首页的
+节点矩形与计算样式,逐项对齐,修掉了 5 个平台/布局细节。Bing 首屏现在除伪元素背景外
+与 Edge 同构,搜索建议与 Edge 完全一致。
+
+## 本轮已完成
+
+| 内容 | 落点 |
+|---|---|
+| **`element.style = "..."` 按 CSSOM `[PutForwards=cssText]` 生效** | 之前给元素赋字符串会创建一个 own data property,遮蔽 `.style` 访问器;Preact 渲染的箭头 SVG 因此丢了 `height:16px;width:16px`,被拉伸成 2360×2360,形成白色竖带与黑色方块。现在赋值会解析为内联声明(`crates/render-js/src/runtime/eval.rs`) |
+| **行 flex 容器的 max-content 宽度改为各项之和** | 之前按块容器的"最宽子项"计算,`换一批` 按钮测得 58px 后把标签挤成两行。现在 `max_content_width` 对 row flex 调用 `flex_intrinsic_size` 求和(`solver/inline.rs`) |
+| **inline-block 的内在宽度包含原子内联子项的 margin** | Bing 顶部 `图片/视频/翻译/地图/学术` 是 6 个 `inline-block;margin-right:36px` 的 li;之前只算 26px 内容宽,导致导航折成 3 行。现在原子项按 margin box 计入(`solver/flex.rs`) |
+| **绝对定位盒 left/right/width 全 auto 时 shrink-to-fit 并保留固定 margin** | `#est_switch` 之前被拉成 955px 宽、从搜索框左缘开始;现在 160px 宽、x = 搜索框 + 20px,与 Edge 一致(`solver/block.rs`) |
+| **classic script 的 MIME 检查只在 `nosniff` 下生效** | Bing Rewards widget 由 CDN 以 `application/json` 返回;真实浏览器在没有 `X-Content-Type-Options: nosniff` 时仍执行。现在同样执行(`render-browser/src/scripts.rs`),`#rh_rwm` 出现 |
+| **QR 图片与箭头图标** | flex 替换元素取固有尺寸(QR 80×80);箭头 SVG 16×16;二维码卡片完整绘制 |
+| **诊断** | `RENDER_DEBUG_TEXT` 打印内在文本测量;`RENDER_DEBUG_SCRIPTS` 打印所有 script 节点;布局转储附带 SVG 的 viewBox/固有尺寸 |
+
+## Bing 与 Edge(同视口)对照
+
+| 指标 | Edge | rENDER |
+|---|---|---|
+| 顶部导航 x | 120/182/244/306/368 | 120/182/244/306/368 |
+| `换一批` | 74×28 | 74×28 |
+| `#est_switch` | 160×37,x=搜索框+20 | 160×37,x=搜索框+20 |
+| `#rh_rwm` | 104.7×42 | 95.5×42 |
+| QR 图片 | 80×80 | 80×80 |
+| 建议(输入“手机”) | 11 条 | 11 条,文本完全一致 |
+
+健康线:
+
+```
+ready=Complete dom_elements=475 boxes=164 scripts_failed=0 scripts_threw=0
+css_errors=0 css_warnings=25 images_failed=3
+```
+
+`images_failed=3` 是 Bing 的 AVIF/WebP 能力探测(引擎不支持 AVIF),随后回退成功。
+
+## 验证
+
+```
+cargo test --workspace                       2702 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+## 明确未做 / 下一步
+
+- **伪元素盒未生成**:`#est_switch .est_common::after` 的白色圆角背景没有产生,`国际版`
+  在照片上依赖白底才清晰;需要实现 `::before`/`::after` 的生成盒。
+- **搜索框占位/热点回填文本**:Edge 会把热词显示在输入框内;rENDER 输入框为空。
+- **右上菜单/应用图标**:节点存在,图标细节与 Edge 仍有差异;菜单展开未验证。
+- JD 主商品区仍受风控(同机 Edge 也 403);IndexedDB 仍是内存子集;GitHub/HN 的
+  本机 TCP 链路仍被阻断。
+
+---
+
 # 交接文档 (2026-10-31, 续十) — Bing 的 RMS 延迟脚本与层叠上下文
 
 接续 JD 风控对照。这一轮用 Edge 的 CDP 找到 Bing 首页缺失的右上账户/Rewards/菜单、

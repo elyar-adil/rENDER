@@ -1454,6 +1454,107 @@ fn an_inline_svg_with_an_auto_width_takes_its_intrinsic_size() {
 }
 
 #[test]
+fn an_inline_block_sums_its_atomic_children_and_their_margins() {
+    // CSS 2.1 §10.3.9 / §10.3.5: an inline-block's max-content width includes
+    // each inline-level child's margin box. Bing's scope bar is six
+    // `display:inline-block` list items with `margin-right:36px`; dropping the
+    // margins measured the bar at one item's width and wrapped it into rows.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='head'><div id='nav'><span class='item'></span>\
+         <span class='item'></span><span class='item'></span><span class='item'></span>\
+         <span class='item'></span><span class='item'></span></div></div></body>",
+        "html, body, div, span { display: block; margin: 0 } \
+         #head { display: flex; width: 900px } #nav { display: inline-block } \
+         #nav .item { display: inline-block; width: 26px; margin-right: 36px }",
+        900.0,
+    );
+    let nav = fragment(&layout, find(&output.dom, "#nav"));
+    assert_eq!(nav.rect.size.width, 26.0 * 6.0 + 36.0 * 6.0);
+    assert_eq!(nav.rect.size.height, 19.2);
+}
+
+#[test]
+fn an_absolute_box_with_no_insets_shrinks_to_fit_at_its_static_position() {
+    // CSS 2.1 §10.3.7: left, width and right all auto means the static position
+    // plus shrink-to-fit. Stretching to the containing block made Bing's
+    // language switch as wide as the search box.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='head'><div id='box'><div id='a'></div>\
+         <div id='b'></div></div></div></body>",
+        "html, body, div { display: block; margin: 0 } \
+         #head { position: relative; width: 400px; height: 40px } \
+         #box { position: absolute; top: 0; margin-left: 20px } \
+         #box div { display: inline-block; width: 76px; margin-right: 4px; height: 37px }",
+        400.0,
+    );
+    let container = fragment(&layout, find(&output.dom, "#box"));
+    assert_eq!(container.rect.origin.x, 20.0);
+    assert_eq!(container.rect.size.width, 76.0 * 2.0 + 4.0 * 2.0);
+}
+
+#[test]
+fn a_shrink_to_fit_flex_row_sums_its_items() {
+    // CSS Flexbox §9.9: the max-content main size of a row flex container is
+    // the sum of its items' max-content contributions. Taking the widest child
+    // (the block-container rule) made Bing's trend-rail button too narrow and
+    // wrapped its label.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='head'><div id='box'><div id='a'>a</div>\
+         <div id='b'>b</div></div></div></body>",
+        "html, body, div { display: block; margin: 0 } \
+         #head { position: relative; width: 400px; height: 40px } \
+         #box { display: flex; position: absolute; right: 0; top: 0 } \
+         #a { width: 20px } #b { width: 30px }",
+        400.0,
+    );
+    let container = fragment(&layout, find(&output.dom, "#box"));
+    assert_eq!(container.rect.size.width, 50.0);
+}
+
+#[test]
+fn a_flex_column_sizes_an_image_to_its_intrinsic_width() {
+    // Bing's QR popup is a column flex container holding one `img`. The
+    // image's intrinsic 80x80 must survive flex layout; walking its children
+    // reported a zero main size and left the QR blank.
+    let output = parse_document(
+        "<!doctype html><body><div id='box'><img id='qr' src='qr.png'></div></body>",
+    );
+    let qr = find(&output.dom, "#qr");
+    let sheet = parse_stylesheet(
+        "html, body, div { display:block; margin:0 } #box { display:flex; flex-direction:column;          align-items:center; width:125px; padding:14px } #qr { display:block }",
+    );
+    let styles = compute_document_styles(
+        &output.dom,
+        &[CascadeInput {
+            sheet: &sheet,
+            origin: CascadeOrigin::Author,
+        }],
+        &PropertyRegistry::standard_baseline(),
+        &ComputationLimits::default(),
+        &MatchContext::default(),
+    );
+    let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+    let images = OneIntrinsicSize(qr, (80, 80));
+    let layout = layout_formatting_tree_with_images(
+        &output.dom,
+        &formatting,
+        &styles,
+        LayoutOptions {
+            viewport: crate::PhysicalSize {
+                width: 1000.0,
+                height: 600.0,
+            },
+            ..LayoutOptions::default()
+        },
+        &SimpleTextMeasurer,
+        Some(&images),
+    );
+    let qr_fragment = fragment(&layout, qr);
+    assert_eq!(qr_fragment.rect.size.width, 80.0);
+    assert_eq!(qr_fragment.rect.size.height, 80.0);
+}
+
+#[test]
 fn absolute_right_inset_hugs_the_containing_block_right_edge() {
     let (output, _, layout) = pipeline(
         "<!doctype html><body><div id='head'><div id='u'><span class='b'></span></div></div></body>",

@@ -340,10 +340,13 @@ impl Solver<'_> {
         } else {
             None
         };
+        // CSS 2.1 §10.3.7: when left, width and right are all `auto`, the used
+        // left is the static position and the width is shrink-to-fit. Requiring
+        // a definite inset here stretched such a box to its containing block
+        // (Bing's 国内版/国际版 switch became 955px wide instead of 160px).
         let shrink_to_fit_width = if out_of_flow
             && specified_width.is_none()
             && positioned_content_width.is_none()
-            && (left.is_some() || right.is_some())
         {
             Some(
                 self.max_content_width(node_id).min(
@@ -398,8 +401,14 @@ impl Solver<'_> {
                 margin_right.value
             };
         } else if specified_width.is_none() && out_of_flow {
-            margin_left.value = 0.0;
-            margin_right.value = 0.0;
+            // An auto width resolves auto side margins to zero; a fixed margin
+            // still places the box at its static position (§10.3.7).
+            if margin_left.auto {
+                margin_left.value = 0.0;
+            }
+            if margin_right.auto {
+                margin_right.value = 0.0;
+            }
         } else if out_of_flow {
             // CSS 2 §10.3.7: with a definite width, auto margins absorb the
             // space left by both definite insets; otherwise auto margins are

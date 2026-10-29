@@ -11556,44 +11556,23 @@ impl Realm {
         let mut seen = std::collections::BTreeSet::new();
         let mut candidate = Some(object);
         let mut visited = 0usize;
-        let mut first = true;
         while let Some(id) = candidate {
             let current = self.objects.get(id.0)?;
-            // A typed array's valid element indices are enumerable own keys (ECMA-262
-            // 10.4.5.7), ahead of its named properties.
-            if let ObjectHost::TypedArray {
-                kind,
-                buffer,
-                start,
-                length,
-            } = &current.host
-            {
-                let count = buffer
-                    .view_length(kind.element_size(), *start, *length)
-                    .unwrap_or(0);
-                for index in 0..count {
-                    let key = index.to_string();
-                    if seen.insert(key.clone()) {
-                        names.push(key);
-                    }
+            // Enumerate in [[OwnPropertyKeys]] order: integer indices ascending,
+            // then string keys in first-insertion order. `properties` is a
+            // BTreeMap, so iterating it directly would order `d` before
+            // `rms:answers:...` and break `for (var k in map)` feature code.
+            for key in self.own_property_names(id)? {
+                if !seen.insert(key.clone()) {
+                    continue;
+                }
+                if self
+                    .own_property(id, &key)
+                    .is_some_and(|descriptor| descriptor.enumerable)
+                {
+                    names.push(key);
                 }
             }
-            for (key, descriptor) in &current.properties {
-                if seen.insert(key.clone()) && descriptor.enumerable {
-                    names.push(key.clone());
-                }
-            }
-            // A String exotic object only contributes its enumerable indexed
-            // characters here; `length` is not enumerable.
-            if first && let ObjectHost::StringPrimitive(text) = &current.host {
-                for index in 0..text.len() {
-                    let key = index.to_string();
-                    if !current.properties.contains_key(&key) && seen.insert(key.clone()) {
-                        names.push(key);
-                    }
-                }
-            }
-            first = false;
             candidate = current.prototype;
             visited = visited.saturating_add(1);
             if visited > self.objects.len() {

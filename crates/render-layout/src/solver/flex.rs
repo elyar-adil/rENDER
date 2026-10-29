@@ -829,6 +829,10 @@ impl Solver<'_> {
     /// take, so a consumer that wants the smaller one must ask for it: §9.9.1's
     /// max-content main size is the preferred width of a flex item, while §4.5's
     /// content-based minimum size is its min-content width.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one measurement walks text, replaced elements, flex and block items"
+    )]
     pub(super) fn flex_intrinsic_size(
         &mut self,
         node: FormattingNodeId,
@@ -862,6 +866,28 @@ impl Solver<'_> {
                 style.style.line_height
             };
         }
+        // A replaced flex item (an image, video or canvas) takes its main-axis
+        // intrinsic size from the replaced element's used size. Walking its
+        // (empty) children would report zero, which collapsed Bing's QR image
+        // to `width: 0` inside a column flex container.
+        if entry.source.is_some() {
+            let source = entry.source;
+            let style = entry
+                .style_source
+                .and_then(|source| self.styles.get(&source))
+                .cloned();
+            let css_width =
+                self.resolve_size(style.as_ref(), "width", self.options.viewport.width, source);
+            let css_height = self.resolve_size(
+                style.as_ref(),
+                "height",
+                self.options.viewport.height,
+                source,
+            );
+            if let Some(size) = self.replaced_size(source, css_width, css_height) {
+                return if horizontal { size.width } else { size.height };
+            }
+        }
         let style = entry
             .style_source
             .and_then(|source| self.styles.get(&source))
@@ -878,13 +904,24 @@ impl Solver<'_> {
         let mut broadest: f32 = 0.0;
         let mut total: f32 = 0.0;
         for child in children.iter().copied() {
-            let child_size = self.flex_intrinsic_size(
-                child,
-                horizontal,
-                basis,
-                depth.saturating_add(1),
-                minimum,
-            );
+            let child_is_atomic = self
+                .formatting
+                .get(child)
+                .is_some_and(|node| matches!(node.kind, FormattingNodeKind::AtomicInline { .. }));
+            // An atomic inline in an inline sequence contributes its *margin
+            // box*, not just its content width. The recursive walk below only
+            // adds outer extras for flex items, so a row of inline-blocks with
+            // `margin-right` measured as if it had no margins and wrapped
+            // (Bing's scope bar).
+            let child_size = if horizontal && child_is_atomic {
+                if minimum {
+                    self.min_content_width(child)
+                } else {
+                    self.atomic_outer_max_content_width(child)
+                }
+            } else {
+                self.flex_intrinsic_size(child, horizontal, basis, depth.saturating_add(1), minimum)
+            };
             let child_size = if is_flex {
                 let child_node = self.formatting.get(child);
                 let child_source = child_node.and_then(|node| node.source);

@@ -795,9 +795,9 @@ impl<'a> Builder<'a> {
         let mut local_positioned: Vec<(i32, FragmentId)> = Vec::new();
         let children = fragment.children.clone();
         for child in children {
-            let (positioned, z_index) = self.fragment_paint_priority(child);
+            let (positioned, hoistable, z_index) = self.fragment_paint_priority(child);
             if positioned {
-                if child_hoist {
+                if child_hoist && hoistable {
                     let sequence = self.deferred_sequence;
                     self.deferred_sequence = self.deferred_sequence.saturating_add(1);
                     self.deferred_positioned
@@ -1789,21 +1789,28 @@ impl<'a> Builder<'a> {
 
     /// Whether a fragment is positioned (so it belongs to a stacking context's
     /// positioned phase) and its own z-index (`auto` reads as 0).
-    fn fragment_paint_priority(&mut self, id: FragmentId) -> (bool, i32) {
+    fn fragment_paint_priority(&mut self, id: FragmentId) -> (bool, bool, i32) {
         let Some(fragment) = self.fragments.get(id) else {
-            return (false, 0);
+            return (false, false, 0);
         };
         let Some(style) = self.style_for(fragment) else {
-            return (false, 0);
+            return (false, false, 0);
         };
-        let positioned = style
-            .get("position")
-            .is_some_and(|value| !value.css_text().trim().eq_ignore_ascii_case("static"));
+        let position = style.get("position").map_or_else(
+            || "static".to_owned(),
+            |value| value.css_text().trim().to_ascii_lowercase(),
+        );
+        let positioned = position != "static";
         let z_index = style
             .get("z-index")
             .and_then(|value| value.css_text().trim().parse::<i32>().ok())
             .unwrap_or(0);
-        (positioned, z_index)
+        // Only fixed/absolute boxes with an explicit positive layer escape to
+        // the root. Relative overlays and z-auto panels stay in their parent
+        // (Bing's `tob_next` trend rail is an absolutely positioned, huge,
+        // z-auto strip that must not float above the wallpaper).
+        let hoistable = z_index > 0 && matches!(position.as_str(), "fixed" | "absolute");
+        (positioned, hoistable, z_index)
     }
 
     /// Paints the positioned boxes deferred to the root stacking context.

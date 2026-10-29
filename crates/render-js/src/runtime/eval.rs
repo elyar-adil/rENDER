@@ -6011,6 +6011,29 @@ impl JsRuntime {
                 }
             }
             Some(ObjectHost::Node(node)) => {
+                // CSSOM `ElementCSSInlineStyle.style` is `[PutForwards=cssText]`:
+                // assigning a string replaces the inline declarations. Without
+                // this, `element.style = "height: 16px"` created an own data
+                // property that shadowed the declaration object, so the size
+                // never reached the attribute (Bing's Preact-rendered arrow SVG
+                // stayed at its default 100% and blew the trend rail up to a
+                // full-page strip).
+                if property == "style" {
+                    let source = value.to_js_string();
+                    let declarations = parse_declaration_list(&(source).to_lossy())
+                        .0
+                        .into_iter()
+                        .map(|declaration| {
+                            (
+                                declaration.name.to_ascii_lowercase(),
+                                declaration.value,
+                                declaration.important,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    Self::write_inline_declarations(dom, node, &declarations)?;
+                    return Ok(());
+                }
                 if property == "className" {
                     return Ok(dom.set_attribute(
                         node,
