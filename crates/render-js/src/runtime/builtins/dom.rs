@@ -1248,13 +1248,37 @@ impl JsRuntime {
             Some(NodeKind::Element(element)) => {
                 self.ensure_heap_capacity(1)?;
                 self.dom_nodes_created = self.dom_nodes_created.saturating_add(1);
-                let copy = target.create_element(element.local_name.clone());
+                // DOM §4.2.3: import must preserve the source node's namespace
+                // and qualified name. Re-creating every element as HTML turned
+                // an `innerHTML`-inserted `<svg>` into an unknown HTML element:
+                // inline-SVG discovery skipped it, its `viewBox` was folded to
+                // `viewbox`, and it laid out at 0x0. Bing's Rewards medallion
+                // is inserted that way, so its icon never painted.
+                let copy = if element.namespace == render_dom::Namespace::Html {
+                    target.create_element(element.local_name.clone())
+                } else {
+                    target.create_element_qualified(
+                        element.namespace.clone(),
+                        element.prefix.clone(),
+                        element.local_name.clone(),
+                    )
+                };
                 for attribute in &element.attributes {
-                    target.set_attribute(
-                        copy,
-                        attribute.local_name.clone(),
-                        attribute.value.clone(),
-                    )?;
+                    if let Some(namespace) = &attribute.namespace {
+                        target.set_attribute_ns(
+                            copy,
+                            Some(namespace.as_str()),
+                            attribute.prefix.as_deref(),
+                            attribute.local_name.clone(),
+                            attribute.value.clone(),
+                        )?;
+                    } else {
+                        target.set_attribute(
+                            copy,
+                            attribute.local_name.clone(),
+                            attribute.value.clone(),
+                        )?;
+                    }
                 }
                 copy
             }

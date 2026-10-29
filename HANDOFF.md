@@ -1,3 +1,71 @@
+# 交接文档 (2026-10-31, 续十四) — 动态 SVG 命名空间与 Rewards 勋章
+
+接续搜索框提示会话。这一轮把 Bing Rewards 的勋章从"DOM 存在但不可见"修到
+"布局 32×32、绘制列表有 image 命令、截图可见",并顺带修复了所有通过
+`innerHTML`/`outerHTML` 插入的 SVG。
+
+## 根因
+
+`import_dom_subtree` 把解析结果搬进目标 DOM 时,无论源节点是什么命名空间都调用
+`create_element(local_name)`(HTML 元素),属性也用 `set_attribute`。于是
+`div.innerHTML = '<svg …>'` 得到的 `svg` 实际是 HTML 命名空间的未知元素:
+
+- `discover_inline_svgs_with_colors` 只认 SVG 命名空间的 `svg`,不会为它生成光栅;
+- `presentational_hint_declarations` 的 SVG 分支不命中,`width`/`height` 不进入
+  计算样式,盒子是 0×0;
+- 属性名被 HTML 规则折叠,`viewBox` 变成 `viewbox`。
+
+Bing 的 Rewards widget 正是用 `innerHTML` 插入勋章模板,所以 DOM 树完整
+(`<g>`/`<path>`/`<defs>` 都在),但既没有 32×32 盒子也没有 image 命令。
+
+## 修复
+
+| 内容 | 落点 |
+|---|---|
+| **导入保留元素命名空间与限定名** | `create_element_qualified(namespace, prefix, local_name)`;HTML 元素仍走 `create_element`(`render-js/src/runtime/builtins/dom.rs`) |
+| **导入保留属性命名空间与大小写** | 有命名空间的属性走 `set_attribute_ns`(保留 `xlink:href` 等前缀);无命名空间属性走 `set_attribute`,在 SVG 元素上保持 `viewBox` 大小写 |
+| **回归测试 1** | `inner_html_preserves_svg_namespaces_and_case_sensitive_attributes`:检查 `namespaceURI`、`viewBox` 与 `xlink:href` |
+| **回归测试 2** | `an_svg_appended_after_parsing_is_discovered_and_painted`:解析后追加 SVG,渲染管线必须产生 image 命令并把绿色矩形绘制到盒中心 |
+| **诊断** | `RENDER_DEBUG_STACKING` 打印每个定位片段的 position/z-index/hoistable |
+
+## Bing 证据(隐藏截图,15 秒)
+
+```
+health page=https://cn.bing.com/ ready=Complete dom_elements=475 boxes=169
+       scripts_failed=0 scripts_threw=0 css_errors=0 css_warnings=19 images_failed=3
+
+layout <div> id=rh_rwm  rect x=2120.475 y=13.5 105.5×42
+layout <svg> class=medal-newlevel-circled rect x=2184 y=18.5 32×32
+paint #279 source=.medal-newlevel-circled … image
+```
+
+截图像素:勋章区域 32×32 内 288 个近白像素;裁剪图 `bing143-rewards.png` 可见
+圆形勋章轮廓与内部奖章图形,右侧汉堡菜单/九宫格同屏。Edge 参考图
+`rewards-edge-crop.png` 的勋章是同位置的圆形勋章(T2 模板);rENDER 本轮拿到
+T5 模板,图形细节不同但结构、尺寸、位置一致。
+
+## 验证
+
+```
+cargo test --workspace                       2709 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+## 明确未做 / 下一步
+
+- **Rewards 模板差异**:Bing 对 Edge 与本机 rENDER 返回不同勋章模板(T2 vs T5),
+  这是页面实验/状态差异;本轮保证两种模板都能被光栅化。
+- **SVG 特性子集**:渐变(`linearGradient`/`radialGradient`)、`clipPath`、`mask`
+  仍未实现;本轮可见的 T5 模板只用白色描边/填充,T2 模板依赖渐变,若拿到 T2
+  仍会缺少彩色细节。
+- `content` 仍只支持字符串;`attr()`/`counter()` 未实现。
+- JD 主商品区仍受风控 403(同机 Edge 也 403);IndexedDB 仍是内存子集;GitHub/HN
+  的本机 TCP 链路仍被阻断;AVIF 解码未实现(images_failed=3 是能力探测)。
+
+---
+
 # 交接文档 (2026-10-31, 续十三) — Bing 搜索框热词提示与头部图标
 
 接续生成内容会话。这一轮定位到 Bing 首屏搜索框热词提示和头部菜单图标缺失的

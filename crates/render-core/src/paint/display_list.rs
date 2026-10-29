@@ -1829,6 +1829,12 @@ impl<'a> Builder<'a> {
         // (Bing's `tob_next` trend rail is an absolutely positioned, huge,
         // z-auto strip that must not float above the wallpaper).
         let hoistable = z_index > 0 && matches!(position.as_str(), "fixed" | "absolute");
+        if std::env::var_os("RENDER_DEBUG_STACKING").is_some() {
+            eprintln!(
+                "stacking source={:?} y={} position={position} z={z_index} positioned={positioned} hoistable={hoistable}",
+                fragment.source, fragment.rect.origin.y
+            );
+        }
         (positioned, hoistable, z_index)
     }
 

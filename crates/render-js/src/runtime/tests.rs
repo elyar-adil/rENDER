@@ -1152,6 +1152,39 @@ fn for_in_uses_first_insertion_order_not_alphabetical_order() {
 }
 
 #[test]
+fn inner_html_preserves_svg_namespaces_and_case_sensitive_attributes() {
+    // DOM §4.2.3 and the parser's foreign-content rules: an `<svg>` inserted
+    // through `innerHTML` is an SVG element, not an HTML one with that local
+    // name. Losing the namespace hides it from inline-SVG rasterisation and
+    // folds `viewBox` to `viewbox`, so the icon never gets a size.
+    let value = evaluate_script(
+        "
+        var host = document.createElement('div');
+        host.innerHTML = '<svg id=icon width=32 height=32 viewBox=\"0 0 32 32\">' +
+            '<defs><clipPath id=cp><rect width=32 height=32></rect></clipPath></defs>' +
+            '<use xlink:href=\"#cp\"></use></svg>';
+        var svg = host.querySelector('#icon');
+        [
+            svg.namespaceURI,
+            svg.getAttribute('viewBox'),
+            svg.getAttribute('viewbox'),
+            svg.firstElementChild.namespaceURI,
+            svg.querySelector('clipPath').namespaceURI,
+            svg.querySelector('use').getAttributeNS('http://www.w3.org/1999/xlink', 'href')
+        ].join('|')
+        ",
+    );
+    assert_eq!(
+        value,
+        JsValue::String(
+            "http://www.w3.org/2000/svg|0 0 32 32||\
+             http://www.w3.org/2000/svg|http://www.w3.org/2000/svg|#cp"
+                .into()
+        )
+    );
+}
+
+#[test]
 fn setting_the_legacy_class_name_attribute_sets_the_class_attribute() {
     // Old virtual-DOM builds spell the IDL name in `setAttribute`; the
     // platform stores `classname`, but the intent is always the class.

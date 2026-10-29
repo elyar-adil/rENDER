@@ -3344,6 +3344,61 @@ mod tests {
         assert!(output.diagnostics.inline_svg.is_empty());
     }
 
+    /// An `svg` appended after the document was parsed is discovered and
+    /// painted on the next render. A JS `innerHTML` import creates exactly
+    /// this shape (Bing's Rewards medallion is inserted that way), so a raster
+    /// that only exists for parser-created icons is not enough.
+    #[test]
+    fn an_svg_appended_after_parsing_is_discovered_and_painted() {
+        use crate::dom::Namespace;
+
+        let mut document =
+            Document::parse("<!doctype html><style>body { margin: 0 }</style><div id=host></div>");
+        let host = target_id(document.dom(), "#host");
+        let svg = document.dom_mut().create_element_ns(Namespace::Svg, "svg");
+        document
+            .dom_mut()
+            .set_attribute(svg, "width", "20")
+            .expect("width attribute");
+        document
+            .dom_mut()
+            .set_attribute(svg, "height", "20")
+            .expect("height attribute");
+        document
+            .dom_mut()
+            .set_attribute(svg, "viewBox", "0 0 20 20")
+            .expect("viewBox attribute");
+        let rect = document.dom_mut().create_element_ns(Namespace::Svg, "rect");
+        document
+            .dom_mut()
+            .set_attribute(rect, "width", "20")
+            .expect("rect width");
+        document
+            .dom_mut()
+            .set_attribute(rect, "height", "20")
+            .expect("rect height");
+        document
+            .dom_mut()
+            .set_attribute(rect, "fill", "#00ff00")
+            .expect("rect fill");
+        document
+            .dom_mut()
+            .append_child(svg, rect)
+            .expect("rect appends");
+        document
+            .dom_mut()
+            .append_child(host, svg)
+            .expect("svg appends");
+
+        let output = document.render_reference(DocumentRenderOptions::default());
+        let painted = output.display.list.items().iter().any(|item| {
+            item.source == Some(svg) && matches!(item.command, DisplayCommand::Image(_))
+        });
+        assert!(painted, "the appended svg was not painted as an image");
+        assert_eq!(centre_pixel(&output, svg), Some(Color::rgb(0, 255, 0)));
+        assert!(output.diagnostics.inline_svg.is_empty());
+    }
+
     /// `currentColor` inside an inline `svg` takes the element's computed
     /// `color`, and changing that colour under unchanged markup re-rasterises
     /// the icon on the next render.
