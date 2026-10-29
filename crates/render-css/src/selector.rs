@@ -290,6 +290,9 @@ pub struct MatchContext {
     pub quirks_mode: bool,
     pub pseudo_element: Option<String>,
     pub focused: Option<NodeId>,
+    /// The focused element when the user agent decides its focus ring should
+    /// show. `:focus` matches on `focused` alone; `:focus-visible` needs both.
+    pub focus_visible: Option<NodeId>,
     pub target: Option<NodeId>,
     pub hovered: HashSet<NodeId>,
     pub active: HashSet<NodeId>,
@@ -305,11 +308,15 @@ pub struct MatchContext {
 /// viewport, quirks mode, and stylesheet scope itself. `hovered` and `active`
 /// are sets rather than single nodes because those pseudo-classes also match
 /// the element's ancestors while the pointer is over a descendant.
+/// `focus_visible` points at the element the user agent would draw a focus
+/// ring for: the focused element after keyboard navigation, or a text-entry
+/// control that was focused by a pointer press.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InteractionState {
     pub hovered: HashSet<NodeId>,
     pub active: HashSet<NodeId>,
     pub focused: Option<NodeId>,
+    pub focus_visible: Option<NodeId>,
     pub target: Option<NodeId>,
 }
 
@@ -1503,7 +1510,8 @@ fn matches_pseudo(
                 && attribute_value(data, "placeholder").is_some()
                 && attribute_value(data, "value").is_none_or(str::is_empty)
         }
-        PseudoClass::Focus | PseudoClass::FocusVisible => context.focused == Some(element),
+        PseudoClass::Focus => context.focused == Some(element),
+        PseudoClass::FocusVisible => context.focus_visible == Some(element),
         PseudoClass::FocusWithin => {
             context.focused == Some(element)
                 || context
@@ -2192,6 +2200,49 @@ mod tests {
             element,
             &selector,
             &context
+        ));
+    }
+
+    #[test]
+    fn focus_visible_needs_its_own_state_on_top_of_focus() {
+        let output = parse_document("<!doctype html><button id=x>b</button>");
+        let element = select_all(
+            &output.dom,
+            output.dom.document(),
+            &parse_selector_list("#x").unwrap(),
+            &MatchContext::default(),
+        )[0];
+        let selector = parse_selector_list("button:focus-visible").unwrap();
+        let focused = MatchContext {
+            focused: Some(element),
+            ..MatchContext::default()
+        };
+
+        // A pointer press focuses the button without showing a focus ring.
+        assert!(!matches_selector_list(
+            &output.dom,
+            element,
+            &selector,
+            &focused
+        ));
+
+        let visible = MatchContext {
+            focus_visible: Some(element),
+            ..focused.clone()
+        };
+        assert!(matches_selector_list(
+            &output.dom,
+            element,
+            &selector,
+            &visible
+        ));
+
+        // `:focus` still matches on focus alone.
+        assert!(matches_selector_list(
+            &output.dom,
+            element,
+            &parse_selector_list("button:focus").unwrap(),
+            &focused
         ));
     }
 

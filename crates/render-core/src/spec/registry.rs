@@ -327,16 +327,17 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
         notes: "Type, universal, id, class, attribute, combinator, the structural \
                 pseudo-classes, `:is()`, `:where()`, `:not()`, `:has()` and the link \
                 and dynamic pseudo-classes all match. The dynamic pseudo-classes read \
-                `MatchContext.hovered`, `.active`, `.focused` and `.target`, seeded from \
-                `InteractionState` by `Document::render_with_interaction`; the browser \
-                derives them from pointer movement, primary-button press/release, click \
-                and script focus, and the committed URL fragment, so `:hover`, `:active`, \
-                `:focus`/`:focus-visible`/`:focus-within` and `:target` match on a \
-                rendered page. Two limits remain: `:visited` never matches because no \
-                visited-link history is exposed, and `:focus-visible` is currently an \
-                alias of `:focus` until keyboard sequential focus is wired. Quirks-mode \
-                case-insensitive `id`/`class` matching is implemented and driven by the \
-                document's mode.",
+                `MatchContext.hovered`, `.active`, `.focused`, `.focus_visible` and \
+                `.target`, seeded from `InteractionState` by \
+                `Document::render_with_interaction`; the browser derives them from pointer \
+                movement, primary-button press/release, click and script focus, Tab/Shift-Tab \
+                sequential focus, and the committed URL fragment, so `:hover`, `:active`, \
+                `:focus`, `:focus-visible`, `:focus-within` and `:target` match on a \
+                rendered page. `:focus-visible` follows the browsers' rule: keyboard focus \
+                always shows the ring, pointer focus only on text entry, script focus \
+                inherits the last input. One limit remains: `:visited` never matches because \
+                no visited-link history is exposed. Quirks-mode case-insensitive `id`/`class` \
+                matching is implemented and driven by the document's mode.",
         dependencies: &[DOM_TREE, CSS_SYNTAX],
         tests: SELECTOR_TESTS,
     },

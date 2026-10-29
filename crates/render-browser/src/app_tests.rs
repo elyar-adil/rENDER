@@ -41,6 +41,7 @@ use crate::frame::FrameDamage;
 use crate::frame::FrameRect;
 use crate::frame::blit_page;
 use crate::frame::surface_to_softbuffer;
+use crate::interaction_state::FocusSource;
 use crate::page_source::PageSource;
 use crate::page_source::home_source;
 use crate::page_source::network_start_source;
@@ -2056,7 +2057,10 @@ fn a_full_frame_payload_carries_all_host_interaction_state() {
         page.navigation.committed.target = NavigationTarget::Url(target);
         assert!(page.set_hovered(Some(field)));
         assert!(page.set_active(Some(field)));
-        assert!(page.set_focused(Some(field)));
+        assert!(
+            page.focus(Some(field), FocusSource::Pointer)
+                .expect("focus listeners do not throw")
+        );
     }
     app.schedule_page_render_for_tab(tab);
     wait_for_renders(&started, 1);
@@ -2070,6 +2074,8 @@ fn a_full_frame_payload_carries_all_host_interaction_state() {
         .as_ref()
         .expect("the first frame is a full render");
     assert_eq!(interaction.focused, Some(field));
+    // A pointer press on a text field still shows the focus ring.
+    assert_eq!(interaction.focus_visible, Some(field));
     assert_eq!(interaction.target, Some(part));
     assert!(interaction.hovered.contains(&field));
     assert!(interaction.active.contains(&field));
@@ -2108,6 +2114,83 @@ fn focused_page_input_exposes_a_caret_that_tracks_the_editor_cursor() {
         app.content_caret_geometry(chrome_height).is_none(),
         "blurring the control must remove its caret"
     );
+}
+
+#[test]
+fn tab_walks_the_sequential_focus_order_and_shows_the_ring() {
+    let (mut app, tab) = headless_app_with(
+        "<!doctype html><button id=one>one</button>\
+         <a id=link href=/next>link</a><input id=field value=typed>",
+    );
+    let (one, link, field) = {
+        let page = app.pages.get(&tab).expect("page");
+        let dom = page.page.document().dom();
+        (
+            find_id(dom, "one"),
+            find_id(dom, "link"),
+            find_id(dom, "field"),
+        )
+    };
+
+    app.handle_keyboard(&pressed_named(NamedKey::Tab));
+    {
+        let page = app.pages.get(&tab).expect("page");
+        assert_eq!(page.interaction.focused, Some(one));
+        // Sequential keyboard navigation always shows the focus ring.
+        assert_eq!(page.interaction.focus_visible, Some(one));
+    }
+    assert!(app.content_editor.is_none());
+
+    app.handle_keyboard(&pressed_named(NamedKey::Tab));
+    app.handle_keyboard(&pressed_named(NamedKey::Tab));
+    {
+        let page = app.pages.get(&tab).expect("page");
+        assert_eq!(page.interaction.focused, Some(field));
+        assert_eq!(page.interaction.focus_visible, Some(field));
+    }
+    // Tabbing into a text control hands typing to the native editor.
+    assert_eq!(
+        app.content_editor.as_ref().map(|content| content.node),
+        Some(field)
+    );
+
+    app.modifiers = winit::keyboard::ModifiersState::SHIFT;
+    app.handle_keyboard(&pressed_named(NamedKey::Tab));
+    app.modifiers = winit::keyboard::ModifiersState::empty();
+    {
+        let page = app.pages.get(&tab).expect("page");
+        assert_eq!(page.interaction.focused, Some(link));
+        assert_eq!(page.interaction.focus_visible, Some(link));
+    }
+    assert!(app.content_editor.is_none());
+}
+
+#[test]
+fn pointer_focus_shows_the_ring_only_on_text_entry() {
+    let (mut app, tab) =
+        headless_app_with("<!doctype html><button id=one>one</button><input id=field>");
+    let (one, field) = {
+        let page = app.pages.get(&tab).expect("page");
+        let dom = page.page.document().dom();
+        (find_id(dom, "one"), find_id(dom, "field"))
+    };
+
+    let page = app.pages.get_mut(&tab).expect("page");
+    assert!(
+        page.focus(Some(one), FocusSource::Pointer)
+            .expect("focus listeners do not throw")
+    );
+    assert_eq!(page.interaction.focused, Some(one));
+    // A pointer press does not draw a ring on a button.
+    assert_eq!(page.interaction.focus_visible, None);
+
+    assert!(
+        page.focus(Some(field), FocusSource::Pointer)
+            .expect("focus listeners do not throw")
+    );
+    assert_eq!(page.interaction.focused, Some(field));
+    // Text entry keeps the ring, where it doubles as the caret cue.
+    assert_eq!(page.interaction.focus_visible, Some(field));
 }
 
 #[test]

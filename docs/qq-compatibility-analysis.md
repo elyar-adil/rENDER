@@ -16,13 +16,15 @@
 > 当前权威证据是 `docs/capability_matrix.md` 与 `docs/visual_fidelity_gaps.md`；
 > 没有更新 `file:line` 的红色条目应视为历史记录，而不是现状。
 >
-> **2026-10-23 状态注记**：动态伪类状态接线**已关闭**。`InteractionState`
-> （`crates/render-css/src/selector.rs:309`）经
-> `Document::render_with_interaction`（`crates/render-core/src/document.rs:1161`）
+> **2026-10-29 状态注记**：动态伪类状态接线及其三个边界**已关闭**。`InteractionState`
+> （`crates/render-css/src/selector.rs`）经
+> `Document::render_with_interaction`（`crates/render-core/src/document.rs`）
 > 进入 cascade；浏览器从指针/按压/焦点/URL fragment 更新状态，并随全帧 payload 送入
-> worker。`:hover`、`:active`、`:focus`、`:focus-within` 和 `:target` 现在按宿主状态
-> 匹配。仍有三个明确边界：`:visited` 恒不匹配（不暴露访问历史）、`:focus-visible`
-> 仍等同 `:focus`、Tab/Shift-Tab 顺序焦点尚未接到页面输入路径。
+> worker。`:hover`、`:active`、`:focus`、`:focus-visible`、`:focus-within` 和 `:target`
+> 现在按宿主状态匹配。Tab/Shift-Tab 走顺序焦点（先派发可取消 `keydown`），点击、键盘和
+> 脚本焦点都会派发 `blur`/`focusout`/`focus`/`focusin`。`:focus-visible` 按浏览器规则
+> 判定：键盘恒显示、指针仅文本控件、脚本继承上一次输入方式。唯一剩余的边界是
+> `:visited` 恒不匹配（不暴露访问历史）。
 >
 > 目标页面：https://www.qq.com 、https://www.taobao.com 、https://www.jd.com
 > 原则：从零实现，correctness over completeness，每一行代码都要有价值。
@@ -176,7 +178,7 @@
 | 1 | ~~字体轴（weight / style / family）~~ | ✅ **已于 2026-10-22 关闭。** `TextStyle` 携带 `FontRequest`，cascade 到字体后端的链路已接通；剩余的是 webfont 获取（P2 #7）。 | `docs/visual_fidelity_gaps.md` S1 |
 | 2 | **`::before`/`::after` 生成内容** | qq 这类门户的装饰几乎全靠伪元素；选择器已能解析，只差 cascade→layout 的盒子生成 | `selector.rs:539-584`；`render-layout`/`paint` 无生成 |
 | 3 | **quirks 模式** | 无 doctype 的老页面现在按 standards-mode 盒模型排，必然错；UA 表注释也声明"this sheet is the no-quirks rendering" | `crates/render-core/src/document.rs:65-67,847-855` |
-| 4 | ~~动态伪类状态接线~~ | ✅ **已于 2026-10-23 关闭。** `InteractionState` 经 `Document::render_with_interaction` 进入 cascade；指针移动/离开、主键按下/释放、点击焦点、脚本焦点同步与 URL fragment 都会更新状态（`crates/render-browser/src/{interaction_state,page_state,app}.rs`）。剩余边界：`:visited` 恒不匹配、`:focus-visible` 等同 `:focus`、Tab 顺序焦点未接线。 | `docs/visual_fidelity_gaps.md` S16 |
+| 4 | ~~动态伪类状态接线~~ | ✅ **已于 2026-10-23 关闭，2026-10-29 补齐边界。** `InteractionState` 经 `Document::render_with_interaction` 进入 cascade；指针移动/离开、主键按下/释放、点击焦点、脚本焦点同步与 URL fragment 都会更新状态（`crates/render-browser/src/{interaction_state,page_state,app}.rs`）。Tab/Shift-Tab 已接顺序焦点，点击/键盘/脚本焦点全部派发 `blur`/`focusout`/`focus`/`focusin`，`:focus-visible` 独立判定。唯一剩余边界：`:visited` 恒不匹配。 | `docs/visual_fidelity_gaps.md` S16 |
 | 5 | **elliptical `border-radius`** | 斜杠语法已解析但被 `f32::midpoint` 平均成圆，胶囊形按钮与头像被画成正圆 | `display_list.rs:1817,1834` |
 
 ### P2 — 中等难度、高收益

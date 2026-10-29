@@ -26,6 +26,7 @@ use crate::frame::FrameDamage;
 use crate::frame::FrameRect;
 use crate::frame::blit_page;
 use crate::frame::copy_frame_regions;
+use crate::interaction_state::FocusSource;
 use crate::page_source::PageSource;
 use crate::page_source::error_source;
 use crate::page_source::home_source;
@@ -99,6 +100,7 @@ use render_browser::worker::RenderViewport;
 use render_core::image::ImageLimits;
 use render_core::image::ImageSelectionContext;
 use render_core::image::ImageSource;
+use render_core::interaction::FocusNavigationDirection;
 use render_core::navigation::HistoryEntry;
 
 use render_core::js::RuntimeLimits;
@@ -2226,14 +2228,116 @@ impl BrowserApp {
         }
     }
 
-    fn set_content_focus(&mut self, node: Option<render_core::dom::NodeId>) {
+    fn set_content_focus(&mut self, node: Option<render_core::dom::NodeId>, source: FocusSource) {
         let id = self.tabs.active_id();
         let changed = self
             .pages
             .get_mut(&id)
-            .is_some_and(|page| page.set_focused(node));
+            .is_some_and(|page| match page.focus(node, source) {
+                Ok(changed) => changed,
+                Err(error) => {
+                    eprintln!("render-browser focus refused: {error}");
+                    false
+                }
+            });
         if changed {
             self.schedule_page_render_for_tab(id);
+        }
+    }
+
+    /// Runs one sequential focus step (Tab or Shift-Tab) in the page.
+    ///
+    /// The page sees a trusted cancelable `keydown` first, targeted at the
+    /// focused element, and focus only moves when nothing prevented the
+    /// default. The move runs the runtime's focusing steps, so `blur`,
+    /// `focusout`, `focus` and `focusin` fire before the new frame.
+    fn advance_content_focus(&mut self, backward: bool) {
+        let id = self.tabs.active_id();
+        let allowed = {
+            let Some(page) = self.pages.get_mut(&id) else {
+                return;
+            };
+            let target = page
+                .page
+                .document()
+                .dom()
+                .focused_element()
+                .unwrap_or_else(|| page.page.document().dom().document());
+            let task = page.page.queue_keydown_at(target, "Tab").ok();
+            task.is_none_or(|task| {
+                let (_, defaults) = page.run_page_turns();
+                defaults.get(&task).copied().unwrap_or(true)
+            })
+        };
+        if !allowed {
+            return;
+        }
+        let direction = if backward {
+            FocusNavigationDirection::Backward
+        } else {
+            FocusNavigationDirection::Forward
+        };
+        let changed =
+            self.pages
+                .get_mut(&id)
+                .is_some_and(|page| match page.advance_focus(direction) {
+                    Ok(changed) => changed,
+                    Err(error) => {
+                        eprintln!("render-browser focus refused: {error}");
+                        false
+                    }
+                });
+        // Focus listeners run scripts; settle them before the editor choice
+        // reads the focused control, and take any script-driven focus move.
+        let (rendered, settled) = {
+            let Some(page) = self.pages.get_mut(&id) else {
+                return;
+            };
+            let (rendered, _) = page.run_page_turns();
+            (rendered, page.sync_focused_from_dom())
+        };
+        self.drain_script_navigations(id);
+        self.sync_page_title(id);
+        if rendered || changed || settled {
+            self.schedule_page_render_for_tab(id);
+        }
+        self.open_editor_for_focused_control(id);
+        self.repaint_chrome();
+    }
+
+    /// Opens the native text editor when sequential focus lands on a text
+    /// control, and closes it when focus lands anywhere else.
+    fn open_editor_for_focused_control(&mut self, id: TabId) {
+        if id != self.tabs.active_id() {
+            return;
+        }
+        let focused = self
+            .pages
+            .get(&id)
+            .and_then(|page| page.page.document().dom().focused_element());
+        let editable = focused.and_then(|node| {
+            self.content_editable_node(id, node)
+                .or_else(|| self.content_wrapper_control(id, node))
+        });
+        let Some(node) = editable else {
+            self.close_content_editor_ui();
+            return;
+        };
+        let Some(value) = self.content_text_input_value(id, node) else {
+            self.close_content_editor_ui();
+            return;
+        };
+        let mut editor = AddressEditor::new(value);
+        editor.place_cursor(editor.text().len(), false);
+        editor.set_focused(true);
+        self.content_editor = Some(ContentTextEditor {
+            tab: id,
+            node,
+            editor,
+        });
+        self.content_selecting = false;
+        if let Some(window) = &self.window {
+            window.set_ime_allowed(true);
         }
     }
 
@@ -2508,7 +2612,7 @@ impl BrowserApp {
                 editor,
             });
             self.content_selecting = true;
-            self.set_content_focus(Some(node));
+            self.set_content_focus(Some(node), FocusSource::Pointer);
             if let Some(window) = &self.window {
                 window.set_ime_allowed(true);
             }
@@ -2516,10 +2620,20 @@ impl BrowserApp {
             return;
         }
         self.close_content_editor();
-        self.set_content_focus(self.content_focus_target(id, hit_node));
+        self.set_content_focus(
+            self.content_focus_target(id, hit_node),
+            FocusSource::Pointer,
+        );
         if let Some(window) = &self.window {
             window.set_ime_allowed(false);
         }
+        self.perform_content_click(id, hit_node);
+        self.repaint_chrome();
+    }
+
+    /// Dispatches the trusted `click` for `hit_node` and then runs the submit
+    /// and navigation default actions it left enabled.
+    fn perform_content_click(&mut self, id: TabId, hit_node: Option<render_core::dom::NodeId>) {
         // Give page scripts a chance to observe or cancel the click before
         // any default action (navigation) runs.
         let mut default_allowed = true;
@@ -2588,7 +2702,6 @@ impl BrowserApp {
                 )
             });
         self.perform_content_navigation(id, navigation);
-        self.repaint_chrome();
     }
 
     fn press_cache_clear_control(
@@ -2600,7 +2713,10 @@ impl BrowserApp {
             return false;
         }
         self.clear_http_cache();
-        self.set_content_focus(self.content_focus_target(id, hit_node));
+        self.set_content_focus(
+            self.content_focus_target(id, hit_node),
+            FocusSource::Pointer,
+        );
         self.repaint_chrome();
         true
     }
@@ -3453,6 +3569,16 @@ impl BrowserApp {
                 return;
             }
         }
+        // Tab belongs to sequential focus navigation, including while a page
+        // control's native editor is open: the move commits and closes it.
+        if matches!(key.logical_key, Key::Named(NamedKey::Tab))
+            && !primary
+            && !self.modifiers.alt_key()
+            && !self.editor.is_focused()
+        {
+            self.advance_content_focus(shift);
+            return;
+        }
         if self.content_editor.is_some() && self.handle_content_keyboard(key) {
             return;
         }
@@ -3463,6 +3589,12 @@ impl BrowserApp {
             self.forward_keydown_to_page(key);
             return;
         }
+        self.handle_address_key(key, shift, primary);
+    }
+
+    /// Routes a key press to the address field, whose editor owns text entry
+    /// and Enter navigation while it holds focus.
+    fn handle_address_key(&mut self, key: &RawKeyInput, shift: bool, primary: bool) {
         let ime_enter_pending = self.editor.take_pending_ime_enter();
         let composing = !self.editor.preedit().is_empty();
         match &key.logical_key {
@@ -3773,8 +3905,17 @@ impl BrowserApp {
     }
 
     /// Drops the focused content control, reverting any uncommitted IME
-    /// composition text so the control keeps only its committed value.
+    /// composition text so the control keeps only its committed value, and
+    /// blurs the page.
     pub(super) fn close_content_editor(&mut self) {
+        self.close_content_editor_ui();
+        self.set_content_focus(None, FocusSource::Pointer);
+    }
+
+    /// The editor half of [`Self::close_content_editor`], without touching
+    /// page focus: sequential focus moves the page's focus first, and an extra
+    /// blur would fire `blur`/`focusout` twice.
+    fn close_content_editor_ui(&mut self) {
         if let Some(content) = self.content_editor.as_ref()
             && !content.editor.preedit().is_empty()
         {
@@ -3800,7 +3941,6 @@ impl BrowserApp {
         }
         self.content_editor = None;
         self.content_selecting = false;
-        self.set_content_focus(None);
     }
 
     pub(super) fn update_window_title(&self) {

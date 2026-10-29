@@ -1269,6 +1269,7 @@ fn render_dom(
         viewport_height: Some(options.layout.viewport.height),
         quirks_mode: is_quirks_mode(quirks_mode),
         focused: environment.interaction.focused,
+        focus_visible: environment.interaction.focus_visible,
         target: environment.interaction.target,
         hovered: environment.interaction.hovered.clone(),
         active: environment.interaction.active.clone(),
@@ -1935,6 +1936,7 @@ mod tests {
              #target:hover { color: rgb(2, 2, 2) }\
              #target:active { color: rgb(3, 3, 3) }\
              #target:focus { color: rgb(4, 4, 4) }\
+             #target:focus-visible { color: rgb(7, 7, 7) }\
              #target:target { color: rgb(5, 5, 5) }\
              #parent:focus-within #child { color: rgb(6, 6, 6) }\
              </style><div id=parent><div id=target tabindex=0></div>\
@@ -1986,6 +1988,14 @@ mod tests {
                     ..InteractionState::default()
                 },
                 "rgb(4, 4, 4)",
+            ),
+            (
+                InteractionState {
+                    focused: Some(target),
+                    focus_visible: Some(target),
+                    ..InteractionState::default()
+                },
+                "rgb(7, 7, 7)",
             ),
             (
                 InteractionState {

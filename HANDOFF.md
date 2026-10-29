@@ -1,3 +1,37 @@
+# 交接文档 (2026-10-29) — 键盘顺序焦点、真正的 :focus-visible、聚焦事件全路径
+
+接续 10-23 的 S16(S16 = 动态伪类接线)会话。那一轮的 WIP 先在 10-29 恢复并提交
+(`e05c2f1`),本轮把它记录的三个已知边界收掉。
+
+## 本轮已完成
+
+| 内容 | 落点 |
+|---|---|
+| **Tab/Shift-Tab 顺序焦点** | `render_core::interaction::sequential_focus_target` 只算目标不改焦点;`Page::advance_focus` 对目标跑运行时聚焦步骤。壳层先向焦点元素(无焦点时向 document)派发可取消的 `keydown`,被取消则不动。焦点落在文本控件上时打开原生编辑器、落在别处则关闭 |
+| **真正的 `:focus-visible`** | `MatchContext.focus_visible` 与 `InteractionState.focus_visible` 独立于 `focused`;`:focus` 只看 `focused`,`:focus-visible` 只看自己的字段。壳层规则:键盘导航恒显示、指针只对文本输入显示、脚本 `focus()` 继承最近一次真实输入方式 |
+| **聚焦事件全路径** | 点击/键盘/脚本都走 `JsRuntime::focus_element` / `blur_element`(HTML §6.6.3),`blur`→`focusout`→`focus`→`focusin` 按序触发,`relatedTarget` 正确。壳层不再直接 `set_focused_element` 绕过事件 |
+| **前置 bug:`Event` 构造器在首个脚本前不可用** | 任何宿主事件(点击、`focus()`)在页面尚未执行过脚本时会以 "event constructor is unavailable" 失败,因为 prelude 是惰性安装的。现在 `dispatch_dom_event`、`focus_element`、`blur_element` 入口都先 `ensure_prelude` |
+
+## 验证
+
+- `cargo test --workspace` 全绿;`cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --all --check` 干净。
+- 新增覆盖:`page::tests::focus_element_runs_the_focus_events_and_reports_the_transition`(四次事件的顺序与内容)、`advance_focus_walks_the_sequential_order_and_wraps`(两端回绕)、`document::tests::host_interaction_state_reaches_dynamic_pseudo_class_cascade` 增加 `:focus-visible` 用例、`app_tests::tab_walks_the_sequential_focus_order_and_shows_the_ring`、`pointer_focus_shows_the_ring_only_on_text_entry`、`selector::focus_visible_needs_its_own_state_on_top_of_focus`。
+
+## 明确未做
+
+- `:visited` 仍恒不匹配(不暴露访问历史)。
+- `:focus-visible` 是浏览器通行规则,不是 Selectors 4 的完整启发式:命令行/提交按钮、指针拖动选中文本等分支未建模。
+- Tab 顺序不跨文档、不穿透 shadow host 的 `tabindex` 委托;焦点进入 chrome(地址栏)时不清页面焦点。
+
+## 下一步候选
+
+1. 动画/transition:registry 中仍为 `Missing`,先做时间驱动与 invalidation 接缝,再接 `@keyframes`/`animation-*`/`transition-*`;不要用整帧重绘冒充 transition。
+2. `::backdrop` + top layer(~75 reftest)。
+3. `drawImage`(解锁图像像素、pattern 与 `toDataURL` 解码测试)。
+4. 表单约束校验(`checkValidity`/`:invalid`,~9 WPT)。
+
+---
+
 # 交接文档 (2026-10-26) — canvas toDataURL + 预乘合成/混合模式
 
 接续 2026-10-25 canvas 会话,补齐合成正确性并加上 `toDataURL`。

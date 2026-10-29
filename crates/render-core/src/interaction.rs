@@ -503,20 +503,7 @@ pub fn advance_sequential_focus(
     direction: FocusNavigationDirection,
 ) -> FocusTransition {
     let previous = dom.focused_element();
-    let order = sequential_focus_order(dom);
-    let next = if order.is_empty() {
-        None
-    } else {
-        let current_index =
-            previous.and_then(|focused| order.iter().position(|candidate| *candidate == focused));
-        let index = match (direction, current_index) {
-            (FocusNavigationDirection::Forward, Some(index)) => (index + 1) % order.len(),
-            (FocusNavigationDirection::Backward, Some(0) | None) => order.len() - 1,
-            (FocusNavigationDirection::Backward, Some(index)) => index - 1,
-            (FocusNavigationDirection::Forward, None) => 0,
-        };
-        Some(order[index])
-    };
+    let next = sequential_focus_target(dom, direction);
     let stored = dom.set_focused_element(next);
     debug_assert!(
         stored,
@@ -526,6 +513,30 @@ pub fn advance_sequential_focus(
         previous,
         current: dom.focused_element(),
     }
+}
+
+/// The element one sequential navigation step away from the focused area.
+///
+/// This is the target `advance_sequential_focus` would move to, without
+/// changing focus, so a host that runs the focusing steps (and their events)
+/// through the script bindings can ask for the destination first. `None` means
+/// the document has no focusable area, which leaves focus where it is.
+#[must_use]
+pub fn sequential_focus_target(dom: &Dom, direction: FocusNavigationDirection) -> Option<NodeId> {
+    let order = sequential_focus_order(dom);
+    if order.is_empty() {
+        return None;
+    }
+    let current = dom
+        .focused_element()
+        .and_then(|focused| order.iter().position(|candidate| *candidate == focused));
+    let index = match (direction, current) {
+        (FocusNavigationDirection::Forward, Some(index)) => (index + 1) % order.len(),
+        (FocusNavigationDirection::Backward, Some(0) | None) => order.len() - 1,
+        (FocusNavigationDirection::Backward, Some(index)) => index - 1,
+        (FocusNavigationDirection::Forward, None) => 0,
+    };
+    Some(order[index])
 }
 
 /// Compute positive `tabindex` elements first (ascending, stable DOM order),

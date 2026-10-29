@@ -17,13 +17,15 @@ use crate::runtime::JsRuntime;
 impl JsRuntime {
     /// `focus()` (HTML §6.6.4): run the focusing steps for `target`, unless it is
     /// not a focusable area or already holds focus, in which case nothing happens.
-    pub(in crate::runtime) fn focus_element(
-        &mut self,
-        dom: &mut Dom,
-        target: NodeId,
-    ) -> Result<(), JsError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed error of a focus listener that throws; the focusing
+    /// steps stop at that point.
+    pub fn focus_element(&mut self, dom: &mut Dom, target: NodeId) -> Result<(), JsError> {
         // HTML §6.6.3 focusing steps: a shadow host whose root delegates focus
         // hands focus to its focus delegate, when it has one.
+        self.ensure_prelude(dom);
         let target = dom.focus_delegate(target).unwrap_or(target);
         if dom.focused_element() == Some(target) || !dom.is_focusable_area(target) {
             return Ok(());
@@ -33,14 +35,16 @@ impl JsRuntime {
 
     /// `blur()` (HTML §6.6.4): if `target` holds focus, run the unfocusing steps,
     /// which make the viewport the focused area. Otherwise nothing happens.
-    pub(in crate::runtime) fn blur_element(
-        &mut self,
-        dom: &mut Dom,
-        target: NodeId,
-    ) -> Result<(), JsError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed error of a focus listener that throws; the unfocusing
+    /// steps stop at that point.
+    pub fn blur_element(&mut self, dom: &mut Dom, target: NodeId) -> Result<(), JsError> {
         if dom.focused_element() != Some(target) {
             return Ok(());
         }
+        self.ensure_prelude(dom);
         self.update_focused_area(dom, None)
     }
 

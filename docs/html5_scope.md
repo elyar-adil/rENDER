@@ -245,7 +245,7 @@ Microdata、`is=""`、`<dialog>` 完整模态语义、Drag & Drop API、可访�
 | 后代/子/相邻/通用兄弟 组合器 | ✅ |
 | 属性选择器全集（`[a] [a=b] [a~=b] [a\|=b] [a^=b] [a$=b] [a*=b]`） | ✅ 7 种算子（`selector.rs:185-192,602-612`）+ `i`/`s` 大小写标志（`:627`）+ 匹配（`:1217-1245`） |
 | 结构伪类（`:first-child :last-child :only-child :first/last/only-of-type :nth-child :nth-last-child :nth-of-type :nth-last-of-type :empty :root`） | ✅ `selector.rs:650-664` |
-| 状态伪类（`:hover :focus :focus-visible :focus-within :active :checked :placeholder-shown :target :enabled :disabled`） | 🟡 **匹配逻辑齐备，宿主状态已接线。** `MatchContext`（`selector.rs:285-296`）由 `InteractionState`（`:309`）经 `Document::render_with_interaction`（`document.rs:1161`）注入；浏览器从指针移动/离开、主键按下/释放、点击焦点、页面输入框焦点、脚本焦点同步和 URL fragment 更新状态（`crates/render-browser/src/interaction_state.rs`、`page_state.rs:336-395`），并随 `FullPageRenderPayload` 进入 worker。`:hover`/`:active` 含祖先链，`:target` 每次全帧重算。🟡 `:focus-visible` 仍等同 `:focus`（指针点击按钮也会命中）；Tab 顺序焦点尚未接线；`:visited` 仍恒不匹配（见下一行）。 |
+| 状态伪类（`:hover :focus :focus-visible :focus-within :active :checked :placeholder-shown :target :enabled :disabled`） | 🟡 **匹配逻辑齐备，宿主状态已接线。** `MatchContext`（`selector.rs:285-296`）由 `InteractionState`（`:309`）经 `Document::render_with_interaction`（`document.rs:1161`）注入；浏览器从指针移动/离开、主键按下/释放、点击焦点、页面输入框焦点、脚本焦点同步和 URL fragment 更新状态（`crates/render-browser/src/interaction_state.rs`、`page_state.rs:336-395`），并随 `FullPageRenderPayload` 进入 worker。`:hover`/`:active` 含祖先链，`:target` 每次全帧重算。🟡 `:focus-visible` 已独立判定：键盘导航恒显示、指针仅文本控件、脚本焦点继承上次输入；Tab/Shift-Tab 已接顺序焦点（先派发可取消 `keydown`）；`:visited` 仍恒不匹配（见下一行）。 |
 | 链接伪类（`:link :any-link :visited`） | 🟡 可解析可匹配（`selector.rs:669-671,1309-1311`），`:link`/`:any-link` 正常；`visited_links` 仍恒空 ⇒ `:visited` 永不匹配（浏览器壳不暴露访问历史） |
 | 否定 `:not()`（接受选择器列表） | ✅ `selector.rs:667` |
 | `:is() :where()` | ✅ `selector.rs:665-666`（`:where()` 0 特异性） |
@@ -665,7 +665,7 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 | 复杂脚本整形 | 🔵 见 4.5；上一版的 "⛔ NON-GOAL（依赖 HarfBuzz，超出 PyQt 默认能力）" 已删除 |
 | ARIA 属性反射到 DOM | 🔴（`aria-*` 只是普通属性，无消费者） |
 | 可访问性树 / 屏幕阅读器对接 | ⛔ |
-| 键盘导航：Tab 焦点环、Enter/Space 触发按钮 | 🟡 顺序焦点排序与前进/后退 ✅（`crates/render-core/src/interaction.rs`，`sequential_focus_order` / `advance_sequential_focus`）；`focus()` / `blur()` ✅；**Tab 键未接到页面输入路径 🔴**；`:focus` 样式 ✅（点击与脚本焦点），但 `:focus-visible` 仍等同 `:focus`，指针点击也会显示焦点环 🟡 |
+| 键盘导航：Tab 焦点环、Enter/Space 触发按钮 | 🟡 顺序焦点排序与前进/后退 ✅（`crates/render-core/src/interaction.rs`，`sequential_focus_order` / `sequential_focus_target`）；`focus()` / `blur()` ✅；**Tab/Shift-Tab 已接到页面输入路径 ✅**（先派发可取消 `keydown`，落到文本控件时打开原生编辑器）；`:focus` / `:focus-visible` 样式 ✅（键盘恒显示、指针仅文本控件、脚本继承上次输入）；Enter/Space 触发按钮仍 🟡 |
 | `Intl.*` | ⛔ |
 | 高 DPI（device pixel ratio）一致绘制 | 🔴 恒 1.0（见 7.7） |
 | 用户缩放 / 页面缩放 | ⛔ |
@@ -762,7 +762,7 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 |------|------|------|
 | HTML tokenizer + tree builder | `crates/render-html/src/{tokenizer,tree_builder,encoding,serialization}.rs` | 🟡 foreign content 已实现；misnested formatting（adoption agency）🔴；`noscript` scripting 分支 🔴 |
 | CSS 语法 + 样式表 | `crates/render-css/src/{properties,length,stylesheet}.rs` | 🟡 token/escape 与复杂 at-rule 行为有缺口；`@font-face`/`@keyframes`/`@import` 丢弃；`@supports` 条件丢弃 |
-| 选择器 | `crates/render-css/src/selector.rs` | 🟡 语法面很宽（7 种属性选择器算子 + 31 个伪类，含 `:has()`/`:is()`/`:where()`）；动态伪类状态已接线（`:hover/:active/:focus/:focus-within/:target`），`:visited`、独立 `:focus-visible` 与 Tab 顺序焦点仍是缺口 |
+| 选择器 | `crates/render-css/src/selector.rs` | 🟡 语法面很宽（7 种属性选择器算子 + 31 个伪类，含 `:has()`/`:is()`/`:where()`）；动态伪类状态已接线（`:hover/:active/:focus/:focus-visible/:focus-within/:target`），Tab/Shift-Tab 走顺序焦点且各焦点路径都派发事件，剩余缺口只有 `:visited` |
 | Cascade / computed | `crates/render-css/src/{cascade,computed}.rs` | 🟡 origin + `@layer` + `revert-layer` 完整；CSS-wide keywords 逐项行为 ❓ 部分未核实 |
 | 布局求解 | `crates/render-layout/src/solver/{block,inline,flex,grid,table,resolve}.rs` | 🟡 block/inline/flex/grid/table 五套上下文齐备；**margin collapsing 🔴**、sticky 🟡（绘制与命中测试已位移；嵌套滚动偏移未实现）、multi-column 🟡（不含 `column-rule`）、RTL 🔴 |
 | 格式化结构 | `crates/render-layout/src/{tree,fragment,geometry}.rs` | 🟡 匿名块与 `display:contents` ✅；**伪元素盒 🔴** |

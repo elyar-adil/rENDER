@@ -4,6 +4,7 @@ use crate::ACTIVE_PAGE_TURN_BUDGET;
 use crate::fetch_handles::CachedBatchHandle;
 use crate::fetch_handles::CachedRequestHandle;
 use crate::interaction_state;
+use crate::interaction_state::FocusSource;
 use crate::page_source::PageSource;
 use crate::profile::ProfileCookies;
 use crate::profile::ProfileStorage;
@@ -20,8 +21,10 @@ use render_core::document::ExternalStyleSheetKey;
 use render_core::document::ExternalStyleSheets;
 use render_core::image::ImageResourceKey;
 use render_core::image::ImageResources;
+use render_core::interaction::FocusNavigationDirection;
 use render_core::js::DocumentReadyState;
 use render_core::js::ElementRect;
+use render_core::js::JsError;
 use render_core::js::JsValue;
 use render_core::navigation::HistoryEntry;
 use render_core::navigation::NavigationLimits;
@@ -79,6 +82,9 @@ pub(super) struct PageState {
     /// Every change schedules a full render, because these states participate
     /// in selector matching and cannot be applied by repainting an old frame.
     pub(super) interaction: InteractionState,
+    /// Whether the last focus the user gave the page came from the keyboard.
+    /// Script-initiated focus inherits it when deciding `:focus-visible`.
+    keyboard_focus: bool,
     pub(super) pending_images: Option<PendingImages>,
     pub(super) styles_resolved: bool,
     pub(super) pending_style_sheets: Option<PendingStyleSheets>,
@@ -231,6 +237,7 @@ impl PageState {
             attempted_images: HashSet::new(),
             computed_styles: BTreeMap::new(),
             interaction,
+            keyboard_focus: false,
             pending_images: None,
             styles_resolved: false,
             pending_style_sheets: None,
@@ -314,6 +321,7 @@ impl PageState {
             self.page.document().dom(),
             &self.navigation.committed().target.history_url(),
         );
+        self.keyboard_focus = false;
         self.styles_resolved = false;
         self.scripts_resolved = false;
         self.started_scripts.clear();
@@ -352,33 +360,73 @@ impl PageState {
         true
     }
 
-    /// Replaces the focused node and reports whether selector matching changed.
+    /// Moves focus through the script runtime's focusing steps and reports
+    /// whether selector matching changed.
     ///
-    /// Focus is document state, so this records it on the DOM as well; the
-    /// value is then what `document.activeElement` and the `:focus` cascade
-    /// both read. A non-focusable node is refused and leaves focus unchanged.
-    pub(super) fn set_focused(&mut self, node: Option<render_core::dom::NodeId>) -> bool {
-        let stored = self.page.document_mut().dom_mut().set_focused_element(node);
-        let focused = if stored {
-            node
-        } else {
-            self.page.document().dom().focused_element()
+    /// The steps fire `blur`/`focusout`/`focus`/`focusin` and store the result
+    /// on the DOM, so `document.activeElement` and the `:focus` cascade read
+    /// the same value. `source` decides `:focus-visible`: keyboard navigation
+    /// always shows the ring, a pointer press only on text entry, and script
+    /// focus inherits the last real input. `None` blurs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed error of a focus listener that throws.
+    pub(super) fn focus(
+        &mut self,
+        node: Option<render_core::dom::NodeId>,
+        source: FocusSource,
+    ) -> Result<bool, JsError> {
+        let transition = match node {
+            Some(node) => self.page.focus_element(node)?,
+            None => self.page.blur_focused()?,
         };
-        if self.interaction.focused == focused {
-            return false;
+        if source != FocusSource::Script {
+            self.keyboard_focus = source == FocusSource::Keyboard;
         }
-        self.interaction.focused = focused;
-        true
+        Ok(self.record_focus(transition.current, source))
+    }
+
+    /// Moves focus one step through the sequential focus order, wrapping at
+    /// either end, and reports whether selector matching changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed error of a focus listener that throws.
+    pub(super) fn advance_focus(
+        &mut self,
+        direction: FocusNavigationDirection,
+    ) -> Result<bool, JsError> {
+        let transition = self.page.advance_focus(direction)?;
+        self.keyboard_focus = true;
+        Ok(self.record_focus(transition.current, FocusSource::Keyboard))
     }
 
     /// Copies focus changes made by scripts into the host interaction state.
     /// Returns whether the `:focus` cascade needs a new frame.
     pub(super) fn sync_focused_from_dom(&mut self) -> bool {
         let focused = self.page.document().dom().focused_element();
-        if self.interaction.focused == focused {
+        self.record_focus(focused, FocusSource::Script)
+    }
+
+    fn record_focus(
+        &mut self,
+        focused: Option<render_core::dom::NodeId>,
+        source: FocusSource,
+    ) -> bool {
+        let visible = focused.filter(|node| {
+            interaction_state::focus_visible(
+                self.page.document().dom(),
+                *node,
+                source,
+                self.keyboard_focus,
+            )
+        });
+        if self.interaction.focused == focused && self.interaction.focus_visible == visible {
             return false;
         }
         self.interaction.focused = focused;
+        self.interaction.focus_visible = visible;
         true
     }
 

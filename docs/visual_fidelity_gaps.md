@@ -237,13 +237,25 @@ reach a full-frame payload), plus the helper tests in `interaction_state.rs`.
 
 - `:visited` still never matches: `visited_links` is empty because the shell does not expose
   visited-link history. This is the privacy-sensitive pseudo-class, not a missing parser arm.
-- `:focus-visible` is currently an alias of `:focus`. A pointer click on a button therefore
-  matches it, where the spec would not; text inputs are always focus-visible, so the common
-  input case is right.
-- Tab/Shift-Tab are not routed to `render_core::interaction::advance_sequential_focus` yet.
-  Script `focus()`/`blur()` and click focus do update the focused area and `:focus`.
-- A host click sets `document.activeElement`, but focus/blur/focusin/focusout events are only
-  fired by the script `focus()`/`blur()` path, not by the click path.
+- `:focus-visible` follows the browsers' rule rather than the full Selectors 4 heuristic:
+  sequential keyboard navigation always shows the ring, a pointer press shows it only on text
+  entry (text inputs, textareas, `contenteditable`), and script `focus()` inherits the last real
+  input. Heuristics that look at command-line/submit buttons and at pointer-induced text
+  selection are not modelled.
+- Focus moves via Tab/Shift-Tab, a click, or script `focus()`/`blur()` all run the runtime's
+  focusing steps, so `blur`, `focusout`, `focus` and `focusin` fire on every path. Tab targets
+  the focused element (or the document when nothing is focused) with a cancelable `keydown`
+  first, so a page can prevent the move. Cross-document Tab order and `tabindex` on shadow hosts
+  are not modelled.
+
+Evidence: `crates/render-core/src/document.rs` `host_interaction_state_reaches_dynamic_pseudo_class_cascade`
+renders one document twice and asserts the computed colors for `:hover`, `:active`, `:focus`,
+`:focus-visible`, `:focus-within`, `:target` and their non-matching defaults. Browser coverage is
+`crates/render-browser/src/app_tests.rs` `pointer_movement_and_press_update_the_pages_dynamic_state`,
+`a_push_state_fragment_updates_the_target_pseudo_class`, `a_full_frame_payload_carries_all_host_interaction_state`,
+`tab_walks_the_sequential_focus_order_and_shows_the_ring` and
+`pointer_focus_shows_the_ring_only_on_text_entry`, plus the helper tests in `interaction_state.rs`
+and the `Page` focusing-step tests in `page.rs`.
 
 ## S4 - Partly closed: the silent discard is now reported; evaluation is not implemented
 
@@ -2224,8 +2236,7 @@ that completes a 2.27 MB production bundle.
 **The shape of the remaining distance is not a long tail.** It is the architectural absences
 above, of which animations and transitions, iframe painting, shadow-scoped styling, selection and
 bidi are the ones that would break the largest number of real pages per unit of work. Dynamic
-pseudo-class state (S16) is now wired end to end; `:visited` and keyboard Tab focus remain the
-named limits there.
+pseudo-class state (S16) is now wired end to end; `:visited` remains the named limit there.
 
 ## S28 - OPEN: "styled but bare text" on a real page - the cause is still unknown
 

@@ -517,6 +517,7 @@ pub(super) fn match_context(
     MatchContext {
         quirks_mode: document.quirks_mode() == render_core::html::QuirksMode::Quirks,
         focused: interaction.focused,
+        focus_visible: interaction.focus_visible,
         target: interaction.target,
         hovered: interaction.hovered.clone(),
         active: interaction.active.clone(),

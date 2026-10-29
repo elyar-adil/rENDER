@@ -26,6 +26,63 @@ pub(super) fn ancestor_set(dom: &Dom, node: Option<NodeId>) -> HashSet<NodeId> {
     chain
 }
 
+/// What moved focus, which decides whether `:focus-visible` shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FocusSource {
+    /// A pointer press: the ring stays off except on text entry.
+    Pointer,
+    /// Sequential keyboard navigation: the ring always shows.
+    Keyboard,
+    /// `focus()`/`blur()` from script: the ring follows the last real input.
+    Script,
+}
+
+/// Whether `node` should match `:focus-visible` now that it holds focus.
+///
+/// Selectors 4 §6.4.3 leaves the answer to the user agent. This follows the
+/// browsers' rule: sequential keyboard navigation always shows the ring, while
+/// a pointer press shows it only for text entry, where it doubles as the caret
+/// cue. Script focus inherits the modality of the last user input.
+pub(super) fn focus_visible(
+    dom: &Dom,
+    node: NodeId,
+    source: FocusSource,
+    keyboard_last_input: bool,
+) -> bool {
+    let keyboard = match source {
+        FocusSource::Keyboard => true,
+        FocusSource::Pointer => false,
+        FocusSource::Script => keyboard_last_input,
+    };
+    keyboard || is_text_entry(dom, node)
+}
+
+/// The text controls a browser keeps the focus ring on when clicked.
+fn is_text_entry(dom: &Dom, node: NodeId) -> bool {
+    if crate::content_interaction::is_content_editable(dom, node) {
+        return true;
+    }
+    let Some(NodeKind::Element(data)) = dom.node(node).map(Node::kind) else {
+        return false;
+    };
+    if data.namespace != Namespace::Html {
+        return false;
+    }
+    match data.local_name.as_str() {
+        "textarea" => true,
+        "input" => {
+            let input_type = dom
+                .attribute(node, "type")
+                .ok()
+                .flatten()
+                .unwrap_or("text")
+                .to_ascii_lowercase();
+            render_core::interaction::is_text_entry_input_type(&input_type)
+        }
+        _ => false,
+    }
+}
+
 /// The element a URL fragment names, if any.
 ///
 /// HTML's target element is the first element in tree order with a matching

@@ -20,6 +20,7 @@ use crate::event_loop::{
     TaskId, TaskSource, TimerId, TurnOutcome,
 };
 use crate::image::{DecodedImage, ImageLimits, ImageResources};
+use crate::interaction::{FocusNavigationDirection, FocusTransition, sequential_focus_target};
 use crate::invalidation::{InvalidationCursor, InvalidationError, RenderingInvalidationPlan};
 use crate::js::{
     CompiledScript, ElementRect, FetchOutcome, JsError, JsMicrotask, JsRuntime, JsValue,
@@ -897,6 +898,76 @@ impl Page {
         }
     }
 
+    /// Run the focusing steps (HTML §6.6.3) for `target` and fire the
+    /// `blur`/`focusout`/`focus`/`focusin` events through the page's script
+    /// realm.
+    ///
+    /// The focusing steps are synchronous in the specification, so this runs
+    /// the events immediately rather than queueing a task. A non-focusable
+    /// target is ignored, and a target whose shadow host delegates focus hands
+    /// focus to the delegate; either way the returned transition reports what
+    /// the document ended up with.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed error of a focus listener that throws.
+    pub fn focus_element(&mut self, target: NodeId) -> Result<FocusTransition, JsError> {
+        let previous = self.document.dom().focused_element();
+        self.runtime
+            .focus_element(self.document.dom_mut(), target)?;
+        Ok(FocusTransition {
+            previous,
+            current: self.document.dom().focused_element(),
+        })
+    }
+
+    /// Run the unfocusing steps for the focused element, if the document has
+    /// one, firing `blur` and `focusout` with the same synchronous rules as
+    /// [`Self::focus_element`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed error of a focus listener that throws.
+    pub fn blur_focused(&mut self) -> Result<FocusTransition, JsError> {
+        let previous = self.document.dom().focused_element();
+        if let Some(target) = previous {
+            self.runtime.blur_element(self.document.dom_mut(), target)?;
+        }
+        Ok(FocusTransition {
+            previous,
+            current: self.document.dom().focused_element(),
+        })
+    }
+
+    /// Move focus one step through the sequential focus order (HTML §6.6.3,
+    /// "sequential focus navigation"), running the focusing steps and their
+    /// events for the destination.
+    ///
+    /// Returns a transition whose ends are equal when the document has no
+    /// focusable area.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed error of a focus listener that throws.
+    pub fn advance_focus(
+        &mut self,
+        direction: FocusNavigationDirection,
+    ) -> Result<FocusTransition, JsError> {
+        let previous = self.document.dom().focused_element();
+        let Some(target) = sequential_focus_target(self.document.dom(), direction) else {
+            return Ok(FocusTransition {
+                previous,
+                current: previous,
+            });
+        };
+        self.runtime
+            .focus_element(self.document.dom_mut(), target)?;
+        Ok(FocusTransition {
+            previous,
+            current: self.document.dom().focused_element(),
+        })
+    }
+
     /// Queue typed page work on an explicit task source.
     ///
     /// # Errors
@@ -969,9 +1040,10 @@ impl Page {
 
     /// Queue a trusted cancelable `keydown` event at the document.
     ///
-    /// The engine has no focus model yet, so keyboard events target the
-    /// document itself; listeners on any ancestor still observe them because
-    /// document is the path root.
+    /// The event targets the document itself, which is the fallback when no
+    /// element holds focus; listeners on the path still observe it because
+    /// document is the path root. Callers with a focused node use
+    /// [`Self::queue_keydown_at`] so the event targets that element.
     ///
     /// # Errors
     ///
@@ -996,6 +1068,7 @@ impl Page {
         key: &str,
     ) -> Result<TaskId, PageQueueError> {
         let mut event = PageDomEvent::new(target, "keydown")
+            .bubbles(true)
             .cancelable(true)
             .composed(true);
         event
@@ -1793,6 +1866,100 @@ mod tests {
             Some(NodeKind::Text(value)) if value == "script-first"
         ));
         assert!(page.snapshot().revision > initial_revision);
+    }
+
+    #[test]
+    fn focus_element_runs_the_focus_events_and_reports_the_transition() {
+        let mut page = Page::new(
+            "<!doctype html><input id=first><button id=second>b</button><p id=log></p>\
+             <script>\
+               window.order = [];\
+               for (const id of ['first', 'second']) {\
+                 const el = document.getElementById(id);\
+                 for (const type of ['blur', 'focusout', 'focus', 'focusin']) {\
+                   el.addEventListener(type, () => order.push(id + ':' + type));\
+                 }\
+               }\
+             </script>",
+        );
+        let queue = page.queue_document_scripts(
+            &Url::parse("https://example.test/page").expect("base URL"),
+            ScriptDiscoveryLimits::default(),
+        );
+        assert_eq!(queue.queued.len(), 1);
+        page.pump_until_idle_without_render(Duration::ZERO)
+            .expect("listeners are installed");
+
+        let first = element_with_id(page.document().dom(), "first");
+        let second = element_with_id(page.document().dom(), "second");
+
+        let gained = page
+            .focus_element(first)
+            .expect("focus listeners do not throw");
+        assert_eq!(gained.previous, None);
+        assert_eq!(gained.current, Some(first));
+
+        let moved = page
+            .focus_element(second)
+            .expect("focus listeners do not throw");
+        assert_eq!(moved.previous, Some(first));
+        assert_eq!(moved.current, Some(second));
+
+        let lost = page.blur_focused().expect("blur listeners do not throw");
+        assert_eq!(lost.previous, Some(second));
+        assert_eq!(lost.current, None);
+
+        page.queue_script("document.getElementById('log').textContent = order.join(',')")
+            .expect("the report fits the page limits");
+        page.pump_until_idle_without_render(Duration::ZERO)
+            .expect("the report script runs");
+        let log = element_with_id(page.document().dom(), "log");
+        let text = page.document().dom().children(log).unwrap()[0];
+        assert!(matches!(
+            page.document().dom().node(text).map(crate::dom::Node::kind),
+            Some(NodeKind::Text(value)) if value
+                == "first:focus,first:focusin,\
+                    first:blur,first:focusout,second:focus,second:focusin,\
+                    second:blur,second:focusout"
+        ));
+    }
+
+    #[test]
+    fn advance_focus_walks_the_sequential_order_and_wraps() {
+        let mut page = Page::new(
+            "<!doctype html><button id=one>1</button><button id=two>2</button>\
+             <button id=three>3</button>",
+        );
+        let (one, two, three) = {
+            let dom = page.document().dom();
+            (
+                element_with_id(dom, "one"),
+                element_with_id(dom, "two"),
+                element_with_id(dom, "three"),
+            )
+        };
+
+        // With nothing focused, forward starts at the first element and
+        // backward at the last.
+        let first = page
+            .advance_focus(crate::interaction::FocusNavigationDirection::Forward)
+            .expect("no focus listeners throw");
+        assert_eq!((first.previous, first.current), (None, Some(one)));
+        let second = page
+            .advance_focus(crate::interaction::FocusNavigationDirection::Forward)
+            .expect("no focus listeners throw");
+        assert_eq!((second.previous, second.current), (Some(one), Some(two)));
+        let back = page
+            .advance_focus(crate::interaction::FocusNavigationDirection::Backward)
+            .expect("no focus listeners throw");
+        assert_eq!((back.previous, back.current), (Some(two), Some(one)));
+        let wrapped = page
+            .advance_focus(crate::interaction::FocusNavigationDirection::Backward)
+            .expect("no focus listeners throw");
+        assert_eq!(
+            (wrapped.previous, wrapped.current),
+            (Some(one), Some(three))
+        );
     }
 
     #[test]

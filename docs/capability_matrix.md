@@ -240,9 +240,10 @@ them would break more real pages than everything else combined:
 
 **Closed from this list:** dynamic interaction state is now wired through
 `InteractionState` and `Document::render_with_interaction`, so `:hover`, `:active`, `:focus`,
-`:focus-within` and `:target` match from real pointer, focus and URL input. `:visited` remains
-unmatched (no visited-link history is exposed) and `:focus-visible` still aliases `:focus`; Tab
-focus navigation is not routed to the page yet.
+`:focus-visible`, `:focus-within` and `:target` match from real pointer, keyboard, focus and URL
+input. Tab/Shift-Tab walk the sequential focus order and every focus path fires
+`blur`/`focusout`/`focus`/`focusin`. `:visited` remains unmatched because no visited-link
+history is exposed.
 
 **One measurement is deliberately not a claim.** The site-neutrality gate now has 9 rules, scans
 269 Rust source files, and **exits 0 with 25 advisory findings**. The blocking violations this

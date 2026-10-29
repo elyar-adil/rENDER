@@ -970,6 +970,7 @@ impl JsRuntime {
         composed: bool,
         extra_properties: &[(&str, JsValue)],
     ) -> Result<bool, JsError> {
+        self.ensure_prelude(dom);
         let event = self.create_event_object(event_type, bubbles, cancelable, composed, true)?;
         for (name, value) in extra_properties {
             self.realm
