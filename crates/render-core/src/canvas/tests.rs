@@ -1026,3 +1026,150 @@ fn draw_image_accepts_an_offscreen_canvas_source() {
     );
     assert_eq!(run(&script), "0,255,0,255|0,0,255,255");
 }
+
+/// A page with the standard 10 by 10 canvas plus `<img id=i>`, whose load
+/// state and (optional) decoded pixels are installed before `script` runs.
+fn run_with_image(
+    state: render_dom::ImageLoadState,
+    pixels: Option<crate::image::DecodedImage>,
+    script: &str,
+) -> String {
+    let output = render_html::parse_document(
+        "<!doctype html><body><canvas id=c width=10 height=10></canvas><img id=i>",
+    );
+    let mut dom = output.dom;
+    let image = find_id(&dom, "i");
+    dom.set_image_state(image, state);
+    let handle = CanvasHandle::default();
+    if let Some(pixels) = pixels {
+        handle.engine().borrow_mut().install_image(image, &pixels);
+    }
+    let mut runtime = JsRuntime::new(&dom);
+    runtime.install_canvas_host(Box::new(handle));
+    let outcome = runtime
+        .execute(&mut dom, script)
+        .unwrap_or_else(|error| panic!("the script failed: {error:?}"));
+    match outcome.value {
+        render_js::JsValue::String(text) => text.to_lossy(),
+        other => panic!("the script did not return a string: {other:?}"),
+    }
+}
+
+fn find_id(dom: &render_dom::Dom, id: &str) -> render_dom::NodeId {
+    let mut pending = vec![dom.document()];
+    while let Some(node) = pending.pop() {
+        if dom
+            .attribute(node, "id")
+            .is_ok_and(|value| value == Some(id))
+        {
+            return node;
+        }
+        pending.extend(dom.children(node).unwrap_or_default().iter().rev());
+    }
+    panic!("test element #{id} must exist");
+}
+
+/// A two by one image: red on the left, green on the right.
+fn two_by_one_image() -> crate::image::DecodedImage {
+    crate::image::DecodedImage::from_pixels(
+        2,
+        1,
+        vec![
+            crate::paint::Color::rgb(255, 0, 0),
+            crate::paint::Color::rgb(0, 255, 0),
+        ],
+    )
+    .expect("2 by 1 pixels")
+}
+
+#[test]
+fn draw_image_accepts_a_loaded_image_element_at_its_natural_size() {
+    let script = format!(
+        "{SETUP} ctx.imageSmoothingEnabled = false;\
+         ctx.drawImage(document.getElementById('i'), 4, 4);\
+         [{}, {}].join('|')",
+        pixel(4, 4),
+        pixel(5, 4),
+    );
+    assert_eq!(
+        run_with_image(
+            render_dom::ImageLoadState::Loaded {
+                width: 2,
+                height: 1
+            },
+            Some(two_by_one_image()),
+            &script,
+        ),
+        "255,0,0,255|0,255,0,255"
+    );
+}
+
+#[test]
+fn draw_image_refuses_a_pending_image_and_skips_broken_or_sourceless_ones() {
+    let pending = format!(
+        "{SETUP} var name = 'none';\
+         try {{ ctx.drawImage(document.getElementById('i'), 0, 0); }} catch (e) {{ name = e.name; }}\
+         name"
+    );
+    assert_eq!(
+        run_with_image(render_dom::ImageLoadState::Pending, None, &pending),
+        "InvalidStateError"
+    );
+
+    // A broken image and an element with no source are both "not usable": the
+    // draw is skipped and the background stays untouched.
+    let skipped = format!(
+        "{SETUP} ctx.fillStyle = '#123456'; ctx.fillRect(0, 0, 10, 10);\
+         ctx.drawImage(document.getElementById('i'), 0, 0);\
+         ctx.getImageData(0, 0, 1, 1).data.join(',')"
+    );
+    for state in [
+        render_dom::ImageLoadState::Broken,
+        render_dom::ImageLoadState::Unavailable,
+    ] {
+        assert_eq!(run_with_image(state, None, &skipped), "18,52,86,255");
+    }
+}
+
+#[test]
+fn image_load_state_drives_complete_and_natural_size() {
+    let script = "var i = document.getElementById('i');\
+         [String(i.complete), String(i.naturalWidth), String(i.naturalHeight)].join(',')";
+    assert_eq!(
+        run_with_image(render_dom::ImageLoadState::Unavailable, None, script),
+        "true,0,0"
+    );
+    assert_eq!(
+        run_with_image(render_dom::ImageLoadState::Pending, None, script),
+        "false,0,0"
+    );
+    assert_eq!(
+        run_with_image(
+            render_dom::ImageLoadState::Loaded {
+                width: 2,
+                height: 1
+            },
+            None,
+            script,
+        ),
+        "true,2,1"
+    );
+    assert_eq!(
+        run_with_image(render_dom::ImageLoadState::Broken, None, script),
+        "true,0,0"
+    );
+
+    // Setting a new source makes the element pending immediately; removing it
+    // returns the element to the sourceless state.
+    let changed = format!(
+        "{SETUP} var i = document.getElementById('i');\
+         i.src = 'next.png';\
+         var after_set = String(i.complete);\
+         i.removeAttribute('src');\
+         [after_set, String(i.complete), String(i.naturalWidth)].join(',')"
+    );
+    assert_eq!(
+        run_with_image(render_dom::ImageLoadState::Broken, None, &changed),
+        "false,true,0"
+    );
+}

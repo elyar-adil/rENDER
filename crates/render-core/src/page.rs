@@ -554,6 +554,21 @@ impl Page {
         &mut self.runtime
     }
 
+    /// Installs decoded pixels for an image element, so `drawImage` can use
+    /// the element as a source (HTML §4.12.5.1.15).
+    ///
+    /// The embedding owns fetching and decoding; the script runtime never sees
+    /// image data. The matching [`render_dom::Dom`] load state is what script
+    /// reads as `complete`/`naturalWidth`, so the embedder updates both.
+    pub fn install_canvas_image(&mut self, node: NodeId, image: &DecodedImage) {
+        self.canvas.install_image(node, image);
+    }
+
+    /// Drops the pixels installed for an image element.
+    pub fn remove_canvas_image(&mut self, node: NodeId) {
+        self.canvas.remove_image(node);
+    }
+
     /// Applies a session-history traversal between entries of this document:
     /// the location moves, `history.state` is restored and `popstate` fires.
     ///

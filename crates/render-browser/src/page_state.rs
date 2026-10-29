@@ -465,6 +465,17 @@ impl PageState {
     pub(super) fn cancel_images(&mut self) {
         if let Some(pending) = self.pending_images.take() {
             pending.handle.cancel();
+            // A cancelled batch never reports a result, so the elements it was
+            // loading stop being pending: they are back to having no source,
+            // which reads as complete with a zero natural size.
+            for resource in &pending.plan.resources {
+                if resource.key.source == render_core::image::ImageSource::Element {
+                    self.page.document_mut().dom_mut().set_image_state(
+                        resource.key.owner,
+                        render_core::dom::ImageLoadState::Unavailable,
+                    );
+                }
+            }
         }
     }
 

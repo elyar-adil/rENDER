@@ -12,6 +12,7 @@ use std::fmt;
 mod clone;
 mod document;
 mod focus;
+mod image;
 mod named;
 mod range;
 mod shadow;
@@ -526,6 +527,28 @@ impl fmt::Display for DomError {
 
 impl Error for DomError {}
 
+/// The loading state of an image element (HTML §4.8.4, "updating the image
+/// data").
+///
+/// The network and the decoder belong to the embedder, so it reports the
+/// result here; the DOM exposes `complete`/`naturalWidth`/`naturalHeight` in
+/// script from this state, and `drawImage` uses it to decide whether an
+/// `<img>` source is usable. An element with no entry has never started a
+/// load and is [`Self::Unavailable`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImageLoadState {
+    /// No source to load: `complete` is true and the natural size is zero.
+    #[default]
+    Unavailable,
+    /// A source is being fetched or decoded: `complete` is false.
+    Pending,
+    /// Decoded pixels are available at this natural size.
+    Loaded { width: u32, height: u32 },
+    /// The fetch or the decode failed: `complete` is true and the natural
+    /// size is zero.
+    Broken,
+}
+
 /// Arena-backed DOM with stable node identities and a monotonic mutation
 /// revision suitable for incremental rendering and Agent observations.
 #[derive(Clone, Debug)]
@@ -547,6 +570,8 @@ pub struct Dom {
     /// The elements named by their `id` and `name` attributes. See
     /// [`Dom::named_elements`].
     named: named::NamedIndex,
+    /// The loading state of each image element. See [`Dom::image_state`].
+    image_states: BTreeMap<NodeId, ImageLoadState>,
 }
 
 impl Default for Dom {
@@ -576,6 +601,7 @@ impl Dom {
             document_content_types: BTreeMap::new(),
             ranges: Vec::new(),
             named: named::NamedIndex::default(),
+            image_states: BTreeMap::new(),
         }
     }
 
@@ -1231,9 +1257,12 @@ impl Dom {
         }
         self.record_mutations([MutationKind::Attribute {
             target: element,
-            local_name: mutation_name,
+            local_name: mutation_name.clone(),
         }]);
         self.index_named(element);
+        if mutation_name == "src" {
+            self.image_source_changed(element, true);
+        }
         Ok(())
     }
 
@@ -1266,10 +1295,13 @@ impl Dom {
             data.attributes.remove(index);
             self.record_mutations([MutationKind::Attribute {
                 target: element,
-                local_name: normalized,
+                local_name: normalized.clone(),
             }]);
         }
         self.index_named(element);
+        if removed.is_some() && normalized == "src" {
+            self.image_source_changed(element, false);
+        }
         Ok(())
     }
 
@@ -1323,6 +1355,7 @@ impl Dom {
         let value = value.into();
         let mutation_name = local_name.clone();
         let namespace = namespace.map(str::to_owned);
+        let null_namespace = namespace.is_none();
         let prefix = prefix.map(str::to_owned);
         self.unindex_named(element);
         let node = self.node_mut(element)?;
@@ -1344,9 +1377,12 @@ impl Dom {
         }
         self.record_mutations([MutationKind::Attribute {
             target: element,
-            local_name: mutation_name,
+            local_name: mutation_name.clone(),
         }]);
         self.index_named(element);
+        if null_namespace && mutation_name == "src" {
+            self.image_source_changed(element, true);
+        }
         Ok(())
     }
 
@@ -1406,6 +1442,9 @@ impl Dom {
             }]);
         }
         self.index_named(element);
+        if removed.is_some() && namespace.is_none() && local_name == "src" {
+            self.image_source_changed(element, false);
+        }
         Ok(())
     }
 

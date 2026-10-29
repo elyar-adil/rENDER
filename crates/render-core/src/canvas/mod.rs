@@ -1019,9 +1019,37 @@ pub struct CanvasEngine {
     /// the script side chose (HTML §4.12.5.1.3: a gradient is not tied to
     /// the context that made it).
     gradients: BTreeMap<u64, Gradient>,
+    /// Decoded pixels for `<img>` sources of `drawImage`, keyed by element
+    /// node. The embedder installs them when a load completes; the engine
+    /// never fetches or decodes.
+    images: BTreeMap<NodeId, Arc<Bitmap>>,
 }
 
 impl CanvasEngine {
+    /// Installs decoded pixels for an image element, so `drawImage` can use
+    /// it as a source (HTML §4.12.5.1.15).
+    pub fn install_image(&mut self, node: NodeId, image: &crate::image::DecodedImage) {
+        let (width, height) = image.intrinsic_size();
+        let mut bitmap = Bitmap::new(width, height);
+        let mut rgba = Vec::with_capacity(image.pixels().len() * 4);
+        for colour in image.pixels() {
+            rgba.extend_from_slice(&[colour.red, colour.green, colour.blue, colour.alpha]);
+        }
+        bitmap.write_straight(&rgba, width, height, 0, 0, (0, 0, width, height));
+        self.images.insert(node, Arc::new(bitmap));
+    }
+
+    /// Drops the pixels installed for an image element, so a later
+    /// `drawImage` sees the element as unavailable again.
+    pub fn remove_image(&mut self, node: NodeId) {
+        self.images.remove(&node);
+    }
+
+    /// Drops every installed image element's pixels.
+    pub fn clear_images(&mut self) {
+        self.images.clear();
+    }
+
     /// Creates or amends one gradient of the registry (HTML §4.12.5.1.3).
     ///
     /// # Errors
@@ -1117,20 +1145,24 @@ impl CanvasEngine {
         // A `drawImage` source is snapshotted before the destination is
         // touched: the specification requires a canvas drawn onto itself to
         // read the bitmap as it was before the call.
-        let image = match &op {
+        let image: Option<Arc<Bitmap>> = match &op {
             CanvasOp::DrawImage {
                 source: CanvasImageSource::Canvas(source),
                 ..
             } => self
                 .canvases
                 .get(source)
-                .map(|canvas| canvas.bitmap.clone()),
+                .map(|canvas| Arc::new(canvas.bitmap.clone())),
+            CanvasOp::DrawImage {
+                source: CanvasImageSource::Node(node),
+                ..
+            } => self.images.get(node).cloned(),
             _ => None,
         };
         let Some(canvas) = self.canvases.get_mut(&id) else {
             return Ok(CanvasValue::Undefined);
         };
-        let result = canvas.run(op, &self.gradients, image.as_ref());
+        let result = canvas.run(op, &self.gradients, image.as_deref());
         if !reads_only && result.is_ok() {
             self.dirty.insert(id);
         }
@@ -1175,6 +1207,17 @@ impl CanvasHandle {
     #[must_use]
     pub fn engine(&self) -> Rc<RefCell<CanvasEngine>> {
         Rc::clone(&self.0)
+    }
+
+    /// Installs decoded pixels for an image element, so `drawImage` can use
+    /// it as a source (HTML §4.12.5.1.15).
+    pub fn install_image(&mut self, node: NodeId, image: &crate::image::DecodedImage) {
+        self.0.borrow_mut().install_image(node, image);
+    }
+
+    /// Drops the pixels installed for an image element.
+    pub fn remove_image(&mut self, node: NodeId) {
+        self.0.borrow_mut().remove_image(node);
     }
 }
 

@@ -1,3 +1,39 @@
+# 交接文档 (2026-10-29, 续二) — `<img>` 加载状态与图像源 `drawImage`
+
+接续同日的 canvas 会话。上一轮把 `drawImage` 的画布源做完了;这一轮补上 `<img>`
+源——先给图像元素一个真实的加载状态,再把解码位图接进 canvas 引擎。
+
+## 本轮已完成
+
+| 内容 | 落点 |
+|---|---|
+| **图像元素加载状态** | `render-dom::ImageLoadState`(`Unavailable`/`Pending`/`Loaded{width,height}`/`Broken`)存在 `Dom` 上,由嵌入方写入。`src` 被设置(含 `setAttribute`/`setAttributeNS`/属性赋值)立即置 `Pending`,移除 `src` 回到 `Unavailable` |
+| **`complete`/`naturalWidth`/`naturalHeight`** | `eval.rs` 的节点属性读取:`complete` 仅在 `Pending` 时为 false(无源视为 complete),自然尺寸只在 `Loaded` 时非零 |
+| **浏览器侧状态机** | `start_images` 把新计划的元素图置 `Pending` 并丢弃旧像素;`finish_images` 成功 → `Loaded` + 安装像素,传输/解码/缺失结果 → `Broken` + 丢像素(陈旧 URL 是 warning,不误标);`cancel_images` 回到 `Unavailable` |
+| **canvas 图像源** | `CanvasImageSource::Node(NodeId)`;`CanvasEngine` 保存 node → 预乘位图,`Page::install_canvas_image`/`remove_canvas_image` 是嵌入方接缝。`drawImage` 的可用性判定按规范:`Pending` 抛 `InvalidStateError`,`Broken`/无源静默不绘制,`Loaded` 用自然尺寸做三参/五参默认值 |
+| **自绘/合成不变** | 图像源复用上一轮的裁剪、采样、alpha、裁剪区与混合模式路径,只是像素来自节点索引 |
+
+## 验证
+
+- 新增 3 个 canvas 端到端测试:`drawImage(img)` 自然尺寸绘制、`Pending` 抛 `InvalidStateError` 且 `Broken`/无源不绘制、`complete`/`naturalWidth`/`naturalHeight` 在四种状态与 `src` 变更后的取值。
+- 新增 1 个浏览器测试:`a_planned_image_is_pending_until_its_batch_settles_and_broken_when_it_fails`——计划后 `Pending`,批次无结果后 `Broken`。
+- `cargo test --workspace` 全绿;`cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --all --check` 干净。
+
+## 明确未做
+
+- `<video>` 与 `ImageBitmap` 源(`ImageBitmap` 接口本身不存在);`createPattern`。
+- 图像解码是同步发生在批次应用里的,没有独立的"解码中"子状态;`complete` 只在 `Pending` 为 false。
+- `srcset` 选择仍用恒 1000 的 `device_pixel_ratio_milli`(见 gap matrix),与本轮无关。
+
+## 下一步候选
+
+1. `createPattern`(现在有像素了,只差 `CanvasPattern` 对象与绘制时的平铺采样)。
+2. `::backdrop` + top layer(~75 reftest)。
+3. canvas 文本(`fillText` 家族,需要嵌入方字形栅格)。
+4. 表单约束校验(`checkValidity`/`:invalid`,~9 WPT)。
+
+---
+
 # 交接文档 (2026-10-29, 续) — canvas `drawImage`(画布源)
 
 接续同日焦点会话。canvas 里下一个"对真实页面影响大"的缺口是 `drawImage`;本轮先做

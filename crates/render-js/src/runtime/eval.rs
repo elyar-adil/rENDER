@@ -5232,6 +5232,26 @@ impl JsRuntime {
                         .copied()
                         .map_or(JsValue::Null, JsValue::Object));
                 }
+                "complete" | "naturalWidth" | "naturalHeight"
+                    if super::nested::is_html_element(dom, node, "img") =>
+                {
+                    // HTML §4.8.4: `complete` is false only while the image is
+                    // still loading; an element with no source is complete.
+                    let state = dom.image_state(node);
+                    return Ok(match property {
+                        "complete" => {
+                            JsValue::Boolean(!matches!(state, render_dom::ImageLoadState::Pending))
+                        }
+                        "naturalWidth" => JsValue::Number(match state {
+                            render_dom::ImageLoadState::Loaded { width, .. } => f64::from(width),
+                            _ => 0.0,
+                        }),
+                        _ => JsValue::Number(match state {
+                            render_dom::ImageLoadState::Loaded { height, .. } => f64::from(height),
+                            _ => 0.0,
+                        }),
+                    });
+                }
                 property if node_attribute_property(property).is_some() => {
                     let attribute = node_attribute_property(property).expect("checked above");
                     if node_boolean_property(property) {

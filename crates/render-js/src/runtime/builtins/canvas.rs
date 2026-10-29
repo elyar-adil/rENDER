@@ -36,7 +36,7 @@ use crate::value::{
     JsObject, JsSymbol, NativeFunction, ObjectHost, PropertyDescriptor, TypedArrayKind, TypedBuffer,
 };
 use crate::{JsError, JsValue, ObjectId};
-use render_dom::{Dom, Namespace, NodeId, NodeKind};
+use render_dom::{Dom, ImageLoadState, Namespace, NodeId, NodeKind};
 
 /// The interfaces this file installs whose instances need a constructor host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1576,7 +1576,10 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let (source, width, height) = self.canvas_image_source(dom, arguments.first())?;
+        let Some((source, width, height)) = self.canvas_image_source(dom, arguments.first())?
+        else {
+            return Ok(JsValue::Undefined);
+        };
         if width == 0 || height == 0 {
             return Err(self.dom_exception(
                 DomExceptionName::InvalidState,
@@ -1639,7 +1642,7 @@ impl JsRuntime {
         &mut self,
         dom: &mut Dom,
         value: Option<&JsValue>,
-    ) -> Result<(CanvasImageSource, u32, u32), JsError> {
+    ) -> Result<Option<(CanvasImageSource, u32, u32)>, JsError> {
         let Some(value) = value else {
             return Err(missing_argument());
         };
@@ -1660,6 +1663,23 @@ impl JsRuntime {
             Some(ObjectHost::Canvas(CanvasObject::OffscreenCanvas(id))) => {
                 CanvasImageSource::Canvas(id)
             }
+            Some(ObjectHost::Node(node))
+                if crate::runtime::nested::is_html_element(dom, node, "img") =>
+            {
+                // HTML §4.12.5.1.9 usability: a pending image throws, a broken
+                // or sourceless one draws nothing, and a loaded one is drawn
+                // from the pixels the embedder installed for its node.
+                return Ok(match dom.image_state(node) {
+                    ImageLoadState::Pending => Err(self.dom_exception(
+                        DomExceptionName::InvalidState,
+                        "The image argument is an HTMLImageElement whose complete attribute is false",
+                    ))?,
+                    ImageLoadState::Loaded { width, height } if width > 0 && height > 0 => {
+                        Some((CanvasImageSource::Node(node), width, height))
+                    }
+                    _ => None,
+                });
+            }
             _ => {
                 return Err(JsError::type_error(
                     "The image argument is not a CanvasImageSource",
@@ -1673,8 +1693,10 @@ impl JsRuntime {
         };
         let (width, height) = match source {
             CanvasImageSource::Canvas(id) => host.size(dom, id),
+            // The image branch returns above, before the host is needed.
+            CanvasImageSource::Node(_) => (0, 0),
         };
-        Ok((source, width, height))
+        Ok(Some((source, width, height)))
     }
 
     /// The six numbers of a transformation matrix, each required.

@@ -91,16 +91,19 @@ pub enum CanvasValue {
 
 /// A source a `drawImage` call can draw (HTML §4.12.5.1.16).
 ///
-/// The canvas kinds are the sources whose pixels the host already owns: every
+/// The canvases are the sources whose pixels the host already owns: every
 /// element canvas and every `OffscreenCanvas` of the page shares one engine.
-/// An `<img>`, `<video>` or `ImageBitmap` source needs decoded pixels, which
-/// the script runtime does not hold, so the method is installed for canvases
-/// only and rejects the rest with the `TypeError` an unsupported
-/// `CanvasImageSource` gets.
+/// An image element names its node instead; the host resolves it against the
+/// decoded pixels the embedder installed for that node, so the script runtime
+/// never holds image data. Video and `ImageBitmap` sources remain unimplemented
+/// and are rejected with the `TypeError` an unsupported `CanvasImageSource`
+/// gets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CanvasImageSource {
     /// A bitmap of the same engine: an element's canvas or an `OffscreenCanvas`.
     Canvas(CanvasId),
+    /// An image element whose decoded pixels the embedder installed.
+    Node(NodeId),
 }
 
 /// One `CanvasRenderingContext2D` operation, with its arguments converted.

@@ -77,6 +77,7 @@ use render_browser::editor::AddressEditor;
 use render_browser::editor::Clipboard;
 use render_browser::editor::NativeClipboard;
 use render_browser::font_backend::SystemFontBackend;
+use render_browser::images::ImageDiagnosticSeverity;
 use render_browser::images::apply_image_batch;
 use render_browser::images::plan_images_with_styles_and_context;
 use render_browser::model::TabId;
@@ -97,6 +98,7 @@ use render_browser::worker::RenderIdentity;
 use render_browser::worker::RenderJob;
 use render_browser::worker::RenderOffset;
 use render_browser::worker::RenderViewport;
+use render_core::dom::ImageLoadState;
 use render_core::image::ImageLimits;
 use render_core::image::ImageSelectionContext;
 use render_core::image::ImageSource;
@@ -1808,6 +1810,18 @@ impl BrowserApp {
                 .retain(|resource| !page.attempted_images.contains(&resource.key));
             page.attempted_images
                 .extend(plan.resources.iter().map(|resource| resource.key.clone()));
+            // A planned element image is loading from now on, so
+            // `img.complete` reads false and `drawImage` refuses it until the
+            // batch settles.
+            for resource in &plan.resources {
+                if resource.key.source == ImageSource::Element {
+                    page.page
+                        .document_mut()
+                        .dom_mut()
+                        .set_image_state(resource.key.owner, ImageLoadState::Pending);
+                    page.page.remove_canvas_image(resource.key.owner);
+                }
+            }
             let requests = plan
                 .requests()
                 .into_iter()
@@ -2149,6 +2163,21 @@ impl BrowserApp {
             }
         }
         for loaded in &application.loaded {
+            if loaded.source == ImageSource::Element {
+                // The decoded size is what script reads through
+                // `naturalWidth`/`naturalHeight`, and the pixels are what
+                // `drawImage` samples.
+                page.page.document_mut().dom_mut().set_image_state(
+                    loaded.owner,
+                    ImageLoadState::Loaded {
+                        width: loaded.width,
+                        height: loaded.height,
+                    },
+                );
+                if let Some(image) = page.images.get_for_node(loaded.owner) {
+                    page.page.install_canvas_image(loaded.owner, &image.image);
+                }
+            }
             if matches!(
                 loaded.source,
                 ImageSource::Element | ImageSource::VideoPoster
@@ -2157,6 +2186,33 @@ impl BrowserApp {
                     .page
                     .queue_dom_event(PageDomEvent::new(loaded.owner, "load"));
             }
+        }
+        // A transport, decode or missing-result failure ends the load: the
+        // element is broken, which reads as `complete` with a zero natural
+        // size. Stale-source outcomes are warnings for a superseded URL and
+        // must not mark the current element.
+        let element_owners: Vec<render_core::dom::NodeId> = pending
+            .plan
+            .resources
+            .iter()
+            .filter(|resource| resource.key.source == ImageSource::Element)
+            .map(|resource| resource.key.owner)
+            .collect();
+        for diagnostic in &application.diagnostics {
+            if diagnostic.severity != ImageDiagnosticSeverity::Error {
+                continue;
+            }
+            let Some(owner) = diagnostic.owner else {
+                continue;
+            };
+            if !element_owners.contains(&owner) {
+                continue;
+            }
+            page.page
+                .document_mut()
+                .dom_mut()
+                .set_image_state(owner, ImageLoadState::Broken);
+            page.page.remove_canvas_image(owner);
         }
         // Every completed image batch marks the page dirty, not only a batch
         // that decoded something. A batch whose results were all stale, failed,

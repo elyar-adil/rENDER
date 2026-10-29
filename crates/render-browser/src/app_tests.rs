@@ -1023,6 +1023,34 @@ fn broken_image_does_not_refetch_on_every_render_but_new_source_does() {
 }
 
 #[test]
+fn a_planned_image_is_pending_until_its_batch_settles_and_broken_when_it_fails() {
+    let (mut app, tab) = headless_app_with("<img id=photo src=https://example.test/a.png>");
+    let photo = {
+        let page = app.pages.get(&tab).expect("page");
+        find_id(page.page.document().dom(), "photo")
+    };
+
+    app.start_images(tab);
+    {
+        let page = app.pages.get(&tab).expect("page");
+        assert_eq!(
+            page.page.document().dom().image_state(photo),
+            render_core::dom::ImageLoadState::Pending,
+            "a planned image is loading, so complete reads false"
+        );
+    }
+
+    // A batch that returns no result at all reports a missing result for the
+    // resource; the element ends broken rather than staying pending forever.
+    app.finish_images(tab, Vec::new());
+    let page = app.pages.get(&tab).expect("page");
+    assert_eq!(
+        page.page.document().dom().image_state(photo),
+        render_core::dom::ImageLoadState::Broken
+    );
+}
+
+#[test]
 fn image_source_changed_during_fetch_starts_replacement_immediately() {
     let (mut app, tab) = headless_app_with("<img id=photo src=https://example.test/old.png>");
     app.start_images(tab);
