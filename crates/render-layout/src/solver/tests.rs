@@ -2158,3 +2158,44 @@ fn the_same_class_gets_the_same_box_as_a_direct_child_of_a_block() {
         "{inline_box:?} {side_box:?}"
     );
 }
+
+fn collect_paint_order(
+    layout: &crate::solver::LayoutOutput,
+    id: crate::fragment::FragmentId,
+    order: &mut Vec<NodeId>,
+) {
+    if let Some(fragment) = layout.fragments.get(id) {
+        if let Some(source) = fragment.source {
+            order.push(source);
+        }
+        for child in &fragment.children {
+            collect_paint_order(layout, *child, order);
+        }
+    }
+}
+
+#[test]
+fn an_in_flow_wrapper_does_not_float_above_later_siblings_because_of_a_fixed_descendant() {
+    // Bing's homepage is two in-flow blocks. The first holds a fixed header
+    // (`z-index: 6`), the second holds the fixed search box (`z-index: 3`).
+    // Propagating the header's z-index to the first block made that whole
+    // block — including its full-viewport background — paint after the second
+    // block, hiding the search box.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='first'><div id='header'></div></div>\
+         <div id='second'><div id='search'></div></div></body>",
+        "html, body, div { display: block; margin: 0; padding: 0 }\
+         #first { height: 600px; background: #555 } #second { height: 600px }\
+         #header { position: fixed; z-index: 6 } #search { position: fixed; z-index: 3 }",
+        400.0,
+    );
+    let dom = &output.dom;
+    let mut order = Vec::new();
+    collect_paint_order(&layout, layout.fragments.root(), &mut order);
+    let first = order.iter().position(|node| *node == find(dom, "#first"));
+    let second = order.iter().position(|node| *node == find(dom, "#second"));
+    assert!(
+        first < second,
+        "in-flow siblings stay in source order; only their positioned descendants join a later layer"
+    );
+}

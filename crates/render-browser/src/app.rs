@@ -963,6 +963,9 @@ impl BrowserApp {
             return false;
         }
         let request = self.screenshot.take().expect("checked above");
+        if env::var_os("RENDER_DEBUG_LAYOUT").is_some() {
+            self.debug_layout_dump();
+        }
         eprintln!("render-browser health {}", self.health_line());
         match write_frame_png(&self.frame, self.frame_size, &request.path) {
             Ok(()) => eprintln!(
@@ -995,6 +998,152 @@ impl BrowserApp {
     /// document produced boxes, and what each stage reported as failed. This is
     /// the difference between "the page looks wrong" and "three scripts failed
     /// and 60% of the elements have no box".
+    /// Prints the geometry and relevant computed style of every element that
+    /// carries an id or class, for diagnosing a page that renders the wrong
+    /// box tree (`RENDER_DEBUG_LAYOUT=1`). Geometry is the committed layout's
+    /// border box; a missing rect means the element has no box at all.
+    fn debug_layout_dump(&self) {
+        let id = self.tabs.active_id();
+        let Some(page) = self.pages.get(&id) else {
+            return;
+        };
+        let dom = page.page.document().dom();
+        let mut pending = vec![dom.document()];
+        while let Some(node) = pending.pop() {
+            if let Some(children) = dom.children(node) {
+                pending.extend(children.iter().rev().copied());
+            }
+            let Some(render_core::dom::NodeKind::Element(element)) =
+                dom.node(node).map(render_core::dom::Node::kind)
+            else {
+                continue;
+            };
+            let id_attr = dom.attribute(node, "id").ok().flatten().unwrap_or_default();
+            let class = dom
+                .attribute(node, "class")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            if id_attr.is_empty() && class.is_empty() {
+                continue;
+            }
+            let rect = page.geometry.get(&node.as_u64());
+            let style = page.computed_styles.get(&node);
+            let property = |name: &str| {
+                style
+                    .and_then(|style| style.get(name))
+                    .map(|value| value.css_text().to_owned())
+                    .unwrap_or_default()
+            };
+            let background = property("background-color");
+            let background_image = property("background-image");
+            let background_image = background_image
+                .char_indices()
+                .take_while(|(index, _)| *index < 80)
+                .map(|(_, character)| character)
+                .collect::<String>();
+            eprintln!(
+                "layout <{}> id={} class={} rect={:?} display={} position={} z={} opacity={} visibility={} top={} left={} right={} bottom={} width={} height={} margin={} float={} transform={} overflow={} bg={} bgimg={}",
+                element.local_name,
+                id_attr,
+                class,
+                rect,
+                property("display"),
+                property("position"),
+                property("z-index"),
+                property("opacity"),
+                property("visibility"),
+                property("top"),
+                property("left"),
+                property("right"),
+                property("bottom"),
+                property("width"),
+                property("height"),
+                property("margin"),
+                property("float"),
+                property("transform"),
+                property("overflow"),
+                background,
+                background_image,
+            );
+        }
+        self.debug_paint_dump(dom);
+    }
+
+    /// Prints display-list items that touch the page's main content boxes, so
+    /// a missing element can be told apart from one painted under an overlay.
+    fn debug_paint_dump(&self, dom: &render_core::dom::Dom) {
+        let id = self.tabs.active_id();
+        let Some(page) = self.pages.get(&id) else {
+            return;
+        };
+        let Some(list) = &page.display_list else {
+            eprintln!("paint display list: none");
+            return;
+        };
+        let mut printed = 0usize;
+        let print_all = env::var_os("RENDER_DEBUG_PAINT_ALL").is_some();
+        for (index, item) in list.items().iter().enumerate() {
+            let source = item.source.map(|node| {
+                let id = dom.attribute(node, "id").ok().flatten().unwrap_or_default();
+                let class = dom
+                    .attribute(node, "class")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                format!("{id}.{class}")
+            });
+            let source = source.unwrap_or_default();
+            let watched = [
+                "img_cont",
+                "hp_cont",
+                "hp_media",
+                "hp_top_cover",
+                "sbox",
+                "sb_form",
+                "hpl",
+                "hp_body",
+                "b_content",
+            ]
+            .iter()
+            .any(|name| source.contains(name));
+            let command = match &item.command {
+                DisplayCommand::SolidRect { color, .. } => Some(format!(
+                    "solid #{:02x}{:02x}{:02x}{:02x}",
+                    color.red, color.green, color.blue, color.alpha
+                )),
+                DisplayCommand::Image(_) => Some("image".to_owned()),
+                DisplayCommand::GlyphRun(_) => Some("text".to_owned()),
+                DisplayCommand::PushClip(_) => Some("push-clip".to_owned()),
+                DisplayCommand::PopClip => Some("pop-clip".to_owned()),
+                DisplayCommand::PushStackingContext(context) => Some(format!(
+                    "stacking opacity={} reason={:?}",
+                    context.opacity, context.reason
+                )),
+                DisplayCommand::PopStackingContext => Some("pop-stacking".to_owned()),
+                _ => None,
+            };
+            let Some(command) = command else {
+                continue;
+            };
+            if !print_all
+                && !watched
+                && !matches!(item.command, DisplayCommand::PushStackingContext(_))
+            {
+                continue;
+            }
+            if printed >= 300 {
+                eprintln!("paint display list truncated");
+                break;
+            }
+            printed += 1;
+            eprintln!(
+                "paint #{index} phase={:?} source={} bounds={:?} space={:?} {}",
+                item.id.phase, source, item.bounds, item.coordinate_space, command,
+            );
+        }
+    }
+
     fn health_line(&self) -> String {
         let id = self.tabs.active_id();
         let Some(page) = self.pages.get(&id) else {

@@ -1236,6 +1236,73 @@ struct RenderEnvironment<'a> {
     interaction: &'a InteractionState,
 }
 
+/// Prints the fragment tree with each box's source element, rect and the
+/// computed `position`/`z-index` that decide its paint layer
+/// (`RENDER_DEBUG_FRAGMENT=1`). It answers whether an element has no box, or a
+/// box in the wrong place, or a box hidden under a later-painted overlay.
+fn dump_fragment_tree(
+    dom: &Dom,
+    styles: &BTreeMap<NodeId, ComputedStyle>,
+    fragments: &crate::layout::FragmentTree,
+) {
+    fn walk(
+        dom: &Dom,
+        styles: &BTreeMap<NodeId, ComputedStyle>,
+        fragments: &crate::layout::FragmentTree,
+        id: crate::layout::FragmentId,
+        depth: usize,
+        printed: &mut usize,
+    ) {
+        if *printed >= 200 {
+            return;
+        }
+        let Some(fragment) = fragments.get(id) else {
+            return;
+        };
+        *printed += 1;
+        let source = fragment.source.map_or_else(String::new, |node| {
+            let tag = dom
+                .node(node)
+                .map(|node| match node.kind() {
+                    crate::dom::NodeKind::Element(element) => element.local_name.clone(),
+                    _ => "#text".to_owned(),
+                })
+                .unwrap_or_default();
+            let id = dom.attribute(node, "id").ok().flatten().unwrap_or_default();
+            let class = dom
+                .attribute(node, "class")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            format!("<{tag} id={id} class={class}>")
+        });
+        let style = fragment.source.and_then(|node| styles.get(&node));
+        let property = |name: &str| {
+            style
+                .and_then(|style| style.get(name))
+                .map(|value| value.css_text().to_owned())
+                .unwrap_or_default()
+        };
+        eprintln!(
+            "{:indent$}frag {} {} rect={:?} position={} z={} display={} children={}",
+            "",
+            id.as_u32(),
+            source,
+            fragment.rect,
+            property("position"),
+            property("z-index"),
+            property("display"),
+            fragment.children.len(),
+            indent = depth * 2
+        );
+        for child in &fragment.children {
+            walk(dom, styles, fragments, *child, depth + 1, printed);
+        }
+    }
+    let mut printed = 0usize;
+    walk(dom, styles, fragments, fragments.root(), 0, &mut printed);
+}
+
 fn render_dom(
     dom: &Dom,
     quirks_mode: QuirksMode,
@@ -1324,6 +1391,13 @@ fn render_dom(
         images,
     );
     stage_elapsed("layout", &mut stage_mark);
+    if std::env::var_os("RENDER_DEBUG_FRAGMENT").is_some() && layout.fragments.iter().count() > 20 {
+        eprintln!(
+            "fragment tree: {} fragments",
+            layout.fragments.iter().count()
+        );
+        dump_fragment_tree(dom, &styles, &layout.fragments);
+    }
     let display = build_display_list_with_images(
         &layout.fragments,
         &formatting,

@@ -628,41 +628,33 @@ impl Solver<'_> {
             .and_then(|source| self.styles.get(&source))
     }
 
-    /// The layer a child of a block container paints in: its `z-index`, then
-    /// whether it is positioned. CSS 2.1 Appendix E paints a positioned box above
-    /// the in-flow content of the same `z-index`, so a sticky box, which is in
-    /// flow for layout, sorts after the in-flow siblings it can overlap.
+    /// The layer a child of a block container paints in: its own `z-index`
+    /// (positioned boxes only), then whether it is positioned. CSS 2.1
+    /// Appendix E paints a positioned box above the in-flow content of the
+    /// same `z-index`, so a sticky box, which is in flow for layout, sorts
+    /// after the in-flow siblings it can overlap.
+    ///
+    /// The key deliberately does not inherit a descendant's z-index. An
+    /// in-flow wrapper is painted with the in-flow content no matter how high
+    /// a positioned descendant of its own goes; carrying that descendant's
+    /// layer onto the wrapper moved the wrapper's *background* above later
+    /// siblings (Bing's full-viewport `#555` block covered the fixed search
+    /// box this way). Positioned descendants of an earlier sibling are painted
+    /// from inside it, so until a full stacking-context tree exists a later
+    /// sibling can cover them; the common fixed-header case does not overlap.
     fn paint_layer(&self, id: FragmentId) -> (i32, bool) {
-        let positioned = self
-            .fragment_style(id)
-            .is_some_and(|style| resolve::position(Some(style)) != Position::Static);
-        (self.fragment_z_index(id), positioned)
-    }
-
-    fn fragment_z_index(&self, id: FragmentId) -> i32 {
-        let Some(fragment) = usize::try_from(id.as_u32())
-            .ok()
-            .and_then(|index| self.fragments.get(index))
-        else {
-            return 0;
+        let style = self.fragment_style(id);
+        let positioned =
+            style.is_some_and(|style| resolve::position(Some(style)) != Position::Static);
+        let z_index = if positioned {
+            style
+                .and_then(|style| style.get("z-index"))
+                .and_then(|value| value.css_text().trim().parse::<i32>().ok())
+                .unwrap_or(0)
+        } else {
+            0
         };
-        let own = self
-            .fragment_style(id)
-            .and_then(|style| style.get("z-index"))
-            .and_then(|value| value.css_text().trim().parse::<i32>().ok())
-            .unwrap_or(0);
-        // A positioned descendant can escape an otherwise unpositioned
-        // wrapper and overlap a later sibling. Carrying the highest descendant
-        // layer upward preserves that ordering until a full stacking-context
-        // tree is available.
-        own.max(
-            fragment
-                .children
-                .iter()
-                .map(|child| self.fragment_z_index(*child))
-                .max()
-                .unwrap_or(0),
-        )
+        (z_index, positioned)
     }
 
     fn source(&self, node: FormattingNodeId) -> Option<NodeId> {

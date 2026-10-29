@@ -1,3 +1,39 @@
+# 交接文档 (2026-10-30, 续七) — 位置元素不再抬高祖先的绘制层
+
+接续 Bingo/Bing 会话。上一轮把 Bing 的脚本错误清到 0、进程不再崩溃,但页面只剩导航链接和
+`#555` 背景。本轮用新的布局/绘制转储定位到**布局排序把不可见的搜索框埋掉了**并修复。
+
+## 本轮已完成
+
+| 内容 | 落点 |
+|---|---|
+| **层叠排序 bug** | `paint_layer` 把子树的最高 `z-index` 向上传播给祖先。Bing 首页第一个 in-flow 块里有 `position:fixed;z-index:6` 的 header,于是整块(含铺满视口的 `#555` 背景)被排到第二个块之后;第二个块里 `z-index:3` 的固定搜索框先画,随后被第一块的背景盖住。现在排序键只取**元素自身**的 `z-index`(且仅 positioned 元素),in-flow 祖先保持源顺序 |
+| **回归测试** | `an_in_flow_wrapper_does_not_float_above_later_siblings_because_of_a_fixed_descendant`:第一个块含 `z-index:6` 固定子元素,第二个块含 `z-index:3` 固定子元素,断言两块按源顺序绘制 |
+| **布局调试转储** | `RENDER_DEBUG_LAYOUT=1` 打印每个有 id/class 元素的 rect + computed display/position/z-index/opacity/visibility/inset/margin/transform/overflow/背景;`RENDER_DEBUG_PAINT_ALL=1` 打印显示列表顺序;`RENDER_DEBUG_FRAGMENT=1` 打印 fragment 树(缩进、源元素、rect、position/z-index) |
+| **诊断结论** | 修复前绘制顺序:`#51 sb_form 白底` → `#63 .hp_body #555(0,0 全屏)`;修复后:`#4 .hp_body #555` → `#47 sb_form 白底`。fragment 树也确认第一个 `hp_body` 从 html 子列表末尾回到源顺序 |
+
+## 测量(隐藏截图,8 秒)
+
+| 站点 | dom_elements | boxes | scripts_threw | 视觉 |
+|---|---|---|---|---|
+| bing(修复前) | 270 | 58 | 0 | 全屏 `#555`,仅左上导航 |
+| bing(修复后) | 274 | 58 | 0 | **搜索框、国内版/国际版切换、麦克风/搜索图标、导航全部可见** |
+
+Bing 仍缺:主页背景图(`iotd-lite-bg` 动态 `<style>` 未插入,`#img_cont` 的
+`background-image` 为空)、大 Bing logo;这两项是下一步。
+
+## 明确未做 / 下一步
+
+- **动态 `<style>` 背景图**:Bing 通过 `document.createElement("style")` +
+  `textContent` 注入 `#img_cont{background-image:url(...)!important}`,DOM 里没有该元素;
+  需要查清是脚本分支未走到还是动态样式表未进入样式管线。
+- **Bing 大 logo**:`<svg id=bLogo>` 是内联 SVG,截图只显示小导航文字;需要检查 SVG
+  paint 路径。
+- **JD 主区**:仍是 `api.m.jd.com` 403,对比 `Referer`/Cookie/`sec-ch-ua`/TLS 指纹。
+- 传输层:HN/GitHub 的 TCP 链路在本机被阻断,与引擎无关。
+
+---
+
 # 交接文档 (2026-10-29, 续六) — 媒体 EventTarget、微任务 GC 根与 JS 预算
 
 接续同日"临时被调函数被 GC 回收"会话。这一轮把 JD 的脚本层从"勉强跑"推进到
