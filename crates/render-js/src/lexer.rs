@@ -1296,12 +1296,26 @@ impl Lexer<'_> {
         let mut depth = 0_u32;
         let result = loop {
             match self.next_token() {
-                Ok(Some((TokenKind::LeftBrace, _))) => depth = depth.saturating_add(1),
-                Ok(Some((TokenKind::RightBrace, start))) if depth == 0 => {
-                    break Ok(self.source[expression_start..start].to_owned());
+                Ok(Some((kind, start))) => {
+                    let left_brace = matches!(kind, TokenKind::LeftBrace);
+                    let right_brace = matches!(kind, TokenKind::RightBrace);
+                    // Every expression token is pushed so the next `regex vs
+                    // division` decision sees the real predecessor: in
+                    // `${width/2}` the slash is division, and treating it as a
+                    // regexp desynchronises the rest of the template. The list
+                    // is discarded with the saved outer state below.
+                    if let Err(error) = self.push(kind, start) {
+                        break Err(error);
+                    }
+                    if left_brace {
+                        depth = depth.saturating_add(1);
+                    } else if right_brace {
+                        if depth == 0 {
+                            break Ok(self.source[expression_start..start].to_owned());
+                        }
+                        depth = depth.saturating_sub(1);
+                    }
                 }
-                Ok(Some((TokenKind::RightBrace, _))) => depth = depth.saturating_sub(1),
-                Ok(Some(_)) => {}
                 Ok(None) => {
                     break Err(JsError::syntax(
                         "unterminated template interpolation",
@@ -1474,7 +1488,7 @@ fn is_identifier_continue(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{TokenKind, tokenize};
+    use super::{TemplatePart, TokenKind, tokenize};
     use crate::RuntimeLimits;
 
     #[test]
@@ -1598,6 +1612,53 @@ mod tests {
         // U+180E is not white space since Unicode 6.3, so it is a legal body
         // character.
         assert!(tokenize("/\u{180e}/", &RuntimeLimits::default()).is_ok());
+    }
+
+    #[test]
+    fn template_interpolation_lexes_division_as_division() {
+        // A `/` inside `${...}` is division: treating it as a regexp start
+        // swallows the rest of the template and every token after it.
+        let source = "const s = `x ${width/2} y ${height/3} z`;";
+        let tokens =
+            tokenize(source, &RuntimeLimits::default()).expect("the template must tokenize");
+        let expressions: Vec<&str> = tokens
+            .iter()
+            .find_map(|token| match &token.kind {
+                TokenKind::Template(parts) => Some(parts),
+                _ => None,
+            })
+            .expect("one template token")
+            .iter()
+            .filter_map(|part| match part {
+                TemplatePart::Expression(text) => Some(text.as_str()),
+                TemplatePart::Quasi { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            expressions,
+            ["width/2", "height/3"],
+            "both interpolations keep their division operator"
+        );
+
+        // A regexp inside an interpolation still lexes as one, including a `}`
+        // in its body, which the brace scan must not mistake for the end.
+        let source = "const s = `${/[}]/.test(value)}`;";
+        let tokens =
+            tokenize(source, &RuntimeLimits::default()).expect("the template must tokenize");
+        let expression = tokens
+            .iter()
+            .find_map(|token| match &token.kind {
+                TokenKind::Template(parts) => parts.iter().find_map(|part| match part {
+                    TemplatePart::Expression(text) => Some(text.as_str()),
+                    TemplatePart::Quasi { .. } => None,
+                }),
+                _ => None,
+            })
+            .expect("an interpolation");
+        assert_eq!(
+            expression, "/[}]/.test(value)",
+            "the regexp body, including its closing brace, stays in the expression"
+        );
     }
 
     #[test]

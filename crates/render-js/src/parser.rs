@@ -1205,6 +1205,8 @@ impl Parser {
             in_async: false,
             in_generator: false,
             in_parameters: false,
+            speculative_parameters: false,
+            speculative_parameter_error: None,
             super_property_allowed: false,
             super_call_allowed: false,
             new_target_allowed: false,
@@ -1251,6 +1253,14 @@ struct Parser {
     /// Set while the formal parameters of a function are parsed. A `YieldExpression`
     /// or `AwaitExpression` there is an early error (ECMA-262 15.5.1, 15.8.1).
     in_parameters: bool,
+    /// Set while a parenthesised arrow head is parsed *speculatively*. The same
+    /// text may instead be a parenthesised expression (`(x = await 1)` inside
+    /// async code), so the early error is recorded rather than raised, and only
+    /// becomes an error once the `=>` confirms the head.
+    speculative_parameters: bool,
+    /// The first `await`/`yield` seen in a speculative arrow head, with the
+    /// message its confirmed head reports.
+    speculative_parameter_error: Option<(usize, &'static str)>,
     /// `super.name` and `super[expression]` are valid: inside a method, a class
     /// field initializer, or a static block, and in arrows nested in them
     /// (ECMA-262 13.3.7.1).
@@ -2980,7 +2990,14 @@ impl Parser {
     /// operand of an operator: `void yield` is not a `YieldExpression`.
     fn yield_expression(&mut self) -> Result<Expr, JsError> {
         if self.in_parameters {
-            return Err(self.error("yield expression is not allowed in formal parameters"));
+            if self.speculative_parameters {
+                self.speculative_parameter_error.get_or_insert((
+                    self.current().offset,
+                    "yield expression is not allowed in formal parameters",
+                ));
+            } else {
+                return Err(self.error("yield expression is not allowed in formal parameters"));
+            }
         }
         let offset = self.current().offset;
         self.advance();
@@ -3169,6 +3186,7 @@ impl Parser {
 
     fn arrow_function(&mut self) -> Result<Option<Expr>, JsError> {
         let checkpoint = self.cursor;
+        let outer_parameter_error = self.speculative_parameter_error.take();
         let mut is_async_arrow = false;
         // Async arrows have the same callable shape in this synchronous
         // runtime; consume the marker while retaining their parameter/body.
@@ -3197,6 +3215,7 @@ impl Parser {
                 vec![name]
             } else {
                 self.cursor = checkpoint;
+                self.speculative_parameter_error = outer_parameter_error;
                 return Ok(None);
             }
         } else if self.take(&TokenKind::LeftParen) {
@@ -3206,6 +3225,7 @@ impl Parser {
                     if self.take(&TokenKind::Ellipsis) {
                         let TokenKind::Identifier(parameter) = self.advance().kind else {
                             self.cursor = checkpoint;
+                            self.speculative_parameter_error = outer_parameter_error;
                             return Ok(None);
                         };
                         parameters.push(format!("{PARAMETER_REST_MARKER}{parameter}"));
@@ -3215,6 +3235,7 @@ impl Parser {
                         if self.at(&TokenKind::LeftBrace) || self.at(&TokenKind::LeftBracket) {
                             let Ok(pattern) = self.binding_pattern() else {
                                 self.cursor = checkpoint;
+                                self.speculative_parameter_error = outer_parameter_error;
                                 return Ok(None);
                             };
                             let temporary = format!("\0arrow_param_{}", parameters.len());
@@ -3223,6 +3244,7 @@ impl Parser {
                         } else {
                             let TokenKind::Identifier(parameter) = self.advance().kind else {
                                 self.cursor = checkpoint;
+                                self.speculative_parameter_error = outer_parameter_error;
                                 return Ok(None);
                             };
                             parameter
@@ -3232,8 +3254,11 @@ impl Parser {
                         // A default value is part of the formal parameters, so a
                         // `yield` or `await` expression in it is an early error.
                         let previous_parameters = std::mem::replace(&mut self.in_parameters, true);
+                        let previous_speculative =
+                            std::mem::replace(&mut self.speculative_parameters, true);
                         let value = self.assignment();
                         self.in_parameters = previous_parameters;
+                        self.speculative_parameters = previous_speculative;
                         markers.push(Statement::ParameterDefault {
                             index: parameters.len(),
                             value: value?,
@@ -3252,14 +3277,20 @@ impl Parser {
             }
             if !self.take(&TokenKind::RightParen) || !self.take_arrow()? {
                 self.cursor = checkpoint;
+                self.speculative_parameter_error = outer_parameter_error;
                 return Ok(None);
             }
             parameters
         } else {
+            self.speculative_parameter_error = outer_parameter_error;
             return Ok(None);
         };
-        // The `=>` is confirmed, so the head's names and defaults are checked as
-        // arrow parameters (ECMA-262 15.3.1, 15.9.1).
+        // The `=>` is confirmed, so a `yield`/`await` the speculative head
+        // recorded is an early error now, and the head's names and defaults are
+        // checked as arrow parameters (ECMA-262 15.3.1, 15.9.1).
+        if let Some((offset, message)) = self.speculative_parameter_error.take() {
+            return Err(JsError::syntax(message, offset));
+        }
         self.validate_arrow_head(&parameters, &patterns, &markers, is_async_arrow)?;
 
         // An arrow function has no `yield`, and its `await` is its own: it is
@@ -3724,7 +3755,14 @@ impl Parser {
         {
             // `await` has unary-expression precedence (ECMA-262 §15.8).
             if self.in_parameters {
-                return Err(self.error("await expression is not allowed in formal parameters"));
+                if self.speculative_parameters {
+                    self.speculative_parameter_error.get_or_insert((
+                        self.current().offset,
+                        "await expression is not allowed in formal parameters",
+                    ));
+                } else {
+                    return Err(self.error("await expression is not allowed in formal parameters"));
+                }
             }
             self.advance();
             return Ok(Expr::Await(Box::new(self.unary()?)));
@@ -6978,6 +7016,21 @@ mod tests {
         ));
         assert!(!script_is_syntax_error(
             "async function f() { (x = async () => { await 1; }) => x; }"
+        ));
+    }
+
+    #[test]
+    fn a_parenthesised_assignment_containing_await_or_yield_is_not_an_arrow_head() {
+        // The same text is an arrow head only when `=>` follows; without it,
+        // `await`/`yield` are ordinary operators of the enclosing function.
+        assert!(!script_is_syntax_error(
+            "async function f() { let x; (x = await 1); }"
+        ));
+        assert!(!script_is_syntax_error(
+            "function* g() { let x; (x = yield); }"
+        ));
+        assert!(!script_is_syntax_error(
+            "async function f() { let x; let y = (x = await 1) + 2; }"
         ));
     }
 
