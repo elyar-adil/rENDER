@@ -1373,6 +1373,9 @@ impl JsRuntime {
             NativeFunction::RegExpStatic(_) | NativeFunction::RegExpStaticSetter(_) => {
                 unreachable!("dispatched by the RegExp builtins")
             }
+            NativeFunction::IteratorHostNext => {
+                unreachable!("dispatched by the iterator builtins")
+            }
             // HTML §8.9: no Java plugin, so the capability query answers false.
             NativeFunction::NavigatorJavaEnabled => Ok(JsValue::Boolean(false)),
             NativeFunction::RegExpAccessor(_)

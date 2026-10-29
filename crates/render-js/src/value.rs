@@ -1284,6 +1284,10 @@ pub(crate) enum NativeFunction {
     CollectionIsSupersetOf,
     CollectionIsDisjointFrom,
     CollectionIteratorNext,
+    /// The `next` property on `%IteratorPrototype%`, dispatching to the
+    /// engine iterator host the receiver carries, so `'next' in iterator` is
+    /// true like the platform (core-js probes it).
+    IteratorHostNext,
     ArrayIteratorNext,
     TypedArraySet,
     TypedArraySubarray,
@@ -6318,6 +6322,11 @@ impl Realm {
         // Each method carries its spec `length`, set here because the name-based
         // arity table cannot tell `Iterator.concat` (0) from `Array.prototype.concat` (1).
         for (name, function, arity) in [
+            // The host iterators (array, collection, helper) provide `next`
+            // through a native dispatch on the prototype chain, so `in`,
+            // descriptors and Get all agree on it (core-js's iterator probe
+            // checks `'next' in [].keys()`).
+            ("next", NativeFunction::IteratorHostNext, 0.0),
             ("map", NativeFunction::IteratorMap, 1.0),
             ("filter", NativeFunction::IteratorFilter, 1.0),
             ("take", NativeFunction::IteratorTake, 1.0),

@@ -1145,6 +1145,39 @@ fn the_audio_constructor_makes_a_media_element() {
 }
 
 #[test]
+fn iterator_objects_have_next_on_their_prototype_chain() {
+    // core-js's iterator probe reads `'next' in [].keys()`; a host that only
+    // answers `Get` for `next` makes the probe answer false and forces
+    // core-js to replace every collection iterator.
+    let value = evaluate_script(
+        "
+        var arrayIterator = [1, 2].keys();
+        var mapIterator = new Map([[1, 2]]).entries();
+        var setIterator = new Set([1]).values();
+        var generator = (function* () { yield 1; })();
+        [
+            'next' in arrayIterator,
+            'next' in mapIterator,
+            'next' in setIterator,
+            'next' in generator,
+            Reflect.has(mapIterator, 'next'),
+            Object.prototype.hasOwnProperty.call(arrayIterator, 'next'),
+            typeof Object.getOwnPropertyDescriptor(
+                Object.getPrototypeOf(arrayIterator), 'next'
+            ).value,
+            arrayIterator.next().value,
+            mapIterator.next().value.join(','),
+            generator.next().value
+        ].join('|')
+        ",
+    );
+    assert_eq!(
+        value,
+        JsValue::String("true|true|true|true|true|false|function|0|1,2|1".into())
+    );
+}
+
+#[test]
 fn navigator_reports_no_java_plugin() {
     assert_eq!(
         evaluate_script("navigator.javaEnabled() === false"),

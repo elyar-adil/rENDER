@@ -6932,10 +6932,26 @@ impl JsRuntime {
             Some(ObjectHost::ShadowRealmImportRejected) => Err(JsError::type_error(
                 "ShadowRealm.prototype.importValue could not load the module",
             )),
-            _ => Err(JsError::type_error(format!(
-                "value is not callable (callee host {:?})",
-                self.realm.host(callee)
-            ))),
+            _ => {
+                // A host call of a non-callable is a real TypeError on the
+                // platform, with a stack. Build it as an error object so the
+                // embedding can report where the call was made.
+                let keys = self
+                    .realm
+                    .own_property_names(callee)
+                    .map(|names| names.join(","))
+                    .unwrap_or_default();
+                let message = format!(
+                    "value is not callable (callee host {:?}, keys [{keys}])",
+                    self.realm.host(callee)
+                );
+                Err(
+                    match self.construct_standard_error(ErrorKind::TypeError, &message) {
+                        Ok(value) => JsError::thrown(value),
+                        Err(error) => error,
+                    },
+                )
+            }
         };
         self.calls_active = self.calls_active.saturating_sub(1);
         result

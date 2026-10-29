@@ -161,6 +161,7 @@ impl JsRuntime {
             N::IteratorFrom => self.iterator_from(dom, argument(arguments, 0)),
             N::IteratorConcat => self.iterator_concat(dom, arguments),
             N::IteratorPrototypeIterator => Ok(JsValue::Object(receiver)),
+            N::IteratorHostNext => self.iterator_host_next(dom, receiver),
             // `%IteratorPrototype%[@@dispose]`: `return` runs when the iterator has
             // one (GetMethod, then Call), and the result is undefined.
             N::IteratorPrototypeDispose => self
@@ -1120,6 +1121,22 @@ impl JsRuntime {
     // ----- Helper and wrapper prototypes ------------------------------------
 
     /// `%IteratorHelperPrototype%.next()`.
+    /// `%IteratorPrototype%.next`: dispatches to the engine iterator host the
+    /// receiver carries. The host iterators surface `next` through this common
+    /// prototype, so `'next' in iterator` answers true.
+    fn iterator_host_next(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+    ) -> Result<JsValue, JsError> {
+        match self.realm.host(receiver) {
+            Some(ObjectHost::CollectionIterator { .. }) => self.collection_iterator_next(receiver),
+            Some(ObjectHost::ArrayIterator { .. }) => self.array_iterator_next(dom, receiver),
+            Some(ObjectHost::IteratorHelper { .. }) => self.iterator_helper_next(dom, receiver),
+            _ => Err(JsError::type_error("incompatible iterator receiver")),
+        }
+    }
+
     pub(in crate::runtime) fn iterator_helper_next(
         &mut self,
         dom: &mut Dom,
