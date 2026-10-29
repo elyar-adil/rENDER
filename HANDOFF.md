@@ -22,12 +22,19 @@
 
 ## 明确未做 / 下一步
 
-- **JD 的 `Incompatible receiver, Map required`**:core-js 2.6.12 的 `_collection` 在某条
-  `$iterDetect` 路径上判定需要 polyfill,之后把 `validate` 版方法装到原生原型上,早先创建的
-  原生 Map 实例就会抛错。单独加载 core-js 2.6.12 不触发;需要继续缩小到页面加载顺序/实例来源。
-  这是 JD 首屏仍在空转的主因。
-- **`Audio` 构造器缺失**(`new Audio()`),JD 的 aria.js 抛 ReferenceError。
-- 脚本栈只有函数名,没有 file:line;给 `CallFrame` 增加源位置后才能直接指到 bundle 字节。
+- **JD 的 `Incompatible receiver, Map required`**:core-js 2.6.12 的 `_collection` 判定
+  `new Map().entries().next()` 失败后走 polyfill 分支,把 `validate` 版方法装到原生原型上,
+  早先创建的原生 Map 实例随即抛错。单独加载 core-js 2.6.12 **不触发**;页面里在它之前还有
+  `js_security_v3`(见下)与两个前置 bundle,需要继续缩小到"谁在 core-js 之前改坏了
+  entries/iterator"。这是 JD 首屏仍在空转的主因。
+- **`js_security_v3_0.1.4.js` 触发 10,000,000 步执行上限**:234 KB 的安全脚本不应需要
+  10M 步,更像等待某个 API 的空转循环;它跑在 JD 主 bundle 之前,失败时可能留下半初始化的
+  全局对象(与上一条相关)。
+- **`new Audio()` 已补齐**(`audit` 那一轮的 ReferenceError 已消失),`aria.js` 现在停在
+  `addEventListener` 不可调用——媒体宿主对象只有 `on*` 属性,没有通用 EventTarget。
+- 内联脚本(JD source 27)`undefined is not a constructor` 未定位。
+- 脚本栈只有函数名 + 函数体起始偏移,没有 file:line;给 `CallFrame` 带上脚本身份与位置后
+  才能直接指到 bundle 字节。
 - 传输层:本机对 HN/GitHub 的 TCP 连接被网络层阻断(curl -4/-6 同样超时),不是 5 秒预算
   造成的,暂时不改预算。
 

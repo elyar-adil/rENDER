@@ -1123,6 +1123,28 @@ fn string_replace_expands_groups_and_honors_global() {
 }
 
 #[test]
+fn the_audio_constructor_makes_a_media_element() {
+    let value = evaluate_script(
+        "
+        var a = new Audio('/sound.mp3');
+        [
+            typeof Audio,
+            a instanceof Audio,
+            a.src,
+            typeof a.play,
+            typeof a.pause,
+            new Audio() instanceof Audio,
+            Audio('/x.mp3') instanceof Audio
+        ].join('|')
+        ",
+    );
+    assert_eq!(
+        value,
+        JsValue::String("function|true|/sound.mp3|function|function|true|true".into())
+    );
+}
+
+#[test]
 fn navigator_reports_no_java_plugin() {
     assert_eq!(
         evaluate_script("navigator.javaEnabled() === false"),

@@ -148,6 +148,30 @@ impl JsRuntime {
         Ok(JsValue::Object(instance))
     }
 
+    /// `new Audio(src)`: the legacy audio constructor. It shares the media
+    /// element surface with [`Self::video_constructor`] and takes its source
+    /// from the first argument, like the platform's `Audio` (HTML §4.8.5).
+    pub(in crate::runtime) fn audio_constructor(
+        &mut self,
+        dom: &mut Dom,
+        constructor: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let instance = self.video_constructor(dom, constructor, &[])?;
+        let JsValue::Object(instance_object) = instance else {
+            return Ok(instance);
+        };
+        if let Some(value) = arguments.first()
+            && !matches!(value, JsValue::Undefined)
+            && !matches!(value, JsValue::Null)
+        {
+            let src = self.to_string_value(dom, value)?;
+            self.realm
+                .set_property(instance_object, "src".to_owned(), JsValue::String(src));
+        }
+        Ok(JsValue::Object(instance_object))
+    }
+
     /// `video.play()`: starts playback when media is ready, otherwise queues
     /// the media transfer and returns a promise resolved by
     /// [`Self::settle_video_fetch`].

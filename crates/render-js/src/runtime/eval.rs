@@ -5966,6 +5966,7 @@ impl JsRuntime {
                 | ObjectHost::DomConstructor
                 | ObjectHost::ImageConstructor
                 | ObjectHost::VideoConstructor
+                | ObjectHost::AudioConstructor
                 | ObjectHost::Canvas(crate::runtime::builtins::canvas::CanvasObject::Constructor(_))
                 | ObjectHost::XmlHttpRequestConstructor
                 | ObjectHost::AbortControllerConstructor
@@ -6206,6 +6207,9 @@ impl JsRuntime {
             Some(ObjectHost::ImageConstructor) => self.image_constructor(dom, arguments),
             Some(ObjectHost::VideoConstructor) => {
                 self.video_constructor(dom, constructor, arguments)
+            }
+            Some(ObjectHost::AudioConstructor) => {
+                self.audio_constructor(dom, constructor, arguments)
             }
             Some(ObjectHost::XmlHttpRequestConstructor) => {
                 self.xml_http_request_constructor(constructor)
@@ -6539,9 +6543,10 @@ impl JsRuntime {
                 JsError::type_error("Failed to construct a Range: please use the 'new' operator"),
             ),
             Some(ObjectHost::ImageConstructor) => self.image_constructor(dom, arguments),
-            // Legacy web compatibility: `Video()` without `new` constructs,
-            // exactly like `Image()`.
+            // Legacy web compatibility: `Video()`/`Audio()` without `new`
+            // construct, exactly like `Image()`.
             Some(ObjectHost::VideoConstructor) => self.video_constructor(dom, callee, arguments),
+            Some(ObjectHost::AudioConstructor) => self.audio_constructor(dom, callee, arguments),
             Some(ObjectHost::XmlHttpRequestConstructor) => Err(JsError::type_error(
                 "XMLHttpRequest constructor requires 'new'",
             )),

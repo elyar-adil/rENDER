@@ -2386,6 +2386,8 @@ pub(crate) enum ObjectHost {
     },
     DomConstructor,
     ImageConstructor,
+    /// The `Audio` constructor object; `new Audio(src)` makes a media element.
+    AudioConstructor,
     IntersectionObserverConstructor,
     IntersectionObserver {
         callback: ObjectId,
@@ -2716,6 +2718,7 @@ impl ObjectHost {
                 | Self::StaticRangeConstructor
                 | Self::ImageConstructor
                 | Self::VideoConstructor
+                | Self::AudioConstructor
                 | Self::Canvas(crate::runtime::builtins::canvas::CanvasObject::Constructor(
                     _
                 ))
@@ -9469,6 +9472,36 @@ impl Realm {
                 getter: None,
                 setter: None,
                 value: JsValue::Object(video_constructor),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        // `Audio` is the classic `new Audio(src)` constructor: the same media
+        // element surface, with the first argument as `src` (HTML §4.8.5).
+        let audio_constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::AudioConstructor,
+            ..JsObject::default()
+        });
+        objects[audio_constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(video_prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        objects[global.0].properties.insert(
+            "Audio".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(audio_constructor),
                 writable: true,
                 enumerable: false,
                 configurable: true,
