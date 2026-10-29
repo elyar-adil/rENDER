@@ -78,7 +78,8 @@ fn browser_main() -> Result<(), String> {
     use winit::platform::windows::EventLoopBuilderExtWindows as _;
     #[cfg(target_os = "linux")]
     use winit::platform::x11::EventLoopBuilderExtX11 as _;
-    let Some(initial) = load_initial_page().map_err(|error| error.to_string())? else {
+    let launch = load_initial_page().map_err(|error| error.to_string())?;
+    let Some(initial) = launch.page else {
         return Ok(());
     };
     let fonts = Arc::new(SystemFontBackend::load().map_err(|error| error.to_string())?);
@@ -90,6 +91,12 @@ fn browser_main() -> Result<(), String> {
         // otherwise, and the X11 and Wayland builders share that flag.
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         builder.with_any_thread(true);
+        #[cfg(target_os = "macos")]
+        if launch.screenshot.is_some() {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS as _};
+            // No Dock icon and no activation for a measurement run.
+            builder.with_activation_policy(ActivationPolicy::Accessory);
+        }
         builder.build().map_err(|error| error.to_string())?
     };
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -98,6 +105,9 @@ fn browser_main() -> Result<(), String> {
     let render_worker = start_render_worker(Arc::clone(&fonts), event_loop.create_proxy())
         .map_err(|error| error.to_string())?;
     let mut app = BrowserApp::new(initial, fonts, network, render_worker);
+    if let Some((path, delay)) = launch.screenshot {
+        app.schedule_screenshot(path, delay);
+    }
     event_loop
         .run_app(&mut app)
         .map_err(|error| error.to_string())?;

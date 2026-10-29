@@ -11,6 +11,7 @@ rust-version.workspace = true
 arboard = { version = "3.6.1", default-features = false }
 encoding_rs = "0.8.35"
 fontdue = "0.9.3"
+image-codec = { package = "image", version = "0.25.8", default-features = false, features = ["png"] }
 render-core = { path = "../render-core" }
 render-net = { path = "../render-net" }
 softbuffer = { version = "0.4.8", default-features = false }

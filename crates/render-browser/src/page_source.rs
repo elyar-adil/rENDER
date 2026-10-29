@@ -15,6 +15,7 @@ use std::error::Error;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub(super) struct PageSource {
@@ -23,29 +24,80 @@ pub(super) struct PageSource {
     pub(super) target: NavigationTarget,
 }
 
-pub(super) fn load_initial_page() -> Result<Option<PageSource>, Box<dyn Error>> {
+/// What the command line asked the process to do.
+pub(super) struct Launch {
+    /// The page to open, or `None` when `--help` ended the launch.
+    pub(super) page: Option<PageSource>,
+    /// `--screenshot`: where to write the composed frame and how long to let
+    /// the page settle first. The process exits after writing it.
+    pub(super) screenshot: Option<(PathBuf, Duration)>,
+}
+
+pub(super) fn load_initial_page() -> Result<Launch, Box<dyn Error>> {
     let mut arguments = env::args_os().skip(1);
-    let Some(argument) = arguments.next() else {
-        return Ok(Some(home_source()));
+    let mut argument = None;
+    let mut screenshot = None;
+    let mut screenshot_delay = Duration::from_secs(4);
+    while let Some(next) = arguments.next() {
+        match next.to_str() {
+            Some("-h" | "--help") => {
+                println!(
+                    "Usage: render-browser [--screenshot PATH] [--screenshot-delay MILLIS] [URL_OR_LOCAL_HTML_PATH]\n\nNo argument opens the built-in home page. HTTP, HTTPS, and data: URLs use the browser's normal navigation pipeline. With --screenshot the process writes the composed frame to PATH once the page has settled, then exits."
+                );
+                return Ok(Launch {
+                    page: None,
+                    screenshot: None,
+                });
+            }
+            Some("--screenshot") => {
+                screenshot = Some(PathBuf::from(arguments.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--screenshot requires a path")
+                })?));
+            }
+            Some("--screenshot-delay") => {
+                let value = arguments.next().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--screenshot-delay requires milliseconds",
+                    )
+                })?;
+                let millis = value
+                    .to_str()
+                    .and_then(|text| text.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "--screenshot-delay takes a whole number of milliseconds",
+                        )
+                    })?;
+                screenshot_delay = Duration::from_millis(millis);
+            }
+            _ => {
+                if argument.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "expected at most one URL or local HTML path",
+                    )
+                    .into());
+                }
+                argument = Some(next);
+            }
+        }
+    }
+    let Some(argument) = argument else {
+        return Ok(Launch {
+            page: Some(home_source()),
+            screenshot: screenshot.map(|path| (path, screenshot_delay)),
+        });
     };
-    if argument == "-h" || argument == "--help" {
-        println!(
-            "Usage: render-browser [URL_OR_LOCAL_HTML_PATH]\n\nNo argument opens the built-in home page. HTTP, HTTPS, and data: URLs use the browser's normal navigation pipeline."
-        );
-        return Ok(None);
-    }
-    if arguments.next().is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "expected at most one URL or local HTML path",
-        )
-        .into());
-    }
     if let Some(value) = argument.to_str()
         && let Ok(url) = Url::parse(value)
         && matches!(url.scheme(), "http" | "https" | "data")
     {
-        return Ok(Some(network_start_source(url)));
+        return Ok(Launch {
+            page: Some(network_start_source(url)),
+            screenshot: screenshot.map(|path| (path, screenshot_delay)),
+        });
     }
     let path = PathBuf::from(argument);
     if path.to_string_lossy().contains("://") {
@@ -55,7 +107,10 @@ pub(super) fn load_initial_page() -> Result<Option<PageSource>, Box<dyn Error>> 
         )
         .into());
     }
-    source_from_local_file(path).map(Some)
+    Ok(Launch {
+        page: Some(source_from_local_file(path)?),
+        screenshot: screenshot.map(|path| (path, screenshot_delay)),
+    })
 }
 
 pub(super) fn home_source() -> PageSource {

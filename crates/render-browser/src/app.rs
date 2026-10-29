@@ -124,8 +124,11 @@ use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::fmt;
+use std::fs::File;
 use std::io;
 use std::num::NonZeroU32;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
@@ -213,6 +216,9 @@ pub(super) struct BrowserApp {
     pub(super) surface: Option<NativeSurface>,
     pub(super) layout: Option<ChromeLayout>,
     pub(super) frame: Vec<u32>,
+    /// A pending `--screenshot` request: where to write the composed frame and
+    /// when. The event loop exits once it is written.
+    pub(super) screenshot: Option<ScreenshotRequest>,
     pub(super) frame_size: WindowSize<u32>,
     pub(super) frame_damage: FrameDamage,
     pub(super) theme: ChromeTheme,
@@ -273,6 +279,7 @@ impl BrowserApp {
             cookies: ProfileCookies::open(profile_directory()),
             storage: ProfileStorage::open(profile_directory()),
             pending_fetches: Vec::new(),
+            screenshot: None,
             disk_cache,
             pending_disk_clear: None,
             cache_clear_state: CacheClearUiState::Ready,
@@ -326,7 +333,12 @@ impl BrowserApp {
                 f64::from(INITIAL_WIDTH),
                 f64::from(INITIAL_HEIGHT),
             ))
-            .with_min_inner_size(LogicalSize::new(560.0, 360.0));
+            .with_min_inner_size(LogicalSize::new(560.0, 360.0))
+            // A screenshot run is a measurement, not an interactive session:
+            // keep the window off screen so it cannot steal focus or cover
+            // other work while the page settles.
+            .with_visible(self.screenshot.is_none())
+            .with_active(self.screenshot.is_none());
         let window = Arc::new(event_loop.create_window(attributes)?);
         self.theme = window.theme().map_or(ChromeTheme::Light, theme_from_winit);
         let context = Context::new(window.clone())?;
@@ -920,6 +932,38 @@ impl BrowserApp {
                 height: rect.height,
             },
         })
+    }
+
+    /// Schedules a PNG of the composed frame once `delay` has elapsed.
+    ///
+    /// The event loop keeps running normally until then; after writing the
+    /// image it exits. This is how a real page is inspected without a human at
+    /// the screen, with the same fonts and the same frame the window shows.
+    pub(super) fn schedule_screenshot(&mut self, path: PathBuf, delay: Duration) {
+        self.screenshot = Some(ScreenshotRequest {
+            path,
+            deadline: Instant::now() + delay,
+        });
+    }
+
+    /// Writes the scheduled screenshot once its deadline has passed and a
+    /// frame has been composed. Returns whether the event loop should exit.
+    fn take_due_screenshot(&mut self) -> bool {
+        let Some(request) = &self.screenshot else {
+            return false;
+        };
+        if Instant::now() < request.deadline || self.frame.is_empty() {
+            return false;
+        }
+        let request = self.screenshot.take().expect("checked above");
+        match write_frame_png(&self.frame, self.frame_size, &request.path) {
+            Ok(()) => eprintln!(
+                "render-browser screenshot written to {}",
+                request.path.display()
+            ),
+            Err(error) => eprintln!("render-browser screenshot failed: {error}"),
+        }
+        true
     }
 
     pub(super) fn request_redraw(&self) {
@@ -4260,6 +4304,10 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
         for id in navigation_candidates {
             self.drain_script_navigations(id);
         }
+        if self.take_due_screenshot() {
+            event_loop.exit();
+            return;
+        }
         if self.has_pending_network()
             || self.has_pending_script_work()
             || self.has_unresolved_render_request()
@@ -4283,6 +4331,38 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
         }
         event_loop.set_control_flow(ControlFlow::Wait);
     }
+}
+
+/// One `--screenshot` request: where to write and when it is due.
+pub(super) struct ScreenshotRequest {
+    pub(super) path: PathBuf,
+    pub(super) deadline: Instant,
+}
+
+/// Encodes the composed `0x00RRGGBB` frame as an RGBA PNG.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "each channel is masked out of a 0x00RRGGBB pixel and then truncated to its byte"
+)]
+fn write_frame_png(frame: &[u32], size: WindowSize<u32>, path: &Path) -> io::Result<()> {
+    use image_codec::ImageEncoder as _;
+    let mut rgba = Vec::with_capacity(frame.len() * 4);
+    for pixel in frame {
+        rgba.extend_from_slice(&[
+            (*pixel >> 16) as u8,
+            (*pixel >> 8) as u8,
+            *pixel as u8,
+            0xFF,
+        ]);
+    }
+    image_codec::codecs::png::PngEncoder::new(File::create(path)?)
+        .write_image(
+            &rgba,
+            size.width,
+            size.height,
+            image_codec::ExtendedColorType::Rgba8,
+        )
+        .map_err(|error| io::Error::other(error.to_string()))
 }
 
 /// Platform-independent snapshot of a key press, mapped from winit's

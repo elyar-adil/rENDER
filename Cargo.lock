@@ -1633,6 +1633,7 @@ dependencies = [
  "arboard",
  "encoding_rs",
  "fontdue",
+ "image",
  "render-core",
  "render-net",
  "softbuffer",
