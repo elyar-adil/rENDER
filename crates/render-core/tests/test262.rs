@@ -101,6 +101,7 @@ struct ResultRecord {
 }
 
 #[test]
+#[ignore = "full pinned test262 measurement; tools/check.sh runs this in release"]
 fn pinned_test262_manifest_reports_a_real_baseline() {
     assert_pinned_revision();
     if !Path::new(TEST262_ROOT).join("test").is_dir() {
@@ -377,7 +378,18 @@ fn run_parallel(paths: &[String]) -> io::Result<Summary> {
                 .join("../../target/test262-runs")
                 .join(format!("run-{unique}"))
         },
-        PathBuf::from,
+        |dir| {
+            // Cargo runs integration tests with the crate directory as the
+            // working directory. Resolve a relative override against the
+            // workspace root so "target/test262-runs/..." means what a reader
+            // typing the command at the repository root expects.
+            let path = PathBuf::from(dir);
+            if path.is_absolute() {
+                path
+            } else {
+                Path::new(TEST262_ROOT).join("../..").join(path)
+            }
+        },
     );
     fs::create_dir_all(&run_dir)?;
     let results_path = run_dir.join("results.tsv");
@@ -406,7 +418,9 @@ fn run_parallel(paths: &[String]) -> io::Result<Summary> {
     );
     let (sender, receiver) = mpsc::channel();
     let mut workers = BTreeMap::new();
-    for id in 0..worker_count.min(pending.len().max(1)) {
+    // A resumed run can already have every path in `completed.txt`; spawning a
+    // worker with no first assignment would leave it waiting on stdin forever.
+    for id in 0..worker_count.min(pending.len()) {
         workers.insert(id, spawn_worker(id, &sender)?);
     }
     for worker in workers.values_mut() {
@@ -521,6 +535,7 @@ fn spawn_worker(slot: usize, sender: &mpsc::Sender<WorkerEvent>) -> io::Result<W
     let generation = WORKER_GENERATIONS.fetch_add(1, Ordering::Relaxed);
     let mut child = Command::new(env::current_exe()?)
         .args([
+            "--ignored",
             "--exact",
             "pinned_test262_manifest_reports_a_real_baseline",
             "--nocapture",
@@ -841,9 +856,6 @@ fn run_manifest_case(relative_path: &str) -> Vec<ResultRecord> {
     let source = match fs::read_to_string(&path) {
         Ok(source) => source,
         Err(error) => {
-            if relative_path.starts_with("language/module-code/") {
-                return unsupported(relative_path, "module evaluation is not implemented");
-            }
             return vec![ResultRecord {
                 path: relative_path.to_owned(),
                 variant: "manifest".to_owned(),
@@ -852,7 +864,17 @@ fn run_manifest_case(relative_path: &str) -> Vec<ResultRecord> {
             }];
         }
     };
-    let metadata = match parse_metadata(&source) {
+    run_source_case(relative_path, &source)
+}
+
+/// Judge one test source without reading it from the pinned checkout.
+///
+/// Keeping the decision logic separate from the file read is what lets the
+/// runner's own tests exercise classification and module routing on a clone
+/// that has no `third_party/test262`; the suite itself still reads the
+/// official files.
+fn run_source_case(relative_path: &str, source: &str) -> Vec<ResultRecord> {
+    let metadata = match parse_metadata(source) {
         Ok(metadata) => metadata,
         Err(error) => {
             return vec![ResultRecord {
@@ -881,7 +903,7 @@ fn run_manifest_case(relative_path: &str) -> Vec<ResultRecord> {
         );
     }
     if metadata.flags.iter().any(|flag| flag == "module") {
-        return run_module_test(relative_path, &source, &metadata);
+        return run_module_test(relative_path, source, &metadata);
     }
 
     let variants = if metadata.flags.iter().any(|flag| flag == "raw") {
@@ -896,7 +918,7 @@ fn run_manifest_case(relative_path: &str) -> Vec<ResultRecord> {
 
     variants
         .into_iter()
-        .map(|(variant, strict)| run_variant(relative_path, &source, &metadata, variant, strict))
+        .map(|(variant, strict)| run_variant(relative_path, source, &metadata, variant, strict))
         .collect()
 }
 
@@ -1649,7 +1671,7 @@ language	88	2	0	1	200
 
     use render_core::js::{CompiledScript, RuntimeLimits};
 
-    use super::{Status, parse_metadata, path_matches_prefix, run_manifest_case, run_variant};
+    use super::{Status, parse_metadata, path_matches_prefix, run_variant};
 
     #[test]
     fn path_prefix_filter_respects_directory_boundaries() {
@@ -1736,16 +1758,30 @@ language	88	2	0	1	200
 
     #[test]
     fn classifies_blocking_agent_tests_as_unsupported_on_a_browser_main_thread() {
-        let records = run_manifest_case("built-ins/Atomics/wait/bigint/negative-timeout.js");
-        assert_eq!(records[0].status, Status::Unsupported);
+        // The classification reads the `CanBlockIsTrue` flag, so a synthetic
+        // source exercises it without requiring the pinned test262 checkout.
+        let records = super::run_source_case(
+            "synthetic/blocking-agent.js",
+            "/*---\nflags: [CanBlockIsTrue]\n---*/\n0;",
+        );
+        assert_eq!(records[0].status, super::Status::Unsupported);
     }
 
     #[test]
     fn runs_module_tests_instead_of_classifying_them_unsupported() {
-        // Module-flagged files run as module graphs (ECMA-262 16.2.1), so the runner
-        // judges them rather than skipping them.
-        let records = run_manifest_case("language/module-code/eval-export-dflt-cls-anon-semi.js");
+        // Module-flagged files run as module graphs (ECMA-262 16.2.1), so the
+        // runner judges them rather than skipping them. A parse-negative module
+        // keeps this test independent of the pinned checkout's file contents.
+        let records = super::run_source_case(
+            "synthetic/module-parse-negative.js",
+            "/*---\nflags: [module]\nnegative:\n  phase: parse\n  type: SyntaxError\n---*/\nexport default class {",
+        );
         assert_eq!(records.len(), 1);
-        assert_ne!(records[0].status, Status::Unsupported);
+        assert_eq!(records[0].status, super::Status::Pass);
+        assert!(
+            records[0]
+                .detail
+                .contains("matched negative parse:SyntaxError")
+        );
     }
 }

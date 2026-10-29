@@ -58,8 +58,9 @@ Select a subset through the environment:
 
 **The conformance runner is `tools/wpt/`**, and it answers a different question: not "does the
 rendered output match" but "does the engine give the right answer to the test's assertions". It
-covers `dom/` and `html/`, and it **cannot cover `css/`**, because `testcss.js` is an iframe driver
-and the engine has no nested browsing contexts.
+covers `dom/` and `html/`, and it **cannot cover `css/`**, because `testcss.js` is an iframe driver:
+nested browsing contexts now exist, but an iframe document is not painted and the CSS adapter hosts
+one document.
 
 So both statements are true and they are not in tension: **the reftest runner exists and answers a
 pixel question, and it is no longer the only runner.** An earlier version of this file said the
@@ -91,7 +92,7 @@ magnitude and averaging them would be a lie.
 | `dom/` | 559 | 297 | 32 | **10.8%** (32/297) |
 | `html/` | 5,403 | 2,520 | 165 | **6.5%** (165/2,520) |
 | **combined** | **5,962** | **2,817** | **197** | **7.0%** (197/2,817) |
-| `css/` | 26,614 | - | - | **cannot be run** - `testcss.js` is an iframe driver |
+| `css/` | 26,614 | - | - | **cannot be run** - `testcss.js` is an iframe driver; nested contexts exist, but iframe documents are not painted |
 
 Also in that run: 31 errored, 8,060 skipped, **0 passes with zero assertions evaluated**, and 1,684
 tests with no assertion site at all - reported, never scored.

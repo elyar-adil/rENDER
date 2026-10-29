@@ -12,13 +12,21 @@ echo "==> cargo clippy --workspace --all-targets -- -D warnings"
 cargo clippy --workspace --all-targets -- -D warnings
 
 echo "==> site neutrality gate self-test"
-python tools/check_site_neutrality_test.py
+python3 tools/check_site_neutrality_test.py
 
 echo "==> site neutrality"
-python tools/check_site_neutrality.py
+python3 tools/check_site_neutrality.py
 
 echo "==> cargo test --workspace"
 cargo test --workspace
+
+# The full pinned test262 suite is too slow in the debug profile: the generated
+# RegExp property-escape files exceed the per-file timeout even though they pass
+# in release. It is ignored by the workspace test and measured here, where the
+# pass count is comparable with the checked-in baseline.
+echo "==> test262 conformance gate (release)"
+cargo test --release -p render-core --test test262 \
+  pinned_test262_manifest_reports_a_real_baseline -- --ignored --exact --nocapture
 
 # The acceptance harness is the project's only measurement instrument, so a gate that does
 # not run it is a gate that cannot tell whether a change helped. It is a separate workspace
@@ -28,7 +36,7 @@ cargo test --workspace
 # docs/visual_fidelity_gaps.md. They are not noise to be cleared - they are the list of
 # what this engine cannot yet do, and they stop being ignored as each gap closes.
 echo "==> acceptance harness, static gate"
-python tests/test_real_site_capabilities.py
+python3 tests/test_real_site_capabilities.py
 
 echo "==> acceptance harness, contract"
 cargo test --manifest-path tests/real_site_tasks/Cargo.toml

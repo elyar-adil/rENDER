@@ -18,7 +18,7 @@ use crate::css::computed::{
     compute_document_styles_with_hints,
 };
 use crate::css::properties::TypedPropertyValue;
-use crate::css::selector::MatchContext;
+use crate::css::selector::{InteractionState, MatchContext};
 use crate::css::stylesheet::{Declaration, StyleSheet, StyleSheetDiagnostic, parse_stylesheet};
 use crate::dom::{Dom, DomRevision, ElementData, Namespace, Node, NodeId, NodeKind};
 use crate::html::{HtmlParseError, QuirksMode, parse_document_with_scripting};
@@ -1048,9 +1048,12 @@ impl Document {
             self.quirks_mode,
             options,
             backends,
-            None,
-            &ExternalStyleSheets::default(),
-            None,
+            RenderEnvironment {
+                base_url: None,
+                external: &ExternalStyleSheets::default(),
+                images: None,
+                interaction: &InteractionState::default(),
+            },
         )
     }
 
@@ -1066,9 +1069,12 @@ impl Document {
             self.quirks_mode,
             options,
             backends,
-            None,
-            &ExternalStyleSheets::default(),
-            Some(images),
+            RenderEnvironment {
+                base_url: None,
+                external: &ExternalStyleSheets::default(),
+                images: Some(images),
+                interaction: &InteractionState::default(),
+            },
         )
     }
 
@@ -1117,9 +1123,12 @@ impl Document {
             self.quirks_mode,
             options,
             backends,
-            Some(base_url),
-            external,
-            None,
+            RenderEnvironment {
+                base_url: Some(base_url),
+                external,
+                images: None,
+                interaction: &InteractionState::default(),
+            },
         )
     }
 
@@ -1132,14 +1141,43 @@ impl Document {
         external: &ExternalStyleSheets,
         images: &ImageResources,
     ) -> DocumentRenderOutput {
+        self.render_with_interaction(
+            options,
+            backends,
+            base_url,
+            external,
+            images,
+            &InteractionState::default(),
+        )
+    }
+
+    /// Renders with the host's current dynamic-pseudo-class state.
+    ///
+    /// `interaction` supplies `:hover`, `:active`, `:focus` (and its
+    /// `-visible`/`-within` forms) and `:target`. The viewport, quirks mode,
+    /// selection scope and pseudo-element stay owned by the render pipeline,
+    /// so a frontend cannot accidentally override them.
+    #[must_use]
+    pub fn render_with_interaction(
+        &self,
+        options: DocumentRenderOptions,
+        backends: DocumentBackends<'_>,
+        base_url: &Url,
+        external: &ExternalStyleSheets,
+        images: &ImageResources,
+        interaction: &InteractionState,
+    ) -> DocumentRenderOutput {
         render_dom(
             &self.dom,
             self.quirks_mode,
             options,
             backends,
-            Some(base_url),
-            external,
-            Some(images),
+            RenderEnvironment {
+                base_url: Some(base_url),
+                external,
+                images: Some(images),
+                interaction,
+            },
         )
     }
 
@@ -1190,14 +1228,20 @@ pub struct DocumentRenderOutput {
     pub diagnostics: DocumentRenderDiagnostics,
 }
 
+#[derive(Clone, Copy)]
+struct RenderEnvironment<'a> {
+    base_url: Option<&'a Url>,
+    external: &'a ExternalStyleSheets,
+    images: Option<&'a ImageResources>,
+    interaction: &'a InteractionState,
+}
+
 fn render_dom(
     dom: &Dom,
     quirks_mode: QuirksMode,
     options: DocumentRenderOptions,
     backends: DocumentBackends<'_>,
-    base_url: Option<&Url>,
-    external: &ExternalStyleSheets,
-    images: Option<&ImageResources>,
+    environment: RenderEnvironment<'_>,
 ) -> DocumentRenderOutput {
     let stage_timing = std::env::var_os("RENDER_STAGE_TIMING").is_some();
     let mut stage_mark = std::time::Instant::now();
@@ -1224,12 +1268,16 @@ fn render_dom(
         viewport_width: Some(options.layout.viewport.width),
         viewport_height: Some(options.layout.viewport.height),
         quirks_mode: is_quirks_mode(quirks_mode),
+        focused: environment.interaction.focused,
+        target: environment.interaction.target,
+        hovered: environment.interaction.hovered.clone(),
+        active: environment.interaction.active.clone(),
         ..MatchContext::default()
     };
     let collected = collect_author_style_sheets(
         dom,
-        base_url,
-        external,
+        environment.base_url,
+        environment.external,
         options.document_limits,
         &match_context,
     );
@@ -1261,8 +1309,8 @@ fn render_dom(
     let inline_svg = discover_inline_svgs_with_colors(dom, ImageLimits::default(), |node| {
         computed_text_color(&styles, node)
     });
-    let (inline_images, inline_svg_diagnostics) = with_inline_svgs(images, &inline_svg);
-    let images = inline_images.as_ref().or(images);
+    let (inline_images, inline_svg_diagnostics) = with_inline_svgs(environment.images, &inline_svg);
+    let images = inline_images.as_ref().or(environment.images);
     stage_elapsed("inline-svg", &mut stage_mark);
     let formatting = build_formatting_tree(dom, &styles, &options.formatting_limits);
     stage_elapsed("formatting", &mut stage_mark);
@@ -1790,11 +1838,12 @@ fn style_bytes_diagnostic(node: NodeId) -> DocumentDiagnostic {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthorStyleSlot, AuthorStyleSource, Document, DocumentDiagnosticCode, DocumentLimits,
-        DocumentRenderOptions, DocumentRenderOutput, ExternalStyleSheetKey, ExternalStyleSheets,
+        AuthorStyleSlot, AuthorStyleSource, Document, DocumentBackends, DocumentDiagnosticCode,
+        DocumentLimits, DocumentRenderOptions, DocumentRenderOutput, ExternalStyleSheetKey,
+        ExternalStyleSheets,
     };
     use crate::css::computed::ComputedValue;
-    use crate::css::selector::{MatchContext, parse_selector_list, select_all};
+    use crate::css::selector::{InteractionState, MatchContext, parse_selector_list, select_all};
     use crate::dom::{Dom, NodeId, NodeKind};
     use crate::image::{DecodedImage, ImageLimits, ImageResources, discover_images};
     use crate::layout::{FragmentKind, PhysicalPoint, PhysicalSize};
@@ -1871,6 +1920,95 @@ mod tests {
             )
         }));
         assert!(render.diagnostics.document.is_empty());
+    }
+
+    /// The selector engine has always read `MatchContext`'s dynamic fields,
+    /// but every rendering entry point used to build that context with only a
+    /// viewport and quirks mode. This exercises the host seam end to end:
+    /// the same document must paint the base declaration with no interaction,
+    /// and each supplied state must reach the cascade under its pseudo-class.
+    #[test]
+    fn host_interaction_state_reaches_dynamic_pseudo_class_cascade() {
+        let document = Document::parse(
+            "<!doctype html><style>\
+             #target { color: rgb(1, 1, 1) }\
+             #target:hover { color: rgb(2, 2, 2) }\
+             #target:active { color: rgb(3, 3, 3) }\
+             #target:focus { color: rgb(4, 4, 4) }\
+             #target:target { color: rgb(5, 5, 5) }\
+             #parent:focus-within #child { color: rgb(6, 6, 6) }\
+             </style><div id=parent><div id=target tabindex=0></div>\
+             <span id=child></span></div>",
+        );
+        let base_url = Url::parse("https://example.test/index.html").expect("base URL");
+        let external = ExternalStyleSheets::default();
+        let images = ImageResources::default();
+        let target = target_id(document.dom(), "#target");
+        let render = |interaction: &InteractionState| {
+            document.render_with_interaction(
+                DocumentRenderOptions::default(),
+                DocumentBackends {
+                    text_measurer: &crate::layout::SimpleTextMeasurer,
+                    text_shaper: &crate::paint::ReferenceTextShaper,
+                    glyph_masks: &crate::paint::NoGlyphMasks,
+                },
+                &base_url,
+                &external,
+                &images,
+                interaction,
+            )
+        };
+
+        let idle = InteractionState::default();
+        assert_eq!(
+            typed_css(&document, &render(&idle), "#target", "color"),
+            "rgb(1, 1, 1)"
+        );
+
+        for (interaction, expected) in [
+            (
+                InteractionState {
+                    hovered: [target].into_iter().collect(),
+                    ..InteractionState::default()
+                },
+                "rgb(2, 2, 2)",
+            ),
+            (
+                InteractionState {
+                    active: [target].into_iter().collect(),
+                    ..InteractionState::default()
+                },
+                "rgb(3, 3, 3)",
+            ),
+            (
+                InteractionState {
+                    focused: Some(target),
+                    ..InteractionState::default()
+                },
+                "rgb(4, 4, 4)",
+            ),
+            (
+                InteractionState {
+                    target: Some(target),
+                    ..InteractionState::default()
+                },
+                "rgb(5, 5, 5)",
+            ),
+        ] {
+            assert_eq!(
+                typed_css(&document, &render(&interaction), "#target", "color"),
+                expected
+            );
+        }
+
+        let focused = InteractionState {
+            focused: Some(target),
+            ..InteractionState::default()
+        };
+        assert_eq!(
+            typed_css(&document, &render(&focused), "#child", "color"),
+            "rgb(6, 6, 6)"
+        );
     }
 
     #[test]

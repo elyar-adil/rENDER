@@ -112,8 +112,9 @@ HTTP/1.1 - the same protocol the engine speaks. It was never an HTTP/2 compariso
 
 The new sheet contains `a:visited`, and that rule is inert: `:visited` reads
 `MatchContext::visited_links` (`render-css/src/selector.rs:1330`) and that set is never
-populated. See S16. This is a missing feature that degrades quietly rather than a
-page-breaking defect - a browser with no history also shows nothing visited.
+populated. S16 records why that set stays empty while the other dynamic pseudo-classes
+are wired. This is a missing feature that degrades quietly rather than a page-breaking
+defect - a browser with no history also shows nothing visited.
 
 `a:link`, by contrast, **does** work, and it carries most of the value here. `:link` is
 matched structurally at `render-css/src/selector.rs:1326-1329` - an `a`, `area` or `link`
@@ -149,55 +150,38 @@ diagnostic explaining it.
 
 ---
 
-## S1 - The typographic axis is structurally missing (highest impact)
+## S1 - Closed: the typographic axis is carried end to end
 
-`crates/render-layout/src/solver/mod.rs:33`
+`TextStyle` no longer carries only `font_size` and `line_height`. It carries a
+`FontRequest<'a>` (`crates/render-layout/src/font.rs:108-118`):
 
 ```rust
-pub struct TextStyle {
-    pub font_size: f32,
-    pub line_height: f32,
+pub struct FontRequest<'a> {
+    pub family: &'a str,
+    pub weight: u16,
+    pub style: FontStyle,
+    pub synthesis: FontSynthesis,
 }
 ```
 
-**Scope correction, found later:** this is a **three**-crate change, not two. S1 originally
-named `render-layout` and `render-browser`. It is also `render-core`, because
-`crates/render-core/src/interaction/hit_test.rs:903` builds `TextStyle` as a struct literal
-in production code, so adding a field breaks it.
-`crates/render-browser/src/font_backend.rs` only *reads* fields, so it is unaffected by the
-field addition itself.
+The cascade resolves `font-family`, `font-weight` (including `bolder`/`lighter`)
+and `font-style` into that request, and the same request reaches layout, the
+display list, hit testing and the font backend. `render-browser/src/font_backend.rs`
+selects a face by family, then style, then weight, synthesises bold/oblique when
+the family has no matching face, and keeps measure and paint on the same
+resolved instance. The tests that pin this are the `font_matching` and
+`font_backend` families in that crate, including the nine-step weight search,
+the oblique-angle rules, `font-synthesis: none`, and
+`the_face_measured_is_the_face_painted`.
 
-A second, smaller finding from the same round: the letter- and word-spacing work needed a
-place to carry its values, and could not extend `TextStyle` for the reason above. It went
-around the problem in a way worth keeping - a sibling `TextSpacing` type, plus a
-**defaulted** `TextMeasurer::measure_spaced` whose default computes spec-correct advances.
-`font_backend` implements only `measure`, so it inherits the default and gets correct
-tracking with no change in that crate. That is the right shape for the S1 change to follow:
-a defaulted method extends the seam without breaking the one implementor.
+What this does not mean: `@font-face` URL fetching on a real page is still a
+staged integration boundary (the store and install paths exist, the browser
+fetch plan does not), and the font backend still does not implement every
+synthesis corner. Those are tracked under the webfont gaps, not under S1.
 
-There is no `font_weight`, no `font_style`, no `font_family`. The data reaches the
-style map and is then dropped one metre from the glyphs:
-
-- `crates/render-css/src/cascade.rs:833-838` writes `font-style`, `font-weight` and
-  `font-family` into the text style handed to the measurer/shaper/painter.
-- `crates/render-layout`'s `TextStyle` has no field to receive them.
-- `crates/render-browser/src/font_backend.rs:33-43` loads exactly **one** font per
-  fallback candidate group (it `break`s on the first success) and
-  `font_backend.rs:57-63` picks a font purely by glyph coverage, ignoring weight and
-  style entirely.
-
-Consequences, all of them unconditional:
-
-- **Bold is physically impossible.** `<b>`, `<strong>`, `font-weight: 700` and every
-  heading render at regular weight.
-- **Italic is physically impossible.**
-- **`font-family` is ignored.** A page asking for `PingFang SC` / `Microsoft YaHei` /
-  `sans-serif` gets whichever font the backend happened to load first.
-
-Fixing this requires `TextStyle` to carry the three values, the `TextMeasurer` /
-`TextShaper` / `TextPainter` traits to pass them, and the backend to select a face by
-`(family, weight, style)` instead of coverage alone. It spans `render-layout` and
-`render-browser`, so it is sequenced after the agents that own those crates.
+The historical audit that found this gap is kept in git history; the old claim
+that `TextStyle` had no field for the axis is no longer true and should not be
+quoted as current.
 
 ## S2 and S3 - closed
 
@@ -213,47 +197,53 @@ obvious. `box-shadow`, `object-fit` and `contain` are consumed in
 `crates/render-layout/src/solver/table.rs`. A property being in that list is the only
 evidence that it works - the absence of a diagnostic is not evidence that it does not.
 
-## S16 - Dynamic pseudo-class state is never populated
+## S16 - CLOSED: dynamic pseudo-class state is populated
 
-This one is a complete capability seam that is simply not wired, which makes it cheap
-relative to its effect.
+The selector engine always had the state. `MatchContext` in
+`crates/render-css/src/selector.rs` carries `focused`, `target`, `hovered`, `active` and
+`visited_links`, and the matcher reads them in the pseudo-class arms (`PseudoClass::Visited`,
+`Hover`, `Active`, `Focus`/`FocusVisible`, `FocusWithin`, `Target`). The gap was that every
+production construction site left them empty, so a rendered page saw `:hover`, `:active`,
+`:focus`, `:focus-within` and `:target` never match. An older report had the opposite bug and
+claimed they always matched; that was corrected by making the default non-matching, not by
+wiring the state.
 
-The selector engine has the state. `MatchContext`
-(`crates/render-css/src/selector.rs:285-293`) carries `focused`, `target`, `hovered`,
-`active` and `visited_links`, and the matcher reads all of them - `:hover` at `:1349`,
-`:visited` at `:1330`, `:focus`/`:focus-visible` at `:1342`.
+### What now carries the state
 
-Nothing ever fills them in. The page pipeline constructs the context with viewport
-dimensions only:
+- `render_css::selector::InteractionState` names only the host-owned inputs: `hovered`,
+  `active`, `focused` and `target`. It is deliberately narrower than `MatchContext`, so a
+  frontend cannot override viewport, quirks mode, scope or pseudo-element selection.
+- `Document::render_with_interaction` seeds the cascade from that state, and the older render
+  entry points delegate with the default empty state
+  (`crates/render-core/src/document.rs:1161`).
+- `crates/render-browser/src/interaction_state.rs` derives ancestor chains for
+  `:hover`/`:active`, looks up `:target` by percent-decoded fragment (`id`, then `<a name>`),
+  and supplies the initial interaction state for a loaded document (fragment target, no hover
+  or focus yet).
+- `PageState` stores the state, mirrors focus changes made by script through
+  `sync_focused_from_dom`, and `FullPageRenderPayload` carries it into the worker.
+- The shell updates it from real input: pointer movement and leave, primary press and release,
+  click focus for focusable content, the page text editor, history URL changes, and a full
+  `:target` recomputation on every full frame.
 
-```rust
-// crates/render-core/src/document.rs:808-812
-&MatchContext {
-    viewport_width: Some(options.layout.viewport.width),
-    viewport_height: Some(options.layout.viewport.height),
-    ..MatchContext::default()
-},
-```
+Evidence: `crates/render-core/src/document.rs:1931` renders one document twice and asserts the
+computed colors for `:hover`, `:active`, `:focus`, `:focus-within`, `:target` and their
+non-matching defaults. Browser coverage is
+`crates/render-browser/src/app_tests.rs:1926` (pointer move/press/release/focus cycle),
+`:2001` (fragment changes through `pushState`/`replaceState`) and `:2040` (all four inputs
+reach a full-frame payload), plus the helper tests in `interaction_state.rs`.
 
-So on a real page `:hover`, `:active`, `:focus`, `:focus-visible`, `:focus-within`,
-`:target` and `:visited` never match. Consequences: no hover-revealed dropdown or
-flyout, no hover underline or button state, no focus ring for keyboard navigation, and
-no fragment-target highlight.
+### Remaining limits, not hidden by the closure
 
-Note the history here, because it is a trap: an older report claimed these pseudo-classes
-*always* matched, which was wrong in the opposite direction and made every `:hover` style
-show permanently. They now never match without state, which is the correct default but
-still not the correct behaviour. The fix is not in the selector engine at all:
-
-- `DocumentRenderOptions` (or an equivalent seam) must accept the interaction state.
-- `render-browser` must derive `hovered` from the pointer position - it already has hit
-  testing in `crates/render-core/src/interaction/hit_test.rs` - and set `focused` from
-  keyboard focus.
-- A state change must schedule a style/layout/paint invalidation, which
-  `crates/render-core/src/invalidation.rs` exists to do.
-
-`:link` is explicitly **not** affected: it is matched structurally from the tag name and
-the `href` attribute, so link colour and underline already work.
+- `:visited` still never matches: `visited_links` is empty because the shell does not expose
+  visited-link history. This is the privacy-sensitive pseudo-class, not a missing parser arm.
+- `:focus-visible` is currently an alias of `:focus`. A pointer click on a button therefore
+  matches it, where the spec would not; text inputs are always focus-visible, so the common
+  input case is right.
+- Tab/Shift-Tab are not routed to `render_core::interaction::advance_sequential_focus` yet.
+  Script `focus()`/`blur()` and click focus do update the focused area and `:focus`.
+- A host click sets `document.activeElement`, but focus/blur/focusin/focusout events are only
+  fired by the script `focus()`/`blur()` path, not by the click path.
 
 ## S4 - Partly closed: the silent discard is now reported; evaluation is not implemented
 
@@ -318,9 +308,9 @@ and weight lands, "parsed but not evaluated yet" becomes visible on 223 blocks p
 so a parse-only half-feature would be a lie the diagnostics themselves would expose.
 
 The real work needs `render-net` (font file fetching), face registration and glyph
-rasterisation, and an animation clock. `@font-face` evaluation is now correctly sequenced behind
-S1, because the backend it needs to register faces with is the one S1 makes select by
-`(family, weight, style)`.
+rasterisation, and an animation clock. `@font-face` evaluation is no longer blocked by S1:
+the backend now selects by `(family, weight, style)`, so the remaining work is fetching and
+registering faces into that existing selection path.
 
 ## S4b - Closed: `@supports` is evaluated, and it was lying in a way that looked fine
 
@@ -741,10 +731,11 @@ having.
 The two notes for `css.font-face` and `css.animations` are now stale in one respect - "no
 diagnostic is reported" is false as of S4. Their `Missing` status is still correct.
 
-## S32 - The name table claims globals that do not exist, and `DOMException` makes every Web API error the wrong type
+## S32 - The name table claims globals that do not exist; `DOMException` is now real
 
 Two findings from the round that closed most of S10. Both are classes rather than incidents, which
-is what makes them worth their own entries.
+is what makes them worth their own entries. **Status: the `DOMException` half is closed;** the
+name-table audit remains the rule for the rest of the surface.
 
 ### The false-claim class
 
@@ -766,22 +757,21 @@ genuinely dead left over from a removed feature.
 removing a claim is legitimate where removing a feature is not. The project's rule is that gaps
 move forward; making a false claim honest is not moving a gap anywhere.
 
-### `DOMException` is absent, so every Web API error is the wrong type
+### `DOMException` was absent; it is now a real interface object
 
-`DataCloneError` had to be implemented as a plain `Error` with `name === "DataCloneError"` "because
-this engine has no `DOMException`". That generalises: **`DataCloneError`, selector `SyntaxError`,
-`QuotaExceededError`, `InvalidStateError`, `NotFoundError`, `AbortError` and `SecurityError` are
-all currently plain `Error`s.**
+`DataCloneError` used to be a plain `Error` with `name === "DataCloneError"` "because this engine
+has no `DOMException`". That generalised: `DataCloneError`, selector `SyntaxError`,
+`QuotaExceededError`, `InvalidStateError`, `NotFoundError`, `AbortError` and `SecurityError` were
+all plain `Error`s, so `e instanceof DOMException` was false for every Web API error this engine
+raised - and that is the idiom real code branches on.
 
-The consequence is not cosmetic. The common idioms are `e instanceof DOMException` and
-`e.name === "NotFoundError"`, and **`instanceof DOMException` is false for every Web API error this
-engine raises.** Real code branches on exactly that.
-
-So this needs the interface per WebIDL - `name` per error type, the legacy `code` member, the
-standard members, correct `instanceof` behaviour, and the fact that its heritage is `Error` while
-the specification's own heritage rules still do not make it an `Error` - and then an **enumerated**
-decision per error type about migrating. Half of them silently left as `Error` would be the
-failure mode; an explicit list with reasons is fine.
+The interface is now implemented per WebIDL §4.4: `builtins/dom_exception.rs` holds the
+constructor, the `name`/`message`/`code` accessors and one helper every migrated throw site calls;
+`value.rs` installs the interface with `DOMException.prototype -> Error.prototype` and the legacy
+code table. The migration is **enumerated** rather than wholesale: `DomExceptionName` has a variant
+only where a live engine throw site produces that name, so an unused variant is a false claim and
+the compiler can police additions. `instanceof DOMException` and `e.name === "NotFoundError"` now
+both answer correctly.
 
 ### Also closed this round, with expectations measured against Node first
 
@@ -1018,74 +1008,48 @@ It also paid for itself immediately: the control **caught two bugs in the checke
 implementation** - an empty allow-list that flagged every element, and a `has_foreign_root` test
 made vacuous by an `||` - that would have produced **19,800 phantom findings**.
 
-## S34 - There is no line-breaking algorithm at all, and the intrinsic-width path assumes whitespace exists
+## S34 - Line breaking: UAX #14 is implemented; the remaining absences are named
 
-Found by grepping for something nobody had looked at, the same way S24 (form owner) was found. It
-is recorded here at the top of the register because **it lands on the language this project's entire
-corpus is written in**, and because the second half is a plain bug rather than a missing feature.
+**Status: closed in the core algorithm.** This section originally recorded a per-character wrap
+default and a `min_content_width` that split on whitespace. Both are gone:
+`crates/render-layout/src/linebreak/mod.rs` implements UAX #14 and the solver consumes it.
 
-### Every character is a wrap opportunity
+### What is implemented
 
-`crates/render-layout/src/solver/inline.rs:1192`: text is exploded with `for character in
-text.chars()`, and each character's `wrap_allowed` comes from nothing but `white-space` being
-`nowrap` or not (`inline.rs:1187-1191`). There is no break-opportunity computation anywhere - the
-Unicode line breaking algorithm (UAX #14) has zero occurrences in the tree, as do `kinsoku`,
-`LineBreak`, UAX #9 and bidi.
+- UAX #14 §6.1's non-tailorable rules `LB1`-`LB12a`, and §6.2's tailorable rules `LB13`-`LB31` for
+  the classes the engine distinguishes, including Hangul `LB26`/`LB27`, regional-indicator pairs
+  `LB30a` and emoji modifiers `LB30b`.
+- CSS Text 3 §5.1's `word-break` (`normal`, `break-all`, `keep-all`) and §5.2's `line-break`
+  (`auto`, `loose`, `strict`, `anywhere`) feed the same break-opportunity computation
+  (`solver/inline.rs::line_break_options`).
+- Kinsoku shori is a class resolution over `line-break`, not a second pass: a forbidden position
+  is simply not an opportunity.
+- `min_content_width` and the inline-sequence intrinsic measurement use
+  `linebreak::widest_unbreakable_run`, so an unspaced CJK run is measured per character and a
+  `<br>`-separated sequence takes the widest line, not the sum.
+- Tests: `linebreak/tests.rs` (the UAX #14 rules and CSS tailorings) and
+  `solver/linebreak_tests.rs` (line filling and intrinsic widths through the layout pipeline).
 
-What that costs, stated per script:
+### What is deliberately absent
 
-- **CJK: wrapping is right by accident.** Breaking between any two Han characters is correct, so
-  greedy filling produces acceptable line breaks for Chinese text. The engine gets this for the
-  wrong reason, which means it will get it wrong the moment the wrong reason stops holding - for
-  example at a mixed Han/Latin boundary, or inside a run containing punctuation.
-- **CJK: kinsoku shori is absent, and this is a visible defect.** No forbidden line-start or
-  line-end characters are respected, so closing brackets, full stops, commas and other trailing
-  punctuation can begin a line, and opening brackets can end one. On a Chinese page that reads as
-  broken typesetting, and it is the single most recognisable CJK layout error there is.
-- **Latin: long words break mid-word.** Greedy filling means ordinary text happens to break at
-  spaces, so this is invisible until a single word exceeds the line - at which point browsers with
-  `overflow-wrap: normal` would have overflowed instead. The engine breaks instead, and it also
-  breaks inside a word when hyphenation should apply and does not.
+These are absences, not approximations; the module header names each one so a future reader does
+not mistake a default class for a decision:
 
-### The intrinsic-width path is a plain bug for unspaced text
+- Rule `LB28a`'s Brahmic orthographic syllables (`AK`, `AP`, `AS`, `VI`, `VF`) resolve to `AL`,
+  because keeping a syllable together needs a syllable segmenter.
+- `SA` dictionary breaking for Thai, Lao, Khmer and Myanmar resolves to `AL`, because there is no
+  dictionary.
+- The `QU` sub-classes `Pi`/`Pf` are treated as one class, so a quotation mark is not split from
+  its neighbours unless both are East Asian.
+- The optional §5.2 tailorings (no break between `!`/`/`/`|` and a letter) are not taken, and
+  there is no CLDR tailoring. `line-break: auto` is `normal`; it does not vary with line length.
 
-`crates/render-layout/src/solver/inline.rs:1495`: `min_content_width` computes the widest of
-`text.split_whitespace()`. **CJK text has no whitespace**, so an unspaced Chinese run is treated as
-**one unbreakable word** and its min-content width is the width of the entire run.
+**Bidi (UAX #9) remains absent**, so right-to-left scripts still lay out left-to-right. That is a
+separate, larger algorithm and is recorded rather than approximated.
 
-CSS 2.1 §10.3.5 defines min-content as the widest unbreakable run, and for unspaced scripts the
-unbreakable run is a single character, not a whole paragraph. So **any Chinese element with an
-intrinsic width - `width: min-content`, `width: max-content`, a shrink-to-fit float, an auto-width
-table column, a flex item - gets a width derived from the whole paragraph instead of from one
-character.** That is a wrong used value on a public geometry helper, and intrinsic widths feed
-tables, floats, inline-blocks and the sticky constraint alike.
-
-This is the same class as the phantom right margin found in the same crate recently: a fall-through
-arm doing the wrong thing for a case the author did not consider, visible only on the script the
-test corpus is not written in.
-
-### What implementing it actually requires
-
-Not "add UAX #14". Three separable pieces, and the order matters because the first is a bug fix
-and the other two are features:
-
-1. **Fix `min_content_width` for unspaced runs** - treat a run with no break opportunity as
-   per-character rather than whole-run. Small, self-contained, and it is a correctness fix rather
-   than a feature.
-2. **A break-opportunity computation** replacing the per-character default, implementing the line
-   breaking algorithm's interaction classes at least for the scripts in play. `white-space`,
-   `word-break` (`normal` / `break-all` / `keep-all`) and `line-break` (`strict` / `loose` / `anywhere`)
-   all feed it, and all three are currently inert except `nowrap`.
-3. **Kinsoku shori** - forbidden line-start and line-end classes, which is what makes Chinese
-   typesetting correct rather than merely non-overflowing.
-
-There is also **no bidi at all** (UAX #9, zero occurrences), so right-to-left scripts are laid out
-left-to-right. That is a separate and larger item, and given the corpus it is correctly lower
-priority than the three above - but it should be recorded rather than rediscovered.
-
-**Untested either way**: this is the kind of gap whose absence is invisible until a page in the
-target script is rendered, and the acceptance harness's five fixtures do not currently include an
-unspaced CJK paragraph in an intrinsically-sized box.
+**What is still not covered by a test**: the acceptance harness's fixtures do not include an
+unspaced CJK paragraph in an intrinsically-sized box, so the intrinsic-width path is pinned by
+unit tests rather than by a real-page fixture.
 
 ## S35 - `scripting_enabled` is a flag that cannot be validated, and flipping it produces exactly the bare-text symptom still being chased
 
@@ -1246,8 +1210,8 @@ rather than about the web.
 
 Measured over the combined corpus, with every "cannot" a zero cross-checked by two instruments:
 
-- **can exercise:** S1, S4, S4b, S6 stacking, S8, S10, S13 scroll containers, S14, S16 (mechanism
-  only), S19, S22, S26
+- **can exercise:** S4, S4b, S6 stacking, S8, S10, S13 scroll containers, S14, S16's selector
+  mechanism (the corpus has no interaction recording; browser tests cover host state), S19, S22, S26
 - **partial:** S5, S24 (the S6 multi-column measurement predates its implementation; see S6)
 - **cannot:** S7 quirks mode (no doctype-less page), S11 nested browsing contexts (no captured
   iframe `src`), S13 Selection/Range (no interaction recording), S18 device pixel ratio, and S24's
@@ -1350,23 +1314,19 @@ Enumerated from the 117 globals registered in `crates/render-js/src/value.rs`.
 
 Present: `Proxy`, `Reflect`, `URLSearchParams`, `navigator`, `location`, `history`,
 `screen`, `IntersectionObserver`, `MutationObserver`, `queueMicrotask`, `atob`, `btoa`,
-`Blob`, `fetch`/XHR, and - as of the ToObject round - **`localStorage` and
-`sessionStorage`**, which were the worst omission in this table.
+`Blob`, `fetch`/XHR, `localStorage`/`sessionStorage`, `TextEncoder`/`TextDecoder`,
+`structuredClone`, `FormData`, `DataView`, `BigInt`, `Atomics`, `crypto` (`getRandomValues`,
+`randomUUID`), `MessageChannel`, `BroadcastChannel`, `WeakRef`, `FinalizationRegistry`,
+`attachShadow`/`ShadowRoot`, and autonomous `customElements`.
 
 Absent:
 
 | Missing | Why it matters |
 | --- | --- |
-| ~~`localStorage`, `sessionStorage`~~ **now implemented** | Was the top item: read at startup by a large share of production bundles and by essentially every analytics and anti-bot script, so a missing global threw a `ReferenceError` and killed the page's main script before it rendered anything. It was the last blocker standing between the qq.com main bundle and completing. |
-| `FormData` | Every HTML form submission path and every `fetch`/`XHR` call that sends a body. |
-| `TextEncoder`, `TextDecoder` | Used pervasively by bundled base64/utf8 helpers. |
-| `structuredClone` | Used by current framework state handling. |
-| ~~`AbortController`, `AbortSignal`~~ **now implemented** | `AbortSignal` interface object with `abort`/`timeout`/`any`/`throwIfAborted` is in `crates/render-js/src/prelude.js`. |
 | `ResizeObserver` | Component frameworks gate layout on it. |
-| `attachShadow`, `ShadowRoot` (and `customElements` for customized built-ins) | Shadow DOM; `docs/generic-browser-todo.md` Priority 3. Autonomous `customElements` now exist (`crates/render-js/src/prelude.js`, reactions hooked from `set_member` in `runtime/eval.rs`); `attributeChangedCallback` does not fire for `classList`/`style`/`dataset`/`Attr.value` writes. |
-| `DataView` | Absent even though the whole `TypedArray` family is implemented in `runtime/builtins/typed_array.rs`. A small inconsistency in an otherwise complete area. |
-| `WebSocket`, `Worker`, `SharedWorker`, `EventSource`, `BroadcastChannel`, `MessageChannel` | No live-update or off-main-thread execution path. |
-| `indexedDB`, `Notification`, `crypto`, `PerformanceObserver`, `WebAssembly`, `ReadableStream`, `TransformStream`, `WeakRef`, `FinalizationRegistry`, `BigInt`, `Atomics` | Lower frequency on ordinary pages. |
+| Customized built-ins, declarative shadow roots (`shadowrootmode`), `slotchange`, and shadow-scoped stylesheets | The autonomous `customElements` and `attachShadow` paths exist; these are the remaining Shadow DOM pieces. `attributeChangedCallback` also does not fire for `classList`/`style`/`dataset`/`Attr.value` writes. |
+| `WebSocket`, `Worker`, `SharedWorker`, `EventSource` | No live-update or off-main-thread execution path. |
+| `indexedDB`, `Notification`, `PerformanceObserver`, `WebAssembly`, `ReadableStream`, `TransformStream` | Lower frequency on ordinary pages. |
 
 A missing global is worse than a wrong one, because it throws a `ReferenceError` at
 the point of use and takes the surrounding script with it. Every remaining entry above is a
@@ -1503,35 +1463,18 @@ must never be silently ignored, and supported CSS must never be reported as unsu
 Fix: derive the support flag from what the cascade can actually evaluate, rather than
 parsing the query a second time with weaker rules. One evaluator, one answer.
 
-## S18 - `MatchContext` is constructed exhaustively, which blocks three queued items
+## S18 - PARTLY CLOSED: the browser context is future-proof; DPR still missing
 
-`crates/render-browser/src/render_worker.rs:497-509` builds the context by naming all ten
-fields, with no `..MatchContext::default()`:
+`crates/render-browser/src/render_worker.rs` used to build `MatchContext` by naming all ten
+fields, so adding a field broke the build in the browser. It now supplies the interaction
+fields and viewport explicitly and takes the rest from `..MatchContext::default()`. S16 is
+therefore unblocked and closed above, and future context fields no longer break this site.
 
-```rust
-MatchContext {
-    scope: None, quirks_mode: ..., pseudo_element: None,
-    focused: None, target: None,
-    hovered: HashSet::new(), active: HashSet::new(), visited_links: HashSet::new(),
-    viewport_width: Some(viewport.width), viewport_height: Some(viewport.height),
-}
-```
-
-Adding a field to `MatchContext` therefore breaks the build in `render-browser`. That
-blocks, in one stroke:
-
-- **S16** - dynamic pseudo-class state. The seams exist and the matcher reads them, but
-  the state has to travel from the browser's hit test into the context, and today
-  `document.rs:808-812` only supplies viewport dimensions.
-- **Device pixel ratio in media queries.** `resolution` and the `*-device-pixel-ratio`
-  family evaluate false unconditionally - **82 occurrences in the corpus** - so
-  `@media (-webkit-min-device-pixel-ratio: 1)`, which must be *true* on any 1x display,
-  drops its rules. This needs `MatchContext.device_pixel_ratio`, and the browser already
-  knows the value from its fractional-DPI surface.
-
-The cheapest unblocking move is to add `..MatchContext::default()` at that construction
-site so future fields are non-breaking. That is a one-line change in `render-browser`
-and it converts three blocked items into unblocked ones.
+The remaining blocked item is **device pixel ratio in media queries.** `resolution` and the
+`*-device-pixel-ratio` family evaluate false unconditionally - **82 occurrences in the
+corpus** - so `@media (-webkit-min-device-pixel-ratio: 1)`, which must be *true* on any 1x
+display, drops its rules. This needs `MatchContext.device_pixel_ratio`, and the browser
+already knows the value from its fractional-DPI surface.
 
 ## S21 - Gaps the ToObject round found and deliberately left
 
@@ -2235,6 +2178,12 @@ a path literal or a test name, only the identifier and comparison forms it was w
 gate enforcing the project's hardest rule has a hole in it, and that hole is exactly where a site
 name got in.
 
+**Closed since (2026-10-22):** the two `temp_*` functions are gone, `probe.rs` is gone, and the
+gate now has `site-identifier` and `site-path` rules with must-flag self-test cases, so the hole
+this paragraph names is closed. The remaining items are
+`frame_publication_carries_node_and_url` and the two `tests/real_site_tasks` files, one of which is
+assertion-free by its own documented design.
+
 ## S30 - Structural absences: what makes this not yet a browser
 
 Separate from gaps, because these are not defects to be closed one at a time - they are
@@ -2247,17 +2196,22 @@ it is deliberately not expressed as a percentage, because the percentages were r
 | --- | --- |
 | **ES modules** | **Largely closed.** `render-js` parses import/export into tables (`src/module.rs`) and links them with live bindings (`src/runtime/module.rs`): named/default/namespace imports, re-exports, `export *`, `export * as`, cycles for hoisted declarations, `import.meta.url`, evaluate-once ordering, remembered failures. `render-core/src/module_graph.rs` assembles the graph and `render-browser/src/scripts.rs` fetches it in rounds. **Still open:** dynamic `import()` is a stub that resolves an empty object; top-level `await`; import maps (bare specifiers are diagnosed, not resolved); module code runs sloppy, not strict; a namespace object is a snapshot rather than a live exotic object; classic scripts still skip `import`/`export` instead of throwing a SyntaxError; `type=module` `async` scheduling is treated as defer; `<script type=module>` inserted after load goes through the same path as classic follow-up scripts but is untested in a live window |
 | **Web Workers** | zero occurrences of `Worker`. Bundles that offload work get nothing |
-| **`window.matchMedia`** | zero occurrences. Every responsive site that gates behaviour in script gets nothing |
 | **History API** | `pushState`/`replaceState` change the URL and `history.state` without a load. Back/forward/go within the document fire `popstate` without a load; entries of another document reload. `history.length` reflects the list at each turn's start |
 | **WebSocket / `requestIdleCallback` / `PerformanceObserver`** | absent |
-| **Iframes** | S11 - a nested document runs its scripts in its own realm, but an iframe is not painted, so its content is still invisible |
+| **Iframe painting** | S11 - a nested document runs its scripts in its own realm, but it is not laid out or painted, so embedded content is invisible |
 | **Animations and transitions** | `@keyframes` is parsed, diagnosed, and discarded - 249 blocks in the corpus. No clock, so nothing can be time-driven |
 | **Video pixel decode** | S8 - container parsing only |
 | **Selection / Range** | S13 |
-| **Shadow DOM** | no `customElements` / `attachShadow` |
-| **Form submission** | the owner relationship now exists and is derived on read, but there is **no submit event path and no navigation**, so a search box or login does not submit |
+| **Shadow-scoped styling** | shadow trees, `attachShadow` and autonomous `customElements` exist; shadow-tree stylesheets are not collected, `:host`/`::slotted` match nothing, and `slotchange` is not dispatched |
 | **HTTP/2** | structurally rejected: a pooled connection is removed from the pool while in use and `run()` holds it for the whole request, so one connection carries one in-flight request, and multiplexing is the inverse |
 | **Compositing** | there is no compositor. Every frame is a single raster of the whole document, which is why scrolling cannot be cheap and why `position: fixed` cannot be a layer |
+
+**Closed since this table was first written:** `DOMException` is a real interface object;
+`window.matchMedia` evaluates the same media-query function as the cascade and emits changes on
+viewport resize; form submission has a trusted cancelable `submit` event, GET/POST urlencoded
+navigation, a submitter, and `FormData`; line breaking is UAX #14 with the CSS tailorings (S34);
+and shadow trees, `attachShadow` and autonomous `customElements` exist, with the styling boundary
+named in the row above.
 
 **What is genuinely strong**, so the list above is not read as the whole picture: the HTML tree
 builder (120 tests, foreign content, template inertness, the adoption agency with the spec's own
@@ -2267,9 +2221,11 @@ worked examples, form owner derived on read); the CSS cascade and selector match
 tests, synthetic bold and oblique); network phase budgets and connection reuse; and a JS engine
 that completes a 2.27 MB production bundle.
 
-**The shape of the remaining distance is not a long tail.** It is roughly a dozen architectural
-absences above, of which ES modules, `matchMedia` and form submission are the three that would
-break the largest number of real pages per unit of work.
+**The shape of the remaining distance is not a long tail.** It is the architectural absences
+above, of which animations and transitions, iframe painting, shadow-scoped styling, selection and
+bidi are the ones that would break the largest number of real pages per unit of work. Dynamic
+pseudo-class state (S16) is now wired end to end; `:visited` and keyboard Tab focus remain the
+named limits there.
 
 ## S28 - OPEN: "styled but bare text" on a real page - the cause is still unknown
 
@@ -2587,8 +2543,9 @@ S2 and S3 were scheduled first because they were pure CSS with a small blast rad
 they made every site look like a page instead of a text dump. Both are now closed. The
 remaining order is:
 
-**S1**, then **S5's rendering half**, then **S12**, then S4, then S6, then S7, then S16,
-then S10.
+**S1**, then **S5's rendering half**, then **S12**, then S4, then S6, then S7, then S10.
+S16 is closed; it is kept in this register because its remaining `:visited` and keyboard-focus
+limits still schedule work.
 
 S1 has the largest visual payoff but spans `render-layout` and `render-browser`, so it is
 sequenced after the agents that own those crates finish, and it must be done as one

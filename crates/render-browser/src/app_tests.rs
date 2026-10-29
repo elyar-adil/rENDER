@@ -1075,6 +1075,8 @@ const RENDER_TEST_VIEWPORT: WindowSize<u32> = WindowSize::new(800, 560);
 struct SubmittedRender {
     generation: u64,
     carried_style_batch: bool,
+    /// Interaction state the frame's cascade saw, when the job was a full frame.
+    interaction: Option<render_core::css::selector::InteractionState>,
     /// Whether the job observed that its work was superseded before it
     /// returned.
     cancelled: bool,
@@ -1109,6 +1111,10 @@ fn gated_render_worker() -> (
                     PageRenderPayload::Full(full) => full.style_batch.is_some(),
                     PageRenderPayload::RetainedRaster { .. } => false,
                 };
+                let interaction = match &job.payload {
+                    PageRenderPayload::Full(full) => Some(full.interaction.clone()),
+                    PageRenderPayload::RetainedRaster { .. } => None,
+                };
                 // Only the first job is gated: the resubmission under test must
                 // be free to run so the test can observe the outcome.
                 if job.identity.generation == 1 {
@@ -1124,6 +1130,7 @@ fn gated_render_worker() -> (
                 log.lock().expect("render log lock").push(SubmittedRender {
                     generation: job.identity.generation,
                     carried_style_batch,
+                    interaction,
                     cancelled: cancellation.is_cancelled(),
                 });
                 let width = job.identity.viewport.width;
@@ -1913,6 +1920,159 @@ fn clicking_the_search_box_focuses_it_and_typing_renders_the_value() {
         "Enter must push a history entry for the form submission"
     );
     assert!(app.content_editor.is_none());
+}
+
+#[test]
+fn pointer_movement_and_press_update_the_pages_dynamic_state() {
+    let (mut app, tab, kw) = headless_search_app();
+    let chrome_height = app.layout.as_ref().expect("chrome layout").chrome_height;
+    app.handle_cursor_move(PhysicalPosition::new(
+        400.0,
+        f64::from(chrome_height) + 167.0,
+    ));
+
+    {
+        let page = app.pages.get(&tab).expect("page");
+        assert!(
+            page.interaction.hovered.contains(&kw),
+            "the pointer is over the search box"
+        );
+        assert!(
+            page.interaction
+                .hovered
+                .contains(&page.page.document().dom().document()),
+            "the hover chain reaches the document"
+        );
+        assert!(page.interaction.active.is_empty());
+        assert!(page.interaction.focused.is_none());
+        assert!(page.page.document().dom().focused_element().is_none());
+    }
+
+    click_search_box(&mut app);
+    {
+        let page = app.pages.get(&tab).expect("page");
+        assert!(
+            page.interaction.active.contains(&kw),
+            "the press installs the active chain"
+        );
+        assert_eq!(page.interaction.focused, Some(kw));
+        assert_eq!(
+            page.page.document().dom().focused_element(),
+            Some(kw),
+            "click focus must also be visible to document.activeElement"
+        );
+        assert!(app.content_editor.is_some());
+    }
+
+    app.handle_pointer_release();
+    {
+        let page = app.pages.get(&tab).expect("page");
+        assert!(
+            page.interaction.active.is_empty(),
+            "release ends the active chain"
+        );
+        assert_eq!(
+            page.interaction.focused,
+            Some(kw),
+            "focus outlives the press"
+        );
+    }
+
+    app.close_content_editor();
+    {
+        let page = app.pages.get(&tab).expect("page");
+        assert_eq!(page.interaction.focused, None);
+        assert_eq!(page.page.document().dom().focused_element(), None);
+    }
+
+    app.handle_cursor_move(PhysicalPosition::new(5.0, 5.0));
+    assert!(
+        app.pages
+            .get(&tab)
+            .expect("page")
+            .interaction
+            .hovered
+            .is_empty(),
+        "leaving the page clears the hover chain"
+    );
+}
+
+#[test]
+fn a_push_state_fragment_updates_the_target_pseudo_class() {
+    let (mut app, tab) = headless_app_with(
+        "<!doctype html><div id='part'></div><div id='other'></div><script>\
+         history.pushState(null, '', '#part');\
+         </script>",
+    );
+    let (part, other) = {
+        let page = app.pages.get(&tab).expect("page");
+        let dom = page.page.document().dom();
+        (find_id(dom, "part"), find_id(dom, "other"))
+    };
+    run_page_scripts(&mut app, tab);
+    app.drain_history_requests(tab);
+    assert_eq!(
+        app.pages.get(&tab).expect("page").interaction.target,
+        Some(part)
+    );
+
+    let page = app.pages.get_mut(&tab).expect("page");
+    page.page
+        .queue_script("history.replaceState(null, '', '#other');")
+        .expect("script should queue");
+    let _ = page.run_page_turns();
+    app.drain_history_requests(tab);
+    assert_eq!(
+        app.pages.get(&tab).expect("page").interaction.target,
+        Some(other)
+    );
+
+    let page = app.pages.get_mut(&tab).expect("page");
+    page.page
+        .queue_script("history.replaceState(null, '', '#missing');")
+        .expect("script should queue");
+    let _ = page.run_page_turns();
+    app.drain_history_requests(tab);
+    assert_eq!(app.pages.get(&tab).expect("page").interaction.target, None);
+}
+
+#[test]
+fn a_full_frame_payload_carries_all_host_interaction_state() {
+    let fonts = Arc::new(SystemFontBackend::load().expect("system fonts load"));
+    let (render_worker, started, log, gate) = gated_render_worker();
+    let (mut app, tab) = headless_app_with_render_worker(
+        "<!doctype html><div id='part'><input id='field'></div>",
+        render_worker,
+        fonts,
+    );
+    let (part, field) = {
+        let page = app.pages.get(&tab).expect("page");
+        let dom = page.page.document().dom();
+        (find_id(dom, "part"), find_id(dom, "field"))
+    };
+    let target = Url::parse("file:///rENDER-test-fixtures/page.html#part").expect("target URL");
+    {
+        let page = app.pages.get_mut(&tab).expect("page");
+        page.navigation.committed.target = NavigationTarget::Url(target);
+        assert!(page.set_hovered(Some(field)));
+        assert!(page.set_active(Some(field)));
+        assert!(page.set_focused(Some(field)));
+    }
+    app.schedule_page_render_for_tab(tab);
+    wait_for_renders(&started, 1);
+    release_first_render(&gate);
+    commit_until_logged(&mut app, &log, 1);
+
+    let renders = submitted_renders(&log);
+    assert_eq!(renders.len(), 1);
+    let interaction = renders[0]
+        .interaction
+        .as_ref()
+        .expect("the first frame is a full render");
+    assert_eq!(interaction.focused, Some(field));
+    assert_eq!(interaction.target, Some(part));
+    assert!(interaction.hovered.contains(&field));
+    assert!(interaction.active.contains(&field));
 }
 
 #[test]

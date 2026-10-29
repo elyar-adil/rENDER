@@ -14,7 +14,8 @@
 > `text-decoration` / `text-shadow` / list marker 的绘制接线。本文已包含这些改动并标注了
 > 它们落地的位置；`docs/visual_fidelity_gaps.md` 的 S2（UA 表 28 行）与 S3（含这三项）、
 > S5（内联 SVG 未解析）**已落后于代码**。本文的状态以各节 `path:line` 为准。
-> **S1（字体轴）仍然成立**。
+> **S1（字体轴）已关闭**：`TextStyle` 现携带 `FontRequest`，字体后端按 family/weight/style
+> 选面并合成；剩余的是 webfont 获取。
 
 > 配套文档：
 > - 通用待办（项目法）：`docs/generic-browser-todo.md`
@@ -23,6 +24,12 @@
 > - 站点侧实机诊断：`docs/qq-compatibility-analysis.md`
 > - 产品分层与迁移目标：`docs/rust_migration.md`
 > - test262 门禁：`docs/test262.md`
+>
+> **2026-10-22 状态注记**：下面的能力表仍是 2026-09-27 的快照。此后已关闭的条目包括
+> `localStorage`/`sessionStorage`、`matchMedia`、CORS、表单提交、`attachShadow`/`ShadowRoot`/
+> 自主 `customElements`、`addEventListener` 的 options、BigInt、模块依赖图与 UAX #14 换行。
+> 当前权威证据是 `docs/capability_matrix.md` 和 `docs/visual_fidelity_gaps.md`；本节表格中的
+> 红/黄状态若无 file:line 更新，应视为历史记录而不是现状。
 > - WPT 运行方式：`docs/wpt.md` —— ⚠️ 该文件第 27 行仍写
 >   `python tools/run-wpt-reftests.py`，**该脚本不存在**，真实入口见本文第 10 节
 > - 测试策略：`docs/testing_strategy.md` —— ⚠️ **该文件整体属于已删除的 Python 工程**
@@ -81,13 +88,12 @@
 > 目标：能正确渲染没有动态脚本依赖的现代页面（新闻正文、文档、博客、表单展示）。
 > 验收：WPT `html/`、`css-2d/`、`css-flexbox/` 子集有基线；`crates/render-core/tests/`
 > 下的布局/绘制回归集无已知失败。
-> **当前状态：未达成。** 阻碍不是解析或布局算法，而是**字体轴**与**伪元素**：
-> `font-weight`/`font-style`/`font-family` 无消费者（`docs/visual_fidelity_gaps.md` S1，
-> 且因为 UA 样式表现在已按 HTML §15.3 写对这些规则而更刺眼，见 3.3.1），
-> `::before`/`::after` 无盒子生成（4.1）。
-> **UA 样式表本身已不再是缺口** —— `docs/visual_fidelity_gaps.md` S2 说它是 28 行，
-> 该描述已过期；现在是 142 行的 HTML §15 表（`crates/render-core/src/document.rs:70-211`）。
-> 在字体轴修好之前，"静态文档可读"不成立，无论 WPT 数字如何。
+> **当前状态：未达成。** 解析与布局主路径已具备；字体轴（S1）已由 `TextStyle` 的
+> `FontRequest` 接线：`font-weight`/`font-style`/`font-family` 从 cascade 进入布局、
+> display list 与字体后端（见 3.3.1）。剩余阻碍是 `::before`/`::after` 无盒子生成（4.1）、
+> quirks 模式、webfont 获取，以及视觉基线尚未跑通。
+> **UA 样式表本身已不再是缺口** —— 现在是 142 行的 HTML §15 表
+> （`crates/render-core/src/document.rs:70-211`）。
 > ⚠️ 验收判据里的"`example/` 静态样本页结构断言"**目前不存在** —— `example/` 只有
 > `index.html` / `hao123.html` / `hao123_2003.html` / `hn.html` 四个 fixture，
 > 没有对应的断言测试。上一版写的 `tests/test_modern_rendering_contracts.py`
@@ -171,7 +177,7 @@
 | iframe | `<iframe>` 参与布局，作为 raw-text 元素解析（`tree_builder.rs:547`） | 子文档加载 ⛔ |
 | 交互 | `details summary`（UA 样式表给 `details > summary:first-of-type { display: list-item }`，`document.rs:210`） | `<dialog>` 模态语义 🔵：UA 样式表已给 `dialog:not([open]){display:none}` 与 `dialog{position:absolute;…}`（`document.rs:93-101`），但 `showModal()`/`close()` 与顶层渲染 🔴 |
 | 编辑 | `contenteditable` 已读入并参与交互（`crates/render-browser/src/content_interaction.rs:323`） | 完整富文本编辑 🔵 |
-| 脚本 | `<script>` `<template>` | `<script type=module>` 🟡：`render-js/src/parser.rs:583` 自述"Module declarations are intentionally lowered into the shared page"，`render-js/src/runtime/builtins/global_fns.rs:349` 自述"Module graph fetching belongs to the browser coordinator" —— 即**语法能解析、依赖图不做** 🔵 |
+| 脚本 | `<script>` `<template>` | `<script type=module>` ✅：语法解析、依赖图获取、链接与执行已由 `render-core/src/module_graph.rs` 与 `page.rs` 接入；动态 `import()` 与 import maps 仍不完整 |
 | 元数据 | `<meta charset>` `<meta http-equiv>` `<meta name=viewport>` `<base>` | 其他 meta ⛔ |
 | 链接 | `rel=stylesheet` 执行 ✅（`document.rs:987-991`）；`rel=icon` 的处理 ❓ 本次未核实 | `preload` / `preconnect` / `canonical` / `alternate` ⛔ |
 
@@ -196,7 +202,7 @@
 | 适配项 | 说明 | 对应缺口 |
 |--------|------|---------|
 | 逻辑属性全部物理化 | 规范写 `margin-block` / `padding-inline-start` / `inset-inline-start` / `border-inline-width`，布局求解器只消费物理 longhand，故逐条写物理值 | 表因此是 LTR 的；block 方向与 RTL 镜像需要先给 layout 加 `direction`（见 4.5 的 `direction: rtl` 行） |
-| 字体轴声明保留但无消费者 | `font-weight`/`font-style`/`font-family`/`small-caps`/`text-transform`/`letter-spacing`/`text-indent`/`vertical-align` 到达 computed style 后无人读 | 见 4.5 的三条 🔴 |
+| 字体轴声明已接线 | `font-weight`/`font-style`/`font-family` 进入 `FontRequest` 并由字体后端消费；`small-caps`/`text-transform`/`letter-spacing`/`text-indent` 等仍未接线 | 见 4.5 的剩余 🟡/🔴 行 |
 | `q::before`/`q::after` 不生成 | 需要 generated content，引擎不建模 | `q` 规则只保留能兑现的排版提示 |
 | quirks 规则不应用 | §15.3.9 的 margin collapsing quirks、`li` 内 `list-style-position` 默认值、表格字体重置都没做 | 见 3.5 与 S7 |
 | `dialog` 用物理 `left`/`right` | 同逻辑属性一条 | — |
@@ -212,7 +218,7 @@
 | `input` 类型 `text/password/email/url/tel/number/search/hidden/submit/reset/button/checkbox/radio` | 🟡 激活语义已实现（`crates/render-core/src/interaction.rs:1035-1060`），UA 样式表给了 `display:inline-block`、`font-size:13.3333px`、`box-sizing:border-box`、宽度/最小高度/内边距/边框，以及 `input[type=hidden]{display:none}` 与 `button`/非隐藏 `input` 的 `text-align:center`（`document.rs:74,176-187`） |
 | `input` 类型 `file/range/color/date/datetime-local/time/month/week` | ⛔ NON-GOAL |
 | 默认值 / disabled / readonly / required | 🟡 `disabled` 参与成功控件排除（`interaction.rs:891-893`）与 `:disabled` 匹配（`crates/render-css/src/selector.rs:672,1582-1592`）；未命名控件、无 `name` 控件、按钮/重置/文件/图像类型、未选中的 checkbox/radio、非 submitter 的 submit 也都正确排除（`interaction.rs:894-926`）；`readonly` / `required` 🔴 |
-| `placeholder` | 🟡 `value` 为空时树构造器合成 placeholder 文本节点（`HANDOFF.md` 2026-09-27 记录，已实测）；`:placeholder-shown` 可解析（`selector.rs:675`）但状态恒不匹配（同 S6 动态伪类问题） |
+| `placeholder` | 🟡 `value` 为空时树构造器合成 placeholder 文本节点（`HANDOFF.md` 2026-09-27 记录，已实测）；`:placeholder-shown` 按 `placeholder` 属性与 `value`/空值结构匹配（`selector.rs:1501-1505`） |
 | `<form>` 提交（GET，`application/x-www-form-urlencoded`） | ✅ 提交计划在 `interaction.rs:783-827`（含 `form` 属性关联、disabled 排除、成功控件收集），`submit` 事件可取消（`crates/render-browser/src/app.rs:2048-2069`），GET 导航在 `app.rs:3009-3017` |
 | `<form>` 提交（POST） | 🔴 传输层支持（`crates/render-net/src/transport.rs:160,274,946`），但壳过滤掉非 GET 提交（`app.rs:3009`） |
 | `multipart/form-data` | ⛔ NON-GOAL（无文件上传） |
@@ -239,8 +245,8 @@ Microdata、`is=""`、`<dialog>` 完整模态语义、Drag & Drop API、可访�
 | 后代/子/相邻/通用兄弟 组合器 | ✅ |
 | 属性选择器全集（`[a] [a=b] [a~=b] [a\|=b] [a^=b] [a$=b] [a*=b]`） | ✅ 7 种算子（`selector.rs:185-192,602-612`）+ `i`/`s` 大小写标志（`:627`）+ 匹配（`:1217-1245`） |
 | 结构伪类（`:first-child :last-child :only-child :first/last/only-of-type :nth-child :nth-last-child :nth-of-type :nth-last-of-type :empty :root`） | ✅ `selector.rs:650-664` |
-| 状态伪类（`:hover :focus :focus-visible :focus-within :active :checked :placeholder-shown :target :enabled :disabled`） | 🟡 **语法与匹配逻辑齐备，但状态从不接线。** 匹配读 `MatchContext`（`selector.rs:285-296`，`:1300-1340`）；在线渲染路径把 `focused`/`target` 置 `None`、`hovered`/`active`/`visited_links` 置空集（`crates/render-browser/src/render_worker.rs:495-508`）。结果：这些伪类**永不匹配**。这是 `docs/visual_fidelity_gaps.md` S6 同类问题的动态态版本 |
-| 链接伪类（`:link :any-link :visited`） | 🟡 可解析可匹配（`selector.rs:669-671,1309-1311`），`visited_links` 恒空 ⇒ `:visited` 永不匹配 |
+| 状态伪类（`:hover :focus :focus-visible :focus-within :active :checked :placeholder-shown :target :enabled :disabled`） | 🟡 **匹配逻辑齐备，宿主状态已接线。** `MatchContext`（`selector.rs:285-296`）由 `InteractionState`（`:309`）经 `Document::render_with_interaction`（`document.rs:1161`）注入；浏览器从指针移动/离开、主键按下/释放、点击焦点、页面输入框焦点、脚本焦点同步和 URL fragment 更新状态（`crates/render-browser/src/interaction_state.rs`、`page_state.rs:336-395`），并随 `FullPageRenderPayload` 进入 worker。`:hover`/`:active` 含祖先链，`:target` 每次全帧重算。🟡 `:focus-visible` 仍等同 `:focus`（指针点击按钮也会命中）；Tab 顺序焦点尚未接线；`:visited` 仍恒不匹配（见下一行）。 |
+| 链接伪类（`:link :any-link :visited`） | 🟡 可解析可匹配（`selector.rs:669-671,1309-1311`），`:link`/`:any-link` 正常；`visited_links` 仍恒空 ⇒ `:visited` 永不匹配（浏览器壳不暴露访问历史） |
 | 否定 `:not()`（接受选择器列表） | ✅ `selector.rs:667` |
 | `:is() :where()` | ✅ `selector.rs:665-666`（`:where()` 0 特异性） |
 | `:has()`（相对选择器） | ✅ `selector.rs:668` |
@@ -306,16 +312,16 @@ Microdata、`is=""`、`<dialog>` 完整模态语义、Drag & Drop API、可访�
 ### 4.5 文本与字体
 
 > ⚠️ 本节是当前引擎**最差的一节**。上一版把它标成 🟡 "font 基础属性"，是低估。
-> 真相是：`font-weight` / `font-style` / `font-family` 从 computed style 出发，
-> 在到达字形之前就被丢弃。
+> 字体轴不再是这个断点：`font-weight` / `font-style` / `font-family` 已经从 computed
+> style 到达字形选择。剩余端到端问题见上文的脚本/网络/时序记录。
 
 | 能力 | 状态 |
 |------|------|
 | `font-size` | ✅ `crates/render-layout/src/solver/inline.rs:575`、`solver/resolve.rs:344` |
 | `line-height` | ✅ `solver/inline.rs:580` |
-| `font-weight` | 🔴 **物理上不可能。** `crates/render-css/src/cascade.rs:833-838` 把它写进交给测量/整形/绘制的 text style，但 `crates/render-layout/src/solver/mod.rs:33-36` 的 `TextStyle` 只有 `font_size` 与 `line_height`，没有接收字段；`crates/render-browser/src/font_backend.rs:33-43` 每个候选组只加载**一个**字体就 `break`，`:57-63` 只按字形覆盖选字体。⚠️ **UA 样式表已经写对了**：`b, strong { font-weight: bolder }` 与 `h1..h6 { font-weight: bold }` 都在 `crates/render-core/src/document.rs:105,130`，而该表自己的文档注释（`document.rs:56-62`）已声明这些声明"reach the computed style but no consumer downstream of render-core reads them"。规则正确、执行无效果 |
-| `font-style` | 🔴 同上（斜体不可能）。UA 样式表已写 `cite, dfn, em, i, var, q, address { font-style: italic }`（`document.rs:91,104,125`），同样无消费者 |
-| `font-family` | 🔴 同上（被忽略）。UA 样式表已写 `code, kbd, samp, tt` 与 `listing, plaintext, pre, xmp` 的 `font-family: monospace`（`document.rs:92,106`），同样无消费者 ⇒ 等宽块与正文字体完全相同 |
+| `font-weight` | ✅ `TextStyle` 的 `FontRequest.weight` 接收 cascade 结果；字体后端按九档权重选面并在缺面时合成（见 `font_matching` 测试组）。 |
+| `font-style` | ✅ `FontRequest.style` 接收 `normal`/`italic`/`oblique`（含角度）；后端按 style 选面或合成斜体。 |
+| `font-family` | ✅ `FontRequest.family` 接收 family list；后端按列表顺序与通用族选面，等宽块不再与正文相同。 |
 | `font-stretch` / `font-variant` / `font-feature-settings` / `font-variation-settings` | 🔴/⛔ |
 | `white-space` | ✅ `solver/inline.rs:544,612` |
 | `text-align: left / right / center` | ✅ `solver/inline.rs:446-454,456-467` |
@@ -424,9 +430,10 @@ HTTP Range 与资源状态 → HTMLMediaElement 状态机 → MP4 解复用 → 
 > ⚠️ 上一版第 6.3 节写"实现层面绑定 Python `re`"、6.1 节把整个语言层标成
 > 🔵 PLANNED M2，并建议先不实现 JS 引擎。**这两条已随 Python 架构退役。**
 > rENDER 现在有自研 JS 引擎（`crates/render-js/`，无任何 JS 第三方运行时），
-> test262 门禁基线为 **30,808 / 98,096 变体通过（31.41%），264 桶，crash 22，timeout 20**
-> （`crates/render-core/tests/test262-baseline.tsv`，由 `crates/render-core/tests/test262.rs:234`
-> 的 `enforce_baseline` 把关，只查回退）。
+> test262 门禁基线为 **90,765 / 103,199 变体通过（88.0%），264 桶，crash 0，timeout 6**
+> （`crates/render-core/tests/test262-baseline.tsv`，由 `crates/render-core/tests/test262.rs`
+> 的 `enforce_baseline` 把关，只查回退）。全量门禁以 release 运行；debug 下生成的
+> RegExp property-escape 用例会触发每文件超时。
 
 ### 6.1 语言版本
 
@@ -453,8 +460,8 @@ HTTP Range 与资源状态 → HTMLMediaElement 状态机 → MP4 解复用 → 
 | TypedArray 家族 | ✅ | `runtime/builtins/typed_array.rs` |
 | `Date`（TimeClip、`toISOString`、ISO `Date.parse`、`toJSON`） | ✅ | `HANDOFF.md` 2026-09-20 |
 | **generator / async 函数体** | 🔴 **未实现。** `crates/render-js/src/parser.rs:581-583` 源码注释直陈"Treat async/generator declarations as ordinary functions. The runtime does not suspend generator frames, but accepting their syntax lets feature-detection and polyfill code load normally."。`HANDOFF.md` 2026-09-20 记录 `methods-gen-*` 一族约 1k 用例失败 |
-| `BigInt` 字面量 | 🔴 38 个字面量用例失败（`HANDOFF.md` 2026-09-20 记录） |
-| 模块（`import` / `export`） | 🟡 语法可解析（`crates/render-js/src/parser.rs:583`），依赖图与执行顺序不做（`runtime/builtins/global_fns.rs:349`） |
+| `BigInt` 字面量 | ✅ lexer/parser/value 均有 `JsBigInt`（`crates/render-js/src/lexer.rs:58-59,990-1027`）；剩余缺口见 test262 失败簇 |
+| 模块（`import` / `export`） | ✅ 语法、依赖图获取、链接与执行顺序已接入（`crates/render-core/src/module_graph.rs`、`page.rs`）；剩余失败簇见 test262 |
 | 动态 `import()` | 🟡 全局 `import` 存在（`crates/render-js/src/value.rs:1455-1462`），语义为页面内解析 |
 | 顶层 await | 🔴 |
 | `Intl.*` / `Temporal` | 🔴 各自是独立大簇，test262 大量 Syntax/Reference 失败（`HANDOFF.md`） |
@@ -481,7 +488,7 @@ HTTP Range 与资源状态 → HTMLMediaElement 状态机 → MP4 解复用 → 
 |------|------|
 | `<script>` 顺序加载 | 🟡 顺序与阻塞语义由 `crates/render-core/src/script.rs` 与 `crates/render-browser/src/scripts.rs` 承担；`app.rs` 的 `start_classic_scripts()` 是否仍以样式表完成为门控，**❓ UNVERIFIED**（`.diag/qq/GAP_REPORT.md` §2.2 记录过该缺陷） |
 | `<script async>` / `<script defer>` | 🟡 `docs/html5_gap_matrix.md` 记为待精确建模（`docs/generic-browser-todo.md` Priority 4） |
-| `<script type=module>` 依赖图 | 🔴 |
+| `<script type=module>` 依赖图 | ✅ 入口/相对说明符解析、循环检测、按轮获取与链接；失败会产生结构化诊断 |
 | 动态 `import()` | 🟡 页面内解析 |
 | Import maps | ⛔ |
 
@@ -537,11 +544,11 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 
 | API | 状态 |
 |------|------|
-| `addEventListener / removeEventListener` | 🟡 **第三个参数被完全忽略**（`runtime/builtins/events.rs:106-127` 只读 type 与 callback），故 `{ once, capture, passive }` 一律无效。冒泡 ✅（`:163-168,236,283`，最后冒泡到 window） |
+| `addEventListener / removeEventListener` | ✅ `capture`/`once`/`passive` 从第三个参数（布尔或 options 对象）解析并生效，含默认 passive 目标；冒泡到 window ✅。捕获/被动边界仍由 WPT `dom/events/` 继续校验 |
 | `Event` / `CustomEvent` 构造、`bubbles` | ✅ `events.rs:58-92`；`stopPropagation` / `stopImmediatePropagation` / `preventDefault` 🟡（`preventDefault` 驱动壳的默认动作，`crates/render-browser/src/app.rs:2048-2069`；两个 stop 方法 ❓ 未核实） |
 | 鼠标事件 `click / mousedown / mouseup / mouseover / mouseout / mousemove` | 🟡 指针事件到 DOM 事件的映射在 `crates/render-core/src/interaction/hit_test.rs`；❓ 逐类型未核实 |
 | 键盘事件 `keydown / keyup` | 🟡 焦点态在 `crates/render-dom/src/focus.rs`（可聚焦判定、`set_focused_element`、焦点修正），顺序导航在 `crates/render-core/src/interaction.rs`（`advance_sequential_focus`）；❓ JS 事件构造未核实 |
-| 表单事件 `submit / change / input / focus / blur` | 🟡 `submit` ✅（`app.rs:2048-2069`，可取消）；`focus` / `blur` / `focusin` / `focusout` ✅ 由 `focus()` / `blur()` 触发（`crates/render-js/src/runtime/builtins/focus.rs`，焦点更新步骤）；`:focus` 样式匹配仍 🔴（焦点态未写入 `MatchContext.focused`，见 4.1） |
+| 表单事件 `submit / change / input / focus / blur` | 🟡 `submit` ✅（`app.rs:2048-2069`，可取消）；`focus` / `blur` / `focusin` / `focusout` ✅ 由脚本 `focus()` / `blur()` 触发（`crates/render-js/src/runtime/builtins/focus.rs`，焦点更新步骤）；点击可聚焦内容会更新 `document.activeElement` 与 `:focus`，但**不派发** focus/blur/focusin/focusout 事件 |
 | 触摸 / Pointer Events | ⛔ |
 | Drag / Clipboard | ⛔ |
 | Composition / IME 事件 | 🟡 输入法合成状态被跟踪（`app.rs:2923,3093` 有"合成期间不提交表单"的闩锁），完整 Composition 事件 ⛔ |
@@ -556,14 +563,14 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 | `XMLHttpRequest` | 🟡 `open/send/setRequestHeader/getAllResponseHeaders/onload/onerror/responseText` 有（`fetch.rs:597-803`）；**同步 XHR 明确抛错**（`:729`：`synchronous XMLHttpRequest is not supported`）；`responseType=text\|json\|arraybuffer` ❓ 未核实 |
 | `URL` / `URLSearchParams` | ✅ `runtime/builtins/url.rs` |
 | `AbortController` / `AbortSignal` | 🟡 传输层有 `CancelToken`（`crates/render-net/src/transport.rs:1024` 的 `FetchError::Cancelled`），JS 侧 `AbortController` 🔴 |
-| CORS | 🔴 `crates/render-net/src/lib.rs:3-6` 明确自述"deliberately below browser Fetch semantics … does not own … CORS"。`Access-Control-*` 全仓库无消费 |
+| CORS | ✅ 浏览器 Fetch 层实现 simple/preflight 校验、`Access-Control-*` 允许列表与凭证规则（`crates/render-browser/src/cors.rs`）；`render-net` 传输层仍刻意低于 Fetch 语义 |
 | WebSocket / SSE / Beacon / WebTransport / WebRTC | ⛔ |
 
 ### 7.4 存储
 
 | API | 状态 |
 |------|------|
-| `localStorage` / `sessionStorage` | 🔴 反证：`crates/render-core/examples/baidu_diag.rs:245-248` 把它们列进"存在性探测"名单，而 `render-js` 内无实现 |
+| `localStorage` / `sessionStorage` | ✅ 按 origin 隔离，local 持久化、session 随文档生命周期；回归测试见 `crates/render-browser/src/app.rs` 的 storage 测试 |
 | `document.cookie` | 🟡 **已实现（上一版标 🔵 PLANNED，已过时）。** getter `crates/render-js/src/runtime/eval.rs:2848-2849`，setter `:3339-3342`，jar `runtime/mod.rs:111-112,325-345`，回归测试 `runtime/tests.rs:2488-2503`。⚠️ **但 jar 只是 `name -> value` 的 map，没有 path / domain / Secure / SameSite 作用域**，上一版承诺的"遵守 path/domain/secure/SameSite"不成立 |
 | 传输层 cookie jar（HTTP 侧） | 🟡 `crates/render-net/src/cookie.rs` 有独立 jar 与 Domain 过宽拒绝（`:277`）、重定向链上的 cookie 处理（`transport.rs:1186,608-609`）；与 JS 侧 jar 是否同一份 ❓ 未核实 |
 | IndexedDB / Cache API / File API / FileReader / Blob | ⛔（`Blob` 仅作为 fetch body 占位存在于 `runtime/builtins/blob.rs`） |
@@ -581,25 +588,25 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 
 | 能力 | 状态 |
 |------|------|
-| `customElements.define` + 自动升级 | 🔴 反证：`crates/render-core/examples/baidu_diag.rs:248` 把它列进探测名单，`render-js` 内无实现 |
-| Shadow DOM `attachShadow({mode})` | 🔴（`render-dom` 已命名空间就绪，`crates/render-dom/src/lib.rs:192,209,502`，但没有 shadow root 概念） |
-| `<slot>` 投影 | 🔴 |
-| `<template>` 内容文档 | 🔴（见 3.1） |
-| `closed` shadow root / declarative shadow DOM | ⛔ |
+| `customElements.define` + 自动升级 | ✅ 自主 custom elements 的定义、升级、`connectedCallback` 等反应已实现；customized built-ins 仍 🔴 |
+| Shadow DOM `attachShadow({mode})` | ✅ open/closed 两种模式、`ShadowRoot`、retargeting 已实现；shadow-scoped 样式表仍 🔴 |
+| `<slot>` 投影 | ✅ named/manual slot 投影与 flat tree 已实现 |
+| `<template>` 内容文档 | ✅ 内容位于无父 `DocumentFragment`，默认惰性；克隆/激活边界见 `registry.rs` 的 `html.template-contents` |
+| `closed` shadow root / declarative shadow DOM | 🟡 closed 模式 ✅；declarative shadow DOM（`<template shadowrootmode>`）仍 🔴 |
 
 ### 7.7 其他
 
 | API | 状态 |
 |------|------|
 | `requestAnimationFrame` / `cancelAnimationFrame` | ✅ `value.rs:2639-2643` + `runtime/types.rs:203`（由宿主每帧驱动一次） |
-| `window.matchMedia` | 🔴 |
+| `window.matchMedia` | ✅ 复用 cascade 的 media-query 求值并在视口变化时派发 `change` |
 | `performance.now()` | ✅ `value.rs:2809-2832` |
 | `performance.timeOrigin` / `performance.timing.navigationStart` | ✅ `value.rs:2833-2849`（`timeOrigin` 恒 0，❓ 是否诚实未核实） |
 | `performance.getEntries` / `getEntriesByType` | 🟡 存在（`value.rs:2850-2858`），返回内容 ❓ 未核实 |
 | `navigator.cookieEnabled` / `navigator.onLine` | ✅ 但均恒 `true`（`value.rs:2754`） |
 | `screen.colorDepth` 等 | ✅ 测试 `runtime/tests.rs:383` |
 | `getComputedStyle` | ✅ `value.rs:1399` + `runtime/builtins/dom.rs:146` |
-| `crypto.getRandomValues` | 🔴 |
+| `crypto.getRandomValues` / `randomUUID` | ✅ prelude 通过宿主熵源实现，`getRandomValues` 单次上限 65,536 字节 |
 | `alert` / `confirm` / `prompt` | 🔴。⚠️ 上一版写"实现为 PyQt 对话框"，该说法随 Qt 架构退役，本次删除。通用做法是走宿主抽象（`render-core/src/interaction.rs` 的 `DefaultActionKind` 家族已有同类扩展点） |
 | `devicePixelRatio` | 🔴 硬编码 1.0（`crates/render-browser/src/app.rs:1464` 与 `crates/render-core/src/image.rs:109` 都是 `device_pixel_ratio_milli: 1_000`）。它目前只用于 `srcset` 密度选择（`image.rs:1085`），所以高分屏资源选择是错的 |
 | `crypto.subtle` / WebAuthn / Notification / Geolocation / Battery / DeviceOrientation / Gamepad / Speech / WebMIDI / WebUSB / WebBluetooth / WebHID / WebSerial / WebNFC / `Intl.*` | ⛔ |
@@ -626,9 +633,9 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 
 | 能力 | 状态 |
 |------|------|
-| origin 判定（scheme + host + port） | 🟡 `render-core/src/navigation.rs` 有 `is_same_document_fragment_navigation` 等；CORS 未实现，故同源策略目前只在导航层生效 |
-| CORS（Simple / Preflight / `Access-Control-*`） | 🔴 `render-net/src/lib.rs:3-6` 明确不负责 |
-| 凭据传播规则（`credentials`） | 🔴 |
+| origin 判定（scheme + host + port） | ✅ 导航层与浏览器 Fetch/CORS 层都按键比较；跨源读取受 CORS 检查 |
+| CORS（Simple / Preflight / `Access-Control-*`） | ✅ 浏览器 Fetch 层实现（`crates/render-browser/src/cors.rs`）；传输层刻意不负责策略 |
+| 凭据传播规则（`credentials`） | 🟡 同源默认携带 cookie，跨源 `include` 与通配符/`Authorization` 的禁止规则已实现；完整 WPT 凭据矩阵未跑 |
 | Referrer Policy | ✅ **完整决策表**：`ReferrerPolicy` 九种取值（`navigation.rs:350-362`）、`StandardReferrerPolicy` 实现（`:373-410`）、默认 `strict-origin-when-cross-origin`（`:1057`） |
 | Content-Security-Policy | 🔴 |
 | 混合内容拦截 | 🔴 |
@@ -658,7 +665,7 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 | 复杂脚本整形 | 🔵 见 4.5；上一版的 "⛔ NON-GOAL（依赖 HarfBuzz，超出 PyQt 默认能力）" 已删除 |
 | ARIA 属性反射到 DOM | 🔴（`aria-*` 只是普通属性，无消费者） |
 | 可访问性树 / 屏幕阅读器对接 | ⛔ |
-| 键盘导航：Tab 焦点环、Enter/Space 触发按钮 | 🟡 顺序焦点排序与前进/后退 ✅（`crates/render-core/src/interaction.rs`，`sequential_focus_order` / `advance_sequential_focus`）；`focus()` / `blur()` ✅；**Tab 键未接到页面输入路径 🔴**；**可见焦点环 🔴**（`:focus` 永不匹配，见 4.1） |
+| 键盘导航：Tab 焦点环、Enter/Space 触发按钮 | 🟡 顺序焦点排序与前进/后退 ✅（`crates/render-core/src/interaction.rs`，`sequential_focus_order` / `advance_sequential_focus`）；`focus()` / `blur()` ✅；**Tab 键未接到页面输入路径 🔴**；`:focus` 样式 ✅（点击与脚本焦点），但 `:focus-visible` 仍等同 `:focus`，指针点击也会显示焦点环 🟡 |
 | `Intl.*` | ⛔ |
 | 高 DPI（device pixel ratio）一致绘制 | 🔴 恒 1.0（见 7.7） |
 | 用户缩放 / 页面缩放 | ⛔ |
@@ -687,10 +694,10 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
    - `crates/render-net/tests/{connection_reuse,connect_budget,local_transport,proxy_transport}.rs`
    - 各 crate 内的 `#[cfg(test)]` 模块（如 `crates/render-layout/src/solver/table_tests.rs`）
 2. **test262 门禁**：`crates/render-core/tests/test262.rs` + `tests/test262-baseline.tsv`
-   （264 桶，30,808 / 98,096 变体通过，31.41%）。固定 revision 由
+   （264 桶，90,765 / 103,199 变体通过，88.0%）。固定 revision 由
    `tools/fetch-test262.sh` 取入 `third_party/test262`，CI 缓存。
-   门禁语义是"桶内 pass 不得回退"（`test262.rs:234-274`），不是"全绿"。
-   子集跑自动跳过门禁；`RENDER_TEST262_UPDATE_BASELINE=1` 重建基线。
+   门禁语义是"桶内 pass 不得回退"，不是"全绿"。
+   全量扫描以 release 运行，子集跑自动跳过门禁；`RENDER_TEST262_UPDATE_BASELINE=1` 重建基线。
 3. **WPT reftests**：`crates/render-core/tests/wpt_reftests.rs`。
    ⚠️ 上一版写"运行 `tools/run-wpt-reftests.py`" —— **该文件不存在**。
    真实入口是 Rust 测试：外部 checkout 由 `tools/fetch-wpt.ps1` 取入
@@ -755,15 +762,15 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 |------|------|------|
 | HTML tokenizer + tree builder | `crates/render-html/src/{tokenizer,tree_builder,encoding,serialization}.rs` | 🟡 foreign content 已实现；misnested formatting（adoption agency）🔴；`noscript` scripting 分支 🔴 |
 | CSS 语法 + 样式表 | `crates/render-css/src/{properties,length,stylesheet}.rs` | 🟡 token/escape 与复杂 at-rule 行为有缺口；`@font-face`/`@keyframes`/`@import` 丢弃；`@supports` 条件丢弃 |
-| 选择器 | `crates/render-css/src/selector.rs` | 🟡 语法面很宽（7 种属性选择器算子 + 31 个伪类，含 `:has()`/`:is()`/`:where()`），但动态伪类状态从不接线 |
+| 选择器 | `crates/render-css/src/selector.rs` | 🟡 语法面很宽（7 种属性选择器算子 + 31 个伪类，含 `:has()`/`:is()`/`:where()`）；动态伪类状态已接线（`:hover/:active/:focus/:focus-within/:target`），`:visited`、独立 `:focus-visible` 与 Tab 顺序焦点仍是缺口 |
 | Cascade / computed | `crates/render-css/src/{cascade,computed}.rs` | 🟡 origin + `@layer` + `revert-layer` 完整；CSS-wide keywords 逐项行为 ❓ 部分未核实 |
 | 布局求解 | `crates/render-layout/src/solver/{block,inline,flex,grid,table,resolve}.rs` | 🟡 block/inline/flex/grid/table 五套上下文齐备；**margin collapsing 🔴**、sticky 🟡（绘制与命中测试已位移；嵌套滚动偏移未实现）、multi-column 🟡（不含 `column-rule`）、RTL 🔴 |
 | 格式化结构 | `crates/render-layout/src/{tree,fragment,geometry}.rs` | 🟡 匿名块与 `display:contents` ✅；**伪元素盒 🔴** |
-| JS 引擎 | `crates/render-js/src/{lexer,parser,value,regex}.rs` + `runtime/` | 🟡 test262 31.41%；generator/async 🔴、BigInt 字面量 🔴、模块依赖图 🔴 |
+| JS 引擎 | `crates/render-js/src/{lexer,parser,value,regex}.rs` + `runtime/` | 🟡 test262 88.0%；剩余失败簇见 `docs/test262.md` 与 `docs/capability_matrix.md` |
 | 事件循环 | `crates/render-core/src/event_loop.rs` | ✅ task/microtask/rendering opportunity 三段式齐备 |
-| DOM 与 Web API | `crates/render-js/src/runtime/builtins/*.rs` | 🟡 域覆盖广；`addEventListener` options、Shadow DOM、`localStorage`、`matchMedia`、CORS 🔴 |
+| DOM 与 Web API | `crates/render-js/src/runtime/builtins/*.rs` | 🟡 域覆盖广；事件 options、Shadow DOM、`localStorage`、`matchMedia`、CORS 已接入；剩余缺口见 `docs/capability_matrix.md` |
 | 网络 | `crates/render-net/src/{transport,batch,worker,cookie,diagnostics}.rs` | 🟡 有界并发、背压、代理、重定向、gzip；br 🔴、每地址回退 ❓、连接复用 ❓ |
-| 绘制 | `crates/render-core/src/paint/{display_list,raster,scene,color}.rs` | 🟡 六相绘制序 `PaintPhase`（`display_list.rs:336-344`）、`box-shadow`（`:1907`）、`text-shadow`、`text-decoration-*`、list marker、`contain`（`:1048`）、`object-fit`（`:1497,1621`）、`transform`（`:764`）、`opacity`（`:2179`）、圆角裁剪（`:1768,1817`）、`linear-gradient`（`:1998`）、`overflow:hidden` 裁剪（`:709,1702`）均可用；仍有 10 个属性零消费者；`RadialGradient`/`Canvas` 两种命令有类型与光栅化但**无生产者** |
+| 绘制 | `crates/render-core/src/paint/{display_list,raster,scene,color}.rs` | 🟡 六相绘制序 `PaintPhase`（`display_list.rs:336-344`）、`box-shadow`（`:1907`）、`text-shadow`、`text-decoration-*`、list marker、`contain`（`:1048`）、`object-fit`（`:1497,1621`）、`transform`（`:764`）、`opacity`（`:2179`）、圆角裁剪（`:1768,1817`）、`linear-gradient`（`:1998`）、`overflow:hidden` 裁剪（`:709,1702`）均可用；仍有若干属性零消费者；`Canvas` 已由脚本绘制接入页面光栅，`RadialGradient` 仍有类型与光栅化但**无生产者** |
 | 交互 | `crates/render-core/src/{interaction.rs,interaction/hit_test.rs}` | 🟡 命中测试、选择、焦点、激活、提交计划齐备 |
 | 能力登记 | `crates/render-core/src/spec/registry.rs` | 🟡 20 条 `FeatureDefinition` 全为 `SupportStatus::Partial`，外加 `fetch.runtime` 标 `Missing`（`:266-273`）且 `tests: &[]` —— **与 `runtime/builtins/fetch.rs` 的实际实现不一致**；且完全没有动画、`@font-face`、伪元素、表格、内联 SVG、视频解码、表单的条目（`docs/visual_fidelity_gaps.md` S9） |
 | 桌面壳 | `crates/render-browser/src/*.rs` | 🟡 标签、地址栏、缓存、字体后端、渲染/资源工作线程齐备；**`app.rs` 的样式表→脚本门控 ❓ 未核实** |

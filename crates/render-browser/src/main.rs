@@ -8,6 +8,7 @@ mod cors;
 mod diagnostics;
 mod fetch_handles;
 mod frame;
+mod interaction_state;
 mod page_source;
 mod page_state;
 mod profile;

@@ -3,6 +3,7 @@
 use crate::ACTIVE_PAGE_TURN_BUDGET;
 use crate::fetch_handles::CachedBatchHandle;
 use crate::fetch_handles::CachedRequestHandle;
+use crate::interaction_state;
 use crate::page_source::PageSource;
 use crate::profile::ProfileCookies;
 use crate::profile::ProfileStorage;
@@ -13,6 +14,7 @@ use render_browser::scripts::ScriptBatchPreparation;
 use render_browser::scripts::ScriptFetchPlan;
 use render_browser::worker::RenderIdentity;
 use render_core::css::computed::ComputedStyle;
+use render_core::css::selector::InteractionState;
 use render_core::document::DocumentRenderOptions;
 use render_core::document::ExternalStyleSheetKey;
 use render_core::document::ExternalStyleSheets;
@@ -73,6 +75,10 @@ pub(super) struct PageState {
     /// every paint of the same broken URL.
     pub(super) attempted_images: HashSet<ImageResourceKey>,
     pub(super) computed_styles: BTreeMap<render_core::dom::NodeId, ComputedStyle>,
+    /// The host's current `:hover`, `:active`, `:focus` and `:target` nodes.
+    /// Every change schedules a full render, because these states participate
+    /// in selector matching and cannot be applied by repainting an old frame.
+    pub(super) interaction: InteractionState,
     pub(super) pending_images: Option<PendingImages>,
     pub(super) styles_resolved: bool,
     pub(super) pending_style_sheets: Option<PendingStyleSheets>,
@@ -212,6 +218,8 @@ impl PageState {
         let history = SessionHistory::new(first_entry, NavigationLimits::default())
             .expect("browser-created page URLs fit the session-history limits");
         let page = Page::with_url_unrendered(&source.html, &source.target.history_url());
+        let interaction =
+            interaction_state::initial_state(page.document().dom(), &source.target.history_url());
         Self {
             navigation: PageNavigation::new(source),
             page,
@@ -222,6 +230,7 @@ impl PageState {
             images: ImageResources::default(),
             attempted_images: HashSet::new(),
             computed_styles: BTreeMap::new(),
+            interaction,
             pending_images: None,
             styles_resolved: false,
             pending_style_sheets: None,
@@ -301,6 +310,10 @@ impl PageState {
         self.images = ImageResources::default();
         self.attempted_images.clear();
         self.computed_styles.clear();
+        self.interaction = interaction_state::initial_state(
+            self.page.document().dom(),
+            &self.navigation.committed().target.history_url(),
+        );
         self.styles_resolved = false;
         self.scripts_resolved = false;
         self.started_scripts.clear();
@@ -317,6 +330,66 @@ impl PageState {
         self.external_styles_generation = 0;
         self.expected_render = None;
         self.created_at = Instant::now();
+    }
+
+    /// Replaces the hover chain and reports whether selector matching changed.
+    pub(super) fn set_hovered(&mut self, node: Option<render_core::dom::NodeId>) -> bool {
+        let hovered = interaction_state::ancestor_set(self.page.document().dom(), node);
+        if self.interaction.hovered == hovered {
+            return false;
+        }
+        self.interaction.hovered = hovered;
+        true
+    }
+
+    /// Replaces the active chain and reports whether selector matching changed.
+    pub(super) fn set_active(&mut self, node: Option<render_core::dom::NodeId>) -> bool {
+        let active = interaction_state::ancestor_set(self.page.document().dom(), node);
+        if self.interaction.active == active {
+            return false;
+        }
+        self.interaction.active = active;
+        true
+    }
+
+    /// Replaces the focused node and reports whether selector matching changed.
+    ///
+    /// Focus is document state, so this records it on the DOM as well; the
+    /// value is then what `document.activeElement` and the `:focus` cascade
+    /// both read. A non-focusable node is refused and leaves focus unchanged.
+    pub(super) fn set_focused(&mut self, node: Option<render_core::dom::NodeId>) -> bool {
+        let stored = self.page.document_mut().dom_mut().set_focused_element(node);
+        let focused = if stored {
+            node
+        } else {
+            self.page.document().dom().focused_element()
+        };
+        if self.interaction.focused == focused {
+            return false;
+        }
+        self.interaction.focused = focused;
+        true
+    }
+
+    /// Copies focus changes made by scripts into the host interaction state.
+    /// Returns whether the `:focus` cascade needs a new frame.
+    pub(super) fn sync_focused_from_dom(&mut self) -> bool {
+        let focused = self.page.document().dom().focused_element();
+        if self.interaction.focused == focused {
+            return false;
+        }
+        self.interaction.focused = focused;
+        true
+    }
+
+    /// Recomputes `:target` after a URL change and reports whether it changed.
+    pub(super) fn set_target_url(&mut self, url: &Url) -> bool {
+        let target = interaction_state::target_node(self.page.document().dom(), url);
+        if self.interaction.target == target {
+            return false;
+        }
+        self.interaction.target = target;
+        true
     }
 
     pub(super) fn cancel_pending(&mut self) {

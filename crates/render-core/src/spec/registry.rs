@@ -272,10 +272,11 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 as atomic inlines and carry their `value` and placeholder synthesis. \
                 The form collections are implemented: `document.forms`, `form.elements`, \
                 `fieldset.elements`, `form.length`, the indexed and named members of a \
-                form, `control.form`, and `RadioNodeList`. Not implemented: form \
-                submission, constraint validation, `reset()`, the past names map, and \
-                radio-group checkedness. `FormData` is absent from the global object, \
-                so any bundle that reads it throws a ReferenceError.",
+                form, `control.form`, and `RadioNodeList`. Submission is implemented: \
+                a trusted cancelable `submit` event, GET and urlencoded POST navigation, \
+                the submitter's name/value pair, and `FormData` on the global object. \
+                Not implemented: constraint validation, `reset()`, the past names map, \
+                radio-group checkedness, and multipart or text/plain request bodies.",
         dependencies: &[DOM_TREE, LAYOUT],
         tests: &[],
     },
@@ -325,12 +326,17 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
         status: SupportStatus::Partial,
         notes: "Type, universal, id, class, attribute, combinator, the structural \
                 pseudo-classes, `:is()`, `:where()`, `:not()`, `:has()` and the link \
-                and dynamic pseudo-classes all match. Two things are wired but have no \
-                data: the dynamic pseudo-classes read `MatchContext.hovered`, \
-                `.active`, `.focused`, `.focus_visible` and `.visited_links`, and \
-                nothing populates them, so `:hover` and `:focus` never match on a \
-                rendered page. Quirks-mode case-insensitive `id`/`class` matching is \
-                implemented and driven by the document's mode.",
+                and dynamic pseudo-classes all match. The dynamic pseudo-classes read \
+                `MatchContext.hovered`, `.active`, `.focused` and `.target`, seeded from \
+                `InteractionState` by `Document::render_with_interaction`; the browser \
+                derives them from pointer movement, primary-button press/release, click \
+                and script focus, and the committed URL fragment, so `:hover`, `:active`, \
+                `:focus`/`:focus-visible`/`:focus-within` and `:target` match on a \
+                rendered page. Two limits remain: `:visited` never matches because no \
+                visited-link history is exposed, and `:focus-visible` is currently an \
+                alias of `:focus` until keyboard sequential focus is wired. Quirks-mode \
+                case-insensitive `id`/`class` matching is implemented and driven by the \
+                document's mode.",
         dependencies: &[DOM_TREE, CSS_SYNTAX],
         tests: SELECTOR_TESTS,
     },

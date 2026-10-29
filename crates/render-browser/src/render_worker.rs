@@ -18,6 +18,7 @@ use render_browser::worker::RenderWorkerOptions;
 use render_core::css::cascade::media_query_list_matches;
 use render_core::css::computed::ComputedStyle;
 use render_core::css::computed::ComputedValue;
+use render_core::css::selector::InteractionState;
 use render_core::css::selector::MatchContext;
 use render_core::css::stylesheet::StyleSheet;
 use render_core::document::Document;
@@ -68,6 +69,7 @@ pub(super) struct FullPageRenderPayload {
     pub(super) style_batch: Option<(StylesheetFetchPlan, Vec<FetchResult>)>,
     pub(super) discover_external_styles: bool,
     pub(super) images: ImageResources,
+    pub(super) interaction: InteractionState,
 }
 
 #[derive(Debug)]
@@ -128,6 +130,7 @@ pub(super) fn process_page_render(
                 style_batch,
                 discover_external_styles,
                 images,
+                interaction,
             } = *full;
             cancellation.check()?;
             let (style_sheets, applied_style_sheets, style_diagnostics) =
@@ -183,7 +186,7 @@ pub(super) fn process_page_render(
                 y: job.identity.scroll_offset.y,
             };
             let raster_background = options.raster_background;
-            let output = document.render_with_external_style_sheets_and_images(
+            let output = document.render_with_interaction(
                 options,
                 DocumentBackends {
                     text_measurer: fonts,
@@ -193,6 +196,7 @@ pub(super) fn process_page_render(
                 &base_url,
                 &style_sheets,
                 &images,
+                &interaction,
             );
             cancellation.check()?;
             let viewport = WindowSize::new(
@@ -220,6 +224,7 @@ pub(super) fn process_page_render(
                     &style_sheets,
                     &base_url,
                     output.layout.fragments.viewport,
+                    &interaction,
                 );
                 eprintln!(
                     "render-browser frame breakdown display_items={} content_height={} kinds={:?} display_none={} vanished={} zero_size_boxes={}",
@@ -391,6 +396,7 @@ fn frame_style_report(
     style_sheets: &ExternalStyleSheets,
     base_url: &Url,
     viewport: PhysicalSize,
+    interaction: &InteractionState,
 ) -> FrameStyleReport {
     let dom = document.dom();
     let mut item_kinds = BTreeMap::new();
@@ -432,7 +438,7 @@ fn frame_style_report(
         }
     }
     let sheets = ordered_applied_sheets(document, style_sheets, base_url);
-    let context = match_context(document, viewport);
+    let context = match_context(document, viewport, interaction);
     let describe = |label: &str, nodes: &[NodeId]| -> Vec<String> {
         nodes
             .iter()
@@ -503,18 +509,22 @@ pub(super) fn ordered_applied_sheets<'a>(
         .collect()
 }
 
-pub(super) fn match_context(document: &Document, viewport: PhysicalSize) -> MatchContext {
+pub(super) fn match_context(
+    document: &Document,
+    viewport: PhysicalSize,
+    interaction: &InteractionState,
+) -> MatchContext {
     MatchContext {
-        scope: None,
         quirks_mode: document.quirks_mode() == render_core::html::QuirksMode::Quirks,
-        pseudo_element: None,
-        focused: None,
-        target: None,
-        hovered: HashSet::new(),
-        active: HashSet::new(),
-        visited_links: HashSet::new(),
+        focused: interaction.focused,
+        target: interaction.target,
+        hovered: interaction.hovered.clone(),
+        active: interaction.active.clone(),
         viewport_width: Some(viewport.width),
         viewport_height: Some(viewport.height),
+        // Scope, pseudo-element and visited state stay pipeline-owned. The
+        // default keeps future context fields non-breaking here.
+        ..MatchContext::default()
     }
 }
 

@@ -16,14 +16,18 @@ This page is a pointer and a working inventory. It is not the log.
 
 ## Verified baseline
 
-Measured on the tree as of commit `2bd8e8c`, before the parallel workstream landed:
+Measured on the working tree at `a6c39f0` plus the 2026-10-22/23 gate-repair and
+interaction-state changes (uncommitted):
 
 | Check | Result |
 | --- | --- |
-| `cargo test --workspace` | all targets ok, 0 failed |
-| test262 conformance gate | 9 passed, 484 s |
-| `render-js` unit tests | 195 passed |
-| `render-layout` unit tests | 81 passed, 1 ignored |
+| `cargo test --workspace` | all targets ok, 0 failed; test262 self-tests 10 passed, 1 ignored |
+| test262 conformance gate (release) | 90,765 / 103,199 variants = 88.0%; 264 buckets ok; 6 timeout, 0 crash; 865.67 s |
+| `render-js` unit tests | 1,116 passed |
+| `render-core` unit tests | 298 passed |
+| `render-layout` unit tests | 306 passed, 1 ignored |
+| `render-browser` unit tests | 198 lib + 99 app tests passed |
+| site-neutrality gate | 9 rules, 269 Rust files, 60 self-test checks, 25 advisory findings, exit 0 |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 
 These numbers are the arbitration baseline. When an agent reports a pass count, check
@@ -58,7 +62,7 @@ a new print statement.
 | Variable | Effect |
 | --- | --- |
 | `RENDER_DEBUG_FRAME=1` | per-frame render pipeline diagnostics: stylesheet count, computed style count, fragment count, display item count, content height, and per-image fragment rects |
-| `RENDER_DUMP_FRAME=<path>` | write each frame as a PPM. Convert with `python tools/ppm2png.py <in.ppm> <out.png>` |
+| `RENDER_DUMP_FRAME=<path>` | write each frame as a PPM. Convert with `python3 tools/ppm2png.py <in.ppm> <out.png>` |
 | `RENDER_STAGE_TIMING=1` | per-stage timing during document render |
 | `RENDER_JS_TRACE=1`, `RENDER_JS_DEPTH=1`, `RENDER_JS_BINDINGS=1` | JS execution trace, depth budget, and binding trace |
 | `RENDER_JS_GC=1` | force JS garbage collection reporting |

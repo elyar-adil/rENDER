@@ -174,6 +174,46 @@ roundrect 集群 57 pass(此前 0);dialog 集群 13 pass,其余转 skip(focus/to
 4. showPopover/showModal(~49 reftest 因它们失败)。
 5. 嵌套浏览上下文仍是最大 harness 限制(630+),也是 css/ 区 26k 测试的阻塞项。
 
+# 交接文档 (2026-10-22 → 2026-10-23) — 门禁修复、release test262 基线与动态伪类接线
+
+**检查点**: 基于 `a6c39f0` 的未提交 WIP,已于 2026-10-29 在 master 上提交。本轮先恢复可信的绿色门禁和基线,再继续能力实现。
+
+## 本轮已落地
+
+1. **clippy 门禁恢复**: 修掉 `collapsible_match`（`crates/render-js/src/runtime/eval.rs`、`crates/render-core/src/canvas/mod.rs` 四处、`crates/render-browser/src/app.rs`）。
+2. **test262 runner 加固**:
+   - 全量测量改为 `#[ignore]`，`cargo test --workspace` 只跑 10 个 runner 自测；`tools/check.sh` 和 CI 以 release + `--ignored` 跑全量门禁。
+   - 证据：生成型 RegExp property-escape 用例在 debug 下超过每文件 30 秒硬超时（本机 `ASCII.js` debug 40 秒、release 7.5 秒）。debug 全量在 RegExp 段制造了 228 个假 timeout；release 全量实际只有 6 个 staging timeout。
+   - worker 子进程也必须带 `--ignored`。父测试被标记 ignore 后，旧 `spawn_worker` 没有传该标志，worker 立即退出，整轮被误记为 crash；已修。
+   - `RENDER_TEST262_RUN_DIR` 相对路径现在按 workspace root 解析；resume 一个已经完成的目录时不再 spawn 没有任务的 worker（旧代码会永久等待 stdin）。
+   - 自测不再依赖 checkout 中的缺失模块，改用合成 fixture；11 个 runner 测试中 10 个默认运行，1 个全量测量默认 ignored。
+3. **基线重建**: 2026-10-22 release 全量结果为 files=53,869、variants=103,199、pass=90,765（88.0%）、fail=12,127、skip=294、unsupported=7、timeout=6、crash=0；264 个桶全部不低于旧地板，门禁输出 `264 buckets ok`，耗时 865.67 秒。`crates/render-core/tests/test262-baseline.tsv` 已按同一组桶计数重写，新地板为 90,765；旧地板为 47,116（2026-10-09，`cba591c`）。
+4. **其他门禁/文档修复**: cookie 跨源测试改用 IPv6 loopback `[::1]`（macOS 不配置 `127.0.0.2`）；`tools/check.sh` 与 README 改用 `python3`；站点中立性门禁 60 个自测检查、0 blocking、25 advisory、269 个 Rust 文件。README、PROGRESS、`docs/capability_matrix.md`、`docs/test262.md`、`docs/html5_gap_matrix.md`、`docs/html5_scope.md`、`docs/qq-compatibility-analysis.md` 的 test262 数字已对账；已关闭能力（`matchMedia`、CORS、`localStorage`、POST urlencoded、Shadow DOM、`addEventListener` options、BigInt、模块图、UAX #14 换行）的陈旧断言已更新或加历史快照注记。同时核对并关闭了 **S1 字体轴**的文档缺口：`TextStyle` 已携带 `FontRequest`（`crates/render-layout/src/font.rs:108-118`），字体后端按 family/style/weight 选面并合成；`docs/visual_fidelity_gaps.md` 的 S1 已改为 Closed，`html5_scope`/`html5_gap_matrix`/`qq` 的“无消费者”断言同步更正。
+5. **动态伪类状态接线（S16 关闭）**:
+   - `render_css::selector::InteractionState` 只携带宿主知道的 `hovered`/`active`/`focused`/`target`；`Document::render_with_interaction` 把它们注入 `MatchContext`，viewport/quirks/scope/pseudo-element 仍由渲染管线拥有。
+   - `render-browser` 新增 `interaction_state`：祖先链、百分号解码的 fragment `id` 查找与 `<a name>` 回退、初始状态。`PageState` 保存状态并让脚本 `focus()`/`blur()` 通过 `sync_focused_from_dom` 同步到 cascade；`FullPageRenderPayload` 携带状态。
+   - 壳层接线：指针移动/离开、主键按下/释放、点击可聚焦内容（同时写 `document.activeElement`）、页面输入框焦点、URL/history fragment 变化；每次全帧重算 `:target`，滚动后也会重算指针下的 hover 链（hover 变化时放弃 retained raster）。
+   - 证据：`render-core` 的 `host_interaction_state_reaches_dynamic_pseudo_class_cascade` 同一文档双渲染断言六个伪类的 computed color；浏览器测试 `pointer_movement_and_press_update_the_pages_dynamic_state`、`a_push_state_fragment_updates_the_target_pseudo_class`、`a_full_frame_payload_carries_all_host_interaction_state`，以及 `interaction_state` 的 4 个 helper 测试。
+   - 明确边界：`:visited` 仍恒不匹配（不暴露访问历史）；`:focus-visible` 仍等同 `:focus`；Tab/Shift-Tab 尚未接到 `advance_sequential_focus`；点击焦点不派发 focus/blur/focusin/focusout 事件（脚本 `focus()`/`blur()` 仍派发）。
+
+## 验证
+
+- `bash tools/check.sh`: **All checks passed**（fmt/clippy 干净；站点中立性 269 文件、0 blocking、25 advisory；workspace 全绿；test262 步骤复用已验证的 release run dir：90,765/103,199、264 buckets ok）。
+- `cargo test --workspace`: 全绿；test262 `10 passed, 1 ignored`；WPT reftest `0 passed, 1 ignored`。
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean。
+- `cargo fmt --all --check`: clean。
+- 站点中立性: 60 checks passed（25 must-flag / 31 must-pass / 4 exit-status / 1 coverage），0 blocking，25 advisory。
+
+## 明确未做
+
+- WPT checkout 仍缺席；WPT 脚本仍是 PowerShell-only，本机没有 `pwsh`/`powershell`；CSS WPT 仍被“iframe 文档不绘制”阻断。
+- iframe 内容仍未绘制；动画/transition 仍 `Missing`；shadow-scoped 样式表、webfonts 仍开放。
+- 动态伪类仍缺 `:visited`、独立的 `:focus-visible` 判定与 Tab 顺序焦点；点击焦点不派发焦点事件。
+
+## 下一步
+
+P1 动态伪类接线已完成（S16），`docs/visual_fidelity_gaps.md` 记录了剩余边界。下一步进入动画/transition（registry 中仍为 `Missing`）：先设计时间驱动与 invalidation 接缝，再实现解析后的 `@keyframes` 和 `animation-*`/`transition-*` 消费；伪元素盒生成也可并行推进。不要用整帧重绘冒充 transition。
+
 ---
 
 # 交接文档 (2026-09-27, 进行中) — 视觉保真专项:UA 样式表 / 字体轴 / 内联 SVG / 文字装饰

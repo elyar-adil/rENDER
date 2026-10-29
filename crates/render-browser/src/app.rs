@@ -433,9 +433,13 @@ impl BrowserApp {
                 viewport_height: page.scroll.viewport_height(),
             }
         } else {
+            let base_url = page.navigation.committed().target.history_url();
+            // The fragment target follows the document as scripts mutate it,
+            // so recompute it for every full frame rather than only on load.
+            let _target_changed = page.set_target_url(&base_url);
             PageRenderPayload::Full(Box::new(FullPageRenderPayload {
                 document: page.page.document().clone(),
-                base_url: page.navigation.committed().target.history_url(),
+                base_url,
                 external_style_sheets: page.style_sheets.clone(),
                 style_batch: page.style_batch.clone(),
                 // Re-scan after DOM mutations as well as on initial load.
@@ -443,6 +447,7 @@ impl BrowserApp {
                 // completed batch may itself have raced with a new link.
                 discover_external_styles: page.pending_style_sheets.is_none(),
                 images: page.images.clone(),
+                interaction: page.interaction.clone(),
             }))
         };
         let source_snapshot = Arc::from(page.navigation.committed().html.as_str());
@@ -1120,16 +1125,23 @@ impl BrowserApp {
             eprintln!("render-browser history entry refused: {error}");
             return;
         }
-        self.commit_history_url(id, url);
+        if self.commit_history_url(id, url) {
+            self.schedule_page_render_for_tab(id);
+        }
     }
 
     /// Moves the committed URL of `id` after a history change that loads
     /// nothing, so the address bar and relative links follow the document.
-    fn commit_history_url(&mut self, id: TabId, url: Url) {
+    /// Returns whether `:target` changed and therefore needs a new frame.
+    fn commit_history_url(&mut self, id: TabId, url: Url) -> bool {
         let Some(page) = self.pages.get_mut(&id) else {
-            return;
+            return false;
         };
         page.navigation.committed.target = NavigationTarget::from_url(url);
+        // `pushState` and `popstate` can change the fragment without reloading,
+        // so `:target` follows the committed URL rather than only the load.
+        let target_url = page.navigation.committed().target.history_url();
+        let target_changed = page.set_target_url(&target_url);
         let title = page.navigation.committed().title.clone();
         let address = page.navigation.committed().target.display_address();
         self.tabs.update(id, title, address);
@@ -1137,6 +1149,7 @@ impl BrowserApp {
             self.sync_active_address();
         }
         self.repaint_chrome();
+        target_changed
     }
 
     /// Moves `id` through its session history by `delta` entries, as the
@@ -1172,7 +1185,7 @@ impl BrowserApp {
         };
         page.traverse_document_history(&entry.url, entry.state.as_deref());
         page.scripts_resolved = false;
-        self.commit_history_url(id, entry.url);
+        let _ = self.commit_history_url(id, entry.url);
         self.sync_page_title(id);
         self.start_classic_scripts(id);
         if id == self.tabs.active_id() {
@@ -2171,6 +2184,59 @@ impl BrowserApp {
         }
     }
 
+    /// Recomputes the `:hover` chain from the current pointer position.
+    ///
+    /// Returns whether selector matching changed without scheduling a render;
+    /// callers that are already scheduling one use the flag to choose between a
+    /// full frame and a retained raster.
+    fn refresh_content_hover(&mut self) -> bool {
+        let id = self.tabs.active_id();
+        let node = self.content_hover_target();
+        self.pages
+            .get_mut(&id)
+            .is_some_and(|page| page.set_hovered(node))
+    }
+
+    fn schedule_content_hover(&mut self) {
+        let id = self.tabs.active_id();
+        if self.refresh_content_hover() {
+            self.schedule_page_render_for_tab(id);
+        }
+    }
+
+    fn clear_content_hover(&mut self) {
+        let id = self.tabs.active_id();
+        let changed = self
+            .pages
+            .get_mut(&id)
+            .is_some_and(|page| page.set_hovered(None));
+        if changed {
+            self.schedule_page_render_for_tab(id);
+        }
+    }
+
+    fn set_content_active(&mut self, node: Option<render_core::dom::NodeId>) {
+        let id = self.tabs.active_id();
+        let changed = self
+            .pages
+            .get_mut(&id)
+            .is_some_and(|page| page.set_active(node));
+        if changed {
+            self.schedule_page_render_for_tab(id);
+        }
+    }
+
+    fn set_content_focus(&mut self, node: Option<render_core::dom::NodeId>) {
+        let id = self.tabs.active_id();
+        let changed = self
+            .pages
+            .get_mut(&id)
+            .is_some_and(|page| page.set_focused(node));
+        if changed {
+            self.schedule_page_render_for_tab(id);
+        }
+    }
+
     /// Polls in-flight `fetch()`/XHR transfers. A transfer either moves on to
     /// the next stage or settles its runtime. Returns per-transfer settlement
     /// callback errors for the caller to log (a throwing callback must not abort
@@ -2294,6 +2360,9 @@ impl BrowserApp {
     )]
     pub(super) fn handle_pointer_press(&mut self, event_loop: &ActiveEventLoop) {
         self.left_pointer_down = true;
+        // A new press ends the previous active chain. Content presses install
+        // their own chain in `handle_content_press`.
+        self.set_content_active(None);
         if let Some(menu) = self.address_menu.take() {
             if let Some(item) = menu.item_at(self.cursor)
                 && item.enabled
@@ -2416,9 +2485,10 @@ impl BrowserApp {
         self.editor.set_focused(false);
         let id = self.tabs.active_id();
         let hit_node = self.content_node_at_cursor();
-        if self.is_cache_clear_control(id, hit_node) {
-            self.clear_http_cache();
-            self.repaint_chrome();
+        // `:active` is the element the primary button went down on, plus its
+        // ancestors, and lasts until the release.
+        self.set_content_active(hit_node);
+        if self.press_cache_clear_control(id, hit_node) {
             return;
         }
         let editable = hit_node.and_then(|node| {
@@ -2438,6 +2508,7 @@ impl BrowserApp {
                 editor,
             });
             self.content_selecting = true;
+            self.set_content_focus(Some(node));
             if let Some(window) = &self.window {
                 window.set_ime_allowed(true);
             }
@@ -2445,6 +2516,7 @@ impl BrowserApp {
             return;
         }
         self.close_content_editor();
+        self.set_content_focus(self.content_focus_target(id, hit_node));
         if let Some(window) = &self.window {
             window.set_ime_allowed(false);
         }
@@ -2517,6 +2589,20 @@ impl BrowserApp {
             });
         self.perform_content_navigation(id, navigation);
         self.repaint_chrome();
+    }
+
+    fn press_cache_clear_control(
+        &mut self,
+        id: TabId,
+        hit_node: Option<render_core::dom::NodeId>,
+    ) -> bool {
+        if !self.is_cache_clear_control(id, hit_node) {
+            return false;
+        }
+        self.clear_http_cache();
+        self.set_content_focus(self.content_focus_target(id, hit_node));
+        self.repaint_chrome();
+        true
     }
 
     pub(super) fn is_cache_clear_control(
@@ -2797,6 +2883,116 @@ impl BrowserApp {
         self.schedule_page_render_for_tab(tab);
     }
 
+    /// The pointer icon for the current hit target, including the pointer over
+    /// a navigable page element and the default over the scrollbar overlay.
+    fn hover_cursor_icon(&self) -> CursorIcon {
+        match self.hot {
+            HitTarget::AddressBar => CursorIcon::Text,
+            HitTarget::Content if self.scrollbar_hot || self.scrollbar_drag.is_some() => {
+                CursorIcon::Default
+            }
+            HitTarget::Content => self
+                .content_node_at_cursor()
+                .and_then(|node| {
+                    let page = self.pages.get(&self.tabs.active_id())?;
+                    content_interaction::content_navigation(
+                        page.page.document().dom(),
+                        node,
+                        &page.navigation.committed().target.history_url(),
+                        &|node| page.geometry.contains_key(&node.as_u64()),
+                    )
+                })
+                .map_or(CursorIcon::Default, |_| CursorIcon::Pointer),
+            HitTarget::NewTab | HitTarget::Toolbar(_) | HitTarget::WindowControl(_) => {
+                CursorIcon::Pointer
+            }
+            HitTarget::Tab(_)
+            | HitTarget::CloseTab(_)
+            | HitTarget::TitleBar
+            | HitTarget::Chrome => CursorIcon::Default,
+        }
+    }
+
+    /// The node `:hover` should name at the current pointer position.
+    ///
+    /// Chrome and the scrollbar overlay cover the page, so hovering either of
+    /// them clears the page's hover chain. Paint order decides the element
+    /// under the pointer; geometry is the fallback for boxes whose paint item
+    /// only exposed an ancestor background.
+    fn content_hover_target(&self) -> Option<render_core::dom::NodeId> {
+        if self.hot != HitTarget::Content || self.scrollbar_hot || self.scrollbar_drag.is_some() {
+            return None;
+        }
+        self.content_hover_node_at_cursor()
+    }
+
+    fn content_hover_node_at_cursor(&self) -> Option<render_core::dom::NodeId> {
+        let id = self.tabs.active_id();
+        let page = self.pages.get(&id)?;
+        let layout = self.layout.as_ref()?;
+        let display_hit = page.display_list.as_ref().and_then(|display_list| {
+            content_interaction::hit_test_content_regions(
+                display_list
+                    .items()
+                    .iter()
+                    .map(|item| content_interaction::ContentHitRegion {
+                        bounds: item.bounds,
+                        source: item.source,
+                        coordinate_space: item.coordinate_space,
+                        hit_testable: content_interaction::is_content_hit_command(&item.command),
+                    }),
+                self.cursor,
+                layout.chrome_height,
+                PhysicalPoint {
+                    x: 0.0,
+                    y: page.scroll.offset_y(),
+                },
+            )
+        });
+        if display_hit.is_some() {
+            return display_hit;
+        }
+        let point = PhysicalPoint {
+            x: self.cursor.x,
+            y: self.cursor.y - layout.chrome_height as f32 + page.scroll.offset_y(),
+        };
+        page.geometry
+            .iter()
+            .filter_map(|(raw_node, rect)| {
+                (rect.width > 0.0
+                    && rect.height > 0.0
+                    && point.x >= rect.x
+                    && point.x < rect.x + rect.width
+                    && point.y >= rect.y
+                    && point.y < rect.y + rect.height)
+                    .then_some((
+                        rect.width * rect.height,
+                        render_core::dom::NodeId::from_u64(*raw_node),
+                    ))
+            })
+            .min_by(|(left, _), (right, _)| left.total_cmp(right))
+            .map(|(_, node)| node)
+    }
+
+    /// The focusable element a press on `node` focuses, searching from the hit
+    /// node towards the root as browsers do for a click on a child of a control.
+    fn content_focus_target(
+        &self,
+        id: TabId,
+        node: Option<render_core::dom::NodeId>,
+    ) -> Option<render_core::dom::NodeId> {
+        let page = self.pages.get(&id)?;
+        let dom = page.page.document().dom();
+        let mut current = node;
+        while let Some(candidate) = current {
+            if dom.is_focusable_area(candidate) {
+                return Some(candidate);
+            }
+            current = dom.parent(candidate);
+        }
+        None
+    }
+
     pub(super) fn content_node_at_cursor(&self) -> Option<render_core::dom::NodeId> {
         let id = self.tabs.active_id();
         let page = self.pages.get(&id)?;
@@ -3019,31 +3215,7 @@ impl BrowserApp {
             && self
                 .active_scrollbar_geometry()
                 .is_some_and(|geometry| geometry.track.contains(self.cursor));
-        let cursor_icon = match self.hot {
-            HitTarget::AddressBar => CursorIcon::Text,
-            HitTarget::Content if self.scrollbar_hot || self.scrollbar_drag.is_some() => {
-                CursorIcon::Default
-            }
-            HitTarget::Content => self
-                .content_node_at_cursor()
-                .and_then(|node| {
-                    let page = self.pages.get(&self.tabs.active_id())?;
-                    content_interaction::content_navigation(
-                        page.page.document().dom(),
-                        node,
-                        &page.navigation.committed().target.history_url(),
-                        &|node| page.geometry.contains_key(&node.as_u64()),
-                    )
-                })
-                .map_or(CursorIcon::Default, |_| CursorIcon::Pointer),
-            HitTarget::NewTab | HitTarget::Toolbar(_) | HitTarget::WindowControl(_) => {
-                CursorIcon::Pointer
-            }
-            HitTarget::Tab(_)
-            | HitTarget::CloseTab(_)
-            | HitTarget::TitleBar
-            | HitTarget::Chrome => CursorIcon::Default,
-        };
+        let cursor_icon = self.hover_cursor_icon();
         if cursor_icon != self.cursor_icon {
             if let Some(window) = &self.window {
                 window.set_cursor(cursor_icon);
@@ -3055,6 +3227,7 @@ impl BrowserApp {
                 address_index_at_x(layout, &self.editor, self.cursor.x, self.fonts.as_ref());
             self.editor.extend_pointer_selection(index);
             self.repaint_chrome();
+            self.schedule_content_hover();
             return;
         }
         if let Some(grab) = self.scrollbar_drag {
@@ -3072,6 +3245,7 @@ impl BrowserApp {
                 let delta = target - page.scroll.offset_y();
                 self.apply_scroll_delta(delta);
             }
+            self.schedule_content_hover();
             return;
         }
         if self.content_selecting
@@ -3085,6 +3259,7 @@ impl BrowserApp {
                 content.editor.extend_pointer_selection(index);
             }
             self.repaint_chrome();
+            self.schedule_content_hover();
             return;
         }
         let move_intent = self.left_pointer_down.then(|| {
@@ -3101,10 +3276,15 @@ impl BrowserApp {
         {
             self.repaint_chrome();
         }
+        self.schedule_content_hover();
     }
 
     pub(super) fn handle_pointer_release(&mut self) {
         self.left_pointer_down = false;
+        // The active chain ends at the release, before the click's default
+        // action, so a navigation cannot leave `:active` stuck on the document
+        // it replaced.
+        self.set_content_active(None);
         let was_dragging = self.drag.is_some() || self.tab_drag_paint.is_some();
         let release_intent = self.layout.as_ref().and_then(|layout| {
             self.drag
@@ -3134,6 +3314,10 @@ impl BrowserApp {
             }
             self.repaint_chrome();
         }
+        // A scrollbar drag suppresses the page's hover chain. Releasing the
+        // button can leave the pointer over the page, so refresh it now rather
+        // than waiting for the next mouse move.
+        self.schedule_content_hover();
     }
 
     /// Scrollbar geometry for the active tab's current frame, if any.
@@ -3217,8 +3401,11 @@ impl BrowserApp {
                     self.frame_size.height.saturating_sub(layout.chrome_height),
                 )
             });
+            // Scrolling moves the content under a stationary pointer, so the
+            // hover chain changes even without a CursorMoved event.
+            let hover_changed = self.refresh_content_hover();
             if let Some(viewport) = viewport {
-                self.schedule_page_render(id, viewport, true);
+                self.schedule_page_render(id, viewport, !hover_changed);
             }
             self.repaint_chrome();
         }
@@ -3613,6 +3800,7 @@ impl BrowserApp {
         }
         self.content_editor = None;
         self.content_selecting = false;
+        self.set_content_focus(None);
     }
 
     pub(super) fn update_window_title(&self) {
@@ -3735,6 +3923,7 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
                 self.repaint_chrome();
             }
             WindowEvent::CursorMoved { position, .. } => self.handle_cursor_move(position),
+            WindowEvent::CursorLeft { .. } => self.clear_content_hover(),
             WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -3759,6 +3948,7 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
                 self.address_menu = None;
                 self.close_content_editor();
                 self.left_pointer_down = false;
+                self.set_content_active(None);
                 self.drag = None;
                 self.tab_drag_paint = None;
                 self.scrollbar_drag = None;
@@ -3825,7 +4015,9 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
                     // A change made by an input handler was already counted by its
                     // turn, so the revision comparison alone would miss it.
                     let changed_in_turn = std::mem::take(&mut page.dom_changed_in_turn);
-                    if revision_after != revision_before || changed_in_turn {
+                    // `focus()` changes document state but not the DOM revision.
+                    let focus_changed = page.sync_focused_from_dom();
+                    if revision_after != revision_before || changed_in_turn || focus_changed {
                         rendered_active |= *id == active;
                         title_candidates.push(*id);
                         page.scripts_resolved = false;

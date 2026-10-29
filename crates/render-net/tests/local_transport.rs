@@ -44,10 +44,12 @@ fn spawn_server(
 
 /// Binds a local test server on a chosen loopback address.
 ///
-/// Tests that need a second RFC 6265 origin bind `127.0.0.2`: cookies are keyed
-/// by host and ignore the port, and a literal address keeps the request off
-/// name resolution, which on a machine that filters loopback SYNs would
-/// otherwise spend the connect budget on an address nothing is listening on.
+/// Tests that need a second RFC 6265 origin bind `[::1]`: cookies are keyed by
+/// host and ignore the port, and a literal address keeps the request off name
+/// resolution, which on a machine that filters loopback SYNs would otherwise
+/// spend the connect budget on an address nothing is listening on. IPv6
+/// loopback is available on macOS, Linux and Windows, unlike `127.0.0.2`,
+/// which macOS does not configure by default.
 fn spawn_server_on(
     bind_address: &str,
     expected_connections: usize,
@@ -405,7 +407,7 @@ fn caller_and_hop_cookies_are_not_leaked_across_a_cross_origin_redirect() {
         .expect("cross-origin target URL")
         .to_string();
 
-    let (bound_a, server_a) = spawn_server_on("127.0.0.2", 1, move |_| WireResponse {
+    let (bound_a, server_a) = spawn_server_on("[::1]", 1, move |_| WireResponse {
         status: "302 Found",
         headers: vec![
             ("Location".into(), cross_target.clone()),
@@ -415,10 +417,10 @@ fn caller_and_hop_cookies_are_not_leaked_across_a_cross_origin_redirect() {
         delay: Duration::ZERO,
         body_chunk_delay: Duration::ZERO,
     });
-    // Origin A lives on a second loopback address so the two origins have
-    // distinct cookie hosts: RFC 6265 cookies are deliberately not isolated by
-    // port, so two 127.0.0.1 servers on different ports would share them just
-    // like real browsers do.
+    // Origin A lives on the IPv6 loopback so the two origins have distinct
+    // cookie hosts: RFC 6265 cookies are deliberately not isolated by port, so
+    // two 127.0.0.1 servers on different ports would share them just like real
+    // browsers do. IPv6 loopback is portable; 127.0.0.2 is not on macOS.
     let origin_a = bound_a.clone();
     let start = origin_a.join("start").expect("start URL");
     let request = FetchRequest::get(start).with_cookie("caller=secret");

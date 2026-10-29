@@ -14,34 +14,36 @@ says so. `docs/visual_fidelity_gaps.md` is the working register; this file is th
 
 | what | number | when |
 | --- | --- | --- |
-| `render-js` unit tests | 237 passed, 0 failed | this session |
-| `render-core` unit tests | 192 passed, 0 failed | this session |
-| `render-layout` unit tests | 202 passed, 0 failed, 1 ignored | this session |
-| `render-css` unit tests | 183 passed, 0 failed | this session |
-| `render-browser` unit tests | 161 passed, 0 failed | this session |
-| `render-html` unit tests | 131 passed, 0 failed | this session |
-| `render-net` unit tests | 81 passed, 0 failed | this session |
-| `render-dom` unit tests | 29 passed, 0 failed | this session |
-| real-site acceptance harness | 25 passed, 5 `#[ignore]`s each mapped to a named gap | this session |
-| Python static gate | 15 passed, 55 subtests | this session |
-| site-neutrality gate | **9 rules, 173 files, currently exit 1** on 9 genuine violations | this session |
-| **test262** | **30,808 / 98,096 = 31.4%** | **2026-09-20, NOT re-measured this session** |
-| **html5lib tree construction** | **5,810 / 7,377 pairs = 78.75%**; 190 acceptable difference, 776 unimplemented, **601 engine defect (8.15%)** | this session, pinned |
-| html5lib parse-error count agreement | **4,784 / 6,601 = 72.47%** under `max`, **60.60%** under `sum` - the gap between those two is the choice of reading, not the parser | this session |
-| **WPT `dom/`** | **32 / 297 executable = 10.8%**, 0 vacuous passes | this session, pinned `c7fdee80f3f1` |
-| **WPT `html/`** | **165 / 2,520 executable = 6.5%**, 31 errored, 0 vacuous passes | this session, pinned |
-| **WPT combined** | **197 / 2,817 = 7.0%** - 5,962 scored, 8,060 skipped, 1,684 with no assertion site at all | this session, pinned |
-| **WPT `css/`** | **cannot be run** - `testcss.js` is an iframe driver and the engine has no nested browsing contexts | - |
-| production HTML corpus sweep | **3,718 documents**, 0 of our diagnostic kinds at fault, 3 real defects found and fixed | this session |
-| production CSS corpus | 11,102 rules, 42,356 declarations, 1.93 MB | this session |
-| production JS | a 2.27 MB real bundle completes; a second probe also runs to completion, 0 threw | this session |
-| clippy `-D warnings`, workspace-wide | clean | this session |
-| mutation audit | 34 hand-picked mutations, **10 survived (29%)** | this session |
+| `render-js` unit tests | 1,116 passed, 0 failed | 2026-10-22 |
+| `render-core` unit tests | 298 passed, 0 failed | 2026-10-23 |
+| `render-layout` unit tests | 306 passed, 0 failed, 1 ignored | 2026-10-22 |
+| `render-css` unit tests | 191 passed, 0 failed | 2026-10-22 |
+| `render-browser` unit tests | 198 passed, 0 failed | 2026-10-23 |
+| `render-browser` app tests (binary) | 99 passed, 0 failed | 2026-10-23 |
+| `render-html` unit tests | 149 passed, 0 failed | 2026-10-22 |
+| `render-net` unit tests | 32 passed, 0 failed | 2026-10-22 |
+| `render-dom` unit tests | 77 passed, 0 failed | 2026-10-22 |
+| real-site acceptance harness | 25 passed, 5 `#[ignore]`s each mapped to a named gap | last recorded |
+| Python static gate | 15 passed, 55 subtests | last recorded |
+| site-neutrality gate | **9 rules, 269 Rust source files, exit 0** with 25 advisory findings | 2026-10-23 |
+| **test262** | **90,765 / 103,199 = 88.0%**; 264 buckets, 6 timeout, 0 crash; checked-in baseline floor = 90,765 | **2026-10-22, release profile, pinned revision** |
+| **html5lib tree construction** | **5,810 / 7,377 pairs = 78.75%**; 190 acceptable difference, 776 unimplemented, **601 engine defect (8.15%)** | last recorded, pinned |
+| html5lib parse-error count agreement | **4,784 / 6,601 = 72.47%** under `max`, **60.60%** under `sum` - the gap between those two is the choice of reading, not the parser | last recorded |
+| **WPT `dom/`** | **32 / 297 executable = 10.8%**, 0 vacuous passes | last recorded, pinned `c7fdee80f3f1` |
+| **WPT `html/`** | **165 / 2,520 executable = 6.5%**, 31 errored, 0 vacuous passes | last recorded, pinned |
+| **WPT combined** | **197 / 2,817 = 7.0%** - 5,962 scored, 8,060 skipped, 1,684 with no assertion site at all | last recorded, pinned |
+| **WPT `css/`** | **cannot be run** - `testcss.js` is an iframe driver, and while nested contexts now exist, an iframe document is not painted and the adapter hosts one document | - |
+| production HTML corpus sweep | **3,718 documents**, 0 of our diagnostic kinds at fault, 3 real defects found and fixed | last recorded |
+| production CSS corpus | 11,102 rules, 42,356 declarations, 1.93 MB | last recorded |
+| production JS | a 2.27 MB real bundle completes; a second probe also runs to completion, 0 threw | last recorded |
+| clippy `-D warnings`, workspace-wide | clean | 2026-10-22 |
+| mutation audit | 34 hand-picked mutations, **10 survived (29%)** | last recorded |
 
-The test262 figure is the only **external** conformance number that exists, and it is five weeks
-stale. Everything else is either the engine agreeing with itself or a measurement over real
-production code - which is worth a great deal, and is not the same thing as an external authority
-checking it. Two runners for that are in progress.
+The test262 figure is the external authority for the JavaScript language; the html5lib and WPT
+figures cover tree construction and the DOM/HTML surface. Everything else is either the engine
+agreeing with itself or a measurement over real production code - which is worth a great deal, and
+is not the same thing as an external authority checking it. Both external runners now exist and
+have produced the numbers in the table.
 
 ## Strong: deeper than the outside suggests
 
@@ -78,7 +80,7 @@ The body budget is an **idle-read** interval, not a total, so a large slow downl
 proved live by a 502,941-byte fetch that outlived its own 500 ms response budget and still
 completed.
 
-**Capability tracking.** `spec/registry.rs` has 36 entries and now **rejects any non-conformant
+**Capability tracking.** `spec/registry.rs` has 35 entries and now **rejects any non-conformant
 entry with a blank note**, so it cannot decay back into a list of `Partial`s that says nothing.
 
 ## Partial: works, with a named hole
@@ -100,22 +102,23 @@ Verified by grep, not inferred. Full discussion in the register's S30.
 | absent | consequence |
 | --- | --- |
 | **ES modules** | **Largely closed.** `render-js` parses import/export into tables (`src/module.rs`) and links them with live bindings (`src/runtime/module.rs`): named/default/namespace imports, re-exports, `export *`, `export * as`, cycles for hoisted declarations, `import.meta.url`, evaluate-once ordering, remembered failures. `render-core/src/module_graph.rs` assembles the graph and `render-browser/src/scripts.rs` fetches it in rounds. **Still open:** dynamic `import()` is a stub that resolves an empty object; top-level `await`; import maps (bare specifiers are diagnosed, not resolved); module code runs sloppy, not strict; a namespace object is a snapshot rather than a live exotic object; classic scripts still skip `import`/`export` instead of throwing a SyntaxError; `type=module` `async` scheduling is treated as defer; `<script type=module>` inserted after load goes through the same path as classic follow-up scripts but is untested in a live window |
-| **Line breaking** | there is **no break-opportunity algorithm at all** - text is exploded per character and every character is a wrap opportunity. UAX #14, `kinsoku` and `LineBreak` all have zero occurrences. CJK wrapping is right *by accident*; CJK **kinsoku shori is absent, so punctuation can begin a line**; and `min_content_width` splits on `split_whitespace()`, so **an unspaced Chinese run counts as one unbreakable word** - meaning `width: min-content`, a shrink-to-fit float, an auto table column or a flex item all derive their width from a whole paragraph. Detail in S34 |
-| **`DOMException`** | every Web API error is a plain `Error`, so **`instanceof DOMException` is false for all of them** - and that is the idiom real code branches on. `DataCloneError`, selector `SyntaxError`, `NotFoundError`, `AbortError` and the rest |
-| **`window.matchMedia`** | every responsive site that gates behaviour in script gets nothing |
-| **Form submission** | the owner relationship exists and is derived on read, but there is **no submit event path and no navigation**. A search box and a login do not submit - the single most-used interactive path on the web |
 | **Web Workers** | zero occurrences of `Worker` |
 | **History API** | `pushState`/`replaceState` change the URL and `history.state` without a load. Back/forward/go within the document fire `popstate` without a load; entries of another document reload. `history.length` reflects the list at each turn's start |
-| **Iframes** | no second document, so any page embedding one loses that content entirely |
+| **Iframe painting** | a nested document runs scripts in its own realm, but it is not laid out or painted, so a page embedding one loses that content visually |
 | **Animations and transitions** | `@keyframes` is parsed, diagnosed and discarded - 249 blocks in the corpus. No clock, so nothing can be time-driven |
 | **Selection / Range** | Range is implemented (DOM §5): `Range`, `StaticRange`, `createRange`, the boundary-point and content algorithms, and live updates on every tree mutation. There is no `getSelection` selection state, so `getSelection()` reports an empty selection, and no caret position APIs |
-| **Shadow DOM** | no `customElements` or `attachShadow` |
+| **Shadow-scoped styling** | shadow trees, `attachShadow` and autonomous `customElements` exist; shadow-tree stylesheets are not collected, `:host`/`::slotted` match nothing, and `slotchange` is not dispatched |
 | **Compositing** | there is no compositor. Every frame is one raster of the whole document, which is why scrolling cannot be cheap and why `position: fixed` cannot be a layer |
 | **Bidi** | UAX #9 has zero occurrences, so right-to-left scripts lay out left-to-right. Correctly lower priority given the corpus, but recorded rather than left to be rediscovered |
 | **HTTP/2** | structurally rejected: a pooled connection leaves the pool while in use and is held for the whole request, so one connection carries one in-flight request. Multiplexing is the inverse |
 | Multi-column layout | `column-count`, `column-width`, `columns`, `column-gap`, `column-fill` and `column-span: all`: the flow is cut at line boundaries, and a block that a break crosses is split with `box-decoration-break: slice` | `column-rule` is not implemented; `column-span` applies to direct block children only |
 | `filter`, `clip-path`, `backdrop-filter`, `mask-image`, `mix-blend-mode` | zero occurrences in the paint layer. Not approximated - absent |
 | `WebSocket`, `requestIdleCallback`, `PerformanceObserver` | absent |
+
+**Closed since this table was first written:** line breaking now implements UAX #14 and the CSS
+tailorings (S34); `DOMException` is a real interface object; `window.matchMedia` is implemented and
+tracks viewport changes; form submission has a cancelable `submit` event, GET/POST urlencoded
+navigation and `FormData`; and shadow trees exist, with styling still open as the row above says.
 
 ## What the numbers do not tell you
 
@@ -143,7 +146,7 @@ suites.
 - **DOM and HTML: 7.0%** - 197 of 2,817 executable tests, with 5,962 scored and 8,060 skipped.
   Per area, `dom/` is **10.8%** and `html/` is **6.5%**.
 - **CSS still cannot be run at all**, and the reason is structural rather than a gap in the runner:
-  `testcss.js` is an iframe driver and the engine has no nested browsing contexts.
+  `testcss.js` is an iframe driver, nested contexts exist, but an iframe document is not painted.
 
 **So the honest answer to "how far off is it" is now three numbers rather than one estimate, and
 they disagree by an order of magnitude** - a parser that is nearly conformant, a DOM API surface
@@ -153,7 +156,7 @@ document.
 
 The DOM and HTML figure is low for a reason that is worth naming rather than excusing: of 2,817
 executable tests, the largest single mechanism is **1,564 that lack canvas** and **630 that lack a
-nested browsing context**, both unimplemented capabilities rather than wrong answers. **The
+painted nested browsing context**, both unimplemented capabilities rather than wrong answers. **The
 defects proper are 664 tests**, and the largest defect mechanism - host objects not initialising
 Web IDL defaults - accounts for 638 of them across two mechanisms, where **every default is declared
 in the interface's IDL, so it is one change per interface rather than 638 changes.**
@@ -192,31 +195,21 @@ comparison agrees on 77% of cases while the **parse-error count agrees on only 4
 under-reports on 3,100 and over-reports on 835. A reader of the pass rate alone could not see that,
 because **a parser can build the right tree and still report the wrong number of errors.**
 
-**The WPT runner is built and the suite is censusued, and it cannot run a single test - and that is
-the correct result, reported as such.** WPT's CSS tests are `testcss.js` tests, and `testcss.js` is
-an **iframe driver**. `render-core` has no nested browsing contexts. **The largest area with a real
-cascade, a real selector matcher and a real layout engine is the one whose harness cannot run.**
+**The WPT conformance runner has real numbers for `dom/` and `html/`; `css/` is still blocked by
+iframe painting.** WPT's CSS tests are `testcss.js` tests, and `testcss.js` is an **iframe driver**.
+Nested browsing contexts now exist, but an iframe document is not laid out or painted, and the CSS
+computed-value adapter hosts one document. **The largest area with a real cascade, a real selector
+matcher and a real layout engine is still the one whose harness cannot run.**
 
-| area | scored tests | statically executable | run |
-| --- | --- | --- | --- |
-| `css/` | 26,614 | 18,174 (68.3%) | 0 |
-| `dom/` | 559 | 252 (45.1%) | 0 |
-| `html/` | 5,403 | 2,560 (47.4%) | 0 |
-| **total** | **32,576** | **20,986 (64.4%)** | **0** |
+The static census counted 26,614 scored CSS tests, of which 18,174 (68.3%) looked executable. That
+is a feasibility count, not a pass rate. `dom/` and `html/` have since been run (above), and the
+runner still reports no rate where the denominator is zero, so an empty run prints nothing rather
+than `0%`.
 
-The runner **has no code path that can report a conformance rate** - `Rate` returns `None` on a
-zero denominator, so an empty run prints nothing rather than `0%`. Its defensible claim is static
-feasibility, stated as such, and it names the capability that blocks the most: nested browsing
-contexts alone block **1,772** of the executable-looking tests.
-
-**And no engine defect list is reported, which the report correctly labels "blocked, not empty"** -
-nothing was evaluated, so a defect list would be an artefact of the harness rather than a fact
-about the engine.
-
-This reframes iframes. They are not just one more feature gap among twelve: **they are what blocks
-the external measurement of everything else.** An engine that cannot host a nested document cannot
-be scored by the largest CSS conformance suite in existence, so the absence of iframes is costing
-not one page but the project's ability to know whether its CSS is right.
+This reframes iframes. They are not just one more feature gap: **they block embedded content on
+real pages and the external measurement of CSS.** An engine that cannot paint a nested document
+cannot be scored by the largest CSS conformance suite in existence, so the absence of the iframe
+paint path costs not one page but the project's ability to know whether its CSS is right.
 
 The runner also found **two defects in its own instrument**, both the same failure class this
 project keeps meeting: a reference-identity metric whose two sets were in different key spaces, so
@@ -232,32 +225,31 @@ to fail**, which is a useful calibration for anyone who reads a conformance perc
 
 ## The shape of the remaining distance
 
-It is **not a long tail of small gaps.** It is roughly a dozen structural absences, and a short
-list of them would break more real pages than everything else combined:
+It is **not a long tail of small gaps.** It is a set of structural absences, and a short list of
+them would break more real pages than everything else combined:
 
-1. **Form submission** - the search box and the login, on every site. The owner relationship is
-   derived and correct; what is missing is the submit event path and the navigation
-2. **ES modules** - static graphs now link and run (see the row above); dynamic `import()` and top-level `await` are what remain for modern bundles
-3. **`matchMedia`** - every responsive site that gates behaviour in script
-4. **Line breaking** - **specific to this project's corpus.** There is no break-opportunity
-   algorithm, so kinsoku shori is absent and CJK punctuation can begin a line, and
-   `min_content_width` treats an unspaced Chinese paragraph as one unbreakable word, so **every
-   intrinsic width on a Chinese page is wrong today**. The first three are mostly a matter of
-   wiring up what exists - the form owner is derived and correct, the parser runs script bodies,
-   the viewport is known. **This one is a real hole in a core algorithm**, and it is the only item
-   on this list that is wrong *right now* on the pages this project is built around
+1. **Iframe painting** - nested documents run scripts in their own realm, but they are not laid
+   out or painted, so any embedded content is invisible
+2. **Animations and transitions** - `@keyframes` is parsed and discarded, and there is no
+   animation clock, so nothing can be time-driven
+3. **Shadow-scoped styling** - shadow trees exist, but a `<style>` inside a shadow root applies
+   nowhere and `:host`/`::slotted` match nothing
+4. **Selection, bidi, workers and compositing** - the remaining structural absences. The
+   compositor in particular is an architectural fact rather than a gap: it changes what scrolling
+   and fixed positioning can cost
 
-**One measurement is deliberately not a claim.** The site-neutrality gate now has 9 rules and
-currently **exits 1** on 9 genuine violations - live tests named after specific commercial sites,
-and diagnostic tools reading site-named corpus paths. It reads all of them and reports them, so
-nothing fails silently, but `tools/check.sh` and CI are red until they are removed. The gate also
-turned out to have **two of its own rules dead for their own target** - `\b` does not fire next to
-`_`, so the identifier rule never matched the one name it existed for - which is exactly what a
-gate that looks like it is working, and is not, looks like.
+**Closed from this list:** dynamic interaction state is now wired through
+`InteractionState` and `Document::render_with_interaction`, so `:hover`, `:active`, `:focus`,
+`:focus-within` and `:target` match from real pointer, focus and URL input. `:visited` remains
+unmatched (no visited-link history is exposed) and `:focus-visible` still aliases `:focus`; Tab
+focus navigation is not routed to the page yet.
 
-Behind the list: iframes, animations, workers, shadow DOM, selection, bidi, and a compositor.
-Those are larger, and the compositor in particular is an architectural fact rather than a gap - it
-changes what scrolling and fixed positioning can cost.
+**One measurement is deliberately not a claim.** The site-neutrality gate now has 9 rules, scans
+269 Rust source files, and **exits 0 with 25 advisory findings**. The blocking violations this
+section used to record are gone; the advisories are site names in comments and diagnostic file
+names, and they are still reported so the vocabulary does not become invisible. A gate that reads
+as enforcement but has stopped detecting is worse than no gate, which is why the self-test runs
+first.
 
 **And one symptom is still unexplained.** A large real portal renders some regions as bare
 unstyled text. Four candidate causes have been eliminated by measurement, including the lead the

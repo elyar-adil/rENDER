@@ -13,8 +13,10 @@ rENDER 的 JavaScript 一致性门禁使用官方 [tc39/test262](https://github.
 在仓库根目录执行：
 
 ```bash
-cargo test -p render-core --test test262 pinned_test262_manifest_reports_a_real_baseline -- --exact --nocapture
+cargo test --release -p render-core --test test262 pinned_test262_manifest_reports_a_real_baseline -- --ignored --exact --nocapture
 ```
+
+全量测试默认标记为 `#[ignore]`，因此 `cargo test --workspace` 只运行 runner 自身的 10 个自测，不会在 debug profile 下扫描全部 103,199 个变体。这个区分是必要的：生成的 RegExp property-escape 用例在 debug 下会超过每文件 30 秒的硬超时，在 release 下则远低于它（本机 `ASCII.js` 实测 debug 40 秒、release 7.5 秒）。`tools/check.sh` 和 CI 以 release 运行全量门禁，记录的数字也来自 release。
 
 runner 默认使用逻辑 CPU 一半、最多 8 个隔离 worker。协调器逐文件动态派发任务；每个 worker 拥有独立进程、DOM 和 Runtime。单文件超过硬超时，或 worker 出现 panic/崩溃时，协调器会终止该进程、记录 `timeout`/`crash`，再启动新 worker 继续队列，避免一次异常中断整轮扫描。
 
@@ -48,20 +50,35 @@ runner 已实现的执行骨架遵循官方 `INTERPRETING.md`：
 7. 核对 `negative.phase` 与错误类型；
 8. `module`、`async` 和 `_FIXTURE` 先显式分类，不伪造通过率。
 
-2026-08-02 在新增 DOM/JS、布局和网络改动之后重新完成的全量基线为：
+2026-10-22 在 release profile 下完成的全量基线（默认 worker 数，865.67 秒）：
 
 ```text
 files=53869
-variants=98096
-pass=11628
-fail=79820
+variants=103199
+pass=90765
+fail=12127
 skip=294
-unsupported=6354
-timeout=0
+unsupported=7
+timeout=6
 crash=0
 ```
 
-这只是固定 revision、当前 runner 和当前引擎边界下的工程基线，不是完整 ECMAScript 合规率。该次扫描的主要失败簇包括未实现语法、默认 harness 编译失败、异步完成协议和模块执行；后续以失败簇为单位修复，禁止按具体测试路径写特判。
+分类计数：
+
+```text
+annexB:    pass=1209  fail=168   skip=0   unsupported=0 timeout=0 crash=0
+built-ins: pass=42938 fail=4361  skip=3   unsupported=7 timeout=0 crash=0
+intl402:   pass=162   fail=6552  skip=0   unsupported=0 timeout=0 crash=0
+language:  pass=43799 fail=694   skip=283 unsupported=0 timeout=0 crash=0
+other:     pass=230   fail=2     skip=0   unsupported=0 timeout=0 crash=0
+staging:   pass=2427  fail=350   skip=8   unsupported=0 timeout=6 crash=0
+```
+
+检查入的 `crates/render-core/tests/test262-baseline.tsv` 已按这次 release 运行重建（264 个桶，90,765 pass），门禁输出 `264 buckets ok`。此前的检查入基线为 47,116 pass（2026-10-09，提交 `cba591c`）。从那时到本次运行之间有 228 个提交修复了解析器、内建对象和 async 用例；release 运行又避免了 debug 下 RegExp property-escape 的假超时。这次提升是两者共同作用，不能全部归因于运行 profile。旧基线文件合计 98,096 个变体，当前 runner 记录 103,199 个；固定 revision 未变，差异来自 runner 对 module/async/fixture 用例的分类与执行口径变化（例如 `async` 用例不再一律记为 unsupported）。
+
+当前最大的失败簇是 `intl402`（6,552 fail）和 `built-ins` 的 `unexpected Throw`/`Type`/`Reference`；`language` 只剩 694 fail。6 个 timeout 全部在 `staging`，crash 为 0。
+
+这只是固定 revision、当前 runner 和当前引擎边界下的工程基线，不是完整 ECMAScript 合规率。后续以失败簇为单位修复，禁止按具体测试路径写特判。基线文件是回归地板：任何桶的 pass 不得低于该次记录。
 
 全量扫描不应因普通 `fail` 或 `unsupported` 中断，而是输出真实总量、分类计数、失败簇和有限样本，作为适配优先级依据；但引擎 panic、资源失控或 runner 基础设施错误必须使扫描失败。严格回归门禁仍需从全量结果中维护已支持集合，确保已经适配的语义不会退化。不得把支持集合的通过率描述为完整 test262 通过率。
 

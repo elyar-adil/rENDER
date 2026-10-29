@@ -298,6 +298,21 @@ pub struct MatchContext {
     pub viewport_height: Option<f32>,
 }
 
+/// The host's user-interaction state for dynamic pseudo-classes.
+///
+/// This is deliberately narrower than [`MatchContext`]: a frontend supplies
+/// only what it knows about the user, and the render pipeline derives the
+/// viewport, quirks mode, and stylesheet scope itself. `hovered` and `active`
+/// are sets rather than single nodes because those pseudo-classes also match
+/// the element's ancestors while the pointer is over a descendant.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InteractionState {
+    pub hovered: HashSet<NodeId>,
+    pub active: HashSet<NodeId>,
+    pub focused: Option<NodeId>,
+    pub target: Option<NodeId>,
+}
+
 /// Parse a strict selector list. Any invalid selector invalidates the list.
 ///
 /// # Errors

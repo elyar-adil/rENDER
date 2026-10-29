@@ -22,7 +22,7 @@ capabilities that are parsed but never consumed, or computed and then dropped.
 | CSS syntax, selectors, and cascade | 45% | Common selectors, specificity, inheritance, custom properties, and major value grammars work; full CSS syntax and cascade coverage remain. |
 | Layout | 48% | Block/inline, floats, positioned boxes, flex, grid, table, overflow, and common sizing work; intrinsic and multi-axis edge cases remain. |
 | Painting and images | 42% | CPU display lists, backgrounds, borders, clipping, opacity, transforms, and common raster images work; stacking, replaced-element, and SVG coverage remain. |
-| JavaScript runtime | 15% | Common script execution, DOM mutation, promises, timers, and events work; the latest full test262 run passed 30,808/98,096 variants (31.4%), recorded 2026-09-20. |
+| JavaScript runtime | 15% | Common script execution, DOM mutation, promises, timers, and events work; the latest full test262 run passed 90,765/103,199 variants (88.0%), recorded 2026-10-22 in release. |
 | Network and resources | 50% | TLS HTTP(S), redirects, cookies, gzip/Brotli, CSS, scripts, images, and common lazy-image sources work; bounded workers and a conservative private HTTP cache are active; CORS covers simple and preflighted requests without credentials, while credentialed CORS and service workers remain. |
 | Browser shell and interaction | 55% | Native window, tabs, address editing, history, scrolling, links, forms, and DPI-aware painting work; accessibility and broader input remain. |
 | **Overall minimum usable browser** | **42%** | Enough infrastructure exists for iterative real-site compatibility work; this is not a claim of general web compatibility. |
@@ -83,20 +83,25 @@ Run the required checks before finishing any change:
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-python tools/check_site_neutrality.py
+python3 tools/check_site_neutrality.py
 cargo test --workspace
+cargo test --release -p render-core --test test262 \
+  pinned_test262_manifest_reports_a_real_baseline -- --ignored --exact --nocapture
 ```
 
 `tools/check_site_neutrality.py` enforces the no-per-site-branches rule
 mechanically, so a capability gap cannot be quietly closed by special-casing a
-host. It runs in CI alongside the other three checks.
+host. It runs in CI alongside the other checks. The full test262 suite is
+release-only because generated RegExp property-escape files exceed the per-file
+timeout in a debug build; `cargo test --workspace` runs its 10 runner self-tests
+and skips the pinned measurement.
 
 Conformance suites:
 
 - `third_party/test262` (fetched by `tools/fetch-test262.sh`) drives the
   JavaScript conformance runner in `crates/render-core/tests/test262.rs`.
 - WPT reftests (`crates/render-core/tests/wpt_reftests.rs`) run against a
-  pinned WPT checkout fetched by `tools/fetch-wpt.ps1`, configured through
+  pinned WPT checkout fetched by `tools/wpt/fetch-wpt.ps1`, configured through
   `RENDER_WPT_*` environment variables.
 
 ## Repository Layout
@@ -115,7 +120,7 @@ crates/render-browser     Native desktop shell (winit + softbuffer)
 example/                  Local HTML fixtures for manual testing
 docs/                     Notes and compatibility analysis
 tools/                    Pinned conformance-suite fetch scripts
-third_party/              Vendored test262 checkout
+third_party/              Fetched pinned test262 checkout
 ```
 
 ## Architecture
