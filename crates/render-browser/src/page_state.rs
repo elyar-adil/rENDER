@@ -13,6 +13,7 @@ use render_browser::model::PageScrollState;
 use render_browser::resources::StylesheetFetchPlan;
 use render_browser::scripts::ScriptBatchPreparation;
 use render_browser::scripts::ScriptFetchPlan;
+use render_browser::scripts::ScriptResourceSeverity;
 use render_browser::worker::RenderIdentity;
 use render_core::css::computed::ComputedStyle;
 use render_core::css::selector::InteractionState;
@@ -494,6 +495,7 @@ impl PageState {
 
     pub(super) fn execute_script_batch(&mut self, preparation: ScriptBatchPreparation) -> bool {
         let revision_before_execution = self.page.document().dom().revision();
+        self.fire_script_element_errors(&preparation.diagnostics);
         let mut origins = preparation
             .scripts
             .iter()
@@ -566,6 +568,12 @@ impl PageState {
                         if let PageJob::Task { id, .. } = execution.job {
                             turn_origin = origins.get(&id);
                         }
+                        // An external script that ran — even one whose
+                        // uncaught exception was just reported — fires `load`
+                        // at its element (HTML "execute the script element").
+                        if let Some((owner, _, Some(_))) = turn_origin {
+                            let _ = self.page.queue_dom_event(PageDomEvent::new(*owner, "load"));
+                        }
                         if let Err(error) = execution.result {
                             if let Some((owner, source_order, final_url)) = turn_origin {
                                 let url = final_url.as_ref().map_or("inline", Url::as_str);
@@ -587,6 +595,29 @@ impl PageState {
         }
         self.dom_revision = self.page.document().dom().revision().as_u64();
         self.page.document().dom().revision() != revision_before_execution
+    }
+
+    /// Fires `error` at every script element whose resource failed to fetch or
+    /// compile.
+    ///
+    /// HTML "execute the script element": a script whose result is null never
+    /// runs, and the element gets an `error` event instead. Pages implement
+    /// their own fallbacks on that event (CDN fallback chains, `<script
+    /// onerror>` handlers), so dropping the script without firing it silently
+    /// breaks them.
+    fn fire_script_element_errors(
+        &mut self,
+        diagnostics: &[render_browser::scripts::ScriptResourceDiagnostic],
+    ) {
+        for diagnostic in diagnostics {
+            if diagnostic.severity != ScriptResourceSeverity::Error {
+                continue;
+            }
+            let Some(owner) = diagnostic.owner else {
+                continue;
+            };
+            let _ = self.page.queue_dom_event(PageDomEvent::new(owner, "error"));
+        }
     }
 
     /// Derive the committed page title from the document's `<title>` element,

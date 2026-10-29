@@ -981,6 +981,40 @@ fn timer_inserted_script_runs_after_initial_script_scan_completed() {
 }
 
 #[test]
+fn a_failed_script_fires_error_at_its_element_so_page_fallbacks_run() {
+    let (mut app, tab) = headless_app_with("<main id=host></main>");
+    {
+        let page = app.pages.get_mut(&tab).expect("page state");
+        page.styles_resolved = true;
+        page.scripts_resolved = true;
+        page.initial_script_scan_completed = true;
+        page.page
+            .queue_script(
+                r"var s = document.createElement('script');
+                  s.textContent = 'this is not javascript (';
+                  s.addEventListener('error', function () { document.title = 'Fallback'; });
+                  document.getElementById('host').appendChild(s);",
+            )
+            .expect("the setup script fits the page limits");
+        let (changed, _) = page.run_page_turns();
+        assert!(changed, "the setup script inserts the failing element");
+        assert!(
+            !page.scripts_resolved,
+            "a new script element reopens discovery"
+        );
+    }
+
+    // The element's source cannot compile, so it never runs; the page's own
+    // fallback is the only thing that can react, and HTML gives it the
+    // element's `error` event.
+    app.start_classic_scripts(tab);
+    assert_eq!(
+        app.pages.get(&tab).unwrap().navigation.committed().title,
+        "Fallback"
+    );
+}
+
+#[test]
 fn broken_image_does_not_refetch_on_every_render_but_new_source_does() {
     let (mut app, tab) = headless_app_with("<img id=photo src=https://example.test/a.png>");
     app.start_images(tab);

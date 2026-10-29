@@ -1,3 +1,37 @@
+# 交接文档 (2026-10-29, 续三) — 生产 bundle 的两处硬失败与脚本元素事件
+
+真实页面排查（baidu / zhihu / qq / jd / bing / hn / github）发现:失败不在同一层。
+本轮修掉脚本层的两类**整包失败**,并把"脚本失败兜底"对齐 HTML 规范。
+
+## 本轮已完成
+
+| 内容 | 落点 |
+|---|---|
+| **模板字符串里的除号被当成正则** | `${width/2}` 让 lexer 在空 token 表上做 regex/division 判定,吞掉后续几 KB 并在字符串中间报 `invalid numeric literal`。现在扫描 `${...}` 时逐 token 入栈,结束后随外层状态一起丢弃 |
+| **括号赋值被误判成箭头参数默认值** | `(x = await 1)` 在 async 函数里是普通赋值,却在 speculative arrow head 里提前报"await 不允许出现在形参"。现在记录该早期错误,只有 `=>` 确认时才抛出;失败的回溯恢复外层状态 |
+| **脚本元素 `error` / `load` 事件** | 按 HTML "execute the script element":结果为 null(抓取失败、MIME 拒绝、编译失败)→ 在元素上派发 `error`;外部脚本执行完(含运行时抛错)→ 派发 `load`。此前只有 stderr 诊断,页面的 CDN 回退链、`<script onerror>` 永远不触发 |
+| **无窗口截图** | `--screenshot PATH [--screenshot-delay MS]`:真实管线(网络/CSS/脚本/系统字体)渲染后写 PNG 并退出;窗口隐藏、不抢焦点、macOS 无 Dock 图标。用于不打扰使用者的视觉验收 |
+
+## 验证
+
+- JD 的 1.9 MB `index.chunk.js` 现在完整编译(此前先后挂在 byte 1299026 与 1499679)。
+- 新测试:`template_interpolation_lexes_division_as_division`、`a_parenthesised_assignment_containing_await_or_yield_is_not_an_arrow_head`、`a_failed_script_fires_error_at_its_element_so_page_fallbacks_run`。
+- `cargo test --workspace` 全绿;fmt/clippy 干净。
+
+## 明确未做
+
+- 脚本元素的 `load`/`error` 事件是异步元素任务,但未处理"脚本在执行前被移除/移动文档"的取消规则。
+- 模块图的依赖失败只在入口元素上报 `error` 的语义未逐一核对。
+- 脚本层之后仍是运行时/宿主 API(百度 16 个脚本 URL 拼出 `undefined`)、传输层(5 秒连接预算)、样式/布局层。
+
+## 下一步候选
+
+1. 百度 `...undefined` 的 API 返回值 bug。
+2. 传输层连接预算与多地址回退(HN 整页超时、GitHub 丢样式表)。
+3. 每页健康报告:按层汇总传输失败、编译/运行错误、丢弃声明、无盒元素。
+
+---
+
 # 交接文档 (2026-10-29, 续二) — `<img>` 加载状态与图像源 `drawImage`
 
 接续同日的 canvas 会话。上一轮把 `drawImage` 的画布源做完了;这一轮补上 `<img>`
