@@ -1368,6 +1368,13 @@ impl JsRuntime {
             NativeFunction::RegExpCompile => {
                 self.dispatch_regexp_native(dom, NativeFunction::RegExpCompile, receiver, arguments)
             }
+            // The RegExp statics are dispatched with the other RegExp natives;
+            // listing them keeps this match exhaustive.
+            NativeFunction::RegExpStatic(_) | NativeFunction::RegExpStaticSetter(_) => {
+                unreachable!("dispatched by the RegExp builtins")
+            }
+            // HTML §8.9: no Java plugin, so the capability query answers false.
+            NativeFunction::NavigatorJavaEnabled => Ok(JsValue::Boolean(false)),
             NativeFunction::RegExpAccessor(_)
             | NativeFunction::RegExpSymbolMatch
             | NativeFunction::RegExpSymbolMatchAll

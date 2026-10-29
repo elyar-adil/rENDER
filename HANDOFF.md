@@ -1,3 +1,38 @@
+# 交接文档 (2026-10-29, 续四) — 真实页面第二层：RegExp 静态属性、页面健康线与脚本栈
+
+接续同日"脚本失败兜底"会话。用隐藏截图逐站排查后,这一轮修掉的是**真实站点脚本
+依赖的两个平台细节**,并把"页面为什么烂"变成一行可读的数字。
+
+## 本轮已完成
+
+| 内容 | 落点 |
+|---|---|
+| **Annex B.2.5 RegExp 静态属性** | `RegExp.$1`..`$9`、`$&`、`` $` ``、`$'`、`$+`、`input`/`$_`(含 setter),由每次成功的内建匹配更新。百度的 AMD loader 用 `RegExp.$1` 还原 `.js` 扩展名,此前拿到 `undefined` 把组件 URL 拼成 `...64427334a2undefined`,16 个脚本 404;现在 **0 个脚本错误** |
+| **`navigator.javaEnabled()`** | 恒返回 false,`wl.js` 不再在启动时抛 "not callable" |
+| **脚本错误带调用栈** | `JsError` 的抛出对象已有 `stack`;浏览器诊断现在把它一并打印,匿名帧编号 + 具名帧可用于定位 bundle 内部调用链 |
+| **页面健康线** | `--screenshot` 结束时打印一行:`dom_elements / boxes / scripts_failed / scripts_threw / css_errors / css_warnings / images_failed`。失败不再只表现为"看起来不对" |
+
+## 测量(隐藏截图,9-10 秒)
+
+| 站点 | dom_elements | boxes | scripts_failed | scripts_threw | css_warnings |
+|---|---|---|---|---|---|
+| baidu | 534 | 154 | 0(修复前 16) | 1 | 5 |
+| jd | 654 | 117 | 0(修复前整包编译失败) | 5 | 156 |
+| bing | 273 | 58 | 0 | 2 | 0 |
+
+## 明确未做 / 下一步
+
+- **JD 的 `Incompatible receiver, Map required`**:core-js 2.6.12 的 `_collection` 在某条
+  `$iterDetect` 路径上判定需要 polyfill,之后把 `validate` 版方法装到原生原型上,早先创建的
+  原生 Map 实例就会抛错。单独加载 core-js 2.6.12 不触发;需要继续缩小到页面加载顺序/实例来源。
+  这是 JD 首屏仍在空转的主因。
+- **`Audio` 构造器缺失**(`new Audio()`),JD 的 aria.js 抛 ReferenceError。
+- 脚本栈只有函数名,没有 file:line;给 `CallFrame` 增加源位置后才能直接指到 bundle 字节。
+- 传输层:本机对 HN/GitHub 的 TCP 连接被网络层阻断(curl -4/-6 同样超时),不是 5 秒预算
+  造成的,暂时不改预算。
+
+---
+
 # 交接文档 (2026-10-29, 续三) — 生产 bundle 的两处硬失败与脚本元素事件
 
 真实页面排查（baidu / zhihu / qq / jd / bing / hn / github）发现:失败不在同一层。

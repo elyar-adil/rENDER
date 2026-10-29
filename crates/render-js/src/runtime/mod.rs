@@ -298,6 +298,9 @@ pub struct JsRuntime {
     mutation_seen_revision: DomRevision,
     /// The embedder's 2D canvas host; `None` leaves `getContext` answering `null`.
     canvas_host: Option<Box<dyn crate::canvas::CanvasHost>>,
+    /// Annex B.2.5 legacy `RegExp` static values, updated by every successful
+    /// built-in match and read by `RegExp.$1`..`$9` and their aliases.
+    legacy_regexp: crate::runtime::builtins::regexp::LegacyRegExpState,
     /// The `CanvasRenderingContext2D` object of each canvas, so that repeated
     /// `getContext` calls return the same object. Rooted for the collector.
     canvas_contexts: BTreeMap<crate::canvas::CanvasId, ObjectId>,
@@ -453,6 +456,7 @@ impl JsRuntime {
             media_query_lists: Vec::new(),
             mutation_seen_revision: dom.revision(),
             canvas_host: None,
+            legacy_regexp: crate::runtime::builtins::regexp::LegacyRegExpState::default(),
             canvas_contexts: BTreeMap::new(),
             canvas_gradient_objects: BTreeMap::new(),
             next_gradient_id: 1,
@@ -1180,6 +1184,22 @@ impl JsRuntime {
         let outcome = self.execute(dom, source);
         self.script_filename = None;
         outcome
+    }
+
+    /// The `stack` text of a thrown object, when it has one.
+    ///
+    /// An embedder that reports an uncaught error to a log can print the
+    /// call-site lines the engine captured when the error object was made.
+    #[must_use]
+    pub fn error_stack(&self, value: &JsValue) -> Option<String> {
+        let JsValue::Object(object) = value else {
+            return None;
+        };
+        let stack = self.realm.get_property(*object, "stack")?;
+        let JsValue::String(text) = stack else {
+            return None;
+        };
+        Some(text.to_lossy())
     }
 
     /// Defines `name` on `target` as a function that runs `host` when called. An

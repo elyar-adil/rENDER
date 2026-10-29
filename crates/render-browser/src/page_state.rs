@@ -86,6 +86,13 @@ pub(super) struct PageState {
     /// Whether the last focus the user gave the page came from the keyboard.
     /// Script-initiated focus inherits it when deciding `:focus-visible`.
     keyboard_focus: bool,
+    /// Script elements whose resource never compiled or loaded. Reported in the
+    /// page health line; the page's own `error` listeners also saw them.
+    pub(super) script_load_errors: usize,
+    /// Uncaught exceptions from script tasks that did run.
+    pub(super) script_runtime_errors: usize,
+    /// Image resources whose transfer or decode failed.
+    pub(super) image_errors: usize,
     pub(super) pending_images: Option<PendingImages>,
     pub(super) styles_resolved: bool,
     pub(super) pending_style_sheets: Option<PendingStyleSheets>,
@@ -239,6 +246,9 @@ impl PageState {
             computed_styles: BTreeMap::new(),
             interaction,
             keyboard_focus: false,
+            script_load_errors: 0,
+            script_runtime_errors: 0,
+            image_errors: 0,
             pending_images: None,
             styles_resolved: false,
             pending_style_sheets: None,
@@ -323,6 +333,9 @@ impl PageState {
             &self.navigation.committed().target.history_url(),
         );
         self.keyboard_focus = false;
+        self.script_load_errors = 0;
+        self.script_runtime_errors = 0;
+        self.image_errors = 0;
         self.styles_resolved = false;
         self.scripts_resolved = false;
         self.started_scripts.clear();
@@ -575,14 +588,9 @@ impl PageState {
                             let _ = self.page.queue_dom_event(PageDomEvent::new(*owner, "load"));
                         }
                         if let Err(error) = execution.result {
-                            if let Some((owner, source_order, final_url)) = turn_origin {
-                                let url = final_url.as_ref().map_or("inline", Url::as_str);
-                                eprintln!(
-                                    "render-browser classic script node {owner:?} source {source_order} {url} failed: {error}"
-                                );
-                            } else {
-                                eprintln!("render-browser classic script failed: {error}");
-                            }
+                            self.script_runtime_errors =
+                                self.script_runtime_errors.saturating_add(1);
+                            self.report_script_failure(&error, turn_origin);
                         }
                     }
                 }
@@ -595,6 +603,28 @@ impl PageState {
         }
         self.dom_revision = self.page.document().dom().revision().as_u64();
         self.page.document().dom().revision() != revision_before_execution
+    }
+
+    /// Logs one script task failure, with the call-site lines the engine
+    /// captured on the thrown error object when it has them.
+    fn report_script_failure(
+        &self,
+        error: &render_core::js::JsError,
+        origin: Option<&(render_core::dom::NodeId, usize, Option<Url>)>,
+    ) {
+        let stack = error
+            .thrown_value()
+            .and_then(|value| self.page.runtime().error_stack(value))
+            .map(|stack| format!("\n{stack}"))
+            .unwrap_or_default();
+        if let Some((owner, source_order, final_url)) = origin {
+            let url = final_url.as_ref().map_or("inline", Url::as_str);
+            eprintln!(
+                "render-browser classic script node {owner:?} source {source_order} {url} failed: {error}{stack}"
+            );
+        } else {
+            eprintln!("render-browser classic script failed: {error}{stack}");
+        }
     }
 
     /// Fires `error` at every script element whose resource failed to fetch or
@@ -613,6 +643,7 @@ impl PageState {
             if diagnostic.severity != ScriptResourceSeverity::Error {
                 continue;
             }
+            self.script_load_errors = self.script_load_errors.saturating_add(1);
             let Some(owner) = diagnostic.owner else {
                 continue;
             };

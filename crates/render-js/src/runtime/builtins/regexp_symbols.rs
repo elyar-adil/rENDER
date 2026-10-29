@@ -271,6 +271,7 @@ impl JsRuntime {
             let end = found.end as f64;
             self.set_strict(dom, rx, "lastIndex", JsValue::Number(end))?;
         }
+        self.record_legacy_regexp_match(input, &found);
         Ok(Some(found))
     }
 

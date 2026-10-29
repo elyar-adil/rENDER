@@ -633,6 +633,24 @@ pub(crate) enum RegExpAccessor {
     HasIndices,
 }
 
+/// One Annex B.2.5 legacy `RegExp` static, read from the runtime's record of
+/// the last successful match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RegExpStaticProperty {
+    /// `RegExp.input` and its alias `RegExp.$_`.
+    Input,
+    /// `RegExp.lastMatch` and `RegExp.$&`.
+    LastMatch,
+    /// `RegExp.lastParen` and `RegExp.$+`.
+    LastParen,
+    /// `RegExp.leftContext` and `` RegExp.$` ``.
+    LeftContext,
+    /// `RegExp.rightContext` and `RegExp.$'`.
+    RightContext,
+    /// `RegExp.$1` through `RegExp.$9`, 1-based.
+    Capture(u8),
+}
+
 /// The Annex B.2.2 HTML methods as `(method, tag, attribute)`, where an empty
 /// attribute means the method takes no argument. `NativeFunction::StrHtml`
 /// indexes this table, so a method's native and its name share one row.
@@ -960,6 +978,10 @@ pub(crate) enum NativeFunction {
     /// `RegExp.prototype.compile` (Annex B.2.4.1).
     RegExpCompile,
     RegExpAccessor(RegExpAccessor),
+    RegExpStatic(RegExpStaticProperty),
+    /// `navigator.javaEnabled()`, which reports no Java plugin.
+    NavigatorJavaEnabled,
+    RegExpStaticSetter(RegExpStaticProperty),
     /// `RegExp.prototype[@@match]`, `[@@matchAll]`, `[@@replace]`, `[@@search]`
     /// and `[@@split]` (ECMA-262 22.2.6.8-12).
     RegExpSymbolMatch,
@@ -3706,7 +3728,7 @@ impl Realm {
             function_prototype,
             document_url,
         );
-        Self::install_navigator(objects, global, object_prototype);
+        Self::install_navigator(objects, global, object_prototype, function_prototype);
         Self::install_screen(objects, global, object_prototype);
         Self::install_performance(objects, global, object_prototype, function_prototype);
         Self::install_dom_exception(objects, global, error_prototype, function_prototype);
@@ -6968,6 +6990,7 @@ impl Realm {
         objects: &mut Vec<JsObject>,
         global: ObjectId,
         object_prototype: ObjectId,
+        function_prototype: ObjectId,
     ) {
         let navigator = ObjectId(objects.len());
         objects.push(JsObject {
@@ -6986,6 +7009,16 @@ impl Realm {
                 PropertyDescriptor::builtin(JsValue::String((value.to_owned()).into())),
             );
         }
+        let java_enabled = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::NavigatorJavaEnabled),
+            ..JsObject::default()
+        });
+        objects[navigator.0].properties.insert(
+            "javaEnabled".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(java_enabled)),
+        );
         for (name, value) in [("cookieEnabled", true), ("onLine", true)] {
             objects[navigator.0].properties.insert(
                 name.to_owned(),
@@ -7594,6 +7627,60 @@ impl Realm {
                     writable: false,
                     getter: Some(getter),
                     setter: None,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
+        // ECMA-262 Annex B.2.5: the legacy static properties read (and, for
+        // `input`/`$_`, write) the runtime's record of the last match. They are
+        // installed on the constructor, not the prototype.
+        for (name, property, writable) in [
+            ("input", RegExpStaticProperty::Input, true),
+            ("$_", RegExpStaticProperty::Input, true),
+            ("lastMatch", RegExpStaticProperty::LastMatch, false),
+            ("$&", RegExpStaticProperty::LastMatch, false),
+            ("lastParen", RegExpStaticProperty::LastParen, false),
+            ("$+", RegExpStaticProperty::LastParen, false),
+            ("leftContext", RegExpStaticProperty::LeftContext, false),
+            ("$`", RegExpStaticProperty::LeftContext, false),
+            ("rightContext", RegExpStaticProperty::RightContext, false),
+            ("$'", RegExpStaticProperty::RightContext, false),
+        ]
+        .into_iter()
+        .chain((1..=9).map(|index| {
+            (
+                // The names are static strings, so the capture index is part of
+                // a small fixed table.
+                Box::leak(format!("${index}").into_boxed_str()) as &str,
+                RegExpStaticProperty::Capture(index),
+                false,
+            )
+        })) {
+            let getter = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(NativeFunction::RegExpStatic(property)),
+                properties: Self::function_metadata(&format!("get {name}"), 0.0),
+                ..JsObject::default()
+            });
+            let setter = writable.then(|| {
+                let setter = ObjectId(objects.len());
+                objects.push(JsObject {
+                    prototype: Some(function_prototype),
+                    host: ObjectHost::NativeFunction(NativeFunction::RegExpStaticSetter(property)),
+                    properties: Self::function_metadata(&format!("set {name}"), 1.0),
+                    ..JsObject::default()
+                });
+                setter
+            });
+            objects[constructor.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    value: JsValue::Undefined,
+                    writable: false,
+                    getter: Some(getter),
+                    setter,
                     enumerable: false,
                     configurable: true,
                 },

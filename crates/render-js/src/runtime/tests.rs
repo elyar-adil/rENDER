@@ -1123,6 +1123,59 @@ fn string_replace_expands_groups_and_honors_global() {
 }
 
 #[test]
+fn navigator_reports_no_java_plugin() {
+    assert_eq!(
+        evaluate_script("navigator.javaEnabled() === false"),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn legacy_regexp_statics_follow_the_last_successful_match() {
+    // Annex B.2.5: `test` is a match, so it updates `$1`, `lastMatch`,
+    // `input`, the contexts and `lastParen` just like `exec` does.
+    let value = evaluate_script(
+        r#"
+        /x(a)?(b)?/.test("zxa");
+        [
+            RegExp.$1 === "a",
+            RegExp.$2 === undefined,
+            RegExp.lastMatch === "xa",
+            RegExp["$&"] === "xa",
+            RegExp.leftContext === "z",
+            RegExp.rightContext === "",
+            RegExp.input === "zxa",
+            RegExp.$_ === "zxa",
+            RegExp.lastParen === "a",
+            RegExp.$9 === undefined
+        ].every(Boolean)
+        "#,
+    );
+    assert_eq!(value, JsValue::Boolean(true));
+
+    // A failed match leaves the previous values alone, and the input setter
+    // converts its argument like the platform's `ToString`.
+    let value = evaluate_script(
+        r#"
+        /a/.test("a");
+        /b/.test("c");
+        RegExp.input = 42;
+        RegExp.lastMatch === "a" && RegExp.$1 === undefined && RegExp.input === "42"
+        "#,
+    );
+    assert_eq!(value, JsValue::Boolean(true));
+
+    // The highest-numbered participating group wins `lastParen`.
+    let value = evaluate_script(
+        r#"
+        /(a)(b)(c)/.exec("abc");
+        RegExp.lastParen === "c" && RegExp.$1 === "a" && RegExp.$3 === "c"
+        "#,
+    );
+    assert_eq!(value, JsValue::Boolean(true));
+}
+
+#[test]
 fn string_split_match_search_interoperate_with_regex() {
     let mut parsed = parse_document("<!doctype html><p></p>");
     let mut runtime = JsRuntime::new(&parsed.dom);

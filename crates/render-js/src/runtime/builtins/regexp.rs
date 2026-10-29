@@ -25,7 +25,7 @@ use crate::runtime::types::RegexRecord;
 use crate::utf16;
 use crate::utf16::JsString;
 use crate::value::ObjectHost;
-use crate::value::{NativeFunction, RegExpAccessor};
+use crate::value::{NativeFunction, RegExpAccessor, RegExpStaticProperty};
 use render_dom::Dom;
 
 impl JsRuntime {
@@ -43,6 +43,10 @@ impl JsRuntime {
             NativeFunction::RegExpCompile => self.regexp_compile(dom, receiver, arguments),
             NativeFunction::RegExpAccessor(accessor) => {
                 self.regexp_accessor(dom, receiver, accessor)
+            }
+            NativeFunction::RegExpStatic(property) => Ok(self.regexp_static(property)),
+            NativeFunction::RegExpStaticSetter(property) => {
+                self.regexp_static_setter(dom, property, arguments)
             }
             NativeFunction::RegExpSymbolMatch
             | NativeFunction::RegExpSymbolMatchAll
@@ -721,4 +725,91 @@ fn is_regexp_escape_space(code: u32) -> bool {
             | 0x3000
             | 0xFEFF
     )
+}
+
+/// The legacy `RegExp` statics (ECMA-262 Annex B.2.5) of the last successful
+/// built-in match. A failed match leaves them untouched.
+#[derive(Debug, Default)]
+pub(in crate::runtime) struct LegacyRegExpState {
+    input: Vec<u16>,
+    matched: Vec<u16>,
+    left: Vec<u16>,
+    right: Vec<u16>,
+    /// Groups 1..=9 of the last match, `None` for a group that did not
+    /// participate.
+    captures: Vec<Option<Vec<u16>>>,
+    last_paren: Option<Vec<u16>>,
+}
+
+impl LegacyRegExpState {
+    fn record(&mut self, input: &[u16], found: &crate::regex::MatchRanges) {
+        let mut captures: Vec<Option<Vec<u16>>> = found
+            .groups
+            .iter()
+            .map(|group| group.map(|(start, end)| input[start..end].to_vec()))
+            .collect();
+        let last_paren = captures.iter().rev().find_map(Clone::clone);
+        captures.truncate(9);
+        *self = Self {
+            input: input.to_vec(),
+            matched: input[found.start..found.end].to_vec(),
+            left: input[..found.start].to_vec(),
+            right: input[found.end..].to_vec(),
+            captures,
+            last_paren,
+        };
+    }
+}
+
+fn static_string(units: Vec<u16>) -> JsValue {
+    JsValue::String(JsString::from_unit_vec(units))
+}
+
+impl JsRuntime {
+    /// Annex B.2.5: every successful built-in match updates the legacy statics.
+    pub(in crate::runtime) fn record_legacy_regexp_match(
+        &mut self,
+        input: &[u16],
+        found: &crate::regex::MatchRanges,
+    ) {
+        self.legacy_regexp.record(input, found);
+    }
+
+    /// One legacy static read. `$1`..`$9` are `undefined` when the group did
+    /// not participate in the last match.
+    fn regexp_static(&self, property: RegExpStaticProperty) -> JsValue {
+        let state = &self.legacy_regexp;
+        match property {
+            RegExpStaticProperty::Input => static_string(state.input.clone()),
+            RegExpStaticProperty::LastMatch => static_string(state.matched.clone()),
+            RegExpStaticProperty::LastParen => state
+                .last_paren
+                .clone()
+                .map_or(JsValue::Undefined, static_string),
+            RegExpStaticProperty::LeftContext => static_string(state.left.clone()),
+            RegExpStaticProperty::RightContext => static_string(state.right.clone()),
+            RegExpStaticProperty::Capture(index) => state
+                .captures
+                .get(usize::from(index).saturating_sub(1))
+                .cloned()
+                .flatten()
+                .map_or(JsValue::Undefined, static_string),
+        }
+    }
+
+    /// `RegExp.input` and `RegExp.$_` have setters; the other legacy statics do
+    /// not, so this only ever runs for `Input`.
+    fn regexp_static_setter(
+        &mut self,
+        dom: &mut Dom,
+        property: RegExpStaticProperty,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        if property == RegExpStaticProperty::Input {
+            let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+            let text = self.to_string_value(dom, &value)?;
+            self.legacy_regexp.input = text.units().to_vec();
+        }
+        Ok(JsValue::Undefined)
+    }
 }

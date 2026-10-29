@@ -1849,6 +1849,8 @@ fn headless_app_with_render_worker(
         address_clicks: render_browser::chrome::AddressClickTracker::default(),
         left_pointer_down: false,
         screenshot: None,
+        stylesheet_errors: 0,
+        stylesheet_warnings: 0,
         started_at: Instant::now(),
     };
     app.layout = Some(ChromeLayout::new(800, 600, 1.0, app.tabs.tabs()));

@@ -86,6 +86,7 @@ use render_browser::model::TabModel;
 use render_browser::navigation::NavigationIntent;
 use render_browser::navigation::NavigationTarget;
 use render_browser::navigation::intent_from_address;
+use render_browser::resources::StylesheetDiagnosticSeverity;
 use render_browser::resources::StylesheetFetchPlan;
 use render_browser::scripts::ScriptBatchPreparation;
 use render_browser::scripts::ScriptFetchPlan;
@@ -219,6 +220,9 @@ pub(super) struct BrowserApp {
     /// A pending `--screenshot` request: where to write the composed frame and
     /// when. The event loop exits once it is written.
     pub(super) screenshot: Option<ScreenshotRequest>,
+    /// Stylesheet diagnostics for the active page, for the health summary.
+    pub(super) stylesheet_errors: usize,
+    pub(super) stylesheet_warnings: usize,
     pub(super) frame_size: WindowSize<u32>,
     pub(super) frame_damage: FrameDamage,
     pub(super) theme: ChromeTheme,
@@ -280,6 +284,8 @@ impl BrowserApp {
             storage: ProfileStorage::open(profile_directory()),
             pending_fetches: Vec::new(),
             screenshot: None,
+            stylesheet_errors: 0,
+            stylesheet_warnings: 0,
             disk_cache,
             pending_disk_clear: None,
             cache_clear_state: CacheClearUiState::Ready,
@@ -591,6 +597,7 @@ impl BrowserApp {
                 })
                 .filter(|plan| !plan.is_empty() || !page.styles_resolved)
         };
+        self.count_stylesheet_diagnostics(&frame.style_diagnostics);
         report_stylesheet_diagnostics(&frame.style_diagnostics);
 
         if let Some(plan) = style_plan {
@@ -956,6 +963,7 @@ impl BrowserApp {
             return false;
         }
         let request = self.screenshot.take().expect("checked above");
+        eprintln!("render-browser health {}", self.health_line());
         match write_frame_png(&self.frame, self.frame_size, &request.path) {
             Ok(()) => eprintln!(
                 "render-browser screenshot written to {}",
@@ -964,6 +972,58 @@ impl BrowserApp {
             Err(error) => eprintln!("render-browser screenshot failed: {error}"),
         }
         true
+    }
+
+    /// Adds one batch of stylesheet diagnostics to the health summary.
+    fn count_stylesheet_diagnostics(
+        &mut self,
+        diagnostics: &[render_browser::resources::StylesheetResourceDiagnostic],
+    ) {
+        for diagnostic in diagnostics {
+            match diagnostic.severity {
+                StylesheetDiagnosticSeverity::Error => {
+                    self.stylesheet_errors = self.stylesheet_errors.saturating_add(1);
+                }
+                StylesheetDiagnosticSeverity::Warning => {
+                    self.stylesheet_warnings = self.stylesheet_warnings.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// One line per pipeline layer, printed with a screenshot: how much of the
+    /// document produced boxes, and what each stage reported as failed. This is
+    /// the difference between "the page looks wrong" and "three scripts failed
+    /// and 60% of the elements have no box".
+    fn health_line(&self) -> String {
+        let id = self.tabs.active_id();
+        let Some(page) = self.pages.get(&id) else {
+            return "no page".to_owned();
+        };
+        let dom = page.page.document().dom();
+        let mut elements = 0usize;
+        let mut pending = vec![dom.document()];
+        while let Some(node) = pending.pop() {
+            if matches!(
+                dom.node(node).map(render_core::dom::Node::kind),
+                Some(render_core::dom::NodeKind::Element(_))
+            ) {
+                elements = elements.saturating_add(1);
+            }
+            if let Some(children) = dom.children(node) {
+                pending.extend(children.iter().copied());
+            }
+        }
+        format!(
+            "page={} dom_elements={elements} boxes={} scripts_failed={} scripts_threw={} css_errors={} css_warnings={} images_failed={}",
+            page.navigation.committed().target.display_address(),
+            page.geometry.len(),
+            page.script_load_errors,
+            page.script_runtime_errors,
+            self.stylesheet_errors,
+            self.stylesheet_warnings,
+            page.image_errors,
+        )
     }
 
     pub(super) fn request_redraw(&self) {
@@ -1649,6 +1709,7 @@ impl BrowserApp {
             }
         }
         if plan.is_empty() {
+            self.count_stylesheet_diagnostics(&plan.diagnostics);
             report_stylesheet_diagnostics(&plan.diagnostics);
             let Some(page) = self.pages.get_mut(&id) else {
                 return;
@@ -2197,6 +2258,13 @@ impl BrowserApp {
             ImageLimits::default(),
         );
         report_image_diagnostics(&application.diagnostics);
+        page.image_errors = page.image_errors.saturating_add(
+            application
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == ImageDiagnosticSeverity::Error)
+                .count(),
+        );
         if env::var_os("RENDER_DEBUG_FRAME").is_some() {
             eprintln!("render-browser image loaded={}", application.loaded.len());
             for loaded in application.loaded.iter().take(12) {
