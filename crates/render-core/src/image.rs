@@ -147,7 +147,12 @@ pub fn discover_images_with_context(
     limits: ImageLimits,
     context: ImageSelectionContext,
 ) -> ImageDiscovery {
-    let (elements, mut diagnostics) = collect_elements(dom, limits.max_discovery_nodes);
+    let (mut elements, mut diagnostics) = collect_elements(dom, limits.max_discovery_nodes);
+    if let Some(diagnostic) =
+        collect_detached_images(dom, &mut elements, limits.max_discovery_nodes)
+    {
+        diagnostics.push(diagnostic);
+    }
     let effective_base_url = effective_base_url(dom, &elements, document_url, &mut diagnostics);
     let mut resources = Vec::new();
 
@@ -927,6 +932,36 @@ impl fmt::Display for ImageStoreError {
 
 impl Error for ImageStoreError {}
 
+/// Adds script-created `img` elements that are not in the document. The
+/// browser starts their load when `src` is set, so the preload pattern
+/// `new Image().src = ...` must reach the fetch plan even though the element
+/// is never inserted.
+fn collect_detached_images(
+    dom: &Dom,
+    elements: &mut Vec<NodeId>,
+    limit: usize,
+) -> Option<ImageDiscoveryDiagnostic> {
+    let attached: std::collections::BTreeSet<NodeId> = elements.iter().copied().collect();
+    for (node, candidate) in dom.nodes() {
+        if elements.len() >= limit {
+            return Some(ImageDiscoveryDiagnostic {
+                node: Some(node),
+                code: ImageDiscoveryDiagnosticCode::NodeLimit,
+                message: format!("image discovery node limit ({limit}) exceeded"),
+            });
+        }
+        if attached.contains(&node) {
+            continue;
+        }
+        if let NodeKind::Element(element) = candidate.kind()
+            && element.local_name == "img"
+        {
+            elements.push(node);
+        }
+    }
+    None
+}
+
 fn collect_elements(dom: &Dom, limit: usize) -> (Vec<NodeId>, Vec<ImageDiscoveryDiagnostic>) {
     let mut elements = Vec::new();
     let mut diagnostics = Vec::new();
@@ -1378,6 +1413,27 @@ mod tests {
         discovery = discover_images(&parsed.dom, &document_url, ImageLimits::default());
         assert_eq!(discovery.resources.len(), 2);
         assert!(discovery.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn a_detached_script_created_image_is_discovered() {
+        // `new Image(); image.src = ...` is the standard preload pattern. The
+        // element is never inserted, but the browser still starts the load and
+        // fires load/error on it.
+        let mut parsed = parse_document("<p>page</p>");
+        let image = parsed.dom.create_element("img");
+        parsed
+            .dom
+            .set_attribute(image, "src", "/preload.png")
+            .unwrap();
+        let document_url = Url::parse("https://example.test/page/").unwrap();
+        let discovery = discover_images(&parsed.dom, &document_url, ImageLimits::default());
+        assert_eq!(discovery.resources.len(), 1);
+        assert_eq!(discovery.resources[0].key.owner, image);
+        assert_eq!(
+            discovery.resources[0].key.requested_url.as_str(),
+            "https://example.test/preload.png"
+        );
     }
 
     #[test]

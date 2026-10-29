@@ -708,6 +708,17 @@ impl Dom {
         node.index().and_then(|index| self.nodes.get(index))
     }
 
+    /// Every node in the arena, attached or not. Script-created elements
+    /// (`new Image()`, `document.createElement`) exist here before they are
+    /// inserted, and some never are; consumers that start work at creation
+    /// time, such as image loads, have to see them too.
+    pub fn nodes(&self) -> impl Iterator<Item = (NodeId, &Node)> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (NodeId::from_u64(index as u64), node))
+    }
+
     #[must_use]
     pub fn parent(&self, node: NodeId) -> Option<NodeId> {
         self.node(node).and_then(Node::parent)

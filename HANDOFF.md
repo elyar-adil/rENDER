@@ -24,9 +24,14 @@ Bing 仍缺:主页背景图(`iotd-lite-bg` 动态 `<style>` 未插入,`#img_cont
 
 ## 明确未做 / 下一步
 
-- **动态 `<style>` 背景图**:Bing 通过 `document.createElement("style")` +
-  `textContent` 注入 `#img_cont{background-image:url(...)!important}`,DOM 里没有该元素;
-  需要查清是脚本分支未走到还是动态样式表未进入样式管线。
+- **动态 `<style>` 背景图**:动态样式本身已验证可用(探针 `#result` 的
+  `background-color: rgb(0,128,0)` 生效);Bing 的壁纸分支在
+  `if (!forceNoIOTD && isIotdEnabled === 0 && window.indexedDB)` 处被跳过——
+  **本引擎没有 IndexedDB**,所以整段壁纸逻辑不执行。要么实现 IndexedDB,要么接受
+  无壁纸;不能用假的 `indexedDB` 掩盖。
+- **detached `new Image()` 已支持**:图片发现现在扫描 DOM arena 中未挂载的 `<img>`
+  (`new Image().src = ...` 预加载模式),探针确认 `onload` 触发
+  (`detached-image-loaded`)。
 - **Bing 大 logo**:`<svg id=bLogo>` 是内联 SVG,截图只显示小导航文字;需要检查 SVG
   paint 路径。
 - **JD 主区**:仍是 `api.m.jd.com` 403,对比 `Referer`/Cookie/`sec-ch-ua`/TLS 指纹。
