@@ -1638,7 +1638,8 @@ fn prepared_scripts_mutate_the_persistent_page_document() {
         &RuntimeLimits::default(),
     );
 
-    assert!(page.execute_script_batch(preparation));
+    let mut cookies = crate::profile::ProfileCookies::open(None);
+    assert!(page.execute_script_batch(preparation, &mut cookies));
     let dom = page.page.document().dom();
     let mut pending = vec![dom.document()];
     let message = loop {
@@ -1718,7 +1719,8 @@ fn executed_bootstrap_script_exposes_inserted_external_script_to_follow_up_scan(
         &RuntimeLimits::default(),
     );
 
-    assert!(page.execute_script_batch(preparation));
+    let mut cookies = crate::profile::ProfileCookies::open(None);
+    assert!(page.execute_script_batch(preparation, &mut cookies));
     let follow_up = plan_unstarted_classic_scripts(
         page.page.document(),
         &base_url,
@@ -2848,6 +2850,7 @@ fn a_same_origin_fetch_stores_the_cookies_its_response_sets() {
             method: "GET".to_owned(),
             headers: Vec::new(),
             body: None,
+            credentials: render_core::js::FetchCredentials::SameOrigin,
         },
     );
     drain_page_fetches(&mut app);
@@ -2890,6 +2893,7 @@ fn a_cross_origin_put_is_sent_only_after_its_preflight_allows_it() {
             method: "PUT".to_owned(),
             headers: vec![("X-Token".to_owned(), "t".to_owned())],
             body: Some("{}".to_owned()),
+            credentials: render_core::js::FetchCredentials::SameOrigin,
         },
     );
     drain_page_fetches(&mut app);
@@ -2931,6 +2935,7 @@ fn a_refused_preflight_keeps_the_request_from_being_sent() {
             method: "DELETE".to_owned(),
             headers: Vec::new(),
             body: None,
+            credentials: render_core::js::FetchCredentials::SameOrigin,
         },
     );
     drain_page_fetches(&mut app);
@@ -2977,6 +2982,7 @@ fn a_cross_origin_page_fetch_carries_no_cookies() {
             method: "GET".to_owned(),
             headers: Vec::new(),
             body: None,
+            credentials: render_core::js::FetchCredentials::SameOrigin,
         },
     );
     let received = other_origin.join().expect("other origin thread");

@@ -105,9 +105,9 @@ mod tests;
 mod using_tests;
 
 pub use types::{
-    ConsoleLevel, ConsoleMessage, DocumentReadyState, ElementRect, FetchOutcome, HistoryRequest,
-    JsMicrotask, NavigationRequest, PendingFetch, TimerEntry, TimerHandler, TimerKind,
-    TimerRequest,
+    ConsoleLevel, ConsoleMessage, DocumentReadyState, ElementRect, FetchCredentials, FetchOutcome,
+    HistoryRequest, JsMicrotask, NavigationRequest, PendingFetch, TimerEntry, TimerHandler,
+    TimerKind, TimerRequest,
 };
 
 /// Whether a history change may point `new` at the document URL `current`.
@@ -299,6 +299,9 @@ pub struct JsRuntime {
     pending_error_event: Option<ObjectId>,
     /// JS-visible cookies (`document.cookie`), keyed by name.
     js_cookie_jar: BTreeMap<String, String>,
+    /// Raw `document.cookie = ...` assignments, drained by the embedding and
+    /// applied to its HTTP cookie jar.
+    pending_cookie_writes: Vec<String>,
     /// The `returnValue` of each dialog (HTML §4.11.2): internal state, not a
     /// reflection, so a script-defined `returnValue` setter is not invoked.
     dialog_return_values: BTreeMap<NodeId, String>,
@@ -461,6 +464,7 @@ impl JsRuntime {
             write_sessions: Vec::new(),
             write_stream_epoch: 0,
             js_cookie_jar: BTreeMap::new(),
+            pending_cookie_writes: Vec::new(),
             dialog_return_values: BTreeMap::new(),
             random_state: {
                 let nanos = std::time::SystemTime::now()
@@ -845,7 +849,10 @@ impl JsRuntime {
             .join("; ")
     }
 
-    /// Store one cookie from a `document.cookie` assignment.
+    /// Store one cookie from a `document.cookie` assignment. The browser's
+    /// HTTP jar is updated separately: the raw assignment is queued for the
+    /// embedding, because attributes (`Path`, `Domain`, `Max-Age`) belong to
+    /// the jar, not to the JS-visible name/value map.
     pub(super) fn js_cookie_store(&mut self, assignment: &str) {
         let Some((name, value)) = assignment.split_once('=') else {
             return;
@@ -858,6 +865,30 @@ impl JsRuntime {
         } else {
             self.js_cookie_jar.insert(name, value);
         }
+        self.pending_cookie_writes.push(assignment.to_owned());
+    }
+
+    /// Replace the JS-visible cookie jar with the cookies applicable to the
+    /// document (`document.cookie` reads the embedding's HTTP jar).
+    pub fn set_document_cookies(&mut self, serialized: &str) {
+        self.js_cookie_jar.clear();
+        for pair in serialized.split(';') {
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            self.js_cookie_jar
+                .insert(name.to_owned(), value.trim().to_owned());
+        }
+    }
+
+    /// Raw `document.cookie` assignments since the last call, for the
+    /// embedding's HTTP cookie jar.
+    pub fn take_pending_cookie_writes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_cookie_writes)
     }
 
     /// Whether any `fetch()`/XHR transfer is still queued for the

@@ -535,7 +535,28 @@ impl PageState {
             .collect()
     }
 
-    pub(super) fn execute_script_batch(&mut self, preparation: ScriptBatchPreparation) -> bool {
+    /// Moves `document.cookie` writes into the HTTP jar and seeds the JS jar
+    /// with the HTTP cookies that apply to the committed document. Scripts set
+    /// device/risk cookies through `document.cookie`, and the next XHR must
+    /// carry them.
+    pub(super) fn sync_js_cookies(&mut self, cookies: &mut ProfileCookies) {
+        let url = self.navigation.committed().target.history_url();
+        let writes = self.page.runtime_mut().take_pending_cookie_writes();
+        for write in writes {
+            if let Err(issue) = cookies.set_cookie(&url, &write) {
+                eprintln!("browser cookie rejected: {}", issue.message);
+            }
+        }
+        let header = cookies.cookie_header(&url);
+        self.page.runtime_mut().set_document_cookies(&header);
+    }
+
+    pub(super) fn execute_script_batch(
+        &mut self,
+        preparation: ScriptBatchPreparation,
+        cookies: &mut ProfileCookies,
+    ) -> bool {
+        self.sync_js_cookies(cookies);
         let revision_before_execution = self.page.document().dom().revision();
         self.fire_script_element_errors(&preparation.diagnostics);
         let mut origins = preparation
@@ -630,6 +651,7 @@ impl PageState {
                 }
             }
         }
+        self.sync_js_cookies(cookies);
         self.dom_revision = self.page.document().dom().revision().as_u64();
         self.page.document().dom().revision() != revision_before_execution
     }

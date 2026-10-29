@@ -30,6 +30,7 @@ use crate::runtime::JsRuntime;
 use crate::runtime::builtins::dom_exception::DomExceptionName;
 use crate::runtime::builtins::json::JsonParser;
 use crate::runtime::convert::required_argument;
+use crate::runtime::types::FetchCredentials;
 use crate::runtime::types::FetchOutcome;
 use crate::runtime::types::JsMicrotask;
 use crate::runtime::types::PendingFetch;
@@ -107,6 +108,7 @@ impl JsRuntime {
         let mut headers = Vec::new();
         let mut body = None;
         let mut signal = None;
+        let mut credentials = FetchCredentials::SameOrigin;
         if let Some(JsValue::Object(init)) = arguments.get(1) {
             if let Some(value) = self.realm.get_property(*init, "method")
                 && !matches!(value, JsValue::Undefined)
@@ -135,6 +137,13 @@ impl JsRuntime {
                 && !matches!(value, JsValue::Undefined | JsValue::Null)
             {
                 body = Some(self.request_body(&value, &mut headers));
+            }
+            if let Some(value) = self.realm.get_property(*init, "credentials") {
+                credentials = match value.to_js_string().to_lossy().as_str() {
+                    "include" => FetchCredentials::Include,
+                    "omit" => FetchCredentials::Omit,
+                    _ => FetchCredentials::SameOrigin,
+                };
             }
             if let Some(JsValue::Object(candidate)) = self.realm.get_property(*init, "signal")
                 && matches!(self.realm.host(candidate), Some(ObjectHost::AbortSignal))
@@ -187,6 +196,7 @@ impl JsRuntime {
                     method,
                     headers,
                     body,
+                    credentials,
                 });
                 self.pending_fetch_promises.insert(id, promise);
                 if let JsValue::Object(promise_object) = value {
@@ -764,6 +774,15 @@ impl JsRuntime {
                 "synchronous XMLHttpRequest is not supported",
             ));
         }
+        let credentials = if self
+            .realm
+            .get_property(receiver, "withCredentials")
+            .is_some_and(|value| value.is_truthy())
+        {
+            FetchCredentials::Include
+        } else {
+            FetchCredentials::SameOrigin
+        };
         let mut headers = state.headers;
         let body = match arguments.first() {
             None | Some(JsValue::Undefined | JsValue::Null) => None,
@@ -777,6 +796,7 @@ impl JsRuntime {
             method: state.method,
             headers,
             body,
+            credentials,
         });
         if let Some(ObjectHost::XmlHttpRequest(state)) = self.realm.host_mut(receiver) {
             state.sent = true;

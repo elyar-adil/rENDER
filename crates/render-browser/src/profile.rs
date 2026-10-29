@@ -13,6 +13,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use render_net::Url;
 use render_net::{CookieIssue, CookieJar, FetchRequest, FetchResponse};
 
 const COOKIE_FILE: &str = "cookies.txt";
@@ -58,6 +59,24 @@ impl ProfileCookies {
 
     pub(super) fn decorate_request(&self, request: FetchRequest) -> FetchRequest {
         self.jar.decorate_request(request)
+    }
+
+    /// The `Cookie` header a request to `url` would carry.
+    pub(super) fn cookie_header(&self, url: &Url) -> String {
+        self.decorate_request(FetchRequest::get(url.clone()))
+            .cookie
+            .unwrap_or_default()
+    }
+
+    /// Apply one `document.cookie = ...` assignment against the document URL.
+    pub(super) fn set_cookie(&mut self, url: &Url, assignment: &str) -> Result<(), CookieIssue> {
+        self.dirty = true;
+        self.jar.set_cookie(url, assignment)
+    }
+
+    /// The persisted form of the jar, for diagnostics only.
+    pub(super) fn debug_dump(&self) -> String {
+        self.jar.to_store_text(unix_now())
     }
 
     /// Absorb the `Set-Cookie` fields of a response, marking the store dirty only

@@ -387,6 +387,7 @@ impl JsRuntime {
             method: "GET".to_owned(),
             headers: Vec::new(),
             body: None,
+            credentials: crate::runtime::types::FetchCredentials::SameOrigin,
         });
         // Keeping the element as the transfer target roots it (and, through
         // its state, the pending play promises) until the load settles.

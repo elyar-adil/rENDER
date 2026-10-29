@@ -623,6 +623,18 @@ pub enum HistoryRequest {
 /// through [`JsRuntime::take_pending_fetch_requests`], executes them on its
 /// transport, and completes each one by id through
 /// [`JsRuntime::settle_fetch`].
+/// The fetch/XHR credentials mode for one request. `SameOrigin` is the
+/// default for both APIs: cookies go to same-origin targets only. XHR's
+/// `withCredentials = true` and fetch's `credentials: "include"` select
+/// `Include`, which also sends and stores cookies on cross-origin exchanges.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FetchCredentials {
+    #[default]
+    SameOrigin,
+    Include,
+    Omit,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingFetch {
     /// Correlation id echoed back to [`JsRuntime::settle_fetch`]. Ids are
@@ -636,6 +648,8 @@ pub struct PendingFetch {
     pub headers: Vec<(String, String)>,
     /// Request body for methods that carry one.
     pub body: Option<String>,
+    /// Whether the browser may attach and store cookies on this exchange.
+    pub credentials: FetchCredentials,
 }
 
 /// Completed transfer handed back through [`JsRuntime::settle_fetch`].

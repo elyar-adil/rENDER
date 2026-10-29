@@ -188,6 +188,25 @@ pub(super) fn response_allows(headers: &[Header], origin: &str) -> bool {
     allows_origin(headers, origin)
 }
 
+/// A credentialed CORS response must also name the exact origin and allow
+/// credentials; `Access-Control-Allow-Origin: *` is not enough when cookies
+/// are attached.
+pub(super) fn response_allows_credentials(headers: &[Header], origin: &str) -> bool {
+    let names_origin = headers.iter().any(|header| {
+        header
+            .name
+            .eq_ignore_ascii_case("access-control-allow-origin")
+            && String::from_utf8_lossy(&header.value).trim() == origin
+    });
+    names_origin
+        && headers.iter().any(|header| {
+            header
+                .name
+                .eq_ignore_ascii_case("access-control-allow-credentials")
+                && String::from_utf8_lossy(&header.value).trim() == "true"
+        })
+}
+
 /// The response headers a page may read. A same-origin response exposes all of
 /// its headers. A cross-origin one exposes the CORS-safelisted set, plus what
 /// `Access-Control-Expose-Headers` names.
@@ -477,6 +496,23 @@ mod tests {
             .map(|(name, _)| name)
             .collect();
         assert_eq!(same.len(), headers.len());
+    }
+
+    #[test]
+    fn a_credentialed_cors_response_needs_allow_credentials() {
+        let origin = "https://www.jd.com";
+        let allowed = [
+            header("Access-Control-Allow-Origin", origin),
+            header("Access-Control-Allow-Credentials", "true"),
+        ];
+        assert!(response_allows_credentials(&allowed, origin));
+        let wildcard = [
+            header("Access-Control-Allow-Origin", "*"),
+            header("Access-Control-Allow-Credentials", "true"),
+        ];
+        assert!(!response_allows_credentials(&wildcard, origin));
+        let missing = [header("Access-Control-Allow-Origin", origin)];
+        assert!(!response_allows_credentials(&missing, origin));
     }
 
     #[test]

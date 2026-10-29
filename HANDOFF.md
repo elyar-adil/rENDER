@@ -1,3 +1,68 @@
+# 交接文档 (2026-10-31, 续九) — JD 403 环境的实锤与 cookie 桥
+
+接续 IndexedDB/Bing 会话。本轮给 JD 的 `api.m.jd.com` 加了完整请求/响应日志,并引入
+同一台机器上的 **Microsoft Edge headless** 作为对照。结论:JD 的 403 不是 rENDER 的
+签名/指纹 bug,而是 JD 对该网络/会话的风控;Edge 同样被拦截。
+
+## 本轮已完成
+
+| 内容 | 落点 |
+|---|---|
+| **JD 交换日志** | `RENDER_DEBUG_FRAME=1` 下打印发往 `api.m.jd.com` 的完整 URL、credentials、Cookie 头,以及响应状态/头/body(截断 2000 字符) |
+| **XHR withCredentials / fetch credentials** | `PendingFetch` 增加 `FetchCredentials`(SameOrigin/Include/Omit);XHR 读 `withCredentials`,`fetch` 读 `credentials`;跨源 Include 时装饰 Cookie 并吸收 Set-Cookie;凭据型 CORS 响应要求精确 ACAO + `Access-Control-Allow-Credentials: true` |
+| **document.cookie 桥** | 此前 `document.cookie` 只是运行时里的一个独立 map,与浏览器的 HTTP CookieJar 完全不通。现在 `js_cookie_store` 记录原始赋值,`take_pending_cookie_writes` 交给浏览器 `CookieJar::set_cookie`;每个脚本批次前后 `sync_js_cookies` 把 jar 的 Cookie 头回填给 `document.cookie` |
+| **对照方法** | Edge `--headless=new --remote-debugging-port` + CDP 捕获 `Network.requestWillBeSentExtraInfo` / `responseReceived` / `Page.captureScreenshot` |
+
+## JD 的决定性证据
+
+同一台机器、同一网络,Edge headless 打开 `https://www.jd.com/` 后页面文本是:
+
+```
+全部频道
+内容太火爆了，请稍后再试
+当前页面异常
+请刷新或切换账户试试
+刷新 切换账号
+```
+
+截图 `edge-jd.png` 是京东自己的异常页。CDP 记录显示:
+
+- `pchome_firstScreenSoa`、`pchome_horizontalnav`、`pc_home_background` 的 **XHR** 均为 **403**,
+  请求带 Cookie:`__jdv`、`__jdu`、`3AB9D23F7A4B3C9B`;
+- 同一 URL 还有 3 次 `200`,initiator 类型是 **preflight**(CORS 预检),不是数据响应;
+- rENDER 的同一批 XHR 也是 403;修复 cookie 桥后已带上
+  `3AB9D23F7A4B3C9B=...` 与 `__jda=...`,与 Edge 的 Cookie 家族一致;
+- `jsfbox_pre_gb`、`pc_home_top_monetize`、`pc_search_*` 等非风控接口在 rENDER 里返回 200。
+
+因此 JD 首屏商品区空白的直接原因是 **JD 风控拒绝了这个网络/会话**,不是 h5st 算法或
+TLS 指纹在本机的可复现差异。要继续验证 JD 完整首屏,需要一个被 JD 信任的登录态
+Cookie/住宅网络,或人工在真实浏览器中完成验证——这属于用户侧环境,不是继续改引擎能解决的。
+
+## Bing 对照
+
+用 Edge 打开 cn.bing.com 截图(`edge-bing.png`)对照:当前 Bing 首页在同样视口下也
+**没有大字号 Bing 字标**,只有左上 24x24 方块 logo;rENDER 的 Bing 已有壁纸、搜索框、
+国内版/国际版、麦克风/搜索图标。剩余差异是右上角登录/Rewards/菜单、二维码推广和
+搜索建议行(依赖账号态/额外接口),不是布局错误。
+
+## 验证
+
+```
+cargo test --workspace                       2691 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+## 明确未做 / 下一步
+
+- JD:等待用户提供受信任会话/网络后再验证;引擎侧已与 Edge 行为对齐(Cookie、Referer、
+  credentials、h5st 均由页面 JS 生成)。
+- Bing:右上账号/Rewards/菜单、二维码、搜索建议;可按需补对应 API/组件。
+- IndexedDB:仍是内存实现,无磁盘持久化、索引、versionchange 事件。
+- GitHub/HN 的本机 TCP 链路仍被阻断。
+
+---
+
 # 交接文档 (2026-10-30, 续八) — 自托管 IndexedDB 与图片 error 事件
 
 接续 Bing 布局修复。Bing 的壁纸路径整体挂在 `window.indexedDB` 上;本轮补了

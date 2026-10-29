@@ -177,7 +177,11 @@ pub(super) struct PendingPageFetch {
 pub(super) enum PageFetchStage {
     /// The response answers the page. For a cross-origin request, `origin` is
     /// the page's origin, and the response is read only if CORS allows it.
-    Response { origin: Option<String> },
+    Response {
+        origin: Option<String>,
+        /// Whether the exchange carried credentials (cookies).
+        credentials: bool,
+    },
     /// A preflight for a cross-origin request that is not simple. The actual
     /// request is sent only if the preflight allows it.
     Preflight {
@@ -185,6 +189,7 @@ pub(super) enum PageFetchStage {
         method: HttpMethod,
         headers: Vec<(String, String)>,
         actual: Box<FetchRequest>,
+        credentials: bool,
     },
 }
 
@@ -1659,14 +1664,23 @@ impl BrowserApp {
         if let Some(body) = &request.body {
             fetch_request = fetch_request.with_body(body.clone().into_bytes());
         }
-        if !cors::is_cross_origin(&page_url, &url) {
+        let cross_origin = cors::is_cross_origin(&page_url, &url);
+        let include_credentials = match request.credentials {
+            render_core::js::FetchCredentials::Include => true,
+            render_core::js::FetchCredentials::SameOrigin => !cross_origin,
+            render_core::js::FetchCredentials::Omit => false,
+        };
+        if !cross_origin {
             let fetch_request = self.cookies.decorate_request(fetch_request);
             let handle = self.submit_cached_fetch(fetch_request);
             self.pending_fetches.push(PendingPageFetch {
                 tab,
                 id: request.id,
                 handle,
-                stage: PageFetchStage::Response { origin: None },
+                stage: PageFetchStage::Response {
+                    origin: None,
+                    credentials: true,
+                },
             });
             return;
         }
@@ -1675,15 +1689,20 @@ impl BrowserApp {
         // origin. Anti-bot APIs (JD's api.m.jd.com among them) reject requests
         // without it.
         fetch_request = fetch_request.with_header("Referer", cors::referer(&page_url, &url));
+        // A cross-origin request sends cookies only when the page asked for
+        // credentials (XHR `withCredentials`, fetch `credentials: "include"`).
+        if include_credentials {
+            fetch_request = self.cookies.decorate_request(fetch_request);
+        }
         if env::var_os("RENDER_DEBUG_FRAME").is_some() {
             eprintln!(
-                "render-browser page fetch {url} headers={:?}",
-                fetch_request.headers
+                "render-browser page fetch {url} credentials={:?} cookie={:?} headers={:?}",
+                request.credentials, fetch_request.cookie, fetch_request.headers
             );
+            if fetch_request.cookie.is_none() && url.as_str().contains("api.m.jd.com") {
+                eprintln!("render-browser cookie jar: {}", self.cookies.debug_dump());
+            }
         }
-        // A cross-origin request carries no cookies: the page has no
-        // credentials mode yet, so every such request is "omit". Its response
-        // is read only if CORS allows it.
         let origin = cors::page_origin(&page_url);
         let fetch_request = fetch_request.with_header("Origin", origin.clone());
         if cors::is_simple(method, &headers) {
@@ -1694,6 +1713,7 @@ impl BrowserApp {
                 handle,
                 stage: PageFetchStage::Response {
                     origin: Some(origin),
+                    credentials: include_credentials,
                 },
             });
         } else {
@@ -1708,6 +1728,7 @@ impl BrowserApp {
                     method,
                     headers,
                     actual: Box::new(fetch_request),
+                    credentials: include_credentials,
                 },
             });
         }
@@ -1968,7 +1989,7 @@ impl BrowserApp {
                 let Some(preparation) = page.held_scripts.take() else {
                     break;
                 };
-                rerender |= page.execute_script_batch(preparation);
+                rerender |= page.execute_script_batch(preparation, &mut self.cookies);
                 continue;
             }
             if page.scripts_resolved || page.pending_scripts.is_some() {
@@ -2023,7 +2044,7 @@ impl BrowserApp {
                 preparation.finish_modules();
                 report_script_diagnostics(&preparation.diagnostics);
                 if page.styles_resolved {
-                    rerender |= page.execute_script_batch(preparation);
+                    rerender |= page.execute_script_batch(preparation, &mut self.cookies);
                 } else {
                     page.held_scripts = Some(preparation);
                     break;
@@ -2396,7 +2417,7 @@ impl BrowserApp {
                 preparation.finish_modules();
                 report_script_diagnostics(&preparation.diagnostics);
                 if page.styles_resolved {
-                    page.execute_script_batch(preparation)
+                    page.execute_script_batch(preparation, &mut self.cookies)
                 } else {
                     // The bodies arrived before the stylesheets did; hold the
                     // batch until the stylesheets resolve.
@@ -2713,7 +2734,10 @@ impl BrowserApp {
         let mut settled: Vec<(TabId, u64, Result<FetchOutcome, String>)> = Vec::new();
         for mut pending in std::mem::take(&mut self.pending_fetches) {
             let completion = match pending.handle.try_recv() {
-                Ok(result) => result.result.map_err(|error| error.to_string()),
+                Ok(completed) => {
+                    Self::debug_log_fetch_exchange(&completed.request, &completed.result);
+                    completed.result.map_err(|error| error.to_string())
+                }
                 Err(TryRecvError::Empty) => {
                     waiting.push(pending);
                     continue;
@@ -2727,6 +2751,7 @@ impl BrowserApp {
                         method,
                         headers,
                         actual,
+                        credentials,
                     },
                     Ok(response),
                 ) => {
@@ -2744,6 +2769,7 @@ impl BrowserApp {
                             handle,
                             stage: PageFetchStage::Response {
                                 origin: Some(origin),
+                                credentials,
                             },
                         });
                     } else {
@@ -2754,8 +2780,14 @@ impl BrowserApp {
                         ));
                     }
                 }
-                (PageFetchStage::Response { origin }, Ok(response)) => {
-                    let outcome = self.page_fetch_outcome(origin.as_deref(), response);
+                (
+                    PageFetchStage::Response {
+                        origin,
+                        credentials,
+                    },
+                    Ok(response),
+                ) => {
+                    let outcome = self.page_fetch_outcome(origin.as_deref(), credentials, response);
                     settled.push((pending.tab, pending.id, outcome));
                 }
                 (
@@ -2784,16 +2816,63 @@ impl BrowserApp {
     /// cookie jar, as a navigation's does. A cross-origin response is refused
     /// unless CORS allows the page to read it, and then exposes only the headers
     /// CORS allows.
+    /// Logs one completed page fetch under `RENDER_DEBUG_FRAME`, including
+    /// the response body, for exchanges whose rejection explains a page.
+    fn debug_log_fetch_exchange(
+        request: &FetchRequest,
+        result: &Result<FetchResponse, FetchError>,
+    ) {
+        if env::var_os("RENDER_DEBUG_FRAME").is_none()
+            || !request.url.as_str().contains("api.m.jd.com")
+        {
+            return;
+        }
+        match result {
+            Ok(response) => {
+                let headers: Vec<(String, String)> = response
+                    .headers
+                    .iter()
+                    .map(|header| {
+                        (
+                            header.name.clone(),
+                            String::from_utf8_lossy(&header.value).into_owned(),
+                        )
+                    })
+                    .collect();
+                let body = String::from_utf8_lossy(&response.body);
+                let body: String = body.chars().take(2000).collect();
+                eprintln!(
+                    "render-browser fetch exchange {} -> {} headers={headers:?} body={body:?}",
+                    request.url,
+                    response.status.as_u16()
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "render-browser fetch exchange {} failed: {error}",
+                    request.url
+                );
+            }
+        }
+    }
+
     fn page_fetch_outcome(
         &mut self,
         origin: Option<&str>,
+        credentials: bool,
         response: FetchResponse,
     ) -> Result<FetchOutcome, String> {
         if let Some(origin) = origin {
-            if !cors::response_allows(&response.headers, origin) {
+            let allowed = if credentials {
+                cors::response_allows_credentials(&response.headers, origin)
+            } else {
+                cors::response_allows(&response.headers, origin)
+            };
+            if !allowed {
                 return Err(cors::BLOCKED_MESSAGE.to_owned());
             }
-        } else {
+        }
+        if origin.is_none() || credentials {
             for issue in self.cookies.absorb_response(&response) {
                 eprintln!("browser cookie rejected: {}", issue.message);
             }

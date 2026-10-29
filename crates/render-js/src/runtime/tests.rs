@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::FetchCredentials;
 use crate::JsValue;
 use crate::{ElementRect, FetchOutcome, JsRuntime};
 use render_html::parse_document;
@@ -1114,6 +1115,58 @@ fn string_replace_expands_groups_and_honors_global() {
         outcome.value,
         JsValue::String("b_a-c|a+b+c|23/08/2026".into())
     );
+}
+
+#[test]
+fn document_cookie_writes_are_exposed_to_the_embedding() {
+    // The JS-visible jar is separate from the embedding's HTTP jar; the raw
+    // assignment (with Path/Domain/Max-Age) is what the embedding must apply.
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            "document.cookie = 'risk=abc; path=/; domain=.example.test';",
+        )
+        .expect("cookie write executes");
+    assert_eq!(
+        runtime.take_pending_cookie_writes(),
+        vec!["risk=abc; path=/; domain=.example.test".to_owned()]
+    );
+    runtime.set_document_cookies("a=1; b=2");
+    let value = runtime
+        .execute(&mut parsed.dom, "document.cookie")
+        .expect("cookie read executes")
+        .value;
+    assert_eq!(value, JsValue::String("a=1; b=2".into()));
+}
+
+#[test]
+fn fetch_and_xhr_report_their_credentials_mode() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            "
+            fetch('https://example.test/a', { credentials: 'include' });
+            fetch('https://example.test/b');
+            var first = new XMLHttpRequest();
+            first.open('GET', 'https://example.test/c');
+            first.withCredentials = true;
+            first.send();
+            var second = new XMLHttpRequest();
+            second.open('GET', 'https://example.test/d');
+            second.send();
+            ",
+        )
+        .expect("requests queue");
+    let requests = runtime.take_pending_fetch_requests();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[0].credentials, FetchCredentials::Include);
+    assert_eq!(requests[1].credentials, FetchCredentials::SameOrigin);
+    assert_eq!(requests[2].credentials, FetchCredentials::Include);
+    assert_eq!(requests[3].credentials, FetchCredentials::SameOrigin);
 }
 
 #[test]
