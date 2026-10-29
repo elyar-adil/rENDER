@@ -1,3 +1,73 @@
+# 交接文档 (2026-10-31, 续十五) — SVG 渐变与 T2 勋章
+
+接续动态 SVG 命名空间会话。上一轮修好了 `innerHTML` 插入的 SVG 的命名空间和
+T5 白色勋章;这一轮补上渐变,让 Bing 的 T2 渐变勋章模板也能绘制。
+
+## 根因
+
+T2 模板的所有可见路径都用 `fill="url(#paintN...)"` 或 `stroke="url(#...)"`,
+而根 `svg` 是 `fill="none"`。`parse_paint` 不识别 `url(...)`,返回 `Inherit`;
+根 `fill="none"` 使所有形状无填充,渐变描边也被丢弃。于是即使 SVG 已经正确
+光栅化并产生 image 命令,图像仍然全透明。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **收集渐变定义** | 遍历整棵 XML 树,按 `id` 索引 `linearGradient`/`radialGradient`;先于绘制收集,因此 `<defs>` 可以出现在引用之后 |
+| **stop 解析** | `offset`(数字/百分比)、`stop-color`、`stop-opacity`;按 offset 排序,颜色通道线性插值 |
+| **坐标系统** | `gradientUnits="userSpaceOnUse"` 与 `objectBoundingBox`;`gradientTransform` 的 `matrix/translate/rotate/scale/skew` 组合,采样时用逆变换 |
+| **渐变填充与描边** | `Paint::Gradient(index)` 同时用于 fill 和 stroke;每个设备像素反算回用户空间/渐变空间采样 |
+| **alpha 混合** | `Raster::put` 改为 straight-alpha source-over;`stop-opacity` 的柔和边缘和发光不再被替换成不透明色 |
+| **测试** | 线性渐变、`gradientTransform`、径向渐变 stop-opacity、渐变描边,共 4 个单元测试;`image::svg` 17 passed |
+| **文档** | `svg.rs` 与 `inline_svg.rs` 的支持/不支持清单同步更新 |
+
+## 证据
+
+T2 模板(`medal-template.html`,动态 `innerHTML` 插入,32×32):
+
+```
+non-bg pixels = 288
+ring samples: (1,16)=(57,160,245)  (16,1)=(58,159,245)  (16,31)=(83,127,246)
+```
+
+裁剪图 `dynsvg7-medal.png` 可见蓝色渐变外环、缎带和圆形底部;对照
+`rewards-edge-crop.png` 的白色勋章,两者结构相同(T2/T5 模板差异),不再出现
+空透明图。
+
+Bing 持久 profile 仍是 T5 白色勋章:
+
+```
+health ready=Complete dom_elements=470 boxes=168
+       scripts_failed=0 scripts_threw=0 css_errors=0 css_warnings=21 images_failed=3
+layout <div> id=rh_rwm 105.5×42
+layout <svg> class=medal-newlevel-circled 32×32
+paint source=.medal-newlevel-circled … image
+```
+
+## 验证
+
+```
+cargo test --workspace                       2713 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+JD smoke:    dom_elements=1157 boxes=117
+Baidu smoke: dom_elements=453  boxes=156
+```
+
+## 明确未做 / 下一步
+
+- 渐变仍不支持 `xlink:href` 继承、`spreadMethod="reflect/repeat"`、径向
+  `fx`/`fy` 焦点、`userSpaceOnUse` 下的百分比坐标。
+- `<g opacity>` 仍按每个子形状独立绘制,未做组级离屏合成;T2 的 0.7 透明度
+  叠加会比 Edge 略强。
+- `clipPath`/`mask`/`filter`/`<use>` 仍未实现。
+- `content` 仍只支持字符串;IndexedDB 仍是内存子集;JD 主商品区仍受风控 403;
+  GitHub/HN 本机链路阻断;AVIF 未实现。
+
+---
+
 # 交接文档 (2026-10-31, 续十四) — 动态 SVG 命名空间与 Rewards 勋章
 
 接续搜索框提示会话。这一轮把 Bing Rewards 的勋章从"DOM 存在但不可见"修到
@@ -57,9 +127,8 @@ real_site_tasks                              66 passed, 0 failed
 
 - **Rewards 模板差异**:Bing 对 Edge 与本机 rENDER 返回不同勋章模板(T2 vs T5),
   这是页面实验/状态差异;本轮保证两种模板都能被光栅化。
-- **SVG 特性子集**:渐变(`linearGradient`/`radialGradient`)、`clipPath`、`mask`
-  仍未实现;本轮可见的 T5 模板只用白色描边/填充,T2 模板依赖渐变,若拿到 T2
-  仍会缺少彩色细节。
+- **SVG 特性子集**:`clipPath`、`mask`、`filter` 和 `<use>` 仍未实现;渐变已在
+  续十五实现。
 - `content` 仍只支持字符串;`attr()`/`counter()` 未实现。
 - JD 主商品区仍受风控 403(同机 Edge 也 403);IndexedDB 仍是内存子集;GitHub/HN
   的本机 TCP 链路仍被阻断;AVIF 解码未实现(images_failed=3 是能力探测)。

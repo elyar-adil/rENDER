@@ -10,12 +10,16 @@
 //! - nested `<g>` transforms: `translate`, `scale`, `matrix`, `rotate`,
 //!   `skewX`, `skewY`;
 //! - `fill`/`stroke` paints inherited through `<g>`, with `none`;
+//! - linear and radial gradients, including `gradientUnits`,
+//!   `gradientTransform`, `stop-color` and `stop-opacity`, for fills and
+//!   strokes;
 //! - root sizing by `width`/`height` (percentages resolve against the
 //!   `viewBox`), falling back to `viewBox`, then the spec default 300×150.
 //!
-//! Everything outside the subset (gradients, text, clips, masks, embedded
-//! images, scripting) contributes nothing, matching how an `<img>`-loaded
-//! SVG must render: static and script-free.
+//! Everything outside the subset (text, clips, masks, embedded images,
+//! scripting, gradient `xlink:href` inheritance and spread modes other than
+//! `pad`) contributes nothing, matching how an `<img>`-loaded SVG must
+//! render: static and script-free.
 //!
 //! `use` and `symbol` indirection is outside the subset too, so a `<use>`
 //! contributes nothing: SVG 2 §3.2.4 renders it as a shadow tree cloned from
@@ -33,6 +37,7 @@
     reason = "scanline rasterization clamps coordinates before every cast"
 )]
 
+use std::collections::BTreeMap;
 use std::str;
 
 use super::{Color, DecodedImage, ImageDecodeError, ImageLimits, enforce_dimensions};
@@ -79,24 +84,153 @@ impl Affine {
             f: self.b * child.e + self.d * child.f + self.f,
         }
     }
+
+    /// The inverse affine, or `None` when the transform is singular.
+    ///
+    /// Gradient painting maps each device pixel back into user space to sample
+    /// its colour, so a degenerate transform has no colour to sample and the
+    /// paint contributes nothing rather than dividing by zero.
+    fn inverse(self) -> Option<Self> {
+        let determinant = self.a.mul_add(self.d, -(self.b * self.c));
+        if !determinant.is_finite() || determinant.abs() <= f32::EPSILON {
+            return None;
+        }
+        let inverse = determinant.recip();
+        Some(Self {
+            a: self.d * inverse,
+            b: -self.b * inverse,
+            c: -self.c * inverse,
+            d: self.a * inverse,
+            e: (self.c * self.f - self.d * self.e) * inverse,
+            f: (self.b * self.e - self.a * self.f) * inverse,
+        })
+    }
 }
 
-/// Paint for one element: explicit color, explicit `none`, or inherited.
+/// Paint for one element: explicit color, explicit `none`, an indexed
+/// gradient, or inherited.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Paint {
     Inherit,
     None,
     Color(Color),
+    Gradient(usize),
 }
 
 impl Paint {
-    fn resolve(self, inherited: Option<Color>) -> Option<Color> {
+    fn resolve(self, inherited: Option<Paint>) -> Option<Paint> {
         match self {
             Self::Inherit => inherited,
             Self::None => None,
-            Self::Color(color) => Some(color),
+            Self::Color(color) => Some(Self::Color(color)),
+            Self::Gradient(index) => Some(Self::Gradient(index)),
         }
     }
+}
+
+/// The coordinate system a gradient's own geometry is expressed in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GradientUnits {
+    ObjectBoundingBox,
+    UserSpaceOnUse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum GradientKind {
+    Linear { x1: f32, y1: f32, x2: f32, y2: f32 },
+    Radial { cx: f32, cy: f32, r: f32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GradientStop {
+    offset: f32,
+    color: Color,
+}
+
+/// One `linearGradient` or `radialGradient` definition.
+///
+/// `gradientTransform` is applied to the gradient's coordinate system, not to
+/// the shape, so sampling maps the point through its inverse first. The stop
+/// list is sorted by offset; sampling clamps outside the first and last stop,
+/// which is SVG's default `spreadMethod="pad"`.
+#[derive(Clone, Debug, PartialEq)]
+struct Gradient {
+    kind: GradientKind,
+    units: GradientUnits,
+    transform: Affine,
+    stops: Vec<GradientStop>,
+}
+
+impl Gradient {
+    fn sample(&self, x: f32, y: f32) -> Color {
+        let progress = match self.kind {
+            GradientKind::Linear { x1, y1, x2, y2 } => {
+                let dx = x2 - x1;
+                let dy = y2 - y1;
+                let denominator = dx.mul_add(dx, dy * dy);
+                if denominator <= f32::EPSILON {
+                    0.0
+                } else {
+                    ((x - x1).mul_add(dx, (y - y1) * dy) / denominator).clamp(0.0, 1.0)
+                }
+            }
+            GradientKind::Radial { cx, cy, r } => {
+                if r <= 0.0 {
+                    0.0
+                } else {
+                    ((x - cx).hypot(y - cy) / r).clamp(0.0, 1.0)
+                }
+            }
+        };
+        self.color_at(progress)
+    }
+
+    fn color_at(&self, progress: f32) -> Color {
+        let Some(first) = self.stops.first() else {
+            return Color::TRANSPARENT;
+        };
+        if progress <= first.offset {
+            return first.color;
+        }
+        let Some(last) = self.stops.last() else {
+            return first.color;
+        };
+        if progress >= last.offset {
+            return last.color;
+        }
+        for pair in self.stops.windows(2) {
+            let (start, end) = (pair[0], pair[1]);
+            if progress < start.offset || progress > end.offset {
+                continue;
+            }
+            let span = end.offset - start.offset;
+            if span <= f32::EPSILON {
+                return end.color;
+            }
+            return lerp_color(start.color, end.color, (progress - start.offset) / span);
+        }
+        last.color
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "channels are clamped to 0..=255 before the cast"
+)]
+fn lerp_color(from: Color, to: Color, progress: f32) -> Color {
+    let progress = progress.clamp(0.0, 1.0);
+    let channel = |start: u8, end: u8| -> u8 {
+        (f32::from(start) + (f32::from(end) - f32::from(start)) * progress)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color::rgba(
+        channel(from.red, to.red),
+        channel(from.green, to.green),
+        channel(from.blue, to.blue),
+        channel(from.alpha, to.alpha),
+    )
 }
 
 /// Decode an SVG document into an RGBA image.
@@ -227,14 +361,23 @@ fn decode_viewport(
     // attributes of the children it visits. Their initial values are black
     // fill and no stroke. An unparseable value is ignored, which leaves the
     // initial value in force.
-    let fill = root_paint(root, "fill", current_color, Paint::Color(Color::BLACK));
-    let stroke = root_paint(root, "stroke", current_color, Paint::None);
+    let (gradients, gradient_index) = collect_gradients(root, current_color);
+    let fill = root_paint(
+        root,
+        "fill",
+        current_color,
+        Paint::Color(Color::BLACK),
+        &gradient_index,
+    );
+    let stroke = root_paint(root, "stroke", current_color, Paint::None, &gradient_index);
     walk(
         root,
         root_transform,
         fill,
         stroke,
         current_color,
+        &gradients,
+        &gradient_index,
         &mut raster,
     );
     DecodedImage::from_pixels(width, height, raster.pixels)
@@ -247,7 +390,7 @@ struct Raster {
 }
 
 impl Raster {
-    fn fill_polygon(&mut self, points: &[(f32, f32)], color: Color) {
+    fn fill_polygon(&mut self, points: &[(f32, f32)], color_at: impl Fn(f32, f32) -> Color) {
         if points.len() < 2 {
             return;
         }
@@ -280,40 +423,72 @@ impl Raster {
                     .saturating_sub(1)
                     .min(i64::from(self.width.saturating_sub(1)));
                 for x in start..=end {
-                    self.put(x, row, color);
+                    self.put(x, row, color_at(x as f32 + 0.5, row as f32 + 0.5));
                 }
             }
         }
     }
 
-    fn stroke_segments(&mut self, segments: &[Segment], color: Color) {
+    fn stroke_segments(&mut self, segments: &[Segment], color_at: impl Fn(f32, f32) -> Color) {
         for ((x1, y1), (x2, y2)) in segments {
             let steps = ((x2 - x1).abs().max((y2 - y1).abs()).ceil() as i64).clamp(1, 4096);
             for step in 0..=steps {
                 let t = step as f32 / steps as f32;
-                self.put(
-                    (x1 + t * (x2 - x1)).round() as i64,
-                    (y1 + t * (y2 - y1)).round() as i64,
-                    color,
-                );
+                let x = (x1 + t * (x2 - x1)).round() as i64;
+                let y = (y1 + t * (y2 - y1)).round() as i64;
+                self.put(x, y, color_at(x as f32 + 0.5, y as f32 + 0.5));
             }
         }
     }
 
     fn put(&mut self, x: i64, y: i64, color: Color) {
-        if x < 0 || y < 0 || x >= self.width.into() || y >= self.height.into() {
+        if color.alpha == 0 || x < 0 || y < 0 || x >= self.width.into() || y >= self.height.into() {
             return;
         }
         let index =
             usize::try_from(y).unwrap_or(0) * self.width as usize + usize::try_from(x).unwrap_or(0);
-        self.pixels[index] = color;
+        let destination = self.pixels[index];
+        if color.alpha == 255 {
+            self.pixels[index] = color;
+            return;
+        }
+        // Straight-alpha source-over. Gradients use stop-opacity for soft
+        // edges and glows, so replacing the destination pixel would make the
+        // translucent part of an icon opaque instead of blending it.
+        let source_alpha = f32::from(color.alpha) / 255.0;
+        let destination_alpha = f32::from(destination.alpha) / 255.0;
+        let output_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);
+        if output_alpha <= f32::EPSILON {
+            self.pixels[index] = Color::TRANSPARENT;
+            return;
+        }
+        let blend = |source: u8, destination: u8| -> u8 {
+            let source = f32::from(source);
+            let destination = f32::from(destination);
+            ((source * source_alpha + destination * destination_alpha * (1.0 - source_alpha))
+                / output_alpha)
+                .round()
+                .clamp(0.0, 255.0) as u8
+        };
+        self.pixels[index] = Color::rgba(
+            blend(color.red, destination.red),
+            blend(color.green, destination.green),
+            blend(color.blue, destination.blue),
+            (output_alpha * 255.0).round().clamp(0.0, 255.0) as u8,
+        );
     }
 }
 
 /// The paint a root `svg`'s own `fill` or `stroke` attribute gives the shapes
 /// below it. An absent or unparseable value leaves `initial` in force.
-fn root_paint(root: &XmlNode, name: &str, current_color: Color, initial: Paint) -> Paint {
-    match attribute(root, name).map(|raw| parse_paint(raw.trim(), current_color)) {
+fn root_paint(
+    root: &XmlNode,
+    name: &str,
+    current_color: Color,
+    initial: Paint,
+    gradient_index: &BTreeMap<String, usize>,
+) -> Paint {
+    match attribute(root, name).map(|raw| parse_paint(raw.trim(), current_color, gradient_index)) {
         None | Some(Paint::Inherit) => initial,
         Some(paint) => paint,
     }
@@ -321,7 +496,8 @@ fn root_paint(root: &XmlNode, name: &str, current_color: Color, initial: Paint) 
 
 #[allow(
     clippy::too_many_lines,
-    reason = "one shape-arm per SVG element reads clearest as a flat match"
+    clippy::too_many_arguments,
+    reason = "one shape-arm per SVG element reads clearest as a flat match; the gradient table is shared state"
 )]
 fn walk(
     element: &XmlNode,
@@ -329,6 +505,8 @@ fn walk(
     fill: Paint,
     stroke: Paint,
     current_color: Color,
+    gradients: &[Gradient],
+    gradient_index: &BTreeMap<String, usize>,
     raster: &mut Raster,
 ) {
     for child_node in &element.children {
@@ -337,9 +515,11 @@ fn walk(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
         };
-        let child_fill = attribute("fill").map_or(fill, |raw| parse_paint(raw, current_color));
-        let child_stroke =
-            attribute("stroke").map_or(stroke, |raw| parse_paint(raw, current_color));
+        let child_fill =
+            attribute("fill").map_or(fill, |raw| parse_paint(raw, current_color, gradient_index));
+        let child_stroke = attribute("stroke").map_or(stroke, |raw| {
+            parse_paint(raw, current_color, gradient_index)
+        });
         let child_transform = match attribute("transform") {
             Some(specification) => transform.then(parse_transform(specification)),
             None => transform,
@@ -355,11 +535,23 @@ fn walk(
                 ) else {
                     continue;
                 };
-                let points = transform_points(&points, child_transform);
-                if let Some(color) = child_fill.resolve(None) {
-                    raster.fill_polygon(&points, color);
-                }
-                stroke_outline(raster, &points, child_stroke.resolve(None));
+                let device = transform_points(&points, child_transform);
+                paint_shape(
+                    raster,
+                    &points,
+                    &device,
+                    child_transform,
+                    child_fill.resolve(None),
+                    gradients,
+                );
+                stroke_outline(
+                    raster,
+                    &points,
+                    &device,
+                    child_transform,
+                    child_stroke.resolve(None),
+                    gradients,
+                );
             }
             "circle" | "ellipse" => {
                 let cx = attribute("cx").and_then(parse_length).unwrap_or(0.0);
@@ -379,34 +571,51 @@ fn walk(
                 let mut points = Vec::with_capacity(48);
                 for step in 0..48 {
                     let angle = std::f32::consts::TAU * step as f32 / 48.0;
-                    points
-                        .push(child_transform.apply(cx + rx * angle.cos(), cy + ry * angle.sin()));
+                    points.push((cx + rx * angle.cos(), cy + ry * angle.sin()));
                 }
-                if let Some(color) = child_fill.resolve(None) {
-                    raster.fill_polygon(&points, color);
-                }
-                stroke_outline(raster, &points, child_stroke.resolve(None));
+                let device = transform_points(&points, child_transform);
+                paint_shape(
+                    raster,
+                    &points,
+                    &device,
+                    child_transform,
+                    child_fill.resolve(None),
+                    gradients,
+                );
+                stroke_outline(
+                    raster,
+                    &points,
+                    &device,
+                    child_transform,
+                    child_stroke.resolve(None),
+                    gradients,
+                );
             }
             "polygon" | "polyline" => {
-                let Some(raw_points) = attribute("points").and_then(parse_points) else {
+                let Some(points) = attribute("points").and_then(parse_points) else {
                     continue;
                 };
-                if raw_points.len() < 2 {
+                if points.len() < 2 {
                     continue;
                 }
-                let mut points = transform_points(&raw_points, child_transform);
-                if let Some(color) = child_fill.resolve(None) {
-                    // Fill closes the path implicitly, per spec.
-                    if child_node.name == "polygon" {
-                        raster.fill_polygon(&points, color);
-                    } else {
-                        points.push(points[0]);
-                        raster.fill_polygon(&points, color);
-                        points.pop();
-                    }
-                }
-                let segments = polyline_segments(&points, child_node.name == "polygon");
-                stroke_outline_segments(raster, &segments, child_stroke.resolve(None));
+                let device = transform_points(&points, child_transform);
+                paint_shape(
+                    raster,
+                    &points,
+                    &device,
+                    child_transform,
+                    child_fill.resolve(None),
+                    gradients,
+                );
+                let segments = polyline_segments(&device, child_node.name == "polygon");
+                stroke_outline_segments(
+                    raster,
+                    &points,
+                    &segments,
+                    child_transform,
+                    child_stroke.resolve(None),
+                    gradients,
+                );
             }
             "line" => {
                 let (Some(x1), Some(y1), Some(x2), Some(y2)) = (
@@ -419,22 +628,41 @@ fn walk(
                 };
                 let from = child_transform.apply(x1, y1);
                 let to = child_transform.apply(x2, y2);
-                stroke_outline_segments(raster, &[(from, to)], child_stroke.resolve(None));
+                stroke_outline_segments(
+                    raster,
+                    &[(x1, y1), (x2, y2)],
+                    &[(from, to)],
+                    child_transform,
+                    child_stroke.resolve(None),
+                    gradients,
+                );
             }
             "path" => {
                 let Some(specification) = attribute("d") else {
                     continue;
                 };
                 for (subpath, closed) in &parse_path(specification) {
-                    let points = transform_points(subpath, child_transform);
-                    if points.len() < 2 {
+                    if subpath.len() < 2 {
                         continue;
                     }
-                    if let Some(color) = child_fill.resolve(None) {
-                        raster.fill_polygon(&points, color);
-                    }
-                    let segments = polyline_segments(&points, *closed);
-                    stroke_outline_segments(raster, &segments, child_stroke.resolve(None));
+                    let device = transform_points(subpath, child_transform);
+                    paint_shape(
+                        raster,
+                        subpath,
+                        &device,
+                        child_transform,
+                        child_fill.resolve(None),
+                        gradients,
+                    );
+                    let segments = polyline_segments(&device, *closed);
+                    stroke_outline_segments(
+                        raster,
+                        subpath,
+                        &segments,
+                        child_transform,
+                        child_stroke.resolve(None),
+                        gradients,
+                    );
                 }
             }
             "svg" | "g" | "a" | "switch" => {
@@ -447,6 +675,8 @@ fn walk(
                     child_fill,
                     child_stroke,
                     current_color,
+                    gradients,
+                    gradient_index,
                     raster,
                 );
             }
@@ -458,10 +688,145 @@ fn walk(
                     child_fill,
                     child_stroke,
                     current_color,
+                    gradients,
+                    gradient_index,
                     raster,
                 );
             }
         }
+    }
+}
+
+/// Fill one shape with a solid colour or a gradient.
+///
+/// The shape's points arrive both in its own user space (needed for
+/// `objectBoundingBox` gradients) and in device space (the scanline fill).
+/// Gradient painting maps each device pixel back through the element
+/// transform, then through the gradient transform, so a rotated or scaled
+/// shape samples the gradient in the coordinate system the author wrote.
+fn paint_shape(
+    raster: &mut Raster,
+    local_points: &[(f32, f32)],
+    device_points: &[(f32, f32)],
+    transform: Affine,
+    paint: Option<Paint>,
+    gradients: &[Gradient],
+) {
+    let Some(paint) = paint else {
+        return;
+    };
+    match paint {
+        Paint::Color(color) => raster.fill_polygon(device_points, |_, _| color),
+        Paint::Gradient(index) => {
+            let Some(gradient) = gradients.get(index) else {
+                return;
+            };
+            let Some(sampler) = GradientSampler::new(local_points, transform, gradient) else {
+                return;
+            };
+            raster.fill_polygon(device_points, |x, y| sampler.color_at(x, y));
+        }
+        Paint::Inherit | Paint::None => {}
+    }
+}
+
+/// The bounds of a shape in its own user space, for `objectBoundingBox`
+/// gradients. Degenerate shapes have no coordinate system to sample.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Bounds {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+fn points_bounds(points: &[(f32, f32)]) -> Option<Bounds> {
+    let mut minimum = (f32::MAX, f32::MAX);
+    let mut maximum = (f32::MIN, f32::MIN);
+    for (x, y) in points {
+        minimum.0 = minimum.0.min(*x);
+        minimum.1 = minimum.1.min(*y);
+        maximum.0 = maximum.0.max(*x);
+        maximum.1 = maximum.1.max(*y);
+    }
+    let width = maximum.0 - minimum.0;
+    let height = maximum.1 - minimum.1;
+    (width > f32::EPSILON && height > f32::EPSILON).then_some(Bounds {
+        x: minimum.0,
+        y: minimum.1,
+        width,
+        height,
+    })
+}
+
+/// Paint one shape's stroke with a solid colour or a gradient.
+fn paint_stroke(
+    raster: &mut Raster,
+    local_points: &[(f32, f32)],
+    segments: &[Segment],
+    transform: Affine,
+    paint: Option<Paint>,
+    gradients: &[Gradient],
+) {
+    let Some(paint) = paint else {
+        return;
+    };
+    match paint {
+        Paint::Color(color) => raster.stroke_segments(segments, |_, _| color),
+        Paint::Gradient(index) => {
+            let Some(gradient) = gradients.get(index) else {
+                return;
+            };
+            let Some(sampler) = GradientSampler::new(local_points, transform, gradient) else {
+                return;
+            };
+            raster.stroke_segments(segments, |x, y| sampler.color_at(x, y));
+        }
+        Paint::Inherit | Paint::None => {}
+    }
+}
+
+/// A gradient resolved against one shape: the maps from device pixels back to
+/// user space and then to the gradient's own coordinate system.
+struct GradientSampler<'a> {
+    gradient: &'a Gradient,
+    to_local: Affine,
+    to_gradient: Affine,
+    space: GradientSpace,
+}
+
+enum GradientSpace {
+    UserSpace,
+    ObjectBounds(Bounds),
+}
+
+impl<'a> GradientSampler<'a> {
+    fn new(local_points: &[(f32, f32)], transform: Affine, gradient: &'a Gradient) -> Option<Self> {
+        let space = match gradient.units {
+            GradientUnits::UserSpaceOnUse => GradientSpace::UserSpace,
+            GradientUnits::ObjectBoundingBox => {
+                GradientSpace::ObjectBounds(points_bounds(local_points)?)
+            }
+        };
+        Some(Self {
+            gradient,
+            to_local: transform.inverse()?,
+            to_gradient: gradient.transform.inverse()?,
+            space,
+        })
+    }
+
+    fn color_at(&self, x: f32, y: f32) -> Color {
+        let (user_x, user_y) = self.to_local.apply(x, y);
+        let (gradient_x, gradient_y) = match &self.space {
+            GradientSpace::UserSpace => (user_x, user_y),
+            GradientSpace::ObjectBounds(bounds) => (
+                (user_x - bounds.x) / bounds.width,
+                (user_y - bounds.y) / bounds.height,
+            ),
+        };
+        let (gradient_x, gradient_y) = self.to_gradient.apply(gradient_x, gradient_y);
+        self.gradient.sample(gradient_x, gradient_y)
     }
 }
 
@@ -472,14 +837,27 @@ fn transform_points(points: &[(f32, f32)], transform: Affine) -> Vec<(f32, f32)>
         .collect()
 }
 
-fn stroke_outline(raster: &mut Raster, points: &[(f32, f32)], color: Option<Color>) {
-    stroke_outline_segments(raster, &polyline_segments(points, true), color);
+fn stroke_outline(
+    raster: &mut Raster,
+    local_points: &[(f32, f32)],
+    device_points: &[(f32, f32)],
+    transform: Affine,
+    paint: Option<Paint>,
+    gradients: &[Gradient],
+) {
+    let segments = polyline_segments(device_points, true);
+    paint_stroke(raster, local_points, &segments, transform, paint, gradients);
 }
 
-fn stroke_outline_segments(raster: &mut Raster, segments: &[Segment], color: Option<Color>) {
-    if let Some(color) = color {
-        raster.stroke_segments(segments, color);
-    }
+fn stroke_outline_segments(
+    raster: &mut Raster,
+    local_points: &[(f32, f32)],
+    segments: &[Segment],
+    transform: Affine,
+    paint: Option<Paint>,
+    gradients: &[Gradient],
+) {
+    paint_stroke(raster, local_points, segments, transform, paint, gradients);
 }
 
 fn polyline_segments(points: &[(f32, f32)], closed: bool) -> Vec<Segment> {
@@ -725,13 +1103,149 @@ fn rect_polygon(
     ])
 }
 
-fn parse_paint(raw: &str, current_color: Color) -> Paint {
+fn parse_paint(raw: &str, current_color: Color, gradient_index: &BTreeMap<String, usize>) -> Paint {
     let trimmed = raw.trim();
-    match trimmed.to_ascii_lowercase().as_str() {
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("url(") && trimmed.ends_with(')') {
+        let inner = trimmed[4..trimmed.len() - 1].trim();
+        let id = inner
+            .trim_matches(|character| character == '"' || character == '\'')
+            .trim_start_matches('#');
+        if let Some(index) = gradient_index.get(id) {
+            return Paint::Gradient(*index);
+        }
+    }
+    match lower.as_str() {
         "none" | "transparent" => Paint::None,
         "currentcolor" => Paint::Color(current_color),
         _ => parse_color(trimmed).map_or(Paint::Inherit, Paint::Color),
     }
+}
+
+/// Collect every `linearGradient` and `radialGradient` in the document.
+///
+/// The definitions are looked up by `id` because a shape may reference a
+/// gradient that appears after it in a `<defs>` block. Duplicate ids keep the
+/// first definition, which is the order a browser resolves them in.
+fn collect_gradients(
+    root: &XmlNode,
+    current_color: Color,
+) -> (Vec<Gradient>, BTreeMap<String, usize>) {
+    let mut gradients = Vec::new();
+    let mut index = BTreeMap::new();
+    collect_gradients_into(root, current_color, &mut gradients, &mut index);
+    (gradients, index)
+}
+
+fn collect_gradients_into(
+    element: &XmlNode,
+    current_color: Color,
+    gradients: &mut Vec<Gradient>,
+    index: &mut BTreeMap<String, usize>,
+) {
+    for child in &element.children {
+        if matches!(child.name.as_str(), "linearGradient" | "radialGradient") {
+            let id = attribute(child, "id")
+                .map(str::trim)
+                .filter(|id| !id.is_empty());
+            if let Some(id) = id
+                && let Some(gradient) = parse_gradient(child, current_color)
+                && !index.contains_key(id)
+            {
+                index.insert(id.to_owned(), gradients.len());
+                gradients.push(gradient);
+            }
+        }
+        collect_gradients_into(child, current_color, gradients, index);
+    }
+}
+
+fn parse_gradient(element: &XmlNode, current_color: Color) -> Option<Gradient> {
+    let units = if attribute(element, "gradientUnits")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("userSpaceOnUse"))
+    {
+        GradientUnits::UserSpaceOnUse
+    } else {
+        GradientUnits::ObjectBoundingBox
+    };
+    let transform =
+        attribute(element, "gradientTransform").map_or(Affine::IDENTITY, parse_transform);
+    let mut stops: Vec<GradientStop> = element
+        .children
+        .iter()
+        .filter(|child| child.name == "stop")
+        .map(|child| parse_stop(child, current_color))
+        .collect();
+    stops.sort_by(|left, right| {
+        left.offset
+            .partial_cmp(&right.offset)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let kind = match element.name.as_str() {
+        "linearGradient" => GradientKind::Linear {
+            x1: attribute(element, "x1")
+                .and_then(parse_fraction)
+                .unwrap_or(0.0),
+            y1: attribute(element, "y1")
+                .and_then(parse_fraction)
+                .unwrap_or(0.0),
+            x2: attribute(element, "x2")
+                .and_then(parse_fraction)
+                .unwrap_or(1.0),
+            y2: attribute(element, "y2")
+                .and_then(parse_fraction)
+                .unwrap_or(0.0),
+        },
+        "radialGradient" => GradientKind::Radial {
+            cx: attribute(element, "cx")
+                .and_then(parse_fraction)
+                .unwrap_or(0.5),
+            cy: attribute(element, "cy")
+                .and_then(parse_fraction)
+                .unwrap_or(0.5),
+            r: attribute(element, "r")
+                .and_then(parse_fraction)
+                .unwrap_or(0.5),
+        },
+        _ => return None,
+    };
+    Some(Gradient {
+        kind,
+        units,
+        transform,
+        stops,
+    })
+}
+
+fn parse_stop(element: &XmlNode, current_color: Color) -> GradientStop {
+    let offset = attribute(element, "offset")
+        .and_then(parse_fraction)
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    let mut color = match attribute(element, "stop-color").map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("currentcolor") => current_color,
+        Some(value) => parse_color(value).unwrap_or(Color::BLACK),
+        None => Color::BLACK,
+    };
+    if let Some(opacity) = attribute(element, "stop-opacity").and_then(parse_opacity) {
+        color = color.with_opacity(opacity);
+    }
+    GradientStop { offset, color }
+}
+
+/// A gradient coordinate: a number, or a percentage of the relevant basis.
+fn parse_fraction(raw: &str) -> Option<f32> {
+    let trimmed = raw.trim();
+    let value = parse_length(trimmed)?;
+    Some(if trimmed.ends_with('%') {
+        value / 100.0
+    } else {
+        value
+    })
+}
+
+fn parse_opacity(raw: &str) -> Option<f32> {
+    parse_fraction(raw).map(|value| value.clamp(0.0, 1.0))
 }
 
 fn parse_color(raw: &str) -> Option<Color> {
@@ -1348,6 +1862,62 @@ mod tests {
         assert_eq!(second.last(), Some(&(2.0, 3.0)));
         assert_eq!(second[second.len() - 2], (0.0, 5.0));
         assert!(*second_closed);
+    }
+
+    #[test]
+    fn linear_gradient_interpolates_along_its_axis() {
+        let svg = br##"<svg width="8" height="1"><defs>
+            <linearGradient id="g" x1="0" y1="0" x2="8" y2="0" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#ff0000"/><stop offset="1" stop-color="#0000ff"/>
+            </linearGradient></defs>
+            <rect width="8" height="1" fill="url(#g)"/></svg>"##;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        let left = image.pixel(0, 0).expect("left pixel");
+        let right = image.pixel(7, 0).expect("right pixel");
+        assert!(left.red > 200 && left.blue < 60, "{left:?}");
+        assert!(right.blue > 200 && right.red < 60, "{right:?}");
+        assert_eq!(left.alpha, 255);
+        assert_eq!(right.alpha, 255);
+    }
+
+    #[test]
+    fn a_gradient_transform_moves_the_gradient_coordinate_system() {
+        let svg = br#"<svg width="4" height="1"><defs>
+            <linearGradient id="g" x1="0" y1="0" x2="1" y2="0"
+              gradientUnits="userSpaceOnUse" gradientTransform="translate(2 0)">
+              <stop stop-color="red"/><stop offset="1" stop-color="blue"/>
+            </linearGradient></defs>
+            <rect width="4" height="1" fill="url(#g)"/></svg>""#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(0, 0), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(3, 0), Some(Color::rgb(0, 0, 255)));
+    }
+
+    #[test]
+    fn a_gradient_stroke_uses_the_same_coordinate_system() {
+        let svg = br#"<svg width="8" height="8"><defs>
+            <linearGradient id="g" x1="0" y1="0" x2="8" y2="0" gradientUnits="userSpaceOnUse">
+              <stop stop-color="red"/><stop offset="1" stop-color="blue"/>
+            </linearGradient></defs>
+            <line x1="0" y1="4" x2="8" y2="4" stroke="url(#g)" stroke-width="1"/>
+            </svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        let left = image.pixel(0, 4).expect("left stroke pixel");
+        let right = image.pixel(7, 4).expect("right stroke pixel");
+        assert!(left.red > 200 && left.blue < 80, "{left:?}");
+        assert!(right.blue > 200 && right.red < 80, "{right:?}");
+    }
+
+    #[test]
+    fn radial_gradient_stop_opacity_blends_towards_the_edge() {
+        let svg = br#"<svg width="9" height="9"><defs>
+            <radialGradient id="g" cx="0.5" cy="0.5" r="0.5">
+              <stop stop-color="red"/><stop offset="1" stop-color="red" stop-opacity="0"/>
+            </radialGradient></defs>
+            <rect width="9" height="9" fill="url(#g)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(4, 4), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(0, 0), Some(Color::TRANSPARENT));
     }
 
     #[test]
