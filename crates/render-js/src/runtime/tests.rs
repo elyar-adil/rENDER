@@ -1152,6 +1152,31 @@ fn for_in_uses_first_insertion_order_not_alphabetical_order() {
 }
 
 #[test]
+fn setting_the_legacy_class_name_attribute_sets_the_class_attribute() {
+    // Old virtual-DOM builds spell the IDL name in `setAttribute`; the
+    // platform stores `classname`, but the intent is always the class.
+    let value = evaluate_script(
+        "
+        var element = document.createElement('div');
+        element.setAttribute('className', 'alpha beta');
+        var lower = document.createElement('div');
+        lower.setAttribute('classname', 'literal');
+        [
+            element.getAttribute('class'),
+            element.getAttribute('classname'),
+            element.className,
+            lower.getAttribute('classname'),
+            lower.getAttribute('class')
+        ].join('|')
+        ",
+    );
+    assert_eq!(
+        value,
+        JsValue::String("alpha beta||alpha beta|literal|".into())
+    );
+}
+
+#[test]
 fn assigning_an_elements_style_forwards_to_css_text() {
     // CSSOM: `ElementCSSInlineStyle.style` is `[PutForwards=cssText]`. A page
     // (or a virtual DOM) may assign a string; it must become inline

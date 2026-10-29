@@ -57,9 +57,28 @@ impl JsRuntime {
         match function {
             NativeFunction::SetAttribute => {
                 let node = self.require_node(receiver)?;
-                let name = required_argument(arguments, 0, "setAttribute")?.to_js_string();
+                let mut name = required_argument(arguments, 0, "setAttribute")?
+                    .to_js_string()
+                    .to_lossy();
                 let value = required_argument(arguments, 1, "setAttribute")?.to_js_string();
-                dom.set_attribute(node, name.to_lossy(), value.to_lossy())?;
+                // Legacy DOM compatibility: a few older virtual-DOM builds
+                // (including the Preact copy Bing serves to clients without
+                // its homepage bundle) pass the IDL name `className` to
+                // `setAttribute`. HTML attribute names are case-insensitive
+                // and the standard stores that as `classname`, but every
+                // browser-side intent behind this spelling is the class
+                // attribute. Keep lower-case `classname` untouched.
+                if name == "className"
+                    && matches!(
+                        dom.node(node).map(render_dom::Node::kind),
+                        Some(render_dom::NodeKind::Element(element))
+                            if element.namespace == render_dom::Namespace::Html
+                    )
+                {
+                    name.clear();
+                    name.push_str("class");
+                }
+                dom.set_attribute(node, name, value.to_lossy())?;
                 Ok(JsValue::Undefined)
             }
             NativeFunction::SetTimeout | NativeFunction::SetInterval => {

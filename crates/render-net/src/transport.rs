@@ -525,12 +525,14 @@ impl Default for FetchConfig {
             body_idle_timeout: None,
             idle_connections_per_origin: DEFAULT_PER_ORIGIN_CONCURRENCY,
             idle_connections_total: DEFAULT_PER_ORIGIN_CONCURRENCY * ORIGINS_BEFORE_TOTAL_CEILING,
-            user_agent: format!(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-                 AppleWebKit/537.36 (KHTML, like Gecko) \
-                 Chrome/120.0.0.0 Safari/537.36 rENDER/{}",
-                env!("CARGO_PKG_VERSION")
-            ),
+            user_agent: std::env::var("RENDER_USER_AGENT").unwrap_or_else(|_| {
+                format!(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+                     AppleWebKit/537.36 (KHTML, like Gecko) \
+                     Chrome/120.0.0.0 Safari/537.36 rENDER/{}",
+                    env!("CARGO_PKG_VERSION")
+                )
+            }),
             observer: Arc::new(StderrObserver::from_environment()),
         }
     }
@@ -1010,6 +1012,18 @@ impl HttpTransport {
                 if let Some(accept) = request.accept.as_deref() {
                     managed("Accept", accept.to_owned());
                 }
+                // Chromium sends client hints on every navigation; sites use
+                // them (together with the UA) to select a client bundle and
+                // feature set. Without them a Chromium UA looks like a browser
+                // that predates these hints, and Bing serves an older variant.
+                managed(
+                    "Sec-CH-UA",
+                    "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\""
+                        .to_owned(),
+                );
+                managed("Sec-CH-UA-Mobile", "?0".to_owned());
+                managed("Sec-CH-UA-Platform", "\"Windows\"".to_owned());
+                managed("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8".to_owned());
                 // The caller-provided Cookie header was computed for the
                 // original URL. Reusing it only on same-origin hops avoids
                 // leaking it to a cross-origin redirect, while cookies the

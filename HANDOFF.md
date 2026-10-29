@@ -1,3 +1,55 @@
+# 交接文档 (2026-10-31, 续十三) — Bing 搜索框热词提示与头部图标
+
+接续生成内容会话。这一轮定位到 Bing 首屏搜索框热词提示和头部菜单图标缺失的
+共同根因:客户端 Preact 版本通过 `setAttribute('className', …)` 更新 class,
+而 DOM 按标准把它存成 `classname` 属性, 于是 hydration 后的 class 永远不生效。
+
+## 本轮已完成
+
+| 内容 | 落点 |
+|---|---|
+| **`setAttribute('className', …)` 兼容** | 仅对 HTML 元素、精确大小写 `className` 映射到 `class`; 小写 `classname` 仍按标准创建独立属性。旧版 Preact(自动建议使用的那份)因此可以更新 class, Bing 主页 hydration 恢复 |
+| **搜索框热词提示显示** | 修复后 `#sb_form_placeholder` 从 `_hide` 变为可见块, `sb_form_placeholder_query` 获得 `hp_fadein_show`; 截图显示“9点半买的手机10点50坏了” |
+| **头部菜单/应用图标** | hydration 恢复后登录/头像/Rewards 右侧的汉堡菜单与九宫格图标出现(此前只有节点没有 Preact 内容) |
+| **客户端提示头** | 普通请求新增 `Sec-CH-UA` / `Sec-CH-UA-Mobile` / `Sec-CH-UA-Platform` / `Accept-Language`; 与 Chrome 120 的 UA 一致。用于让站点识别为现代 Chromium(本机 Bing 变体未因它改变, 但这是通用保真修复) |
+| **`RENDER_USER_AGENT`** | 诊断用 UA 覆盖, 便于比较不同 UA 下的站点变体 |
+
+## 对照证据(1180×684 逻辑视口, 同机 Edge)
+
+| 元素 | Edge | rENDER |
+|---|---|---|
+| 搜索框热词容器 | `sb_form_placeholder`, x=117.5,y=151.8, 188.5×22 | `sb_form_placeholder`, x=707.5,y=288.6, 189.7×19.2(搜索框 x=692.5+15) |
+| 热词文本 span | `hp_fadein_ph hp_fadein_show` | `hp_fadein_ph hp_fadein_show` |
+| 汉堡菜单 `#id_sc` | 20×39, 背景 SVG | 20×39, 背景 SVG |
+| 应用九宫格 | 可见 | 可见 |
+| Rewards 徽章 | 32×32 内联 SVG | `#rh_rwm` 仍无子节点(仅文本) |
+
+健康线:
+
+```
+ready=Complete dom_elements=476 boxes=169
+scripts_failed=0 scripts_threw=0 css_errors=0 css_warnings=19 images_failed=3
+```
+
+## 验证
+
+```
+cargo test --workspace                       2707 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+## 明确未做 / 下一步
+
+- **Rewards 徽章**:`#rh_rwm` 的 widget 脚本已执行但未生成 `.b_clickarea`/`.medal`/SVG
+  子节点, 只剩文本; 需要继续查 widget 的渲染触发条件(可能是额外 API/feature flag)。
+- 搜索框 placeholder 的主路径已经显示; 键入/聚焦时的 ghost text 动画仍只验证了基础行为。
+- JD 主商品区仍受风控 403(同机 Edge 也 403); IndexedDB 仍是内存子集; GitHub/HN 的
+  本机 TCP 链路仍被阻断。
+
+---
+
 # 交接文档 (2026-10-31, 续十二) — CSS `::before`/`::after` 生成盒
 
 接续 Bing 对照会话。这一轮实现了生成内容:伪元素的样式级联、生成盒、文本内容与
