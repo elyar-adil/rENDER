@@ -502,6 +502,15 @@ impl JsRuntime {
                 *listeners,
             );
         }
+        for entry in &self.performance_entries {
+            mark_object(
+                self,
+                &mut marked,
+                &mut work,
+                &mut marked_environments,
+                *entry,
+            );
+        }
         for root in &self.external_microtask_roots {
             mark_object(
                 self,

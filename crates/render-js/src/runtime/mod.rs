@@ -193,6 +193,10 @@ pub struct JsRuntime {
     /// handed out by [`Self::take_next_microtask`]. The rest stay in the
     /// runtime, where the collector marks them, until they run.
     microtask_cursor: usize,
+    /// Entries created by `performance.mark` / `performance.measure`. They
+    /// are ordinary objects returned to script and also kept here so
+    /// `getEntries*` can return them; the collector marks this list.
+    performance_entries: Vec<ObjectId>,
     /// Objects owned by microtasks that an embedding has queued outside the
     /// runtime's queue (the page event loop). The collector treats them as
     /// roots; the embedding refreshes the set before each runnable.
@@ -408,6 +412,7 @@ impl JsRuntime {
             promise_pairs_resolved: Vec::new(),
             pending_microtasks: Vec::new(),
             microtask_cursor: 0,
+            performance_entries: Vec::new(),
             external_microtask_roots: Vec::new(),
             last_statement_offset: 0,
             event_listeners: BTreeMap::new(),
@@ -1495,6 +1500,14 @@ impl JsRuntime {
     /// like a real engine. Falls back to the resource-limit error when the
     /// heap cannot admit the error object. The diagnostic trail names the
     /// innermost active frames.
+    /// The configured call-depth limit, raised as the platform's `RangeError`.
+    fn check_call_depth(&mut self) -> Result<(), JsError> {
+        if self.calls_active >= self.limits.max_call_depth {
+            return Err(self.call_depth_exceeded());
+        }
+        Ok(())
+    }
+
     fn call_depth_exceeded(&mut self) -> JsError {
         let trail = self.call_frame_trail(8);
         let message = format!("Maximum call stack size exceeded (near {trail})");

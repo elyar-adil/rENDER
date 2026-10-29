@@ -6196,9 +6196,7 @@ impl JsRuntime {
         // Constructors recurse through user code just like calls; keep the
         // same depth accounting so runaway `new` chains stay bounded.
         self.consume_step()?;
-        if self.calls_active >= self.limits.max_call_depth {
-            return Err(self.call_depth_exceeded());
-        }
+        self.check_call_depth()?;
         self.calls_active = self.calls_active.saturating_add(1);
         let result = self.construct_dispatch(dom, constructor, arguments);
         self.calls_active = self.calls_active.saturating_sub(1);
@@ -6678,9 +6676,7 @@ impl JsRuntime {
         receiver: JsValue,
     ) -> Result<JsValue, JsError> {
         self.consume_step()?;
-        if self.calls_active >= self.limits.max_call_depth {
-            return Err(self.call_depth_exceeded());
-        }
+        self.check_call_depth()?;
         self.calls_active = self.calls_active.saturating_add(1);
         let result = match self.realm.host(callee) {
             Some(ObjectHost::ObjectConstructor) => self.object_constructor(arguments),

@@ -1123,6 +1123,61 @@ fn string_replace_expands_groups_and_honors_global() {
 }
 
 #[test]
+fn performance_marks_and_measures_are_entries() {
+    let value = evaluate_script(
+        "
+        performance.clearMarks();
+        performance.clearMeasures();
+        var mark = performance.mark('start');
+        var measure = performance.measure('total');
+        var marks = performance.getEntriesByType('mark');
+        var named = performance.getEntriesByName('total');
+        [
+            mark.name,
+            mark.entryType,
+            typeof mark.startTime,
+            mark.duration,
+            measure.entryType,
+            marks.length,
+            marks[0] === mark,
+            named.length,
+            named[0] === measure,
+            performance.getEntries().length
+        ].join('|')
+        ",
+    );
+    assert_eq!(
+        value,
+        JsValue::String("start|mark|number|0|measure|1|true|1|true|2".into())
+    );
+}
+
+#[test]
+fn window_event_handler_attributes_are_assignable_in_strict_mode() {
+    // Bing's page script is strict and installs its load handler with a bare
+    // `onload = function () {...}`. A Window without the IDL attribute makes
+    // that assignment a ReferenceError.
+    let value = evaluate_script(
+        "
+        'use strict';
+        var handler = function () {};
+        onload = handler;
+        [
+            typeof onload,
+            window.onload === handler,
+            Object.getOwnPropertyDescriptor(window, 'onload').writable,
+            typeof window.onresize,
+            String(window.onresize)
+        ].join('|')
+        ",
+    );
+    assert_eq!(
+        value,
+        JsValue::String("function|true|true|object|null".into())
+    );
+}
+
+#[test]
 fn a_call_on_a_nullish_base_is_a_type_error_not_an_optional_short_circuit() {
     let value = evaluate_script(
         "

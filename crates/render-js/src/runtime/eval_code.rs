@@ -122,9 +122,7 @@ impl JsRuntime {
         };
         // A call of eval is a call for the depth and step accounting of user code.
         self.consume_step()?;
-        if self.calls_active >= self.limits.max_call_depth {
-            return Err(self.call_depth_exceeded());
-        }
+        self.check_call_depth()?;
         self.calls_active = self.calls_active.saturating_add(1);
         let result = self.run_eval(dom, &(source).to_lossy(), &context, direct);
         self.calls_active = self.calls_active.saturating_sub(1);

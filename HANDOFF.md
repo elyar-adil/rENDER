@@ -12,6 +12,9 @@
 | **微任务队列的 GC 根** | 页面把微任务移入事件循环后,回调只在嵌入方的容器里,收集器看不到;一个回调执行中的分配会把它后面的回调扫成空对象(表现为 `stack []` 的 "not callable")。运行时新增 `set_external_microtask_roots` / `take_next_microtask`,页面在每个 runnable 前同步根集合,`invoke_microtask` 也 pin 当前任务;直接 drain 改为逐个取出 |
 | **每次调用 pin callee/receiver/arguments** | 统一在 `call_in_current_realm` 入口 pin,覆盖解释器调用、原生内建回调、微任务、定时器等所有路径。之前只在 `Expr::Call` 的参数求值阶段 pin,原生内建持有时仍可能被回收 |
 | **JS 步数预算 10M → 50M** | `js_security_v3` 不是死循环:用 charAt/charCodeAt 计数探针确认 6.3 万次字符访问、脚本在 30M 步内正常完成;12M 不够、15M 够。默认提到 50M,并新增 `RENDER_JS_STEPS`(覆盖预算)与 `RENDER_JS_STEP_TRACE`(每百万步打印 offset + 调用栈) |
+| **Window 的 `on*` IDL 属性** | 全局对象现在安装完整的 WindowEventHandlers/GlobalEventHandlers 列表(初始 `null`、可写可配置)。此前严格模式脚本里的 `onload = fn` 会抛 ReferenceError(Bing 首页就踩到);现在赋值成功,事件派发仍读同一个属性 |
+| **Performance 条目 API** | `performance.mark/measure/clearMarks/clearMeasures/getEntriesByName`;条目对象含 `name`/`entryType`/`startTime`/`duration`,由运行时保留并纳入 GC |
+| **macOS 主线程栈 256 MiB** | 解释器单帧较大,Bing 的深递归在 626 层就耗尽 8 MiB 主线程栈(进程 abort)。新增 `crates/render-browser/build.rs`,在 macOS 链接 `-Wl,-stack_size,0x10000000`;`otool -l` 显示 `LC_MAIN stacksize 268435456`。Bing 不再崩溃 |
 | **诊断** | 资源上限错误带上最后一条语句的偏移;浏览器错误行打印 `at line/column`;`RENDER_JS_FRAME_OFFSETS` 下调用点消息带 `(call ke at byte N)` |
 
 ## 测量(隐藏截图,12 秒)
@@ -20,6 +23,8 @@
 |---|---|---|---|---|
 | jd(本轮前) | 667 | 120 | 6 | 3 |
 | jd(本轮后) | **1139** | 117(截图时主区仍空) | 11(含 JSONP/传输) | **1**(仅第三方 aria.js) |
+| bing(本轮前) | 273 | 58 | 0 | 2(其中一次随后栈溢出 abort) |
+| bing(本轮后) | 270 | 58 | 0 | **0**(进程正常退出) |
 
 JD 的安全脚本、主 bundle 均执行完成,页脚/搜索/导航真实文本已渲染;主商品区仍依赖
 `api.m.jd.com` 的 403 风控响应(与浏览器指纹/token 有关),不是脚本崩溃。截图时 boxes

@@ -1252,8 +1252,13 @@ pub(crate) enum NativeFunction {
     JsonRawJson,
     JsonStringify,
     PerformanceNow,
+    PerformanceMark,
+    PerformanceMeasure,
+    PerformanceClearMarks,
+    PerformanceClearMeasures,
     PerformanceGetEntries,
     PerformanceGetEntriesByType,
+    PerformanceGetEntriesByName,
     /// The collection methods carry the brand their receiver must have (ECMA-262
     /// 24.1.3, 24.2.3, 24.3.3, 24.4.3): a `Map` method refuses a `WeakMap`.
     CollectionGet(CollectionKind),
@@ -3564,6 +3569,144 @@ impl Realm {
         }
     }
 
+    /// The `on<event>` IDL attributes of a Window (HTML §8.1.7).
+    const WINDOW_EVENT_HANDLER_NAMES: &[&str] = &[
+        "onabort",
+        "onafterprint",
+        "onanimationcancel",
+        "onanimationend",
+        "onanimationiteration",
+        "onanimationstart",
+        "onauxclick",
+        "onbeforeinput",
+        "onbeforematch",
+        "onbeforeprint",
+        "onbeforetoggle",
+        "onbeforeunload",
+        "onblur",
+        "oncancel",
+        "oncanplay",
+        "oncanplaythrough",
+        "onchange",
+        "onclick",
+        "onclose",
+        "oncontextlost",
+        "oncontextmenu",
+        "oncontextrestored",
+        "oncopy",
+        "oncuechange",
+        "oncut",
+        "ondblclick",
+        "ondrag",
+        "ondragend",
+        "ondragenter",
+        "ondragleave",
+        "ondragover",
+        "ondragstart",
+        "ondrop",
+        "ondurationchange",
+        "onemptied",
+        "onended",
+        "onerror",
+        "onfocus",
+        "onformdata",
+        "ongotpointercapture",
+        "onhashchange",
+        "oninput",
+        "oninvalid",
+        "onkeydown",
+        "onkeypress",
+        "onkeyup",
+        "onlanguagechange",
+        "onload",
+        "onloadeddata",
+        "onloadedmetadata",
+        "onloadstart",
+        "onlostpointercapture",
+        "onmessage",
+        "onmessageerror",
+        "onmousedown",
+        "onmouseenter",
+        "onmouseleave",
+        "onmousemove",
+        "onmouseout",
+        "onmouseover",
+        "onmouseup",
+        "onoffline",
+        "ononline",
+        "onpagehide",
+        "onpagereveal",
+        "onpageshow",
+        "onpageswap",
+        "onpaste",
+        "onpause",
+        "onplay",
+        "onplaying",
+        "onpointercancel",
+        "onpointerdown",
+        "onpointerenter",
+        "onpointerleave",
+        "onpointermove",
+        "onpointerout",
+        "onpointerover",
+        "onpointerup",
+        "onpopstate",
+        "onprogress",
+        "onratechange",
+        "onrejectionhandled",
+        "onreset",
+        "onresize",
+        "onscroll",
+        "onscrollend",
+        "onsecuritypolicyviolation",
+        "onseeked",
+        "onseeking",
+        "onselect",
+        "onselectionchange",
+        "onselectstart",
+        "onslotchange",
+        "onstalled",
+        "onstorage",
+        "onsubmit",
+        "onsuspend",
+        "ontimeupdate",
+        "ontoggle",
+        "ontouchcancel",
+        "ontouchend",
+        "ontouchmove",
+        "ontouchstart",
+        "ontransitioncancel",
+        "ontransitionend",
+        "ontransitionrun",
+        "ontransitionstart",
+        "onunhandledrejection",
+        "onunload",
+        "onvolumechange",
+        "onwaiting",
+        "onwheel",
+    ];
+
+    /// Installs the Window event handler IDL attributes (HTML
+    /// `WindowEventHandlers` and `GlobalEventHandlers`) as `null` data
+    /// properties that a script assigns directly. Without them, strict-mode
+    /// `onload = f` throws a `ReferenceError` instead of installing the handler;
+    /// event dispatch reads them back as ordinary `on<type>` properties.
+    fn install_window_event_handlers(objects: &mut [JsObject], global: ObjectId) {
+        for name in Self::WINDOW_EVENT_HANDLER_NAMES {
+            objects[global.0].properties.insert(
+                (*name).to_owned(),
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::Null,
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                },
+            );
+        }
+    }
+
     /// Installs the browser host's globals (HTML, DOM, CSSOM, Web IDL, Fetch,
     /// `WebStorage`, console and timers) into the page's realm. Only that realm
     /// has them: a realm from `CreateRealm` carries the ECMAScript globals alone.
@@ -3591,6 +3734,7 @@ impl Realm {
                 configurable: false,
             },
         );
+        Self::install_window_event_handlers(objects, global);
         let queue_microtask = ObjectId(objects.len());
         objects.push(JsObject {
             host: ObjectHost::BoundFunction {
@@ -7134,10 +7278,18 @@ impl Realm {
             PropertyDescriptor::builtin(JsValue::Object(timing)),
         );
         for (name, function) in [
+            ("mark", NativeFunction::PerformanceMark),
+            ("measure", NativeFunction::PerformanceMeasure),
+            ("clearMarks", NativeFunction::PerformanceClearMarks),
+            ("clearMeasures", NativeFunction::PerformanceClearMeasures),
             ("getEntries", NativeFunction::PerformanceGetEntries),
             (
                 "getEntriesByType",
                 NativeFunction::PerformanceGetEntriesByType,
+            ),
+            (
+                "getEntriesByName",
+                NativeFunction::PerformanceGetEntriesByName,
             ),
         ] {
             let method = ObjectId(objects.len());

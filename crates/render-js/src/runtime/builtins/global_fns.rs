@@ -617,8 +617,28 @@ impl JsRuntime {
                 self.uri_decode(&text, preserved).map(JsValue::String)
             }
             NativeFunction::PerformanceNow => Ok(JsValue::Number(Self::monotonic_now_ms())),
-            NativeFunction::PerformanceGetEntries | NativeFunction::PerformanceGetEntriesByType => {
-                Ok(JsValue::Object(self.create_array_from_values(&[])?))
+            NativeFunction::PerformanceMark => self.performance_mark(arguments),
+            NativeFunction::PerformanceMeasure => self.performance_measure(arguments),
+            NativeFunction::PerformanceClearMarks => {
+                self.performance_clear_entries("mark");
+                Ok(JsValue::Undefined)
+            }
+            NativeFunction::PerformanceClearMeasures => {
+                self.performance_clear_entries("measure");
+                Ok(JsValue::Undefined)
+            }
+            NativeFunction::PerformanceGetEntries => self.performance_entries(None, None),
+            NativeFunction::PerformanceGetEntriesByType => {
+                let entry_type = required_argument(arguments, 0, "getEntriesByType")?
+                    .to_js_string()
+                    .to_lossy();
+                self.performance_entries(Some(&entry_type), None)
+            }
+            NativeFunction::PerformanceGetEntriesByName => {
+                let name = required_argument(arguments, 0, "getEntriesByName")?
+                    .to_js_string()
+                    .to_lossy();
+                self.performance_entries(None, Some(&name))
             }
             NativeFunction::FunctionPrototype
             | NativeFunction::FunctionToString
@@ -1836,6 +1856,84 @@ impl JsRuntime {
             output.extend(decoded.encode_utf16());
         }
         Ok(JsString::from_unit_vec(output))
+    }
+}
+
+impl JsRuntime {
+    /// `performance.mark(name)`: a `PerformanceEntry` with the mark's start
+    /// time. The entry is both returned and retained for `getEntries*`.
+    fn performance_mark(&mut self, arguments: &[JsValue]) -> Result<JsValue, JsError> {
+        let name = required_argument(arguments, 0, "mark")?
+            .to_js_string()
+            .to_lossy();
+        let entry = self.create_performance_entry(&name, "mark", Self::monotonic_now_ms())?;
+        self.performance_entries.push(entry);
+        Ok(JsValue::Object(entry))
+    }
+
+    /// `performance.measure(name, startMark?, endMark?)`. The runtime has no
+    /// long-task timeline; the entry records the current time and a zero
+    /// duration, which is what most feature-detection call sites read.
+    fn performance_measure(&mut self, arguments: &[JsValue]) -> Result<JsValue, JsError> {
+        let name = required_argument(arguments, 0, "measure")?
+            .to_js_string()
+            .to_lossy();
+        let entry = self.create_performance_entry(&name, "measure", Self::monotonic_now_ms())?;
+        self.performance_entries.push(entry);
+        Ok(JsValue::Object(entry))
+    }
+
+    fn create_performance_entry(
+        &mut self,
+        name: &str,
+        entry_type: &str,
+        start_time: f64,
+    ) -> Result<ObjectId, JsError> {
+        self.ensure_heap_capacity(1)?;
+        let entry = self.realm.create_ordinary_object();
+        for (key, value) in [
+            ("name", JsValue::String((name.to_owned()).into())),
+            ("entryType", JsValue::String((entry_type.to_owned()).into())),
+            ("startTime", JsValue::Number(start_time)),
+            ("duration", JsValue::Number(0.0)),
+        ] {
+            self.realm.set_property(entry, key.to_owned(), value);
+        }
+        Ok(entry)
+    }
+
+    fn performance_clear_entries(&mut self, entry_type: &str) {
+        self.performance_entries.retain(|entry| {
+            self.realm
+                .get_property(*entry, "entryType")
+                .map(|value| value.to_js_string().to_lossy())
+                .as_deref()
+                != Some(entry_type)
+        });
+    }
+
+    fn performance_entries(
+        &mut self,
+        entry_type: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<JsValue, JsError> {
+        let mut values = Vec::new();
+        for entry in &self.performance_entries {
+            let matches = |key: &str, expected: Option<&str>| match expected {
+                None => true,
+                Some(expected) => {
+                    self.realm
+                        .get_property(*entry, key)
+                        .map(|value| value.to_js_string().to_lossy())
+                        .as_deref()
+                        == Some(expected)
+                }
+            };
+            if matches("entryType", entry_type) && matches("name", name) {
+                values.push(JsValue::Object(*entry));
+            }
+        }
+        Ok(JsValue::Object(self.create_array_from_values(&values)?))
     }
 }
 
