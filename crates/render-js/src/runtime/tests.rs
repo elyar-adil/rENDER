@@ -8,16 +8,10 @@ use url::Url;
 /// Run every queued microtask (including ones queued by earlier microtasks)
 /// until the runtime has none left.
 fn drain_microtasks(runtime: &mut JsRuntime, dom: &mut render_dom::Dom) {
-    loop {
-        let pending = runtime.take_pending_microtasks();
-        if pending.is_empty() {
-            return;
-        }
-        for microtask in pending {
-            runtime
-                .invoke_microtask(dom, microtask)
-                .expect("microtask executes");
-        }
+    while let Some(microtask) = runtime.take_next_microtask() {
+        runtime
+            .invoke_microtask(dom, microtask)
+            .expect("microtask executes");
     }
 }
 
@@ -1119,6 +1113,124 @@ fn string_replace_expands_groups_and_honors_global() {
     assert_eq!(
         outcome.value,
         JsValue::String("b_a-c|a+b+c|23/08/2026".into())
+    );
+}
+
+#[test]
+fn indexed_db_opens_upgrades_and_round_trips_values() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.log = [];
+                var open = indexedDB.open('cache', 1);
+                open.onupgradeneeded = function (event) {
+                    log.push('upgrade:' + event.oldVersion + '->' + event.newVersion);
+                    open.result.createObjectStore('items');
+                };
+                open.onerror = function () { log.push('open-error'); };
+                open.onsuccess = function () {
+                    var db = open.result;
+                    log.push('open:' + db.version + ':' + db.objectStoreNames.contains('items'));
+                    var tx = db.transaction('items', 'readwrite');
+                    tx.oncomplete = function () { log.push('complete'); };
+                    var store = tx.objectStore('items');
+                    store.put({ name: 'alpha' }, 'a').onsuccess = function () { log.push('put-a'); };
+                    store.put({ name: 'beta' }, 'b').onsuccess = function () { log.push('put-b'); };
+                    store.get('a').onsuccess = function (event) {
+                        log.push('get:' + event.target.result.name);
+                    };
+                    store.count().onsuccess = function (event) {
+                        log.push('count:' + event.target.result);
+                    };
+                };
+            ",
+        )
+        .expect("IndexedDB script executes");
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    let value = runtime
+        .execute(&mut parsed.dom, "log.join('|')")
+        .expect("log reads")
+        .value;
+    assert_eq!(
+        value,
+        JsValue::String("upgrade:0->1|open:1:true|put-a|put-b|get:alpha|count:2|complete".into())
+    );
+}
+
+#[test]
+fn indexed_db_cursor_sees_earlier_writes_and_continues() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.log = [];
+                var open = indexedDB.open('cursor-db', 1);
+                open.onupgradeneeded = function () {
+                    open.result.createObjectStore('items');
+                };
+                open.onsuccess = function () {
+                    var tx = open.result.transaction('items', 'readwrite');
+                    var store = tx.objectStore('items');
+                    store.put({ n: 1 }, 1);
+                    store.put({ n: 2 }, 2);
+                    var cursorRequest = store.openCursor();
+                    cursorRequest.onsuccess = function () {
+                        var cursor = cursorRequest.result;
+                        if (!cursor) { log.push('end'); return; }
+                        log.push('cursor:' + cursor.key + ':' + cursor.value.n);
+                        cursor.continue();
+                    };
+                };
+            ",
+        )
+        .expect("IndexedDB cursor script executes");
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    let value = runtime
+        .execute(&mut parsed.dom, "log.join('|')")
+        .expect("log reads")
+        .value;
+    assert_eq!(value, JsValue::String("cursor:1:1|cursor:2:2|end".into()));
+}
+
+#[test]
+fn indexed_db_missing_store_is_a_not_found_error_like_the_platform() {
+    // Bing opens `ImageCacheDB` version 2 with no upgrade handler: the database
+    // is created but the `IOTD` store does not exist, and the page's own
+    // try/catch falls back to the network wallpaper.
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.log = [];
+                var open = indexedDB.open('fresh', 2);
+                open.onsuccess = function () {
+                    var db = open.result;
+                    log.push('stores:' + db.objectStoreNames.contains('IOTD'));
+                    try {
+                        db.transaction('IOTD');
+                        log.push('opened');
+                    } catch (error) {
+                        log.push('threw:' + error.name);
+                    }
+                };
+            ",
+        )
+        .expect("IndexedDB script executes");
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    let value = runtime
+        .execute(&mut parsed.dom, "log.join('|')")
+        .expect("log reads")
+        .value;
+    assert_eq!(
+        value,
+        JsValue::String("stores:false|threw:NotFoundError".into())
     );
 }
 

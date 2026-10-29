@@ -1664,4 +1664,23 @@
     define(global, 'getSelection', function getSelection() { return emptySelection; });
     define(documentPrototype, 'getSelection', function getSelection() { return emptySelection; });
   }
+  // ------------------------------------------------------- performance observer
+  // The engine exposes performance entries but has no observer scheduling.
+  // Declaring an empty `supportedEntryTypes` lets feature-detecting pages
+  // skip element/resource timing instead of throwing ReferenceError.
+  if (typeof global.PerformanceObserver === 'undefined') {
+    function PerformanceObserver(callback) {
+      this._callback = callback;
+    }
+    PerformanceObserver.supportedEntryTypes = [];
+    PerformanceObserver.prototype.observe = function () {};
+    PerformanceObserver.prototype.disconnect = function () {};
+    PerformanceObserver.prototype.takeRecords = function () { return []; };
+    defineProperty(global, 'PerformanceObserver', {
+      value: PerformanceObserver,
+      writable: true,
+      configurable: true,
+      enumerable: false
+    });
+  }
 })(this);

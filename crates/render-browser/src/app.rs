@@ -2495,6 +2495,20 @@ impl BrowserApp {
                 .dom_mut()
                 .set_image_state(owner, ImageLoadState::Broken);
             page.page.remove_canvas_image(owner);
+            // HTML "update the image data": a failed load fires `error` at the
+            // element, which is what fallback chains (`onerror`, `<picture>`
+            // source switching, AVIF/WebP probes) react to.
+            if matches!(
+                pending
+                    .plan
+                    .resources
+                    .iter()
+                    .find(|resource| resource.key.owner == owner)
+                    .map(|resource| resource.key.source),
+                Some(ImageSource::Element | ImageSource::VideoPoster)
+            ) {
+                let _ = page.page.queue_dom_event(PageDomEvent::new(owner, "error"));
+            }
         }
         // Every completed image batch marks the page dirty, not only a batch
         // that decoded something. A batch whose results were all stale, failed,

@@ -1085,6 +1085,27 @@ fn a_planned_image_is_pending_until_its_batch_settles_and_broken_when_it_fails()
 }
 
 #[test]
+fn an_image_whose_load_fails_fires_error_at_its_element() {
+    let (mut app, tab) = headless_app_with("<img id=photo src=https://example.test/a.png>");
+    {
+        let page = app.pages.get_mut(&tab).expect("page");
+        page.page
+            .queue_script(
+                "document.getElementById('photo').onerror = function () { document.title = 'ImageFailed'; };",
+            )
+            .expect("handler script fits");
+        page.run_page_turns();
+    }
+    app.start_images(tab);
+    // An empty batch reports a missing result for the planned image.
+    app.finish_images(tab, Vec::new());
+    let page = app.pages.get_mut(&tab).expect("page");
+    page.run_page_turns();
+    page.sync_committed_title();
+    assert_eq!(page.navigation.committed().title, "ImageFailed");
+}
+
+#[test]
 fn image_source_changed_during_fetch_starts_replacement_immediately() {
     let (mut app, tab) = headless_app_with("<img id=photo src=https://example.test/old.png>");
     app.start_images(tab);

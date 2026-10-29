@@ -1,3 +1,38 @@
+# 交接文档 (2026-10-30, 续八) — 自托管 IndexedDB 与图片 error 事件
+
+接续 Bing 布局修复。Bing 的壁纸路径整体挂在 `window.indexedDB` 上;本轮补了
+**内存版 IndexedDB**,并顺带修掉"图片加载失败不发 error"的缺口,壁纸终于渲染出来。
+
+## 本轮已完成
+
+| 内容 | 落点 |
+|---|---|
+| **IndexedDB(自托管,内存)** | `crates/render-js/src/prelude_indexeddb.js`: `indexedDB.open`(版本校验、`upgradeneeded`、`onblocked`/`onerror`/`onsuccess`)、`createObjectStore`/`deleteObjectStore`、`transaction`(readonly/readwrite,自动 commit)、`get`/`getKey`/`getAll`/`getAllKeys`/`put`/`add`/`delete`/`clear`/`count`、`openCursor`/`openKeyCursor`(next/prev、continue/advance/delete)、`IDBKeyRange`、请求的 success/error 事件与 `addEventListener`。数据只存活于当前 realm,尚未落盘 |
+| **图片 error 事件** | `finish_images` 此前对失败资源只把元素标成 `Broken`,从不派发 `error`。Bing 用 2x2 AVIF data URL 做能力探测:失败后必须触发 `onerror` 才会回退到 WebP。现在失败元素按 HTML "update the image data" 派发 `error` |
+| **PerformanceObserver** | 提供 `supportedEntryTypes = []`、`observe`/`disconnect`/`takeRecords` 的降级实现;Bing 的 `new PerformanceObserver` 不再抛 ReferenceError,同时因不支持 `element` 计时而跳过该分支 |
+| **回归测试** | `indexed_db_opens_upgrades_and_round_trips_values`、`indexed_db_cursor_sees_earlier_writes_and_continues`、`indexed_db_missing_store_is_a_not_found_error_like_the_platform`、`an_image_whose_load_fails_fires_error_at_its_element` |
+
+## 测量(Bing,隐藏截图,12 秒)
+
+```
+ready=Complete dom_elements=292 boxes=58 scripts_failed=0 scripts_threw=0 images_failed=1
+<样式> id=iotd-lite-bg 存在
+<div id=img_cont ... bgimg=url("https://ts1.tc.mm.bing.net/th?id=OHR.AutumnCranes_ZH-CN5772055404_1920x1080...")
+```
+
+截图确认:必应主页壁纸(秋季鹤群照片)、搜索框、国内版/国际版切换、麦克风/搜索图标、
+顶部导航全部可见。`images_failed=1` 是 AVIF 探测图的预期失败(引擎不支持 AVIF),随后
+WebP 回退成功。
+
+## 明确未做 / 下一步
+
+- IndexedDB 尚无磁盘持久化、索引(`createIndex`)与 versionchange 事件;当前是内存实现。
+- Bing 大字号 "Bing" 字标仍未出现(只剩左上 2x2 方块 logo);需要查它由哪个元素/样式生成。
+- JD 主区仍空:`api.m.jd.com` 403,下一步对比 Referer/Cookie/`sec-ch-ua`/TLS 指纹。
+- GitHub/HN 的本机 TCP 链路仍被阻断。
+
+---
+
 # 交接文档 (2026-10-30, 续七) — 位置元素不再抬高祖先的绘制层
 
 接续 Bingo/Bing 会话。上一轮把 Bing 的脚本错误清到 0、进程不再崩溃,但页面只剩导航链接和

@@ -337,6 +337,9 @@ impl From<DomError> for JsError {
 
 /// The self-hosted standard library; see `JsRuntime::ensure_prelude`.
 const PRELUDE_SOURCE: &str = include_str!("../prelude.js");
+/// `IndexedDB`, self-hosted in `prelude_indexeddb.js` and installed after the
+/// other built-ins.
+const INDEXEDDB_PRELUDE_SOURCE: &str = include_str!("../prelude_indexeddb.js");
 /// The ECMAScript built-ins written in JavaScript, which every realm gets.
 const INTRINSICS_PRELUDE_SOURCE: &str = include_str!("../prelude_intrinsics.js");
 
@@ -1352,6 +1355,14 @@ impl JsRuntime {
         if let Err(error) = outcome {
             if std::env::var_os("RENDER_JS_TRACE").is_some() {
                 eprintln!("[render-js prelude failed: {error}]");
+            }
+            self.prelude_error = Some(error);
+        }
+        if self.prelude_error.is_none()
+            && let Err(error) = self.run_self_hosted(dom, INDEXEDDB_PRELUDE_SOURCE)
+        {
+            if std::env::var_os("RENDER_JS_TRACE").is_some() {
+                eprintln!("[render-js IndexedDB prelude failed: {error}]");
             }
             self.prelude_error = Some(error);
         }
