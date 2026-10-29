@@ -268,6 +268,9 @@ pub struct CompiledScript {
     strict: bool,
     /// Import/export tables; `Some` only for scripts compiled as modules.
     module: Option<module::ModuleInfo>,
+    /// The URL the script was loaded from, when the embedder knows it. It
+    /// names the script in uncaught-error events and stack frames.
+    source_name: Option<String>,
 }
 
 impl CompiledScript {
@@ -285,6 +288,7 @@ impl CompiledScript {
             statements,
             strict,
             module: None,
+            source_name: None,
         })
     }
 
@@ -303,7 +307,20 @@ impl CompiledScript {
             // Module code is always strict (ECMA-262 11.2.2).
             strict: true,
             module: Some(module),
+            source_name: None,
         })
+    }
+
+    /// Records the URL this script was loaded from. Uncaught errors and stack
+    /// frames then name the script instead of the document.
+    pub fn set_source_name(&mut self, name: impl Into<String>) {
+        self.source_name = Some(name.into());
+    }
+
+    /// The URL recorded by [`Self::set_source_name`], if any.
+    #[must_use]
+    pub fn source_name(&self) -> Option<&str> {
+        self.source_name.as_deref()
     }
 
     /// Whether the script's code is strict mode code.

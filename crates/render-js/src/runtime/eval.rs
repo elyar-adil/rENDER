@@ -866,6 +866,7 @@ impl JsRuntime {
             uses_arguments,
             this_context,
             source: None,
+            source_name: self.script_filename.clone(),
         });
         // Spec: the `name` of an anonymous function in progress is the empty
         // string (anonymous arrows included); `length` counts parameters
@@ -7153,12 +7154,15 @@ impl JsRuntime {
             .name
             .clone()
             .unwrap_or_else(|| format!("<anonymous fn #{index}>"));
-        // Diagnostic: append the body source offset to the frame label so
-        // offline stack traces map back to minified bundle positions
-        // (RENDER_JS_FRAME_OFFSETS=1).
+        // Diagnostic: append the body source offset and the defining script to
+        // the frame label so offline stack traces map back to minified bundle
+        // positions (RENDER_JS_FRAME_OFFSETS=1).
         let label = match function.body.first().and_then(statement_offset) {
             Some(offset) if std::env::var_os("RENDER_JS_FRAME_OFFSETS").is_some() => {
-                format!("{label}@{offset}")
+                match &function.source_name {
+                    Some(source) => format!("{label}@{offset} [{source}]"),
+                    None => format!("{label}@{offset}"),
+                }
             }
             _ => label,
         };

@@ -303,6 +303,8 @@ pub(super) struct UserFunction {
     /// The function's own source text, which `Function.prototype.toString`
     /// returns. `None` for a function the parser did not spell out.
     pub(super) source: Option<SourceSpan>,
+    /// The script URL this function was created by, for stack traces.
+    pub(super) source_name: Option<String>,
 }
 
 /// The function context that `this` and the other per-function bindings come

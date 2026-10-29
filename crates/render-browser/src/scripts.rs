@@ -485,16 +485,21 @@ fn compile_source(
         return;
     }
     match CompiledScript::compile(source, limits) {
-        Ok(compiled) => preparation.scripts.push(PreparedClassicScript {
-            owner: script.owner,
-            source_order: script.source_order,
-            scheduling: script.scheduling,
-            final_url,
-            byte_len,
-            compiled,
-            module_key: None,
-            module: None,
-        }),
+        Ok(mut compiled) => {
+            if let Some(url) = &final_url {
+                compiled.set_source_name(url.as_str());
+            }
+            preparation.scripts.push(PreparedClassicScript {
+                owner: script.owner,
+                source_order: script.source_order,
+                scheduling: script.scheduling,
+                final_url,
+                byte_len,
+                compiled,
+                module_key: None,
+                module: None,
+            });
+        }
         Err(error) => preparation.diagnostics.push(ScriptResourceDiagnostic {
             owner: Some(script.owner),
             source_order: Some(script.source_order),

@@ -1320,11 +1320,20 @@ impl JsRuntime {
         self.calls_active = 0;
         self.dom_nodes_created = 0;
         self.environment.clear();
+        // A script that knows its URL reports it in uncaught-error events and
+        // in the frames of the errors it creates. A script without one keeps
+        // the filename the caller established (and an inline script keeps the
+        // document URL).
+        let previous_filename = self.script_filename.clone();
+        if let Some(name) = script.source_name() {
+            self.script_filename = Some(name.to_owned());
+        }
         let outcome =
             self.run_compiled_script(dom, &script.statements, script.is_strict(), from_revision);
         if let Err(error) = &outcome {
             self.report_uncaught_error(dom, error);
         }
+        self.script_filename = previous_filename;
         self.sync_nested_contexts(dom);
         outcome
     }
