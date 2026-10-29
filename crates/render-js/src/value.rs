@@ -7187,6 +7187,24 @@ impl Realm {
                 PropertyDescriptor::builtin(JsValue::Boolean(value)),
             );
         }
+        // `navigator.serviceWorker` exists in every secure-context browsing
+        // context. There is no service worker implementation, but the
+        // container with a null controller is what feature-detecting pages
+        // read (`navigator.serviceWorker.controller && ...`); leaving it
+        // undefined throws where the platform returns null.
+        let service_worker = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        objects[service_worker.0].properties.insert(
+            "controller".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Null),
+        );
+        objects[navigator.0].properties.insert(
+            "serviceWorker".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(service_worker)),
+        );
         objects[global.0].properties.insert(
             "navigator".to_owned(),
             PropertyDescriptor {
@@ -7276,6 +7294,31 @@ impl Realm {
         objects[performance.0].properties.insert(
             "timing".to_owned(),
             PropertyDescriptor::builtin(JsValue::Object(timing)),
+        );
+        // The legacy `performance.navigation` (Navigation Timing Level 1). A
+        // top-level load is `TYPE_NAVIGATE`; page ping code reads `.type`
+        // directly and crashes without the object.
+        let navigation = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (name, value) in [
+            ("type", 0.0),
+            ("redirectCount", 0.0),
+            ("TYPE_NAVIGATE", 0.0),
+            ("TYPE_RELOAD", 1.0),
+            ("TYPE_BACK_FORWARD", 2.0),
+            ("TYPE_RESERVED", 255.0),
+        ] {
+            objects[navigation.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Number(value)),
+            );
+        }
+        objects[performance.0].properties.insert(
+            "navigation".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(navigation)),
         );
         for (name, function) in [
             ("mark", NativeFunction::PerformanceMark),

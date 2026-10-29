@@ -124,12 +124,14 @@ fn weak_references() {
 }
 
 #[test]
-fn immediate_and_idle_callbacks_exist() {
+fn immediate_is_absent_and_idle_callbacks_exist() {
+    // The web platform has no `setImmediate`; exposing one changes feature
+    // detection (Bing's scheduler picks a recursive path when it exists).
     assert_eq!(
         ok(
             "typeof setImmediate + typeof clearImmediate + typeof requestIdleCallback + typeof cancelIdleCallback"
         ),
-        "functionfunctionfunctionfunction"
+        "undefinedundefinedfunctionfunction"
     );
 }
 

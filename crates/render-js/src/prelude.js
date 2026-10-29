@@ -89,13 +89,10 @@
   });
 
   // ---------------------------------------------------------------- timers
-  define(global, 'setImmediate', function setImmediate(callback) {
-    var args = slice.call(arguments, 1);
-    return setTimeout(function () { callback.apply(undefined, args); }, 0);
-  });
-  define(global, 'clearImmediate', function clearImmediate(handle) {
-    clearTimeout(handle);
-  });
+  // `setImmediate`/`clearImmediate` are deliberately absent: the web platform
+  // (Chrome, Firefox, Safari) does not expose them. Sites feature-detect them;
+  // Bing's scheduler takes a different, non-recursive path when they are
+  // missing, which is the path a real browser takes.
   define(global, 'requestIdleCallback', function requestIdleCallback(callback) {
     var start = Date.now();
     return setTimeout(function () {

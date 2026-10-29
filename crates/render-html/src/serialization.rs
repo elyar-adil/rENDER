@@ -102,7 +102,25 @@ pub fn serialize_html_fragment_with_scripting(
 ) -> String {
     let mut output = String::new();
     let source = dom.template_contents(parent).unwrap_or(parent);
+    // The raw-text rule is a property of the *parent*: `innerHTML` on a
+    // script/style element must return its code literally, not HTML-escaped.
+    // Serializing each child node on its own would escape the text (`<` as
+    // `&lt;`), which breaks deferred-script loaders that copy `innerHTML`.
+    let raw_text = dom
+        .node(parent)
+        .and_then(|node| match node.kind() {
+            NodeKind::Element(element) => {
+                Some(is_raw_text_element(&element.local_name, scripting_enabled))
+            }
+            _ => None,
+        })
+        .unwrap_or(false);
     for child in dom.children(source).unwrap_or_default() {
+        if raw_text && let Some(NodeKind::Text(data)) = dom.node(*child).map(render_dom::Node::kind)
+        {
+            output.push_str(data);
+            continue;
+        }
         serialize_node(dom, *child, &mut output, scripting_enabled);
     }
     output

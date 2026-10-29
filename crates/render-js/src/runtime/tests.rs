@@ -1118,6 +1118,44 @@ fn string_replace_expands_groups_and_honors_global() {
 }
 
 #[test]
+fn script_inner_html_is_serialized_as_raw_text() {
+    let value = evaluate_script(
+        "
+        var script = document.createElement('script');
+        script.text = 'if (1 < 2 && 3 > 2) { var s = \"a&b\"; }';
+        script.innerHTML
+        ",
+    );
+    assert_eq!(
+        value,
+        JsValue::String("if (1 < 2 && 3 > 2) { var s = \"a&b\"; }".into())
+    );
+}
+
+#[test]
+fn a_script_elements_text_attribute_sets_its_source() {
+    // Bing's deferred-script loader creates a script and assigns `.text`.
+    // Without the IDL attribute the element stays empty and never runs.
+    let value = evaluate_script(
+        "
+        var script = document.createElement('script');
+        script.type = 'text/javascript';
+        script.text = 'var injected = 1;';
+        [
+            script.text,
+            script.textContent,
+            script.childNodes.length,
+            script.firstChild && script.firstChild.nodeType
+        ].join('|')
+        ",
+    );
+    assert_eq!(
+        value,
+        JsValue::String("var injected = 1;|var injected = 1;|1|3".into())
+    );
+}
+
+#[test]
 fn document_cookie_writes_are_exposed_to_the_embedding() {
     // The JS-visible jar is separate from the embedding's HTTP jar; the raw
     // assignment (with Path/Domain/Max-Age) is what the embedding must apply.
@@ -1285,6 +1323,30 @@ fn indexed_db_missing_store_is_a_not_found_error_like_the_platform() {
         value,
         JsValue::String("stores:false|threw:NotFoundError".into())
     );
+}
+
+#[test]
+fn navigator_has_a_service_worker_container_with_no_controller() {
+    let value = evaluate_script(
+        "[
+            typeof navigator.serviceWorker,
+            navigator.serviceWorker.controller,
+            'serviceWorker' in navigator
+        ].join('|')",
+    );
+    assert_eq!(value, JsValue::String("object||true".into()));
+}
+
+#[test]
+fn performance_navigation_reports_a_top_level_navigation() {
+    let value = evaluate_script(
+        "[
+            performance.navigation.type,
+            performance.navigation.redirectCount,
+            typeof PerformanceNavigationTiming === 'undefined'
+        ].join('|')",
+    );
+    assert_eq!(value, JsValue::String("0|0|true".into()));
 }
 
 #[test]

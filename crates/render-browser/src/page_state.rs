@@ -790,7 +790,12 @@ impl PageState {
             eprintln!("render-browser load dispatched");
         }
         let _ = self.page.queue_dom_event(PageDomEvent::new(target, "load"));
-        Some(self.run_page_turns().0)
+        let changed = self.run_page_turns().0;
+        if let Ok(source) = std::env::var("RENDER_DEBUG_EVAL") {
+            let _ = self.page.queue_script(source);
+            let _ = self.run_page_turns();
+        }
+        Some(changed)
     }
 
     pub(super) fn run_page_turns(

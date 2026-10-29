@@ -649,8 +649,11 @@ pub fn build_display_list_with_images(
         ordinals: BTreeMap::new(),
         glyphs: 0,
         limit_reported: false,
+        deferred_positioned: Vec::new(),
+        deferred_sequence: 0,
     };
-    builder.paint_fragment(fragments.root(), PaintCoordinateSpace::Document);
+    builder.paint_fragment(fragments.root(), PaintCoordinateSpace::Document, true);
+    builder.paint_deferred_positioned();
     DisplayListBuildOutput {
         list: DisplayList {
             dom_revision: fragments.dom_revision,
@@ -675,10 +678,23 @@ struct Builder<'a> {
     ordinals: BTreeMap<(Option<NodeId>, PaintPhase), u32>,
     glyphs: usize,
     limit_reported: bool,
+    /// Positioned boxes whose stacking context is the root: they paint after
+    /// all in-flow content, in z-index order (CSS 2.1 Appendix E step 8/9).
+    deferred_positioned: Vec<(i32, usize, FragmentId, PaintCoordinateSpace)>,
+    deferred_sequence: usize,
 }
 
 impl<'a> Builder<'a> {
-    fn paint_fragment(&mut self, id: FragmentId, parent_space: PaintCoordinateSpace) {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fragment's paint phases read as one sequence"
+    )]
+    fn paint_fragment(
+        &mut self,
+        id: FragmentId,
+        parent_space: PaintCoordinateSpace,
+        hoist_positioned: bool,
+    ) {
         // The fragment tree and the computed styles outlive the builder, so the
         // fragment and its style are borrowed for `'a` rather than cloned: a
         // computed style is a few hundred heap values, and every fragment used to
@@ -768,11 +784,34 @@ impl<'a> Builder<'a> {
             }
             _ => None,
         };
-        // Children are already in paint order: layout sorts them by z-index and
-        // then by positioned-ness, so a sticky box follows the siblings it can
-        // overlap.
-        for child in &fragment.children {
-            self.paint_fragment(*child, coordinate_space);
+        // In-flow children paint in document order. Positioned boxes belong to
+        // the nearest stacking context and paint after its in-flow content in
+        // z-index order (CSS 2.1 Appendix E): a fixed/z-indexed header must be
+        // able to sit above a later in-flow block, and a dropdown must sit
+        // above following content. At the root, defer them until the whole
+        // in-flow tree has painted; inside a stacking context (opacity,
+        // transform), paint them locally after its in-flow children.
+        let child_hoist = hoist_positioned && stacking_context.is_none();
+        let mut local_positioned: Vec<(i32, FragmentId)> = Vec::new();
+        let children = fragment.children.clone();
+        for child in children {
+            let (positioned, z_index) = self.fragment_paint_priority(child);
+            if positioned {
+                if child_hoist {
+                    let sequence = self.deferred_sequence;
+                    self.deferred_sequence = self.deferred_sequence.saturating_add(1);
+                    self.deferred_positioned
+                        .push((z_index, sequence, child, coordinate_space));
+                } else {
+                    local_positioned.push((z_index, child));
+                }
+                continue;
+            }
+            self.paint_fragment(child, coordinate_space, child_hoist);
+        }
+        local_positioned.sort_by_key(|(z_index, child)| (*z_index, child.as_u32()));
+        for (_, child) in local_positioned {
+            self.paint_fragment(child, coordinate_space, false);
         }
         if overflow_clip.is_some() {
             self.push(
@@ -1746,6 +1785,34 @@ impl<'a> Builder<'a> {
             width,
             height,
         )
+    }
+
+    /// Whether a fragment is positioned (so it belongs to a stacking context's
+    /// positioned phase) and its own z-index (`auto` reads as 0).
+    fn fragment_paint_priority(&mut self, id: FragmentId) -> (bool, i32) {
+        let Some(fragment) = self.fragments.get(id) else {
+            return (false, 0);
+        };
+        let Some(style) = self.style_for(fragment) else {
+            return (false, 0);
+        };
+        let positioned = style
+            .get("position")
+            .is_some_and(|value| !value.css_text().trim().eq_ignore_ascii_case("static"));
+        let z_index = style
+            .get("z-index")
+            .and_then(|value| value.css_text().trim().parse::<i32>().ok())
+            .unwrap_or(0);
+        (positioned, z_index)
+    }
+
+    /// Paints the positioned boxes deferred to the root stacking context.
+    fn paint_deferred_positioned(&mut self) {
+        let mut deferred = std::mem::take(&mut self.deferred_positioned);
+        deferred.sort_by_key(|(z_index, sequence, _, _)| (*z_index, *sequence));
+        for (_, _, fragment, space) in deferred {
+            self.paint_fragment(fragment, space, false);
+        }
     }
 
     fn style_for(&mut self, fragment: &Fragment) -> Option<&'a ComputedStyle> {

@@ -1007,12 +1007,55 @@ impl BrowserApp {
     /// carries an id or class, for diagnosing a page that renders the wrong
     /// box tree (`RENDER_DEBUG_LAYOUT=1`). Geometry is the committed layout's
     /// border box; a missing rect means the element has no box at all.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one diagnostic dump reads as a single inspection"
+    )]
     fn debug_layout_dump(&self) {
         let id = self.tabs.active_id();
         let Some(page) = self.pages.get(&id) else {
             return;
         };
         let dom = page.page.document().dom();
+        for (node, candidate) in dom.nodes() {
+            if let render_core::dom::NodeKind::Element(element) = candidate.kind()
+                && element.local_name == "script"
+            {
+                let src = dom
+                    .attribute(node, "src")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let kind = dom
+                    .attribute(node, "type")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let attributes: Vec<String> = element
+                    .attributes
+                    .iter()
+                    .map(|attribute| format!("{}={:?}", attribute.local_name, attribute.value))
+                    .collect();
+                let parent = dom
+                    .parent(node)
+                    .and_then(|parent| dom.node(parent))
+                    .map_or_else(
+                        || "-".to_owned(),
+                        |parent| match parent.kind() {
+                            render_core::dom::NodeKind::Element(element) => {
+                                element.local_name.clone()
+                            }
+                            _ => "?".to_owned(),
+                        },
+                    );
+                eprintln!(
+                    "script-node {:?} src={src} type={kind} connected={} parent={parent} children={} attrs={attributes:?}",
+                    node,
+                    dom.is_connected(node),
+                    candidate.children().len()
+                );
+            }
+        }
         let mut pending = vec![dom.document()];
         while let Some(node) = pending.pop() {
             if let Some(children) = dom.children(node) {
@@ -2822,9 +2865,9 @@ impl BrowserApp {
         request: &FetchRequest,
         result: &Result<FetchResponse, FetchError>,
     ) {
-        if env::var_os("RENDER_DEBUG_FRAME").is_none()
-            || !request.url.as_str().contains("api.m.jd.com")
-        {
+        let is_jd = request.url.as_str().contains("api.m.jd.com");
+        let all = env::var_os("RENDER_DEBUG_FETCH").is_some();
+        if !is_jd && !all {
             return;
         }
         match result {

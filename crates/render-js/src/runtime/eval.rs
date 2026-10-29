@@ -5221,6 +5221,14 @@ impl JsRuntime {
                 _ => {}
             },
             Some(ObjectHost::Node(node)) => match property {
+                // HTML §4.12.1: `HTMLScriptElement.text` is the script's child
+                // text. Deferred-script loaders (Bing's RMS among them) create
+                // an element and assign `.text` instead of appending a text node.
+                "text" if Self::is_script_element(dom, node) => {
+                    return self
+                        .text_content(dom, node)
+                        .map(|text| JsValue::String(JsString::from(text)));
+                }
                 "textContent" => {
                     return self
                         .text_content(dom, node)
@@ -5906,7 +5914,10 @@ impl JsRuntime {
             dom.set_attribute(node, "class", (value.to_js_string()).to_lossy())?;
             return Ok(());
         }
-        if let (Some(ObjectHost::Node(node)), "textContent") = (self.realm.host(object), property) {
+        if let Some(ObjectHost::Node(node)) = self.realm.host(object)
+            && (property == "textContent"
+                || (property == "text" && Self::is_script_element(dom, node)))
+        {
             return self.set_text_content(dom, node, (value.to_js_string()).to_lossy());
         }
         if let (Some(ObjectHost::Node(node)), "innerHTML" | "outerHTML") =
@@ -7639,6 +7650,17 @@ impl JsRuntime {
             Some(ObjectHost::Proxy { target, .. }) => Self::is_callable_object(target, realm),
             host => host.is_some_and(|host| host.is_callable()),
         }
+    }
+
+    /// Whether a node is an HTML `script` element (the `text` IDL attribute's
+    /// brand). Namespace matters: an SVG `script` has no such attribute here.
+    fn is_script_element(dom: &Dom, node: render_dom::NodeId) -> bool {
+        matches!(
+            dom.node(node).map(render_dom::Node::kind),
+            Some(render_dom::NodeKind::Element(element))
+                if element.local_name == "script"
+                    && element.namespace == render_dom::Namespace::Html
+        )
     }
 
     /// Accept an object receiver for member access, wrapping primitives that

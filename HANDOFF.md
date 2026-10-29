@@ -1,3 +1,49 @@
+# 交接文档 (2026-10-31, 续十) — Bing 的 RMS 延迟脚本与层叠上下文
+
+接续 JD 风控对照。这一轮用 Edge 的 CDP 找到 Bing 首页缺失的右上账户/Rewards/菜单、
+二维码和热点面板的根因:它们全部由 **Bing 的 RMS 延迟脚本**(`<script type="text/rms">`)
+生成,而我们的平台缺了让这些脚本跑起来的几个细节。修完后 Bing 首屏已与 Edge 基本同构。
+
+## 本轮已完成
+
+| 内容 | 落点 |
+|---|---|
+| **`HTMLScriptElement.text`** | 之前 `script.text = code` 是空操作;RMS 用 `.text` 创建延迟脚本,导致所有 widget(登录、Rewards、二维码、热点、import())都没跑。getter/setter 现在映射到子文本 |
+| **raw-text 元素的 `innerHTML`** | `script.innerHTML` 之前把 `<`/`&` 转义成 `&lt;`/`&amp;`,RMS 复制 innerHTML 后克隆脚本全部语法错误。现在 script/style/noscript 的 `innerHTML` 按原始文本序列化 |
+| **移除非标准 `setImmediate`** | Chrome/Firefox/Safari 都没有它。Bing 的调度器检测到它就走进递归路径,`si_PP` 直接栈溢出;移除后走 `setTimeout` 分支,`onPP` 正常触发,RMS 模块开始加载 |
+| **`performance.navigation`** | 旧版 Navigation Timing 对象(`type`/`redirectCount` + 常量)。Bing 的 page-ping 读取 `performance.navigation.type`,缺它时 `si_PP` 抛错、`onPP` 永不触发 |
+| **`navigator.serviceWorker.controller`** | service worker 容器存在、`controller = null`;Bing 直接读 `.controller` 再判空,缺容器会 TypeError |
+| **层叠上下文绘制顺序** | 绘制列表现在把定位元素推迟到最近层叠上下文的 in-flow 内容之后,按 z-index 排序(App E 第 8/9 步)。此前 fixed `z-index:6` 的 header 先画,被后面的壁纸盖住,右上登录/二维码不可见 |
+| **诊断工具** | `RENDER_DEBUG_EVAL`(load 后在页面里执行一段 JS,便于用 CDP 式探针定位)、`RENDER_DEBUG_FETCH`(所有页面 fetch 交换日志)、`RENDER_DEBUG_LAYOUT` 增加 script 节点的 src/type/属性/父节点 |
+
+## Bing 对照(Edge 同视口)
+
+Edge 首屏:壁纸、搜索框、国内版/国际版、右上登录/Rewards/菜单、二维码卡片、
+搜索热榜、主页测验、页脚。
+
+rENDER 现在:`dom_elements 451 / boxes 158 / scripts_threw 0`;截图包含壁纸、搜索框、
+切换、**右上登录+头像、二维码卡片、搜索热榜(必应上的热点 + 换一批)、主页测验、页脚**。
+剩余差异:二维码卡片里的二维码图片(白色占位)、Rewards/菜单图标细节、输入时的
+建议下拉需要真实键入才出现。
+
+## 验证
+
+```
+cargo test --workspace                       2695 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+## 明确未做 / 下一步
+
+- 二维码图片未绘制(资源/尺寸问题);Rewards/菜单的图标细节。
+- 搜索建议下拉需要键入交互验证。
+- JD 主商品区仍受京东风控(Edge 同机也被 403),需要受信任会话/网络。
+- IndexedDB 仍是内存子集;GitHub/HN 的本机 TCP 链路仍被阻断。
+
+---
+
 # 交接文档 (2026-10-31, 续九) — JD 403 环境的实锤与 cookie 桥
 
 接续 IndexedDB/Bing 会话。本轮给 JD 的 `api.m.jd.com` 加了完整请求/响应日志,并引入
