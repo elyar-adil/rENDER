@@ -1,3 +1,32 @@
+# 交接文档 (2026-10-29, 续五) — 临时被调函数在实参求值期间被 GC 回收
+
+接续同日"core-js Map 迭代器"会话。上一轮修好 Map 之后,JD 主 bundle 只剩一个
+`value is not callable (callee host Some(Ordinary), keys [])`,栈指向 `pLYI` 里的
+`_interopRequireWildcard(...)` 立即调用表达式。本轮把它定位成**垃圾回收生命周期 bug**并修复。
+
+## 本轮已完成
+
+| 内容 | 落点 |
+|---|---|
+| **调用表达式的被调函数在实参求值期间没有被 pin** | `evaluate_call` 会 pin 每个实参值,却没有 pin callee / receiver。`(function (x) {...})(expensive())` 这类立即调用表达式里,函数对象只被 Rust 局部变量引用;实参求值分配对象触发 GC 时,它被扫成空普通对象,随后调用即报 `value is not callable (callee host Some(Ordinary), keys [])`。现在 callee 与 receiver 在实参求值前进入 `transient_roots`,结束后释放 |
+| **`new C(args)` 同样修** | 构造函数对象在实参求值期间 pin 住;`new (function () {...})(expensive())` 不再被回收 |
+| **带标签模板同样修** | tag / receiver 在模板对象与替换值求值期间 pin 住 |
+| **调用点偏移更准确** | 调用节点记录 callee 末尾 token 的偏移(不是最后一个实参),错误行/列与浏览器一致(`boom()` 报 1:1);`RENDER_JS_FRAME_OFFSETS=1` 时消息里附 `(call .method at byte N)` 便于定位 bundle |
+| **回归测试** | `a_temporary_callee_survives_collections_during_argument_evaluation`:4 KiB 堆上强制 GC,覆盖 IIFE、对象方法、`new` 三种临时 callee |
+
+## 测量(隐藏截图,10 秒)
+
+| 站点 | dom_elements | boxes | scripts_failed | scripts_threw |
+|---|---|---|---|---|
+| jd(修复前) | 658 | 117 | 5 | 4 |
+| jd(修复后) | **993** | **226** | 8(含 4 个 CDN transport/JSONP) | **3** |
+
+JD 首屏从近乎空白变成完整骨架(搜索框、轮播占位、商品卡网格、侧栏),主 bundle
+`index.chunk.js` 不再整体抛错。剩余 3 个运行时错误:`js_security_v3` 步数上限、内联脚本
+`undefined is not a constructor`、`aria.js` 的媒体 `addEventListener` 缺口。
+
+---
+
 # 交接文档 (2026-10-29, 续四) — 真实页面第二层：RegExp 静态属性、页面健康线与脚本栈
 
 接续同日"脚本失败兜底"会话。用隐藏截图逐站排查后,这一轮修掉的是**真实站点脚本

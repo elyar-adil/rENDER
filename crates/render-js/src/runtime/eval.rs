@@ -2099,59 +2099,22 @@ impl JsRuntime {
             Expr::New {
                 constructor,
                 arguments,
-                ..
-            } => {
-                // ECMA-262 13.3.5.1 steps 2-3: an operand that is not a constructor
-                // is a TypeError, whatever it is.
-                let evaluated = self.evaluate(dom, constructor)?;
-                let JsValue::Object(constructor) = evaluated else {
-                    return Err(JsError::type_error(format!(
-                        "{} is not a constructor",
-                        evaluated.to_js_string()
-                    )));
-                };
-                let mut values = Vec::with_capacity(arguments.len());
-                for argument in arguments {
-                    self.evaluate_argument(dom, argument, &mut values)?;
-                }
-                // A `new` expression constructs with its own new.target: the
-                // constructor being evaluated. Push it so a nested `new` inside
-                // another constructor's body does not inherit the enclosing
-                // construction's new.target — that leak gave the nested
-                // instance the outer prototype and tripped transpiled
-                // `_classCallCheck` guards ("Cannot call a class as a
-                // function"). `super()` keeps using the stack top because it
-                // must construct the parent with the derived new.target.
-                self.new_target_stack.push(JsValue::Object(constructor));
-                let constructed = self.construct(dom, constructor, &values);
-                self.new_target_stack.pop();
-                constructed
-            }
+                offset,
+            } => self.evaluate_new(dom, constructor, arguments, *offset),
             Expr::Call {
                 callee,
                 arguments,
                 strict,
-                ..
-            } => self.evaluate_call(dom, callee, arguments, *strict),
+                offset,
+            } => self
+                .evaluate_call(dom, callee, arguments, *strict)
+                .map_err(|error| self.locate_error(error, *offset, callee)),
             Expr::TaggedTemplate {
                 tag,
                 quasis,
                 expressions,
                 ..
-            } => {
-                // §13.3.11: the tag is resolved first, then the template object
-                // is created, then the substitutions run left to right, and only
-                // then is the tag called with all of them.
-                let (callee_value, receiver) = self.call_reference(dom, tag)?;
-                let template = self.create_template_object(quasis)?;
-                let mut values = Vec::with_capacity(expressions.len() + 1);
-                values.push(JsValue::Object(template));
-                for expression in expressions {
-                    self.evaluate_argument(dom, expression, &mut values)?;
-                }
-                let callee = Self::callable_callee(&callee_value, tag)?;
-                self.call_with_this(dom, callee, &values, receiver)
-            }
+            } => self.evaluate_tagged_template(dom, tag, quasis, expressions),
             Expr::Sequence(expressions) => {
                 let mut value = JsValue::Undefined;
                 for expression in expressions {
@@ -3391,6 +3354,159 @@ impl JsRuntime {
         Ok(JsValue::String(("[object Object]".to_owned()).into()))
     }
 
+    /// `` tag`...${...}` ``: resolves the tag, creates the template object,
+    /// evaluates the substitutions and calls the tag. The tag and receiver are
+    /// pinned across the substitutions, which may collect garbage.
+    fn evaluate_tagged_template(
+        &mut self,
+        dom: &mut Dom,
+        tag: &Expr,
+        quasis: &[(JsString, String)],
+        expressions: &[Expr],
+    ) -> Result<JsValue, JsError> {
+        // §13.3.11: the tag is resolved first, then the template object is
+        // created, then the substitutions run left to right, and only then is
+        // the tag called with all of them.
+        let roots = self.transient_roots.len();
+        let result = (|| {
+            let (callee_value, receiver) = self.call_reference(dom, tag)?;
+            for value in [&callee_value, &receiver] {
+                if let JsValue::Object(object) = value {
+                    self.transient_roots.push(*object);
+                }
+            }
+            let template = self.create_template_object(quasis)?;
+            let mut values = Vec::with_capacity(expressions.len() + 1);
+            values.push(JsValue::Object(template));
+            for expression in expressions {
+                self.evaluate_argument(dom, expression, &mut values)?;
+            }
+            let callee = Self::callable_callee(&callee_value, tag)?;
+            self.call_with_this(dom, callee, &values, receiver)
+        })();
+        self.transient_roots.truncate(roots);
+        result
+    }
+
+    /// `new C(...)`: resolves the constructor, evaluates the arguments and
+    /// constructs. The constructor is pinned across the argument evaluation:
+    /// `new (function () { ... })(expensive())` has no other reference to it,
+    /// and a collection there must not sweep it.
+    fn evaluate_new(
+        &mut self,
+        dom: &mut Dom,
+        constructor_expr: &Expr,
+        arguments: &[Expr],
+        offset: usize,
+    ) -> Result<JsValue, JsError> {
+        // ECMA-262 13.3.5.1 steps 2-3: an operand that is not a constructor
+        // is a TypeError, whatever it is.
+        let evaluated = self.evaluate(dom, constructor_expr)?;
+        let JsValue::Object(constructor) = evaluated else {
+            return Err(JsError::type_error(format!(
+                "{} is not a constructor",
+                evaluated.to_js_string()
+            ))
+            .at_offset(offset));
+        };
+        let roots = self.transient_roots.len();
+        self.transient_roots.push(constructor);
+        let result = self.evaluate_new_with_pinned_constructor(
+            dom,
+            constructor,
+            constructor_expr,
+            arguments,
+            offset,
+        );
+        self.transient_roots.truncate(roots);
+        result
+    }
+
+    fn evaluate_new_with_pinned_constructor(
+        &mut self,
+        dom: &mut Dom,
+        constructor: ObjectId,
+        constructor_expr: &Expr,
+        arguments: &[Expr],
+        offset: usize,
+    ) -> Result<JsValue, JsError> {
+        let mut values = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            self.evaluate_argument(dom, argument, &mut values)?;
+        }
+        // A `new` expression constructs with its own new.target: the
+        // constructor being evaluated. Push it so a nested `new` inside
+        // another constructor's body does not inherit the enclosing
+        // construction's new.target — that leak gave the nested instance the
+        // outer prototype and tripped transpiled `_classCallCheck` guards
+        // ("Cannot call a class as a function"). `super()` keeps using the
+        // stack top because it must construct the parent with the derived
+        // new.target.
+        self.new_target_stack.push(JsValue::Object(constructor));
+        let constructed = self.construct(dom, constructor, &values);
+        self.new_target_stack.pop();
+        constructed.map_err(|error| self.locate_error(error, offset, constructor_expr))
+    }
+
+    /// Adds the source offset of the call or `new` expression to a Type
+    /// error, so a bundle failure maps to its byte position. A thrown error
+    /// object keeps its stack; only its `message` gains the suffix.
+    fn locate_error(&mut self, error: JsError, offset: usize, callee: &Expr) -> JsError {
+        // The innermost call site wins (`at_offset` keeps the first span).
+        let error = error.at_offset(offset);
+        if !matches!(error.kind(), JsErrorKind::Type | JsErrorKind::Throw) {
+            return error;
+        }
+        // Adding the call site to the message itself is a debug facility: it
+        // changes what script sees in `error.message`, so it stays behind the
+        // same flag that labels stack frames.
+        if std::env::var_os("RENDER_JS_FRAME_OFFSETS").is_none() {
+            return error;
+        }
+        let detail = match error.thrown_value() {
+            Some(JsValue::Object(object)) => self
+                .realm
+                .get_property(*object, "message")
+                .map(|value| value.to_js_string().to_lossy())
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| error.message().to_owned()),
+            _ => error.message().to_owned(),
+        };
+        let annotated = format!(
+            "{detail} (call {} at byte {offset})",
+            Self::call_site_label(callee)
+        );
+        if let Some(JsValue::Object(object)) = error.thrown_value() {
+            let object = *object;
+            self.realm.set_property(
+                object,
+                "message".to_owned(),
+                JsValue::String(annotated.into()),
+            );
+            return error;
+        }
+        JsError::new(JsErrorKind::Type, annotated, Some(offset))
+    }
+
+    /// A short source-level name for a call target, for diagnostics:
+    /// `ke`, `.shim`, `function named`, `<arrow>`.
+    fn call_site_label(expression: &Expr) -> String {
+        match expression {
+            Expr::Identifier(name) => name.clone(),
+            Expr::Member { property, .. } => format!(".{property}"),
+            Expr::PrivateMember { name, .. } => format!(".{name}"),
+            Expr::ComputedMember { .. } => "[...]".to_owned(),
+            Expr::OptionalGuard(inner) | Expr::OptionalChain(inner) => Self::call_site_label(inner),
+            Expr::Function {
+                name: Some(name), ..
+            } => format!("function {name}"),
+            Expr::Function { .. } => "<function>".to_owned(),
+            Expr::Arrow { .. } => "<arrow>".to_owned(),
+            Expr::Call { .. } => "<call result>".to_owned(),
+            _ => "<expression>".to_owned(),
+        }
+    }
+
     pub(super) fn evaluate_call(
         &mut self,
         dom: &mut Dom,
@@ -3415,6 +3531,15 @@ impl JsRuntime {
         strict: bool,
     ) -> Result<JsValue, JsError> {
         let (callee_value, receiver) = self.call_reference(dom, callee)?;
+        // The callee is often a freshly allocated function expression and the
+        // receiver can be a temporary object literal; both are reachable only
+        // from this frame until the call runs. Evaluating the arguments may
+        // collect garbage, so pin them exactly like the argument values.
+        for value in [&callee_value, &receiver] {
+            if let JsValue::Object(object) = value {
+                self.transient_roots.push(*object);
+            }
+        }
         let mut values = Vec::with_capacity(arguments.len());
         let mut pinned_values = 0;
         for argument in arguments {

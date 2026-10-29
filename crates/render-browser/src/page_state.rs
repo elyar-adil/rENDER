@@ -612,18 +612,21 @@ impl PageState {
         error: &render_core::js::JsError,
         origin: Option<&(render_core::dom::NodeId, usize, Option<Url>)>,
     ) {
-        let stack = error
-            .thrown_value()
+        let thrown = error.thrown_value();
+        let detail = thrown
+            .and_then(|value| self.page.runtime().error_message(value))
+            .unwrap_or_else(|| error.message().to_owned());
+        let stack = thrown
             .and_then(|value| self.page.runtime().error_stack(value))
             .map(|stack| format!("\n{stack}"))
             .unwrap_or_default();
         if let Some((owner, source_order, final_url)) = origin {
             let url = final_url.as_ref().map_or("inline", Url::as_str);
             eprintln!(
-                "render-browser classic script node {owner:?} source {source_order} {url} failed: {error}{stack}"
+                "render-browser classic script node {owner:?} source {source_order} {url} failed: {detail}{stack}"
             );
         } else {
-            eprintln!("render-browser classic script failed: {error}{stack}");
+            eprintln!("render-browser classic script failed: {detail}{stack}");
         }
     }
 

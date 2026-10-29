@@ -5704,6 +5704,54 @@ fn typed_array_with_checks_the_index_after_its_value_resizes_the_buffer() {
 }
 
 #[test]
+fn a_temporary_callee_survives_collections_during_argument_evaluation() {
+    // A call expression's callee can be a freshly allocated function expression
+    // that nothing else references. Evaluating the arguments allocates and can
+    // collect; if the callee is not pinned across that evaluation, its slot is
+    // swept into an empty ordinary object and the call fails as "not callable".
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let limits = crate::RuntimeLimits {
+        max_heap_objects: 4_096,
+        ..crate::RuntimeLimits::default()
+    };
+    let mut runtime = JsRuntime::with_limits(&parsed.dom, limits);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var viaIife = (function (tag) { return tag; })(
+                    (function () {
+                        for (var i = 0; i < 8000; i++) { var junk = { i: i, pad: [i] }; }
+                        return 'arg';
+                    })()
+                );
+                var holder = {
+                    tag: 'recv',
+                    method: function (x) { return this.tag + ':' + x; }
+                };
+                var viaMethod = holder.method(
+                    (function () {
+                        for (var j = 0; j < 8000; j++) { var junk = { i: j }; }
+                        return 'x';
+                    })()
+                );
+                var viaNew = new (function C(tag) { this.tag = tag; })(
+                    (function () {
+                        for (var k = 0; k < 8000; k++) { var junk = { i: k }; }
+                        return 'constructed';
+                    })()
+                ).tag;
+                [viaIife, viaMethod, viaNew].join('|');
+            ",
+        )
+        .expect("temporary callees survive collections");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("arg|recv:x|constructed".into())
+    );
+}
+
+#[test]
 fn array_from_keeps_its_iterator_alive_across_collections() {
     // `Array.from` drives the iterator from Rust locals. With a heap this small,
     // the allocations of each step collect garbage, so an iterator or `next` that

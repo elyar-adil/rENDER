@@ -1186,6 +1186,23 @@ impl JsRuntime {
         outcome
     }
 
+    /// The `message` property of a thrown object, when it is a string.
+    ///
+    /// An embedder's diagnostic line can print this instead of the generic
+    /// rendering of the error kind, and a call-site suffix added after the
+    /// object was created is visible here while its captured stack is not.
+    #[must_use]
+    pub fn error_message(&self, value: &JsValue) -> Option<String> {
+        let JsValue::Object(object) = value else {
+            return None;
+        };
+        let message = self.realm.get_property(*object, "message")?;
+        let JsValue::String(text) = message else {
+            return None;
+        };
+        Some(text.to_lossy())
+    }
+
     /// The `stack` text of a thrown object, when it has one.
     ///
     /// An embedder that reports an uncaught error to a log can print the

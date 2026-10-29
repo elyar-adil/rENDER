@@ -3864,13 +3864,15 @@ impl Parser {
                     break;
                 }
             }
-            let arguments = if self.take(&TokenKind::LeftParen) {
-                self.arguments_after_left_paren()?
+            let (call_offset, arguments) = if self.at(&TokenKind::LeftParen) {
+                let offset = self.previous_offset();
+                self.advance();
+                (offset, self.arguments_after_left_paren()?)
             } else {
-                Vec::new()
+                (self.previous_offset(), Vec::new())
             };
             let expression = Expr::New {
-                offset: self.previous_offset(),
+                offset: call_offset,
                 constructor: Box::new(target),
                 arguments,
             };
@@ -3912,10 +3914,17 @@ impl Parser {
             if self.take(&TokenKind::QuestionDot) {
                 optional = true;
                 expression = Expr::OptionalGuard(Box::new(expression));
-                if self.take(&TokenKind::LeftParen) {
+                if self.at(&TokenKind::LeftParen) {
+                    // The call site is the end of the callee, matching what a
+                    // browser reports for an error raised while resolving a
+                    // bare identifier call (`boom()` points at `boom`). `take`
+                    // does not move `previous_offset`, so a node built after
+                    // the arguments would point inside the last argument.
+                    let call_offset = self.previous_offset();
+                    self.advance();
                     let arguments = self.arguments_after_left_paren()?;
                     expression = Expr::Call {
-                        offset: self.previous_offset(),
+                        offset: call_offset,
                         callee: Box::new(expression),
                         arguments,
                         strict: self.strict,
@@ -3977,10 +3986,14 @@ impl Parser {
                     object: Box::new(expression),
                     property: Box::new(property),
                 };
-            } else if self.take(&TokenKind::LeftParen) {
+            } else if self.at(&TokenKind::LeftParen) {
+                // The end of the callee marks the call site (see the
+                // optional-call branch above).
+                let call_offset = self.previous_offset();
+                self.advance();
                 let arguments = self.arguments_after_left_paren()?;
                 expression = Expr::Call {
-                    offset: self.previous_offset(),
+                    offset: call_offset,
                     callee: Box::new(expression),
                     arguments,
                     strict: self.strict,
@@ -4141,6 +4154,7 @@ impl Parser {
                         token.offset,
                     ));
                 }
+                let call_offset = self.current().offset;
                 self.advance();
                 let specifier = self.in_allowed(Self::assignment)?;
                 self.require(
@@ -4148,7 +4162,7 @@ impl Parser {
                     "expected ')' after import.defer() or import.source() argument",
                 )?;
                 Ok(Expr::Call {
-                    offset: self.previous_offset(),
+                    offset: call_offset,
                     callee: Box::new(Expr::Member {
                         object: Box::new(Expr::Identifier(name)),
                         property: phase,
