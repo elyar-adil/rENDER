@@ -22,11 +22,15 @@
 
 ## 明确未做 / 下一步
 
-- **JD 的 `Incompatible receiver, Map required`**:core-js 2.6.12 的 `_collection` 判定
-  `new Map().entries().next()` 失败后走 polyfill 分支,把 `validate` 版方法装到原生原型上,
-  早先创建的原生 Map 实例随即抛错。单独加载 core-js 2.6.12 **不触发**;页面里在它之前还有
-  `js_security_v3`(见下)与两个前置 bundle,需要继续缩小到"谁在 core-js 之前改坏了
-  entries/iterator"。这是 JD 首屏仍在空转的主因。
+- **JD 的 `Incompatible receiver, Map required`**(已缩小):出错的是 mall-common-component
+  bundle 内的 **core-js 3**(不是 2.6.12;CDN 对浏览器返回的是 1.38 MB 变体,curl 默认拿到
+  484 KB 旧版,这也是之前 offset 对不上的原因)。实测:加载该 bundle 后 `Map` 仍是原生、
+  `Map.prototype.get/set/forEach/values` 未变,但 **`keys`/`entries`/`[Symbol.iterator]`
+  被换成 core-js 的 `getterFor` 迭代器**,于是原生 Map 实例调用即抛。按 core-js 3 的
+  `defineIterator` 逻辑,只有在 `'keys' in Map.prototype`/`'entries' in Map.prototype`
+  为假时才会重定义,而全新 realm 里这两个 `in` 为真——下一步要在 bundle 加载过程中打印
+  属性描述符的变化(已加 `RENDER_DEBUG_FRAME` 下的脚本 URL/源码字节日志)。这是 JD 首屏
+  仍在空转的主因。
 - **`js_security_v3_0.1.4.js` 触发 10,000,000 步执行上限**:234 KB 的安全脚本不应需要
   10M 步,更像等待某个 API 的空转循环;它跑在 JD 主 bundle 之前,失败时可能留下半初始化的
   全局对象(与上一条相关)。

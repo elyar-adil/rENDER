@@ -484,6 +484,14 @@ fn compile_source(
         );
         return;
     }
+    if std::env::var_os("RENDER_DEBUG_FRAME").is_some() {
+        eprintln!(
+            "render-browser script source bytes={} validate={} url={}",
+            source.len(),
+            source.contains("Incompatible receiver"),
+            final_url.as_ref().map_or("inline", |url| url.as_str())
+        );
+    }
     match CompiledScript::compile(source, limits) {
         Ok(mut compiled) => {
             if let Some(url) = &final_url {

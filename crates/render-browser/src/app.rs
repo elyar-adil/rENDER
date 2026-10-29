@@ -1830,6 +1830,7 @@ impl BrowserApp {
             if !follow_up_scan {
                 report_script_discovery_diagnostics(&plan.discovery_diagnostics);
             }
+            Self::report_script_requests(&plan);
             page.initial_script_scan_completed = true;
             page.started_scripts.extend(plan.owners());
             if plan.is_empty() {
@@ -1887,6 +1888,19 @@ impl BrowserApp {
         }
         self.repaint_chrome();
         self.request_redraw();
+    }
+
+    /// Prints each planned script request under `RENDER_DEBUG_FRAME`.
+    fn report_script_requests(plan: &render_browser::scripts::ScriptFetchPlan) {
+        if env::var_os("RENDER_DEBUG_FRAME").is_none() {
+            return;
+        }
+        for resource in &plan.resources {
+            eprintln!(
+                "render-browser script request owner={:?} url={}",
+                resource.owner, resource.request.url
+            );
+        }
     }
 
     pub(super) fn start_images(&mut self, id: TabId) {
