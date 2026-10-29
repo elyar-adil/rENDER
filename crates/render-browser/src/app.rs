@@ -1015,8 +1015,9 @@ impl BrowserApp {
             }
         }
         format!(
-            "page={} dom_elements={elements} boxes={} scripts_failed={} scripts_threw={} css_errors={} css_warnings={} images_failed={}",
+            "page={} ready={:?} dom_elements={elements} boxes={} scripts_failed={} scripts_threw={} css_errors={} css_warnings={} images_failed={}",
             page.navigation.committed().target.display_address(),
+            page.page.runtime().document_ready_state(),
             page.geometry.len(),
             page.script_load_errors,
             page.script_runtime_errors,

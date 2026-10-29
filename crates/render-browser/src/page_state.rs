@@ -734,6 +734,9 @@ impl PageState {
             .runtime_mut()
             .set_document_ready_state(DocumentReadyState::Interactive);
         let target = self.page.document().dom().document();
+        if std::env::var_os("RENDER_DEBUG_FRAME").is_some() {
+            eprintln!("render-browser DOMContentLoaded dispatched");
+        }
         let _ = self
             .page
             .queue_dom_event(PageDomEvent::new(target, "DOMContentLoaded").bubbles(true));
@@ -761,6 +764,9 @@ impl PageState {
             .runtime_mut()
             .set_document_ready_state(DocumentReadyState::Complete);
         let target = self.page.document().dom().document();
+        if std::env::var_os("RENDER_DEBUG_FRAME").is_some() {
+            eprintln!("render-browser load dispatched");
+        }
         let _ = self.page.queue_dom_event(PageDomEvent::new(target, "load"));
         Some(self.run_page_turns().0)
     }
