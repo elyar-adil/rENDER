@@ -1670,6 +1670,17 @@ impl BrowserApp {
             });
             return;
         }
+        // The default referrer policy is strict-origin-when-cross-origin:
+        // same-origin requests send the full URL, cross-origin ones only the
+        // origin. Anti-bot APIs (JD's api.m.jd.com among them) reject requests
+        // without it.
+        fetch_request = fetch_request.with_header("Referer", cors::referer(&page_url, &url));
+        if env::var_os("RENDER_DEBUG_FRAME").is_some() {
+            eprintln!(
+                "render-browser page fetch {url} headers={:?}",
+                fetch_request.headers
+            );
+        }
         // A cross-origin request carries no cookies: the page has no
         // credentials mode yet, so every such request is "omit". Its response
         // is read only if CORS allows it.

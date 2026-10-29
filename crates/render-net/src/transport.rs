@@ -1583,8 +1583,15 @@ fn decode_data_url(url: &Url, body_limit: usize) -> Result<(ContentType, Vec<u8>
     let (media_type, is_base64) = data_media_type(metadata)?;
     let body = if is_base64 {
         let encoded_body = percent_decode_data(encoded_body)?;
+        // Data URLs copied out of HTML often carry ASCII whitespace in the
+        // base64 payload (line wrapping, a stray space before `==`). Browsers
+        // strip it before decoding; keeping it made valid images fail.
+        let compact: Vec<u8> = encoded_body
+            .into_iter()
+            .filter(|byte| !matches!(*byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0c))
+            .collect();
         base64::engine::general_purpose::STANDARD
-            .decode(encoded_body)
+            .decode(compact)
             .map_err(|error| FetchError::InvalidUrl(format!("invalid base64 data URL: {error}")))?
     } else {
         percent_decode_data(encoded_body)?
@@ -2061,6 +2068,12 @@ mod tests {
         let response = transport
             .fetch(&FetchRequest::get(escaped_base64), &CancelToken::default())
             .expect("percent-encoded base64 data URL response");
+        assert_eq!(response.body, [0, 1, 2, 3]);
+
+        let whitespace = Url::parse("data:image/png;base64,AAEC Aw==").unwrap();
+        let response = transport
+            .fetch(&FetchRequest::get(whitespace), &CancelToken::default())
+            .expect("base64 with ASCII whitespace decodes");
         assert_eq!(response.body, [0, 1, 2, 3]);
     }
 

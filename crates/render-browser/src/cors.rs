@@ -79,6 +79,23 @@ pub(super) fn page_origin(page: &Url) -> String {
 /// Whether a request is "simple" (Fetch standard, section 2.2.2): one a browser
 /// sends without a preflight. Such a request uses GET, HEAD or POST and only
 /// headers whose values a cross-origin form could also have sent.
+/// The `Referer` value for a request made by `page_url`, under the default
+/// `strict-origin-when-cross-origin` policy: the full URL (without fragment)
+/// for a same-origin target, the serialized origin for a cross-origin one.
+pub(super) fn referer(page_url: &Url, target: &Url) -> String {
+    if is_cross_origin(page_url, target) {
+        let mut origin = page_origin(page_url);
+        if !origin.ends_with('/') {
+            origin.push('/');
+        }
+        origin
+    } else {
+        let mut referer = page_url.clone();
+        referer.set_fragment(None);
+        referer.to_string()
+    }
+}
+
 pub(super) fn is_simple(method: HttpMethod, headers: &[(String, String)]) -> bool {
     matches!(
         method,
@@ -460,6 +477,25 @@ mod tests {
             .map(|(name, _)| name)
             .collect();
         assert_eq!(same.len(), headers.len());
+    }
+
+    #[test]
+    fn referer_is_full_for_same_origin_and_origin_only_cross_origin() {
+        let page = Url::parse("https://www.jd.com/search?q=1#frag").expect("page URL");
+        assert_eq!(
+            referer(
+                &page,
+                &Url::parse("https://www.jd.com/item").expect("same-origin URL")
+            ),
+            "https://www.jd.com/search?q=1"
+        );
+        assert_eq!(
+            referer(
+                &page,
+                &Url::parse("https://api.m.jd.com/api").expect("cross-origin URL")
+            ),
+            "https://www.jd.com/"
+        );
     }
 
     #[test]

@@ -11,6 +11,8 @@
 | **图片 error 事件** | `finish_images` 此前对失败资源只把元素标成 `Broken`,从不派发 `error`。Bing 用 2x2 AVIF data URL 做能力探测:失败后必须触发 `onerror` 才会回退到 WebP。现在失败元素按 HTML "update the image data" 派发 `error` |
 | **PerformanceObserver** | 提供 `supportedEntryTypes = []`、`observe`/`disconnect`/`takeRecords` 的降级实现;Bing 的 `new PerformanceObserver` 不再抛 ReferenceError,同时因不支持 `element` 计时而跳过该分支 |
 | **回归测试** | `indexed_db_opens_upgrades_and_round_trips_values`、`indexed_db_cursor_sees_earlier_writes_and_continues`、`indexed_db_missing_store_is_a_not_found_error_like_the_platform`、`an_image_whose_load_fails_fires_error_at_its_element` |
+| **XHR/fetch 的 Referer** | `cors::referer`:同源发完整 URL(去 fragment),跨域只发 origin + `/`(strict-origin-when-cross-origin)。JD 的 `api.m.jd.com` 请求现在带 `Referer: https://www.jd.com/`,但 403 仍在 |
+| **data URL 的 base64 空白** | 浏览器会忽略 base64 payload 里的 ASCII 空白(换行、`==` 前的空格);此前的严格解码把 JD 的 1x1 追踪图判成 InvalidUrl。现在过滤空白后再解码,`images_failed` 不再因此增长 |
 
 ## 测量(Bing,隐藏截图,12 秒)
 
