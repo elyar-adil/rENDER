@@ -1,3 +1,59 @@
+# 交接文档 (2026-10-31, 续十二) — CSS `::before`/`::after` 生成盒
+
+接续 Bing 对照会话。这一轮实现了生成内容:伪元素的样式级联、生成盒、文本内容与
+负 `z-index` 绘制顺序。Bing 的 `国内版/国际版` 胶囊背景和顶部导航的 `...` 溢出项
+现在由真实的 `::after`/`::before` 盒绘制,与 Edge 一致。
+
+## 本轮已完成
+
+| 内容 | 落点 |
+|---|---|
+| **`content` 属性进入注册表** | 初始值 `normal`;此前未知声明在计算阶段被丢弃,`content: ''` 永远读不到 |
+| **伪元素样式级联** | `compute_document_styles_with_hints` 对含 `::before`/`::after` 规则的文档,为每个元素计算两份伪元素样式;继承自宿主元素,匹配宿主上的 `:hover`/动态状态。只有 `content` 会生成盒时写入样式表 |
+| **合成样式 id** | 伪元素没有 DOM 节点,但布局/绘制都按 `NodeId` 查样式。`render_css::pseudo::style_source(host, pseudo)` 用最高位标记的合成 id,不会与 DOM arena 冲突;格式化树按同样的 id 探测 |
+| **生成盒进入格式化树** | `append_generated_content`: `::before` 在 DOM 子节点前、`::after` 在后;inline 生成盒与文本共享匿名块;`position:absolute/fixed` 或浮动时按 CSS Display §2.7 块化;字符串 `content` 生成文本子节点并应用 `text-transform` |
+| **选择器伪元素匹配修复** | `#est_switch .est_common::after` 之前无法匹配:伪元素检查被应用到每个复合选择器,祖先 `#est_switch` 被要求也匹配 `::after`。现在只有 subject(最右复合选择器)检查伪元素 |
+| **负 z-index 绘制顺序** | CSS 2.1 Appendix E:负 `z-index` 的定位后代在层叠上下文背景之后、in-flow 内容之前绘制。Bing 的胶囊 `z-index:-10` 现在位于文字后面 |
+| **诊断** | `RENDER_DEBUG_LAYOUT` 额外打印每个匹配到的伪元素的 `content/display/position/z-index/宽高/inset/背景` |
+
+## Bing 验证(隐藏截图,12 秒)
+
+```
+ready=Complete dom_elements=469 boxes=163
+scripts_failed=0 scripts_threw=0 css_errors=0 css_warnings=25 images_failed=3
+
+pseudo <div> id=est_cn class=est_common est_selected after
+  content='' display=inline position=absolute z=-10
+  width=auto height=32px top=4px right=0 bottom=-1px left=0 bg=#fff
+pseudo <div> id=est_en class=est_common est_unselected after
+  content='' ... bg=rgba(255,255,255,.7)
+```
+
+截图确认:两个白色胶囊背景已出现,`国际版` 清晰可读;顶部导航末尾的 `...`
+溢出项由 `.scope.dots::before { content: '. . .' }` 生成;壁纸、搜索框、登录/头像/
+Rewards、二维码、热榜、换一批、页脚均保持正常。
+
+## 验证
+
+```
+cargo test --workspace                       2706 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+## 明确未做 / 下一步
+
+- **`content` 只支持字符串**:`attr()`、`counter()`/`counters()`、`open-quote` 等尚未实现;
+  非字符串内容目前不生成盒,而不是猜测。
+- **生成盒的边界**:`display: contents` 宿主、表格结构盒、替换元素上的伪元素暂不生成;
+  浮动/定位生成盒已支持。
+- 搜索框占位/热词回填文本仍缺失;右上菜单/应用图标细节与 Edge 有差异。
+- JD 主商品区仍受风控 403(同机 Edge 也 403);IndexedDB 仍是内存子集;GitHub/HN 的
+  本机 TCP 链路仍被阻断。
+
+---
+
 # 交接文档 (2026-10-31, 续十一) — Bing 图标、语言切换、Rewards 与建议下拉
 
 接续 RMS 延迟脚本会话。用 Edge CDP 在**同一视口(1180×684, DPR 2)**采集 Bing 首页的

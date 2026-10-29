@@ -101,6 +101,18 @@ pub struct ComplexSelector {
 }
 
 impl ComplexSelector {
+    /// Whether any compound in this selector names `pseudo` as a
+    /// non-functional pseudo-element. Used to skip generated-content work on
+    /// documents whose stylesheets never mention `::before`/`::after`.
+    #[must_use]
+    pub fn has_pseudo_element(&self, pseudo: &str) -> bool {
+        self.compounds.iter().any(|compound| {
+            compound.pseudo_element.as_ref().is_some_and(|element| {
+                element.argument.is_none() && element.name.eq_ignore_ascii_case(pseudo)
+            })
+        })
+    }
+
     #[must_use]
     pub fn specificity(&self) -> Specificity {
         self.compounds
@@ -1275,7 +1287,8 @@ fn matches_complex_at(
     index: usize,
     context: &MatchContext,
 ) -> bool {
-    if !matches_compound(dom, element, &selector.compounds[index], context) {
+    let subject = index == selector.compounds.len() - 1;
+    if !matches_compound(dom, element, &selector.compounds[index], context, subject) {
         return false;
     }
     if index == 0 {
@@ -1314,6 +1327,7 @@ fn matches_compound(
     element: NodeId,
     selector: &CompoundSelector,
     context: &MatchContext,
+    subject: bool,
 ) -> bool {
     let Some(data) = element_data(dom, element) else {
         return false;
@@ -1336,6 +1350,12 @@ fn matches_compound(
         .any(|simple| !matches_simple(dom, element, data, simple, context))
     {
         return false;
+    }
+    // Only the subject compound (the rightmost one) may carry a
+    // pseudo-element; the ancestor compounds of `#host .item::after` match
+    // ordinary elements even while the subject is being matched for `::after`.
+    if !subject {
+        return true;
     }
     match (&selector.pseudo_element, &context.pseudo_element) {
         (None, None) => true,
@@ -1578,7 +1598,14 @@ fn matches_relative_at(
     index: usize,
     context: &MatchContext,
 ) -> bool {
-    if !matches_compound(dom, element, &relative.selector.compounds[index], context) {
+    let subject = index == relative.selector.compounds.len() - 1;
+    if !matches_compound(
+        dom,
+        element,
+        &relative.selector.compounds[index],
+        context,
+        subject,
+    ) {
         return false;
     }
     if index == 0 {
@@ -2108,6 +2135,37 @@ mod tests {
         assert!(parse_selector_list("div, :unsupported()").is_ok());
         assert!(parse_selector_list("#123").is_err());
         assert!(parse_selector_list(":nth-of-type(2 of .x)").is_err());
+    }
+
+    #[test]
+    fn a_pseudo_element_on_the_subject_matches_through_ancestor_compounds() {
+        // Selectors 4 §3.9: only the last compound may carry the pseudo-element.
+        // Matching `#host .item::after` must not require `#host` itself to be an
+        // `::after` subject; requiring that made every descendant pseudo rule
+        // unreachable.
+        let output = parse_document("<!doctype html><div id=host><p class=item id=x></p></div>");
+        let element = select_all(
+            &output.dom,
+            output.dom.document(),
+            &parse_selector_list("#x").unwrap(),
+            &MatchContext::default(),
+        )[0];
+        let after = MatchContext {
+            pseudo_element: Some("after".to_owned()),
+            ..MatchContext::default()
+        };
+        assert!(matches_selector_list(
+            &output.dom,
+            element,
+            &parse_selector_list("#host .item::after").unwrap(),
+            &after
+        ));
+        assert!(!matches_selector_list(
+            &output.dom,
+            element,
+            &parse_selector_list("#host .item::after").unwrap(),
+            &MatchContext::default()
+        ));
     }
 
     #[test]

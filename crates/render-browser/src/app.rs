@@ -1112,6 +1112,38 @@ impl BrowserApp {
             } else {
                 String::new()
             };
+            for pseudo_element in [
+                render_core::css::pseudo::PseudoElement::Before,
+                render_core::css::pseudo::PseudoElement::After,
+            ] {
+                let generated = render_core::css::pseudo::style_source(node, pseudo_element);
+                if let Some(style) = page.computed_styles.get(&generated) {
+                    let property = |name: &str| {
+                        style
+                            .get(name)
+                            .map(|value| value.css_text().to_owned())
+                            .unwrap_or_default()
+                    };
+                    eprintln!(
+                        "pseudo <{}> id={} class={} {} content={} display={} position={} z={} width={} height={} top={} right={} bottom={} left={} bg={}",
+                        element.local_name,
+                        id_attr,
+                        class,
+                        pseudo_element.name(),
+                        property("content"),
+                        property("display"),
+                        property("position"),
+                        property("z-index"),
+                        property("width"),
+                        property("height"),
+                        property("top"),
+                        property("right"),
+                        property("bottom"),
+                        property("left"),
+                        property("background-color"),
+                    );
+                }
+            }
             eprintln!(
                 "layout <{}> id={} class={} rect={:?} display={} position={} z={} opacity={} visibility={} top={} left={} right={} bottom={} width={} height={} margin={} float={} transform={} overflow={} bg={} bgimg={}{}",
                 element.local_name,

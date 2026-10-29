@@ -792,11 +792,30 @@ impl<'a> Builder<'a> {
         // in-flow tree has painted; inside a stacking context (opacity,
         // transform), paint them locally after its in-flow children.
         let child_hoist = hoist_positioned && stacking_context.is_none();
-        let mut local_positioned: Vec<(i32, FragmentId)> = Vec::new();
         let children = fragment.children.clone();
+        // CSS 2.1 Appendix E: negative-z-index positioned descendants paint
+        // after the stacking context's own background but before its in-flow
+        // content. A generated `::after` pill (`z-index:-10`) belongs behind
+        // the element's text, not on top of it.
+        let mut negative_positioned: Vec<(i32, FragmentId)> = Vec::new();
+        for child in children.iter().copied() {
+            let (positioned, _, z_index) = self.fragment_paint_priority(child);
+            if positioned && z_index < 0 {
+                negative_positioned.push((z_index, child));
+            }
+        }
+        negative_positioned.sort_by_key(|(z_index, child)| (*z_index, child.as_u32()));
+        for (_, child) in negative_positioned {
+            self.paint_fragment(child, coordinate_space, false);
+        }
+        let mut local_positioned: Vec<(i32, FragmentId)> = Vec::new();
         for child in children {
             let (positioned, hoistable, z_index) = self.fragment_paint_priority(child);
             if positioned {
+                if z_index < 0 {
+                    // Already painted ahead of the in-flow content.
+                    continue;
+                }
                 if child_hoist && hoistable {
                     let sequence = self.deferred_sequence;
                     self.deferred_sequence = self.deferred_sequence.saturating_add(1);

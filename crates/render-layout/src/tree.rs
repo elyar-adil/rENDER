@@ -7,6 +7,7 @@ use render_css::properties::{
     Display, DisplayBox, DisplayInside, DisplayInternal, DisplayOutside, Float, Position,
     TypedPropertyValue,
 };
+use render_css::pseudo::{self, PseudoElement};
 use render_dom::{Dom, DomRevision, NodeId, NodeKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -299,6 +300,26 @@ impl Builder<'_> {
         text_style_source: Option<NodeId>,
         depth: usize,
     ) {
+        self.append_dom_children_seeded(
+            dom_parent,
+            format_parent,
+            text_style_source,
+            depth,
+            &mut None,
+        );
+    }
+
+    /// [`Self::append_dom_children`] with the anonymous block already in use by
+    /// the caller. Generated `::before` content shares that block with the
+    /// element's own inline content, so both sit on the same line.
+    fn append_dom_children_seeded(
+        &mut self,
+        dom_parent: NodeId,
+        format_parent: FormattingNodeId,
+        text_style_source: Option<NodeId>,
+        depth: usize,
+        anonymous: &mut Option<FormattingNodeId>,
+    ) {
         if depth > self.limits.max_depth {
             self.diagnostics.push(FormattingDiagnostic {
                 node: Some(dom_parent),
@@ -348,10 +369,9 @@ impl Builder<'_> {
                 }
             )
         });
-        let mut anonymous = None;
         for child in children {
             if independent_children {
-                anonymous = None;
+                *anonymous = None;
             }
             self.append_dom_node(
                 child,
@@ -359,7 +379,7 @@ impl Builder<'_> {
                 text_style_source,
                 parent_accepts_inline,
                 independent_children,
-                &mut anonymous,
+                anonymous,
                 depth,
             );
         }
@@ -623,8 +643,54 @@ impl Builder<'_> {
                     self.append_child(format_parent, id);
                 }
                 let enclosing = self.table_parent;
+                let host_is_html_element = matches!(
+                    node.kind(),
+                    NodeKind::Element(element) if element.namespace == render_dom::Namespace::Html
+                );
+                let host_is_replaced = matches!(
+                    node.kind(),
+                    NodeKind::Element(element)
+                        if matches!(
+                            element.local_name.as_str(),
+                            "img" | "video" | "canvas" | "input" | "textarea" | "select" | "iframe"
+                                | "object" | "embed"
+                        )
+                );
+                let generated_allowed = host_is_html_element
+                    && !host_is_replaced
+                    && !matches!(
+                        enclosing,
+                        Some(TableLevel::Rows | TableLevel::Row | TableLevel::Column)
+                    );
                 self.table_parent = Some(table_parent);
-                self.append_dom_children(dom_node, id, Some(dom_node), depth.saturating_add(1));
+                let mut anonymous = None;
+                if generated_allowed {
+                    self.append_generated_content(
+                        dom_node,
+                        id,
+                        PseudoElement::Before,
+                        Some(dom_node),
+                        &mut anonymous,
+                        depth,
+                    );
+                }
+                self.append_dom_children_seeded(
+                    dom_node,
+                    id,
+                    Some(dom_node),
+                    depth.saturating_add(1),
+                    &mut anonymous,
+                );
+                if generated_allowed {
+                    self.append_generated_content(
+                        dom_node,
+                        id,
+                        PseudoElement::After,
+                        Some(dom_node),
+                        &mut anonymous,
+                        depth,
+                    );
+                }
                 self.table_parent = enclosing;
                 // An <input> has no DOM children, but it paints its current
                 // `value` or, when empty, its `placeholder` as the visible
@@ -671,6 +737,99 @@ impl Builder<'_> {
         }
     }
 
+    /// Creates the box for one `::before`/`::after` pseudo-element of `host`.
+    ///
+    /// The generated box has no DOM node; its computed style lives in the same
+    /// map under [`pseudo::style_source`]. Inline content shares the host's
+    /// anonymous block, while an out-of-flow generated box is blockified (CSS
+    /// Display 3 §2.7) and paints from the host's positioning context.
+    fn append_generated_content(
+        &mut self,
+        host: NodeId,
+        format_parent: FormattingNodeId,
+        pseudo_element: PseudoElement,
+        text_style_source: Option<NodeId>,
+        anonymous: &mut Option<FormattingNodeId>,
+        depth: usize,
+    ) {
+        if depth > self.limits.max_depth {
+            return;
+        }
+        let style_source = pseudo::style_source(host, pseudo_element);
+        let Some(style) = self.styles.get(&style_source) else {
+            return;
+        };
+        let Some(content) = pseudo::generated_content(style) else {
+            return;
+        };
+        let display = display(style);
+        if display == Display::Box(DisplayBox::None) {
+            return;
+        }
+        let (mut kind, mut inline_level) = self.formatting_kind_for_display(None, &display);
+        if matches!(
+            crate::solver::resolve::position(Some(style)),
+            Position::Absolute | Position::Fixed
+        ) || float(style) != Float::None
+        {
+            kind = match kind {
+                FormattingNodeKind::Inline => FormattingNodeKind::BlockContainer {
+                    context: FormattingContextKind::Block,
+                },
+                FormattingNodeKind::AtomicInline { context } => {
+                    FormattingNodeKind::BlockContainer { context }
+                }
+                other => other,
+            };
+            inline_level = false;
+        }
+        let Some(id) = self.allocate(None, Some(style_source), kind) else {
+            return;
+        };
+        let parent_accepts_inline = self
+            .get(format_parent)
+            .is_some_and(|node| node.kind.accepts_inline_children());
+        let independent_children = self.get(format_parent).is_some_and(|node| {
+            matches!(
+                node.kind,
+                FormattingNodeKind::BlockContainer {
+                    context: FormattingContextKind::Flex | FormattingContextKind::Grid
+                } | FormattingNodeKind::AtomicInline {
+                    context: FormattingContextKind::Flex | FormattingContextKind::Grid
+                }
+            )
+        });
+        if independent_children {
+            *anonymous = None;
+            self.append_child(format_parent, id);
+        } else if parent_accepts_inline && inline_level {
+            self.append_with_anonymous_if_needed(
+                format_parent,
+                id,
+                text_style_source,
+                true,
+                anonymous,
+            );
+        } else {
+            *anonymous = None;
+            self.append_child(format_parent, id);
+        }
+        if !content.is_empty() {
+            let transform = self.text_transform_of(Some(style_source));
+            let content =
+                transformed_text(&content, transform, &mut self.capitalize_word_start).into_owned();
+            if self.text_bytes.saturating_add(content.len()) > self.limits.max_text_bytes {
+                return;
+            }
+            self.text_bytes += content.len();
+            if let Some(text_id) =
+                self.allocate(None, Some(style_source), FormattingNodeKind::Text(content))
+            {
+                self.append_child(id, text_id);
+            }
+        }
+    }
+
     fn formatting_kind(&mut self, node: NodeId, display: &Display) -> (FormattingNodeKind, bool) {
         if matches!(
             self.dom.node(node).map(render_dom::Node::kind),
@@ -691,13 +850,21 @@ impl Builder<'_> {
                 inline,
             );
         }
+        self.formatting_kind_for_display(Some(node), display)
+    }
+
+    fn formatting_kind_for_display(
+        &mut self,
+        node: Option<NodeId>,
+        display: &Display,
+    ) -> (FormattingNodeKind, bool) {
         match display {
             Display::Normal {
                 outside, inside, ..
             } => {
                 if *outside == DisplayOutside::RunIn {
                     self.diagnostics.push(FormattingDiagnostic {
-                        node: Some(node),
+                        node,
                         code: FormattingDiagnosticCode::RunInNotImplemented,
                         message: "run-in box merging is not implemented yet".to_owned(),
                     });

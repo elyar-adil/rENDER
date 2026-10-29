@@ -1474,6 +1474,49 @@ fn an_inline_block_sums_its_atomic_children_and_their_margins() {
 }
 
 #[test]
+fn an_absolute_after_pseudo_element_lays_out_against_its_host() {
+    // Bing's language pills are `#est_switch .est_common::after` with
+    // `content: ''; position:absolute; left:0; right:0; top:4px; height:32px`.
+    // The generated box must be as wide as the host's padding box and start
+    // four pixels below its top.
+    let (output, styles, layout) = pipeline(
+        "<!doctype html><body><div id='switch'><div id='cn'>国内版</div></div></body>",
+        "html, body, div { display: block; margin: 0 } \
+         #switch { position: relative; width: 200px; height: 40px } \
+         #cn { display: inline-block; position: relative; width: 76px; height: 37px; \
+               padding: 6px 14px 5px; box-sizing: border-box } \
+         #cn::after { content: ''; position: absolute; left: 0; right: 0; top: 4px; \
+                      height: 32px; background: red }",
+        400.0,
+    );
+    let host = fragment(&layout, find(&output.dom, "#cn"));
+    let generated = layout
+        .fragments
+        .iter()
+        .find(|fragment| {
+            fragment.source.is_none()
+                && (fragment.rect.origin.x - host.rect.origin.x).abs() < 0.01
+                && (fragment.rect.origin.y - host.rect.origin.y - 4.0).abs() < 0.01
+        })
+        .expect("the ::after box exists");
+    assert!((generated.rect.size.width - 76.0).abs() < 0.01);
+    assert!((generated.rect.size.height - 32.0).abs() < 0.01);
+    // The pseudo-element's computed style is in the same table under a
+    // synthetic id, and it is the one that carries the red background.
+    let after = render_css::pseudo::style_source(
+        find(&output.dom, "#cn"),
+        render_css::pseudo::PseudoElement::After,
+    );
+    assert!(styles.contains_key(&after));
+    assert_eq!(
+        styles[&after]
+            .get("content")
+            .map(render_css::computed::ComputedValue::css_text),
+        Some("''")
+    );
+}
+
+#[test]
 fn an_absolute_box_with_no_insets_shrinks_to_fit_at_its_static_position() {
     // CSS 2.1 §10.3.7: left, width and right all auto means the static position
     // plus shrink-to-fit. Stretching to the containing block made Bing's

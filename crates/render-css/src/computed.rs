@@ -14,6 +14,7 @@ use render_dom::{Dom, Node, NodeId, NodeKind};
 
 use super::cascade::{CascadeInput, CascadedStyle, cascade_element_with_origins};
 use super::properties::{TypedPropertyValue, parse_typed_property};
+use super::pseudo::{self, PseudoElement};
 use super::selector::MatchContext;
 use super::stylesheet::{CssWideKeyword, Declaration, css_wide_keyword, parse_declaration_list};
 
@@ -110,6 +111,7 @@ impl PropertyRegistry {
             registry.define(name, true, initial);
         }
         for (name, initial) in [
+            ("content", "normal"),
             ("background-color", "transparent"),
             ("background-image", "none"),
             ("background-repeat", "repeat"),
@@ -1395,6 +1397,25 @@ pub fn compute_document_styles_with_hints(
 ) -> BTreeMap<NodeId, ComputedStyle> {
     let mut styles = BTreeMap::new();
     let initials = InitialValues::new(registry, limits);
+    // Pseudo-element cascade is opt-in per document: most stylesheets never
+    // mention `::before`/`::after`, and walking every element twice more would
+    // be a visible cost on large pages.
+    let generate_before = sources.iter().any(|source| {
+        source.sheet.rules.iter().any(|rule| {
+            rule.selectors
+                .selectors()
+                .iter()
+                .any(|selector| selector.has_pseudo_element("before"))
+        })
+    });
+    let generate_after = sources.iter().any(|source| {
+        source.sheet.rules.iter().any(|rule| {
+            rule.selectors
+                .selectors()
+                .iter()
+                .any(|selector| selector.has_pseudo_element("after"))
+        })
+    });
     let mut stack = vec![(dom.document(), None)];
     while let Some((node, parent_element)) = stack.pop() {
         let current_parent = if matches!(dom.node(node).map(Node::kind), Some(NodeKind::Element(_)))
@@ -1414,6 +1435,28 @@ pub fn compute_document_styles_with_hints(
                 limits,
                 &initials,
             );
+            for (pseudo_element, enabled) in [
+                (PseudoElement::Before, generate_before),
+                (PseudoElement::After, generate_after),
+            ] {
+                if !enabled {
+                    continue;
+                }
+                let mut pseudo_context = context.clone();
+                pseudo_context.pseudo_element = Some(pseudo_element.name().to_owned());
+                let pseudo_cascaded =
+                    cascade_element_with_origins(dom, node, sources, &pseudo_context, &[], &[]);
+                let pseudo_style = compute_style_with_initials(
+                    &pseudo_cascaded,
+                    Some(&style),
+                    registry,
+                    limits,
+                    &initials,
+                );
+                if pseudo::generated_content(&pseudo_style).is_some() {
+                    styles.insert(pseudo::style_source(node, pseudo_element), pseudo_style);
+                }
+            }
             styles.insert(node, style);
             Some(node)
         } else {
