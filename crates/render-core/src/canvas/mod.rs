@@ -51,8 +51,8 @@ use std::sync::Arc;
 
 use render_dom::{Dom, NodeId};
 use render_js::canvas::{
-    Attribute, CanvasError, CanvasErrorKind, CanvasHost, CanvasId, CanvasOp, CanvasStyle,
-    CanvasValue, FillRule, GradientKind, GradientOp, MAX_IMAGE_PIXELS, PixelBuffer,
+    Attribute, CanvasError, CanvasErrorKind, CanvasHost, CanvasId, CanvasImageSource, CanvasOp,
+    CanvasStyle, CanvasValue, FillRule, GradientKind, GradientOp, MAX_IMAGE_PIXELS, PixelBuffer,
 };
 
 use crate::paint::coverage::{contains, polygon_coverage};
@@ -608,6 +608,7 @@ impl Canvas {
         &mut self,
         op: CanvasOp,
         gradients: &BTreeMap<u64, Gradient>,
+        image: Option<&Bitmap>,
     ) -> Result<CanvasValue, CanvasError> {
         let matrix = self.state.transform;
         match op {
@@ -870,8 +871,91 @@ impl Canvas {
                     quality,
                 )));
             }
+            CanvasOp::DrawImage {
+                source: _,
+                source_rect,
+                dest_rect,
+            } => {
+                // `execute` resolved and snapshotted the source bitmap; the
+                // op itself only names it so the engine knows what to copy.
+                let Some(source) = image else {
+                    return Ok(CanvasValue::Undefined);
+                };
+                self.draw_image(source, source_rect, dest_rect);
+            }
         }
         Ok(CanvasValue::Undefined)
+    }
+
+    /// `drawImage` (HTML §4.12.5.1.15): paints the source bitmap's rectangle
+    /// through the current transform into the destination rectangle.
+    ///
+    /// The source rectangle is clipped to the source image first, and the
+    /// destination is clipped in the same proportion, as the specification
+    /// requires. Painting honours global alpha, the clip region, the
+    /// compositing operator and `imageSmoothingEnabled`; the filter reads the
+    /// image with clamp-to-edge at its border.
+    fn draw_image(&mut self, source: &Bitmap, source_rect: [f64; 4], dest_rect: [f64; 4]) {
+        let [sx, sy, sw, sh] = source_rect;
+        let [dx, dy, dw, dh] = dest_rect;
+        if !all_finite(&[sx, sy, sw, sh, dx, dy, dw, dh]) {
+            return;
+        }
+        let Some(([sx, sy, sw, sh], [dx, dy, dw, dh])) =
+            clip_image_rects(source, source_rect, dest_rect)
+        else {
+            return;
+        };
+        let matrix = self.state.transform;
+        let Some(inverse) = invert(matrix) else {
+            return;
+        };
+        let polygon = to_device(matrix, &rectangle(dx, dy, dw, dh));
+        let coverage = polygon_coverage(
+            &[polygon],
+            FillRule::NonZero,
+            self.bitmap.width(),
+            self.bitmap.height(),
+        );
+        let global_alpha = self.state.global_alpha;
+        let smoothing = self.state.image_smoothing_enabled;
+        let mode = CompositeMode::parse(&self.state.global_composite_operation)
+            .unwrap_or(CompositeMode::SourceOver);
+        let sampler = |x: u32, y: u32| -> Source {
+            let user = apply(inverse, (f64::from(x) + 0.5, f64::from(y) + 0.5));
+            let u = (user.0 - dx) / dw;
+            let v = (user.1 - dy) / dh;
+            let pixel = sample_premultiplied(source, sx + u * sw, sy + v * sh, smoothing);
+            let alpha = f32::from(pixel[3]);
+            if alpha <= 0.0 {
+                return Source {
+                    red: 0,
+                    green: 0,
+                    blue: 0,
+                    alpha: 0.0,
+                };
+            }
+            let straight = 255.0 / alpha;
+            Source {
+                red: (f32::from(pixel[0]) * straight).round().clamp(0.0, 255.0) as u8,
+                green: (f32::from(pixel[1]) * straight).round().clamp(0.0, 255.0) as u8,
+                blue: (f32::from(pixel[2]) * straight).round().clamp(0.0, 255.0) as u8,
+                alpha: (alpha / 255.0 * global_alpha as f32).clamp(0.0, 1.0),
+            }
+        };
+        if mode == CompositeMode::SourceOver {
+            if let Some(coverage) = coverage {
+                self.bitmap
+                    .fill_where(&coverage, self.state.clip.as_deref(), sampler);
+            }
+        } else {
+            self.bitmap.fill_composited(
+                coverage.as_ref(),
+                self.state.clip.as_deref(),
+                mode,
+                sampler,
+            );
+        }
     }
 
     /// `arcTo`: a straight segment to the first tangent point, then the arc to
@@ -1030,10 +1114,23 @@ impl CanvasEngine {
     ) -> Result<CanvasValue, CanvasError> {
         self.reconcile(dom, id);
         let reads_only = is_read(&op);
+        // A `drawImage` source is snapshotted before the destination is
+        // touched: the specification requires a canvas drawn onto itself to
+        // read the bitmap as it was before the call.
+        let image = match &op {
+            CanvasOp::DrawImage {
+                source: CanvasImageSource::Canvas(source),
+                ..
+            } => self
+                .canvases
+                .get(source)
+                .map(|canvas| canvas.bitmap.clone()),
+            _ => None,
+        };
         let Some(canvas) = self.canvases.get_mut(&id) else {
             return Ok(CanvasValue::Undefined);
         };
-        let result = canvas.run(op, &self.gradients);
+        let result = canvas.run(op, &self.gradients, image.as_ref());
         if !reads_only && result.is_ok() {
             self.dirty.insert(id);
         }
@@ -1186,6 +1283,84 @@ fn to_device(matrix: Matrix, polygon: &[Point]) -> Vec<Point> {
 
 fn all_finite(values: &[f64]) -> bool {
     values.iter().all(|value| value.is_finite())
+}
+
+/// Clip the source rectangle of `drawImage` to the source bitmap, and clip the
+/// destination rectangle in the same proportion (HTML §4.12.5.1.15).
+///
+/// Returns `None` when no part of the source overlaps the image. Negative
+/// widths and heights are kept: the specification processes the image in its
+/// original direction, so the mapping from source to destination stays affine
+/// and the sign only mirrors the result.
+fn clip_image_rects(
+    source: &Bitmap,
+    [sx, sy, sw, sh]: [f64; 4],
+    [dx, dy, dw, dh]: [f64; 4],
+) -> Option<([f64; 4], [f64; 4])> {
+    let width = f64::from(source.width());
+    let height = f64::from(source.height());
+    let (u0, u1) = span_overlap(sx, sw, width)?;
+    let (v0, v1) = span_overlap(sy, sh, height)?;
+    Some((
+        [sx + u0 * sw, sy + v0 * sh, (u1 - u0) * sw, (v1 - v0) * sh],
+        [dx + u0 * dw, dy + v0 * dh, (u1 - u0) * dw, (v1 - v0) * dh],
+    ))
+}
+
+/// The parameter interval of `origin + t * length` (`t` in `0..=1`) whose
+/// values fall inside `0..=bound`, or `None` when the span misses it.
+///
+/// The span may run backwards; the returned interval is always `(low, high)`.
+fn span_overlap(origin: f64, length: f64, bound: f64) -> Option<(f64, f64)> {
+    if length == 0.0 || !length.is_finite() || bound <= 0.0 {
+        return None;
+    }
+    let end = origin + length;
+    let (start, end) = if length > 0.0 {
+        (origin, end)
+    } else {
+        (end, origin)
+    };
+    let clipped_start = start.max(0.0);
+    let clipped_end = end.min(bound);
+    if clipped_end <= clipped_start {
+        return None;
+    }
+    let u0 = (clipped_start - origin) / length;
+    let u1 = (clipped_end - origin) / length;
+    Some((u0.min(u1), u0.max(u1)))
+}
+
+/// The source pixel at `(x, y)` in premultiplied RGBA, filtered as
+/// `imageSmoothingEnabled` asks: bilinear interpolation of the four nearest
+/// pixels, or the enclosing pixel for nearest-neighbour. Samples outside the
+/// image clamp to the nearest edge pixel, which is the filter behaviour HTML
+/// §4.12.5.1.15 names.
+fn sample_premultiplied(source: &Bitmap, x: f64, y: f64, smoothing: bool) -> [u8; 4] {
+    if !smoothing {
+        return source.pixel_clamped(x.floor() as i64, y.floor() as i64);
+    }
+    // Pixel centres sit at half-integers, so the enclosing pixel pair around
+    // `x` shifts by 0.5 before the floor.
+    let x = x - 0.5;
+    let y = y - 0.5;
+    let x0 = x.floor();
+    let y0 = y.floor();
+    let fx = (x - x0) as f32;
+    let fy = (y - y0) as f32;
+    let (x0, y0) = (x0 as i64, y0 as i64);
+    let top_left = source.pixel_clamped(x0, y0);
+    let top_right = source.pixel_clamped(x0 + 1, y0);
+    let bottom_left = source.pixel_clamped(x0, y0 + 1);
+    let bottom_right = source.pixel_clamped(x0 + 1, y0 + 1);
+    let mut out = [0; 4];
+    for channel in 0..4 {
+        let top = f32::from(top_left[channel]) * (1.0 - fx) + f32::from(top_right[channel]) * fx;
+        let bottom =
+            f32::from(bottom_left[channel]) * (1.0 - fx) + f32::from(bottom_right[channel]) * fx;
+        out[channel] = (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8;
+    }
+    out
 }
 
 /// A span given by an origin and a signed length, as the start and length of

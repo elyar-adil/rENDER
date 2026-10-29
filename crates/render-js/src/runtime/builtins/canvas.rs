@@ -19,12 +19,12 @@
 //! the host, so that the paint path and the script read one bitmap.
 //!
 //! Each member is installed only when its behaviour is implemented. A member
-//! that is not listed here, such as `drawImage` or the gradient constructors,
-//! is absent from its prototype rather than stubbed.
+//! that is not listed here, such as `createPattern`, `fillText` or
+//! `createImageBitmap`, is absent from its prototype rather than stubbed.
 
 use crate::canvas::{
-    Attribute, CanvasError, CanvasErrorKind, CanvasHost, CanvasId, CanvasOp, CanvasStyle,
-    CanvasValue, FillRule, MAX_IMAGE_PIXELS, PixelBuffer,
+    Attribute, CanvasError, CanvasErrorKind, CanvasHost, CanvasId, CanvasImageSource, CanvasOp,
+    CanvasStyle, CanvasValue, FillRule, MAX_IMAGE_PIXELS, PixelBuffer,
 };
 use std::f64::consts::FRAC_PI_2;
 use std::f64::consts::PI;
@@ -86,6 +86,7 @@ pub(crate) enum CanvasMethod {
     FillRect,
     ClearRect,
     StrokeRect,
+    DrawImage,
     BeginPath,
     ClosePath,
     MoveTo,
@@ -307,6 +308,7 @@ impl JsRuntime {
                 let segments = self.canvas_number_sequence(dom, arguments)?;
                 self.canvas_run(dom, receiver, CanvasOp::SetLineDash(segments))
             }
+            CanvasMethod::DrawImage => self.canvas_draw_image(dom, receiver, arguments),
             CanvasMethod::FillRect | CanvasMethod::ClearRect | CanvasMethod::StrokeRect => {
                 let [x, y, width, height] = self.canvas_rect_args(dom, arguments)?;
                 let op = match method {
@@ -1559,6 +1561,122 @@ impl JsRuntime {
         ])
     }
 
+    /// `drawImage` (HTML §4.12.5.1.15): resolves the source to one of the
+    /// engine's canvases, applies the overload's defaults, and forwards one
+    /// [`CanvasOp::DrawImage`].
+    ///
+    /// The three overloads take 3, 5 or 9 arguments; a trailing extra argument
+    /// is ignored as `WebIDL` does once a candidate matches. The spelling of
+    /// the checks follows the specification's order: bad usability first (a
+    /// zero-sized canvas throws `InvalidStateError`), then the non-finite and
+    /// zero-extent returns, which paint nothing.
+    fn canvas_draw_image(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let (source, width, height) = self.canvas_image_source(dom, arguments.first())?;
+        if width == 0 || height == 0 {
+            return Err(self.dom_exception(
+                DomExceptionName::InvalidState,
+                "The image argument is an HTMLCanvasElement or OffscreenCanvas whose bitmap has no pixels",
+            ));
+        }
+        let (width, height) = (f64::from(width), f64::from(height));
+        let numeric = match arguments.len() {
+            0..=2 => return Err(missing_argument()),
+            3..=4 => 2,
+            5..=8 => 4,
+            _ => 8,
+        };
+        let mut values = Vec::with_capacity(numeric);
+        for index in 1..=numeric {
+            values.push(self.canvas_number(dom, arguments, index)?);
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            return Ok(JsValue::Undefined);
+        }
+        let (source_rect, dest_rect) = match numeric {
+            2 => (
+                [0.0, 0.0, width, height],
+                [values[0], values[1], width, height],
+            ),
+            4 => (
+                [0.0, 0.0, width, height],
+                [values[0], values[1], values[2], values[3]],
+            ),
+            _ => (
+                [values[0], values[1], values[2], values[3]],
+                [values[4], values[5], values[6], values[7]],
+            ),
+        };
+        if source_rect[2] == 0.0
+            || source_rect[3] == 0.0
+            || dest_rect[2] == 0.0
+            || dest_rect[3] == 0.0
+        {
+            return Ok(JsValue::Undefined);
+        }
+        self.canvas_run(
+            dom,
+            receiver,
+            CanvasOp::DrawImage {
+                source,
+                source_rect,
+                dest_rect,
+            },
+        )
+    }
+
+    /// The `CanvasImageSource` a `drawImage` call names, with its natural size.
+    ///
+    /// Only the engine's canvases are accepted: an `<img>`, `<video>` or
+    /// `ImageBitmap` source needs decoded pixels the script runtime does not
+    /// own, so it is rejected with the `TypeError` `WebIDL` raises for a value
+    /// that is not a `CanvasImageSource`.
+    fn canvas_image_source(
+        &mut self,
+        dom: &mut Dom,
+        value: Option<&JsValue>,
+    ) -> Result<(CanvasImageSource, u32, u32), JsError> {
+        let Some(value) = value else {
+            return Err(missing_argument());
+        };
+        let JsValue::Object(object) = value else {
+            return Err(JsError::type_error(
+                "The image argument is not a CanvasImageSource",
+            ));
+        };
+        let source = match self.realm.host(*object) {
+            Some(ObjectHost::Node(node)) if is_html_canvas(dom, node) => {
+                let Some(host) = self.canvas_host.as_mut() else {
+                    return Err(JsError::type_error(
+                        "The image argument is not a CanvasImageSource",
+                    ));
+                };
+                CanvasImageSource::Canvas(host.canvas_for(dom, node))
+            }
+            Some(ObjectHost::Canvas(CanvasObject::OffscreenCanvas(id))) => {
+                CanvasImageSource::Canvas(id)
+            }
+            _ => {
+                return Err(JsError::type_error(
+                    "The image argument is not a CanvasImageSource",
+                ));
+            }
+        };
+        let Some(host) = self.canvas_host.as_mut() else {
+            return Err(JsError::type_error(
+                "The image argument is not a CanvasImageSource",
+            ));
+        };
+        let (width, height) = match source {
+            CanvasImageSource::Canvas(id) => host.size(dom, id),
+        };
+        Ok((source, width, height))
+    }
+
     /// The six numbers of a transformation matrix, each required.
     fn canvas_matrix(&mut self, dom: &mut Dom, arguments: &[JsValue]) -> Result<[f64; 6], JsError> {
         let mut matrix = [0.0; 6];
@@ -1832,6 +1950,7 @@ const CONTEXT_METHODS: &[(&str, CanvasMethod)] = &[
     ("fillRect", CanvasMethod::FillRect),
     ("clearRect", CanvasMethod::ClearRect),
     ("strokeRect", CanvasMethod::StrokeRect),
+    ("drawImage", CanvasMethod::DrawImage),
     ("beginPath", CanvasMethod::BeginPath),
     ("closePath", CanvasMethod::ClosePath),
     ("moveTo", CanvasMethod::MoveTo),

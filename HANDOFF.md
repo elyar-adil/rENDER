@@ -1,3 +1,40 @@
+# 交接文档 (2026-10-29, 续) — canvas `drawImage`(画布源)
+
+接续同日焦点会话。canvas 里下一个"对真实页面影响大"的缺口是 `drawImage`;本轮先做
+**画布到画布**的完整绘制路径,把几何、过滤与合成语义钉死,`<img>` 源留给下一轮
+(它先需要图像元素的加载状态,见"明确未做")。
+
+## 本轮已完成
+
+| 内容 | 落点 |
+|---|---|
+| **`drawImage` 三个重载** | `render_js::canvas::CanvasOp::DrawImage` + `CanvasImageSource::Canvas`;脚本侧按 WebIDL 解析 3/5/9 个参数,多出的尾参忽略,非有限值直接返回,`sw`/`sh`/`dw`/`dh` 为 0 不绘制 |
+| **源矩形裁剪与等比目的裁剪** | 源矩形先裁到图像边界,目的矩形按同一参数比例裁剪(HTML §4.12.5.1.15);负宽高保持原方向,因此镜像与翻转都由仿射映射自然得到 |
+| **光栅化** | 目的四边形走现有 coverage;采样经逆 CTM 回到源坐标,`imageSmoothingEnabled` 关闭时最近邻、开启时双线性(预乘空间插值),图像边界 clamp-to-edge |
+| **合成语义** | 与填充同一条路径:`globalAlpha`、裁剪区、`globalCompositeOperation`(含非 source-over 的全画布模式)全部生效 |
+| **自绘快照** | 源画布在目标画布被修改前复制,`drawImage(c, ...)` 读到的始终是调用前的位图,重叠拷贝符合规范 |
+| **可用性检查** | 源画布任一边为 0 抛 `InvalidStateError`;非画布对象抛 `TypeError`;`drawImage()` 缺参抛 `TypeError` |
+
+## 验证
+
+- 新增 8 个端到端脚本测试(`crates/render-core/src/canvas/tests.rs`):三重重载几何、源矩形越界等比裁剪、负目的宽镜像 + 自绘快照、alpha/变换、`OffscreenCanvas` 源、零尺寸源抛 `InvalidStateError`、非有限值与零延伸不绘制、非画布源 `TypeError`。
+- `cargo test -p render-core --lib canvas::` 全绿;`cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings` 干净。
+
+## 明确未做
+
+- **`<img>`/`<svg:image>`/`<video>`/`ImageBitmap` 源**:脚本运行时没有解码后的像素,也没有 `complete`/`naturalWidth` 这样的加载状态。正确做法是让图像元素暴露加载状态并把解码位图接进 canvas 引擎的节点索引,再做可用性判定(`complete === false` 抛 `InvalidStateError`,broken 静默返回)。
+- `createPattern`(同样需要图像像素)、canvas 文本、阴影、滤镜、`Path2D`、`getTransform`、`createImageBitmap`。
+- 源画布先整体克隆再绘制:正确但每次调用 O(源像素数),后续可换成写时复制或共享只读快照。
+
+## 下一步候选
+
+1. `HTMLImageElement.complete`/`naturalWidth`/`naturalHeight` + 图像源 `drawImage`(同时解锁 `createPattern` 与 `toDataURL` 的图像解码测试)。
+2. `::backdrop` + top layer(~75 reftest)。
+3. canvas 文本(`fillText` 家族,需要嵌入方字形栅格)。
+4. 表单约束校验(`checkValidity`/`:invalid`,~9 WPT)。
+
+---
+
 # 交接文档 (2026-10-29) — 键盘顺序焦点、真正的 :focus-visible、聚焦事件全路径
 
 接续 10-23 的 S16(S16 = 动态伪类接线)会话。那一轮的 WIP 先在 10-29 恢复并提交

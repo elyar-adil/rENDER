@@ -25,7 +25,7 @@ interaction-state changes (committed as `e05c2f1`), with the counts re-run after
 | `cargo test --workspace` | all targets ok, 0 failed; test262 self-tests 10 passed, 1 ignored |
 | test262 conformance gate (release) | 90,765 / 103,199 variants = 88.0%; 264 buckets ok; 6 timeout, 0 crash; 865.67 s |
 | `render-js` unit tests | 1,157 passed |
-| `render-core` unit tests | 337 passed |
+| `render-core` unit tests | 345 passed |
 | `render-layout` unit tests | 306 passed, 1 ignored |
 | `render-browser` unit tests | 198 lib + 101 app tests passed |
 | site-neutrality gate | 9 rules, 269 Rust files, 60 self-test checks, 25 advisory findings, exit 0 |

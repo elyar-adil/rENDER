@@ -173,6 +173,20 @@ impl Bitmap {
         }
     }
 
+    /// The premultiplied pixel at `(x, y)`, clamped to the nearest edge pixel.
+    ///
+    /// `drawImage`'s filter uses clamp-to-edge for samples that fall outside
+    /// the image (HTML §4.12.5.1.15), and an empty bitmap reads transparent.
+    #[must_use]
+    pub fn pixel_clamped(&self, x: i64, y: i64) -> [u8; 4] {
+        if self.pixels.is_empty() {
+            return [0; 4];
+        }
+        let x = x.clamp(0, i64::from(self.width) - 1) as u32;
+        let y = y.clamp(0, i64::from(self.height) - 1) as u32;
+        self.pixels[self.index(x, y)]
+    }
+
     /// The straight-alpha RGBA8 pixels of the rectangle at `(x, y)` of size
     /// `width` by `height`. Pixels outside the bitmap read as transparent black.
     #[must_use]

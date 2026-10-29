@@ -89,6 +89,20 @@ pub enum CanvasValue {
     Pixels(PixelBuffer),
 }
 
+/// A source a `drawImage` call can draw (HTML §4.12.5.1.16).
+///
+/// The canvas kinds are the sources whose pixels the host already owns: every
+/// element canvas and every `OffscreenCanvas` of the page shares one engine.
+/// An `<img>`, `<video>` or `ImageBitmap` source needs decoded pixels, which
+/// the script runtime does not hold, so the method is installed for canvases
+/// only and rejects the rest with the `TypeError` an unsupported
+/// `CanvasImageSource` gets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanvasImageSource {
+    /// A bitmap of the same engine: an element's canvas or an `OffscreenCanvas`.
+    Canvas(CanvasId),
+}
+
 /// One `CanvasRenderingContext2D` operation, with its arguments converted.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CanvasOp {
@@ -217,6 +231,15 @@ pub enum CanvasOp {
     ToDataUrl {
         mime_type: String,
         quality: Option<f64>,
+    },
+    /// `drawImage` (HTML §4.12.5.1.16): `source_rect` is `(sx, sy, sw, sh)`
+    /// in source pixels and `dest_rect` is `(dx, dy, dw, dh)` in the current
+    /// user space. The script side has already applied the overload defaults
+    /// and the zero/extent checks the specification names.
+    DrawImage {
+        source: CanvasImageSource,
+        source_rect: [f64; 4],
+        dest_rect: [f64; 4],
     },
 }
 

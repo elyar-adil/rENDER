@@ -863,3 +863,166 @@ fn to_data_url_requires_a_canvas_element_receiver() {
         "undefined"
     );
 }
+
+/// Four one-pixel quadrants in a 2 by 2 canvas: red, green, blue, white.
+const QUADRANTS: &str = "\
+    var src = document.createElement('canvas'); src.width = 2; src.height = 2;\
+    var s = src.getContext('2d');\
+    s.fillStyle = '#ff0000'; s.fillRect(0, 0, 1, 1);\
+    s.fillStyle = '#00ff00'; s.fillRect(1, 0, 1, 1);\
+    s.fillStyle = '#0000ff'; s.fillRect(0, 1, 1, 1);\
+    s.fillStyle = '#ffffff'; s.fillRect(1, 1, 1, 1);\
+";
+
+#[test]
+fn draw_image_applies_all_three_overloads() {
+    // 3-arg paints at natural size, 5-arg scales the whole source, 9-arg
+    // selects one source pixel and scales it. Smoothing is off so the
+    // expected values are exact.
+    let script = format!(
+        "{SETUP}{QUADRANTS} ctx.imageSmoothingEnabled = false;\
+         ctx.drawImage(src, 1, 1);\
+         ctx.drawImage(src, 0, 5, 4, 4);\
+         ctx.drawImage(src, 1, 0, 1, 1, 6, 0, 2, 2);\
+         [{}, {}, {}, {}, {}, {}, {}, {}, {}].join('|')",
+        pixel(1, 1),
+        pixel(2, 1),
+        pixel(1, 2),
+        pixel(2, 2),
+        pixel(0, 5),
+        pixel(3, 5),
+        pixel(0, 8),
+        pixel(3, 8),
+        pixel(7, 1),
+    );
+    assert_eq!(
+        run(&script),
+        "255,0,0,255|0,255,0,255|0,0,255,255|255,255,255,255|\
+         255,0,0,255|0,255,0,255|0,0,255,255|255,255,255,255|\
+         0,255,0,255"
+    );
+}
+
+#[test]
+fn draw_image_clips_an_outside_source_rectangle_proportionally() {
+    // The source rectangle starts one pixel outside the image on each axis;
+    // only its bottom-right quadrant is inside, so the destination keeps only
+    // the same bottom-right quadrant (HTML §4.12.5.1.15).
+    let script = format!(
+        "{SETUP}{QUADRANTS} ctx.imageSmoothingEnabled = false;\
+         ctx.drawImage(src, -1, -1, 2, 2, 0, 0, 4, 4);\
+         [{}, {}, {}, {}].join('|')",
+        pixel(0, 0),
+        pixel(3, 0),
+        pixel(0, 3),
+        pixel(3, 3),
+    );
+    assert_eq!(run(&script), "0,0,0,0|0,0,0,0|0,0,0,0|255,0,0,255");
+}
+
+#[test]
+fn draw_image_mirrors_a_negative_destination_and_reads_its_snapshot() {
+    // A negative dw mirrors the destination while the source keeps its
+    // direction. Drawing the canvas onto itself must read the bitmap as it
+    // was before the call, so the second destination column still reads the
+    // original green pixel rather than the red just painted at (1, 0).
+    let script = format!(
+        "{SETUP}{QUADRANTS} ctx.imageSmoothingEnabled = false;\
+         ctx.drawImage(src, 0, 0, 2, 1, 4, 0, -2, 1);\
+         ctx.fillStyle = '#ff0000'; ctx.fillRect(0, 4, 1, 1);\
+         ctx.fillStyle = '#00ff00'; ctx.fillRect(1, 4, 1, 1);\
+         ctx.drawImage(c, 0, 4, 2, 1, 1, 4, 2, 1);\
+         [{}, {}, {}, {}].join('|')",
+        pixel(3, 0),
+        pixel(2, 0),
+        pixel(1, 4),
+        pixel(2, 4),
+    );
+    assert_eq!(
+        run(&script),
+        "255,0,0,255|0,255,0,255|255,0,0,255|0,255,0,255"
+    );
+}
+
+#[test]
+fn draw_image_honours_alpha_compositing_and_transforms() {
+    let script = format!(
+        "{SETUP}{QUADRANTS} ctx.imageSmoothingEnabled = false;\
+         ctx.globalAlpha = 0.5;\
+         ctx.drawImage(src, 0, 0, 2, 2, 0, 0, 2, 2);\
+         ctx.globalAlpha = 1;\
+         ctx.translate(4, 4); ctx.scale(2, 2);\
+         ctx.drawImage(src, 0, 0, 1, 1, 0, 0, 1, 1);\
+         [{}, {}, {}].join('|')",
+        pixel(0, 0),
+        pixel(5, 4),
+        pixel(5, 5),
+    );
+    // Half-alpha red over transparent black keeps straight red at alpha 128.
+    // The translated and scaled draw covers (4, 4) through (5, 5) with red.
+    assert_eq!(run(&script), "255,0,0,128|255,0,0,255|255,0,0,255");
+}
+
+#[test]
+fn draw_image_with_a_zero_sized_canvas_throws_invalid_state() {
+    assert_eq!(
+        run(&format!(
+            "{SETUP} var z = document.createElement('canvas'); z.width = 0; z.height = 2;\
+             var zc = z.getContext('2d'); var name = 'none';\
+             try {{ ctx.drawImage(z, 0, 0); }} catch (e) {{ name = e.name; }}\
+             name"
+        )),
+        "InvalidStateError"
+    );
+}
+
+#[test]
+fn draw_image_ignores_non_finite_and_zero_extents() {
+    // Every call either returns early or paints nothing, so the opaque
+    // background is untouched.
+    let script = format!(
+        "{SETUP}{QUADRANTS} ctx.fillStyle = '#123456'; ctx.fillRect(0, 0, 10, 10);\
+         ctx.drawImage(src, NaN, 0);\
+         ctx.drawImage(src, 0, 0, 0, 0);\
+         ctx.drawImage(src, 0, 0, 2, 2, 0, 0, 0, 1);\
+         ctx.drawImage(src, Infinity, 0, 2, 2);\
+         ctx.getImageData(0, 0, 10, 10).data.join(',')"
+    );
+    let expected = vec!["18,52,86,255"; 100].join(",");
+    assert_eq!(run(&script), expected);
+}
+
+#[test]
+fn draw_image_requires_a_canvas_source() {
+    assert_eq!(
+        run(&format!(
+            "{SETUP} var name = 'none';\
+             try {{ ctx.drawImage({{}}, 0, 0); }} catch (e) {{ name = e.name; }}\
+             name"
+        )),
+        "TypeError"
+    );
+    assert_eq!(
+        run(&format!(
+            "{SETUP} var name = 'none';\
+             try {{ ctx.drawImage(); }} catch (e) {{ name = e.name; }}\
+             name"
+        )),
+        "TypeError"
+    );
+}
+
+#[test]
+fn draw_image_accepts_an_offscreen_canvas_source() {
+    let script = format!(
+        "{SETUP} var off = new OffscreenCanvas(2, 1); var o = off.getContext('2d');\
+         o.fillStyle = '#00ff00'; o.fillRect(0, 0, 1, 1);\
+         o.fillStyle = '#0000ff'; o.fillRect(1, 0, 1, 1);\
+         ctx.imageSmoothingEnabled = false;\
+         ctx.drawImage(off, 4, 4);\
+         [{}, {}].join('|')",
+        pixel(4, 4),
+        pixel(5, 4),
+    );
+    assert_eq!(run(&script), "0,255,0,255|0,0,255,255");
+}
