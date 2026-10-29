@@ -432,6 +432,43 @@ pub enum PromiseCapability {
     Functions { resolve: ObjectId, reject: ObjectId },
 }
 
+impl JsMicrotask {
+    /// The objects this task keeps reachable while it is queued or running.
+    /// A batch queued outside the runtime (the embedding's event loop) must be
+    /// registered with [`JsRuntime::set_external_microtask_roots`], because the
+    /// collector cannot see the embedding's container.
+    pub(super) fn collect_object_roots(&self, roots: &mut Vec<ObjectId>) {
+        match self {
+            Self::Callback(object)
+            | Self::IntersectionObserver(object)
+            | Self::MutationObserver(object)
+            | Self::MediaQueryListChange(object) => roots.push(*object),
+            Self::PromiseReaction {
+                handler,
+                argument,
+                capability,
+                ..
+            } => {
+                if let Some(handler) = handler {
+                    roots.push(*handler);
+                }
+                if let JsValue::Object(object) = argument {
+                    roots.push(*object);
+                }
+                match capability {
+                    Some(PromiseCapability::Record { object, .. }) => roots.push(*object),
+                    Some(PromiseCapability::Functions { resolve, reject }) => {
+                        roots.push(*resolve);
+                        roots.push(*reject);
+                    }
+                    None => {}
+                }
+            }
+            Self::DialogClosed(_) => {}
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct PromiseReaction {
     pub(super) on_fulfilled: Option<ObjectId>,

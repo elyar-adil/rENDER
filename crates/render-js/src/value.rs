@@ -1485,6 +1485,12 @@ pub(crate) enum NativeFunction {
     VideoPause,
     VideoLoad,
     VideoCanPlayType,
+    /// `HTMLMediaElement`'s `EventTarget` surface. Media elements are not DOM
+    /// nodes, so their listener registrations live in a runtime map and their
+    /// events never propagate.
+    VideoAddEventListener,
+    VideoRemoveEventListener,
+    VideoDispatchEvent,
     /// A method of the canvas 2D surface (`builtins/canvas.rs`).
     Canvas(crate::runtime::builtins::canvas::CanvasMethod),
     /// The getter of a canvas accessor.
@@ -9442,6 +9448,12 @@ impl Realm {
             ("pause", NativeFunction::VideoPause),
             ("load", NativeFunction::VideoLoad),
             ("canPlayType", NativeFunction::VideoCanPlayType),
+            ("addEventListener", NativeFunction::VideoAddEventListener),
+            (
+                "removeEventListener",
+                NativeFunction::VideoRemoveEventListener,
+            ),
+            ("dispatchEvent", NativeFunction::VideoDispatchEvent),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {

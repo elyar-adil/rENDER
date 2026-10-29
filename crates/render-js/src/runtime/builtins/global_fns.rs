@@ -268,7 +268,10 @@ impl JsRuntime {
             NativeFunction::VideoPlay
             | NativeFunction::VideoPause
             | NativeFunction::VideoLoad
-            | NativeFunction::VideoCanPlayType => {
+            | NativeFunction::VideoCanPlayType
+            | NativeFunction::VideoAddEventListener
+            | NativeFunction::VideoRemoveEventListener
+            | NativeFunction::VideoDispatchEvent => {
                 self.dispatch_video_native(dom, function, receiver, arguments)
             }
             // The 2D canvas surface is dispatched in `canvas.rs`.

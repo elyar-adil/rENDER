@@ -1123,6 +1123,65 @@ fn string_replace_expands_groups_and_honors_global() {
 }
 
 #[test]
+fn a_call_on_a_nullish_base_is_a_type_error_not_an_optional_short_circuit() {
+    let value = evaluate_script(
+        "
+        var messages = [];
+        try { null.foo(); } catch (e) { messages.push(e.message); }
+        try { undefined['bar'](); } catch (e) { messages.push(e.message); }
+        var nullish = null;
+        messages.push(String(nullish?.foo()));
+        var propertyReads = 0;
+        try { null[(propertyReads += 1, 'baz')](); } catch (e) { messages.push(e.message); }
+        messages.push(propertyReads);
+        messages.join('|')
+        ",
+    );
+    assert_eq!(
+        value,
+        JsValue::String(
+            "Cannot read properties of null (reading 'foo')|Cannot read properties of undefined (reading 'bar')|undefined|Cannot read properties of null (reading 'baz')|1"
+                .into()
+        )
+    );
+}
+
+#[test]
+fn media_elements_are_event_targets() {
+    // `new Audio()` is an `HTMLMediaElement : EventTarget`. Before this, only
+    // the `on*` properties existed and JD's aria script threw on
+    // `addEventListener`.
+    let value = evaluate_script(
+        "
+        var a = new Audio('/x.mp3');
+        var log = [];
+        function first(e) { log.push('first:' + e.type + ':' + (e.target === a)); }
+        a.addEventListener('custom', first);
+        a.addEventListener('custom', function () { log.push('second'); }, { once: true });
+        a.addEventListener('custom', { handleEvent: function (e) { log.push('object:' + e.type); } });
+        var result = a.dispatchEvent(new Event('custom'));
+        a.dispatchEvent(new Event('custom'));
+        a.removeEventListener('custom', first);
+        a.dispatchEvent(new Event('custom'));
+        [
+            log.join(','),
+            result,
+            typeof a.addEventListener,
+            typeof a.removeEventListener,
+            typeof a.dispatchEvent
+        ].join('|')
+        ",
+    );
+    assert_eq!(
+        value,
+        JsValue::String(
+            "first:custom:true,second,object:custom,first:custom:true,object:custom,object:custom|true|function|function|function"
+                .into()
+        )
+    );
+}
+
+#[test]
 fn the_audio_constructor_makes_a_media_element() {
     let value = evaluate_script(
         "

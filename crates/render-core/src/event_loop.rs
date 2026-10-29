@@ -325,6 +325,13 @@ impl<T> EventLoop<T> {
         self.microtasks.len()
     }
 
+    /// The payloads waiting for the next microtask checkpoint, in FIFO order.
+    /// An embedder of a JavaScript runtime uses this to keep the tasks rooted
+    /// in the runtime's collector while they sit in this queue.
+    pub fn microtask_payloads(&self) -> impl Iterator<Item = &T> {
+        self.microtasks.iter().map(|task| &task.payload)
+    }
+
     #[must_use]
     pub fn pending_timer_count(&self) -> usize {
         self.timers.len()

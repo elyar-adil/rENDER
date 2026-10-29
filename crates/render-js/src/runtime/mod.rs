@@ -189,7 +189,22 @@ pub struct JsRuntime {
     /// the pair number a settlement function carries.
     promise_pairs_resolved: Vec<bool>,
     pending_microtasks: Vec<JsMicrotask>,
+    /// How many leading entries of `pending_microtasks` have already been
+    /// handed out by [`Self::take_next_microtask`]. The rest stay in the
+    /// runtime, where the collector marks them, until they run.
+    microtask_cursor: usize,
+    /// Objects owned by microtasks that an embedding has queued outside the
+    /// runtime's queue (the page event loop). The collector treats them as
+    /// roots; the embedding refreshes the set before each runnable.
+    external_microtask_roots: Vec<ObjectId>,
+    /// Byte offset of the statement being evaluated, for attributing a
+    /// resource-limit error (which has no natural source node) to a position.
+    last_statement_offset: usize,
     event_listeners: BTreeMap<NodeId, BTreeMap<String, Vec<types::Listener>>>,
+    /// `HTMLMediaElement` listener registrations. Media elements are
+    /// `EventTarget`s but not nodes, so they neither capture, bubble nor join
+    /// a DOM event path; their events are dispatched directly at the target.
+    media_event_listeners: BTreeMap<ObjectId, BTreeMap<String, Vec<types::Listener>>>,
     /// Per-event dispatch state, present only while the event is dispatched.
     event_flags: BTreeMap<ObjectId, types::EventFlags>,
     event_handlers: BTreeMap<NodeId, BTreeMap<String, ObjectId>>,
@@ -392,7 +407,11 @@ impl JsRuntime {
             promises: Vec::new(),
             promise_pairs_resolved: Vec::new(),
             pending_microtasks: Vec::new(),
+            microtask_cursor: 0,
+            external_microtask_roots: Vec::new(),
+            last_statement_offset: 0,
             event_listeners: BTreeMap::new(),
+            media_event_listeners: BTreeMap::new(),
             event_flags: BTreeMap::new(),
             event_handlers: BTreeMap::new(),
             reflection_base_cache: None,
@@ -632,7 +651,41 @@ impl JsRuntime {
     }
 
     pub fn take_pending_microtasks(&mut self) -> Vec<JsMicrotask> {
+        if self.microtask_cursor > 0 {
+            self.pending_microtasks.drain(..self.microtask_cursor);
+            self.microtask_cursor = 0;
+        }
         std::mem::take(&mut self.pending_microtasks)
+    }
+
+    /// Remove the next queued microtask. The remaining ones stay in the
+    /// runtime queue — and therefore stay reachable — while the returned task
+    /// runs, so a collection inside one callback cannot sweep the others.
+    pub fn take_next_microtask(&mut self) -> Option<JsMicrotask> {
+        let task = self
+            .pending_microtasks
+            .get(self.microtask_cursor)
+            .cloned()?;
+        self.microtask_cursor += 1;
+        if self.microtask_cursor >= self.pending_microtasks.len() {
+            self.pending_microtasks.clear();
+            self.microtask_cursor = 0;
+        }
+        Some(task)
+    }
+
+    /// Replace the roots for microtasks the embedding has moved out of the
+    /// runtime (the page event loop). The embedding calls this after queueing
+    /// and before each runnable, so a collection during one task cannot sweep
+    /// callbacks of the tasks queued behind it.
+    pub fn set_external_microtask_roots<'a>(
+        &mut self,
+        microtasks: impl Iterator<Item = &'a JsMicrotask>,
+    ) {
+        self.external_microtask_roots.clear();
+        for microtask in microtasks {
+            microtask.collect_object_roots(&mut self.external_microtask_roots);
+        }
     }
 
     /// Drain timer scheduling requests emitted by script since the last call.
@@ -1005,6 +1058,10 @@ impl JsRuntime {
         self.calls_active = 0;
         self.dom_nodes_created = 0;
         self.environment.clear();
+        // The task being invoked is no longer in the queue, so pin its own
+        // objects for the duration of the run.
+        let roots = self.transient_roots.len();
+        microtask.collect_object_roots(&mut self.transient_roots);
         let outcome = match microtask {
             JsMicrotask::Callback(callback) => self.call(dom, callback, &[]),
             JsMicrotask::IntersectionObserver(observer) => {
@@ -1022,6 +1079,7 @@ impl JsRuntime {
                 capability,
             } => self.run_promise_reaction(dom, handler, argument, fulfilled, capability),
         };
+        self.transient_roots.truncate(roots);
         match outcome {
             Ok(value) => Ok(value),
             Err(error) => {
@@ -1486,11 +1544,25 @@ impl JsRuntime {
         *ENABLED.get_or_init(|| std::env::var("RENDER_JS_BINDINGS").is_ok())
     }
 
+    fn step_trace_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("RENDER_JS_STEP_TRACE").is_ok())
+    }
+
     fn consume_step(&mut self) -> Result<(), JsError> {
+        if Self::step_trace_enabled() && self.steps_remaining.is_multiple_of(1_000_000) {
+            eprintln!(
+                "render-js steps={} offset={} stack={:?}",
+                self.limits.max_execution_steps - self.steps_remaining,
+                self.last_statement_offset,
+                self.debug_call_stack()
+            );
+        }
         if self.steps_remaining == 0 {
-            return Err(JsError::resource(
-                "JavaScript execution step limit exceeded",
-            ));
+            return Err(
+                JsError::resource("JavaScript execution step limit exceeded")
+                    .at_offset(self.last_statement_offset),
+            );
         }
         self.steps_remaining = self.steps_remaining.saturating_sub(1);
         Ok(())

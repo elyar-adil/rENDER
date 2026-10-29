@@ -64,7 +64,12 @@ impl Default for RuntimeLimits {
             // budget aligned with the 4 MiB source cap.
             max_tokens: 4 * 1_024 * 1_024,
             max_statements: 131_072,
-            max_execution_steps: 10_000_000,
+            // JD's obfuscated `js_security_v3` anti-bot bundle needs about
+            // 13M interpreted steps (each AST node visit is a step) and is
+            // ordinary work, not a loop: at 30M it completes in well under a
+            // second. 50M leaves headroom for similar bundles while still
+            // bounding a runaway script.
+            max_execution_steps: 50_000_000,
             // React and friends recurse through several framework layers per
             // logical render; 4096 frames keeps that well within the 512 MiB
             // dedicated script stack (~2 KiB of native stack per interpreter

@@ -38,17 +38,20 @@
 //!
 //! Audio is deliberately not implemented: this runtime has no audio device.
 //!
-//! `addEventListener` on video elements is still not wired (use the
-//! `on<event>` properties). `playbackRate` stays fixed at 1.0; the property
-//! slot exists for a later phase.
+//! Media elements are `EventTarget`s: `addEventListener` registrations are
+//! kept in a runtime map and receive the same queued events as the `on<event>`
+//! properties. `playbackRate` stays fixed at 1.0; the property slot exists for
+//! a later phase.
 
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
 use crate::runtime::builtins::dom_exception::DomExceptionName;
+use crate::runtime::convert::required_argument;
 use crate::runtime::types::FetchOutcome;
 use crate::runtime::types::JsMicrotask;
+use crate::runtime::types::Listener;
 use crate::runtime::types::PendingFetch;
 use crate::utf16::JsString;
 use crate::value::NativeFunction;
@@ -64,6 +67,7 @@ use render_dom::Namespace;
 use render_dom::NodeId;
 use render_dom::NodeKind;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::Duration;
@@ -81,6 +85,15 @@ impl JsRuntime {
             NativeFunction::VideoPause => self.video_pause(receiver),
             NativeFunction::VideoLoad => self.video_load(receiver),
             NativeFunction::VideoCanPlayType => self.video_can_play_type(receiver, arguments),
+            NativeFunction::VideoAddEventListener => {
+                self.media_add_event_listener(receiver, arguments)
+            }
+            NativeFunction::VideoRemoveEventListener => {
+                self.media_remove_event_listener(receiver, arguments)
+            }
+            NativeFunction::VideoDispatchEvent => {
+                self.media_dispatch_event(dom, receiver, arguments)
+            }
             other => self.dispatch_events_native(dom, other, receiver, arguments),
         }
     }
@@ -712,19 +725,188 @@ impl JsRuntime {
         None
     }
 
-    /// Queue the `on<type>` property callback of a video element as a
-    /// microtask with a minimal event object, mirroring XHR completion.
-    fn queue_video_event(&mut self, receiver: ObjectId, event_type: &str) {
+    /// `HTMLMediaElement.addEventListener`. Media elements are not nodes, so
+    /// the registration lives in `media_event_listeners` instead of the DOM
+    /// event table.
+    fn media_add_event_listener(
+        &mut self,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        self.require_media_target(receiver, "addEventListener")?;
+        let event_type = required_argument(arguments, 0, "addEventListener")?.to_js_string();
+        let Some(listener) = self.listener_from_arguments(arguments, "addEventListener", false)?
+        else {
+            return Ok(JsValue::Undefined);
+        };
+        Self::insert_listener(
+            self.media_event_listeners
+                .entry(receiver)
+                .or_default()
+                .entry((event_type).to_key())
+                .or_default(),
+            listener,
+        );
+        Ok(JsValue::Undefined)
+    }
+
+    /// `HTMLMediaElement.removeEventListener`.
+    fn media_remove_event_listener(
+        &mut self,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        self.require_media_target(receiver, "removeEventListener")?;
+        let event_type = required_argument(arguments, 0, "removeEventListener")?.to_js_string();
+        let Some(listener) =
+            self.listener_from_arguments(arguments, "removeEventListener", false)?
+        else {
+            return Ok(JsValue::Undefined);
+        };
+        Self::remove_media_listener(
+            &mut self.media_event_listeners,
+            receiver,
+            &(event_type).to_key(),
+            &listener,
+        );
+        Ok(JsValue::Undefined)
+    }
+
+    /// `HTMLMediaElement.dispatchEvent`: synchronous delivery at the element,
+    /// with no capture or bubble phase (a media element has no parent in the
+    /// DOM tree).
+    fn media_dispatch_event(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        self.require_media_target(receiver, "dispatchEvent")?;
+        let JsValue::Object(event) = required_argument(arguments, 0, "dispatchEvent")? else {
+            return Err(JsError::type_error(
+                "dispatchEvent argument is not an Event",
+            ));
+        };
+        let event = *event;
+        let event_type = self
+            .realm
+            .get_property(event, "type")
+            .map(|value| value.to_js_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| JsError::type_error("dispatchEvent argument is not an Event"))?;
+        let key = (event_type).to_key();
+        self.realm
+            .set_property(event, "target".to_owned(), JsValue::Object(receiver));
+        self.realm
+            .set_property(event, "currentTarget".to_owned(), JsValue::Object(receiver));
+        let listeners = self
+            .media_event_listeners
+            .get(&receiver)
+            .and_then(|listeners| listeners.get(&key))
+            .cloned()
+            .unwrap_or_default();
+        for listener in &listeners {
+            if listener.once {
+                Self::remove_media_listener(
+                    &mut self.media_event_listeners,
+                    receiver,
+                    &key,
+                    listener,
+                );
+            }
+            self.call_listener(dom, listener, event, receiver, &event_type.to_lossy())?;
+        }
+        self.invoke_media_handler(dom, receiver, &key, event)?;
+        let mut canceled = false;
+        self.with_event_flags(event, |flag, _| canceled = *flag);
+        Ok(JsValue::Boolean(!canceled))
+    }
+
+    /// Calls the `on<type>` property handler, if the script installed one.
+    /// Dispatch continues when it throws (DOM §2.10).
+    fn invoke_media_handler(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        event_type: &str,
+        event: ObjectId,
+    ) -> Result<(), JsError> {
         let Some(JsValue::Object(callback)) = self
             .realm
             .get_property(receiver, &format!("on{event_type}"))
         else {
-            return;
+            return Ok(());
         };
-        if !JsRuntime::is_callable_object(callback, &self.realm) {
+        if !Self::is_callable_object(callback, &self.realm) {
+            return Ok(());
+        }
+        match self.call_with_this(
+            dom,
+            callback,
+            &[JsValue::Object(event)],
+            JsValue::Object(receiver),
+        ) {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == crate::JsErrorKind::ResourceLimit => Err(error),
+            Err(error) => {
+                self.report_uncaught_error(dom, &error);
+                Ok(())
+            }
+        }
+    }
+
+    /// Removes one registration from a media element's listener table, matching
+    /// on callback and capture exactly like `removeEventListener`.
+    fn remove_media_listener(
+        listeners: &mut BTreeMap<ObjectId, BTreeMap<String, Vec<Listener>>>,
+        receiver: ObjectId,
+        event_type: &str,
+        listener: &Listener,
+    ) {
+        if let Some(registered) = listeners
+            .get_mut(&receiver)
+            .and_then(|by_type| by_type.get_mut(event_type))
+        {
+            registered.retain(|candidate| {
+                !(candidate.callback == listener.callback && candidate.capture == listener.capture)
+            });
+        }
+    }
+
+    fn require_media_target(&self, receiver: ObjectId, method: &str) -> Result<(), JsError> {
+        if matches!(self.realm.host(receiver), Some(ObjectHost::VideoElement(_))) {
+            return Ok(());
+        }
+        Err(JsError::type_error(format!(
+            "incompatible HTMLMediaElement method receiver ({method})"
+        )))
+    }
+
+    /// Queue the `on<type>` property callback and every `addEventListener`
+    /// registration of a media element as microtasks with a minimal event
+    /// object, mirroring XHR completion.
+    fn queue_video_event(&mut self, receiver: ObjectId, event_type: &str) {
+        let handler = match self
+            .realm
+            .get_property(receiver, &format!("on{event_type}"))
+        {
+            Some(JsValue::Object(callback))
+                if JsRuntime::is_callable_object(callback, &self.realm) =>
+            {
+                Some(callback)
+            }
+            _ => None,
+        };
+        let listeners = self
+            .media_event_listeners
+            .get(&receiver)
+            .and_then(|listeners| listeners.get(event_type))
+            .cloned()
+            .unwrap_or_default();
+        if handler.is_none() && listeners.is_empty() {
             return;
         }
-        if self.ensure_heap_capacity(2).is_err() {
+        if self.ensure_heap_capacity(2 + listeners.len()).is_err() {
             return;
         }
         let event = self.realm.create_ordinary_object();
@@ -735,12 +917,43 @@ impl JsRuntime {
         ] {
             self.realm.set_property(event, name.to_owned(), value);
         }
-        let bound = self.realm.bound_callable(
-            callback,
-            JsValue::Object(receiver),
-            vec![JsValue::Object(event)],
-        );
-        self.pending_microtasks.push(JsMicrotask::Callback(bound));
+        for listener in &listeners {
+            if listener.once {
+                Self::remove_media_listener(
+                    &mut self.media_event_listeners,
+                    receiver,
+                    event_type,
+                    listener,
+                );
+            }
+            let (callback, this) = if JsRuntime::is_callable_object(listener.callback, &self.realm)
+            {
+                (listener.callback, receiver)
+            } else {
+                match self.realm.get_property(listener.callback, "handleEvent") {
+                    Some(JsValue::Object(method))
+                        if JsRuntime::is_callable_object(method, &self.realm) =>
+                    {
+                        (method, listener.callback)
+                    }
+                    _ => continue,
+                }
+            };
+            let bound = self.realm.bound_callable(
+                callback,
+                JsValue::Object(this),
+                vec![JsValue::Object(event)],
+            );
+            self.pending_microtasks.push(JsMicrotask::Callback(bound));
+        }
+        if let Some(callback) = handler {
+            let bound = self.realm.bound_callable(
+                callback,
+                JsValue::Object(receiver),
+                vec![JsValue::Object(event)],
+            );
+            self.pending_microtasks.push(JsMicrotask::Callback(bound));
+        }
     }
 
     fn with_video_state<T>(

@@ -978,6 +978,9 @@ impl JsRuntime {
         dom: &mut Dom,
         statement: &Statement,
     ) -> Result<Completion, JsError> {
+        if let Some(offset) = statement_offset(statement) {
+            self.last_statement_offset = offset;
+        }
         self.consume_step()?;
         let result = self.evaluate_statement_dispatched(dom, statement);
         if let Err(error) = &result
@@ -3614,21 +3617,54 @@ impl JsRuntime {
                 (value, receiver)
             }
             Expr::Member {
-                object, property, ..
+                object,
+                property,
+                offset,
             } => {
                 let receiver = self.evaluate(dom, object)?;
                 if matches!(receiver, JsValue::Null | JsValue::Undefined) {
-                    return Ok(None);
+                    if optional {
+                        return Ok(None);
+                    }
+                    // ECMA-262 13.3.3: a nullish base is a TypeError, not the
+                    // optional-call short circuit.
+                    return Err(JsError::type_error(format!(
+                        "Cannot read properties of {} (reading '{}')",
+                        if matches!(receiver, JsValue::Null) {
+                            "null"
+                        } else {
+                            "undefined"
+                        },
+                        property.trim_start_matches('.')
+                    ))
+                    .at_offset(*offset));
                 }
                 let object = self.coerce_member_base(&receiver, property)?;
                 (self.get_member(dom, object, property)?, receiver)
             }
             Expr::ComputedMember {
-                object, property, ..
+                object,
+                property,
+                offset,
             } => {
                 let receiver = self.evaluate(dom, object)?;
                 if matches!(receiver, JsValue::Null | JsValue::Undefined) {
-                    return Ok(None);
+                    if optional {
+                        return Ok(None);
+                    }
+                    // The property expression is evaluated before the nullish
+                    // check (ECMA-262 13.3.3).
+                    let key_value = self.evaluate(dom, property)?;
+                    return Err(JsError::type_error(format!(
+                        "Cannot read properties of {} (reading '{}')",
+                        if matches!(receiver, JsValue::Null) {
+                            "null"
+                        } else {
+                            "undefined"
+                        },
+                        key_value.to_js_string().to_lossy()
+                    ))
+                    .at_offset(*offset));
                 }
                 let key_value = self.evaluate(dom, property)?;
                 let object =
@@ -6614,6 +6650,33 @@ impl JsRuntime {
         arguments: &[JsValue],
         receiver: JsValue,
     ) -> Result<JsValue, JsError> {
+        // Every call path (interpreter, native builtin, microtask, timer)
+        // reaches here. The callee, receiver and arguments are reachable only
+        // from this Rust frame, so pin them while user code runs and can
+        // collect: a fresh function expression or a promise handler must not
+        // be swept mid-call.
+        let roots = self.transient_roots.len();
+        self.transient_roots.push(callee);
+        for argument in arguments {
+            if let JsValue::Object(object) = argument {
+                self.transient_roots.push(*object);
+            }
+        }
+        if let JsValue::Object(object) = &receiver {
+            self.transient_roots.push(*object);
+        }
+        let result = self.call_in_current_realm_pinned(dom, callee, arguments, receiver);
+        self.transient_roots.truncate(roots);
+        result
+    }
+
+    fn call_in_current_realm_pinned(
+        &mut self,
+        dom: &mut Dom,
+        callee: ObjectId,
+        arguments: &[JsValue],
+        receiver: JsValue,
+    ) -> Result<JsValue, JsError> {
         self.consume_step()?;
         if self.calls_active >= self.limits.max_call_depth {
             return Err(self.call_depth_exceeded());
@@ -7066,10 +7129,14 @@ impl JsRuntime {
                     .own_property_names(callee)
                     .map(|names| names.join(","))
                     .unwrap_or_default();
-                let message = format!(
+                let mut message = format!(
                     "value is not callable (callee host {:?}, keys [{keys}])",
                     self.realm.host(callee)
                 );
+                if std::env::var_os("RENDER_JS_FRAME_OFFSETS").is_some() {
+                    use std::fmt::Write as _;
+                    let _ = write!(message, " stack {:?}", self.debug_call_stack());
+                }
                 Err(
                     match self.construct_standard_error(ErrorKind::TypeError, &message) {
                         Ok(value) => JsError::thrown(value),

@@ -337,7 +337,7 @@ impl JsRuntime {
 
     /// The `callback` and options of an `addEventListener` /
     /// `removeEventListener` call. `Ok(None)` means "no callback": a no-op.
-    fn listener_from_arguments(
+    pub(in crate::runtime) fn listener_from_arguments(
         &self,
         arguments: &[JsValue],
         method: &str,
@@ -382,7 +382,7 @@ impl JsRuntime {
     }
 
     /// Insert unless an identical (callback, capture) registration exists.
-    fn insert_listener(listeners: &mut Vec<Listener>, listener: Listener) {
+    pub(in crate::runtime) fn insert_listener(listeners: &mut Vec<Listener>, listener: Listener) {
         if !listeners.iter().any(|existing| {
             existing.callback == listener.callback && existing.capture == listener.capture
         }) {
@@ -724,7 +724,7 @@ impl JsRuntime {
     /// Call one listener. A listener that throws is reported and the dispatch
     /// carries on (DOM Standard §2.10 "inner invoke"); only an exhausted
     /// resource budget aborts it.
-    fn call_listener(
+    pub(in crate::runtime) fn call_listener(
         &mut self,
         dom: &mut Dom,
         listener: &Listener,

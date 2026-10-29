@@ -1282,16 +1282,11 @@ impl Page {
             self.runtime
                 .settle_fetch(self.document.dom_mut(), id, outcome);
         }
-        loop {
-            let pending = self.runtime.take_pending_microtasks();
-            if pending.is_empty() {
-                return Ok(());
-            }
-            for microtask in pending {
-                self.runtime
-                    .invoke_microtask(self.document.dom_mut(), microtask)?;
-            }
+        while let Some(microtask) = self.runtime.take_next_microtask() {
+            self.runtime
+                .invoke_microtask(self.document.dom_mut(), microtask)?;
         }
+        Ok(())
     }
 
     /// Virtual-clock instant of the earliest pending timer, if any.
@@ -1369,6 +1364,14 @@ impl Page {
 
         let Some(event_loop_outcome) =
             event_loop.run_one_turn(document.dom_mut(), |runnable, scheduler, dom| {
+                // Callbacks of microtasks queued behind this runnable live
+                // only in the event loop; register them as collector roots.
+                runtime.set_external_microtask_roots(
+                    scheduler.microtask_payloads().filter_map(|payload| match payload {
+                        PageTask::JsMicrotask(microtask) => Some(microtask),
+                        _ => None,
+                    }),
+                );
                 let (job, task, bytes) = match runnable {
                     Runnable::Task {
                         id,
@@ -1470,6 +1473,10 @@ impl Page {
             microtask_source_bytes.clear();
         }
 
+        // The checkpoint drained (or discarded) every microtask; the external
+        // root set is stale from here on.
+        self.runtime
+            .set_external_microtask_roots(std::iter::empty());
         self.sync_script_title();
         let invalidation = self.invalidation.take(self.document.dom())?;
         let canvas_changed = self.canvas.engine().borrow().has_changes();
@@ -1539,16 +1546,10 @@ impl Page {
     /// Handler failures are contained: a throwing `ontimeupdate` must not
     /// abort the pump that is advancing playback.
     fn drain_runtime_microtasks(&mut self) {
-        loop {
-            let pending = self.runtime.take_pending_microtasks();
-            if pending.is_empty() {
-                return;
-            }
-            for microtask in pending {
-                let _ = self
-                    .runtime
-                    .invoke_microtask(self.document.dom_mut(), microtask);
-            }
+        while let Some(microtask) = self.runtime.take_next_microtask() {
+            let _ = self
+                .runtime
+                .invoke_microtask(self.document.dom_mut(), microtask);
         }
     }
 
@@ -2503,6 +2504,46 @@ mod tests {
         assert!(matches!(
             page.document().dom().node(text).map(crate::dom::Node::kind),
             Some(NodeKind::Text(value)) if value == "QP"
+        ));
+    }
+
+    #[test]
+    fn a_microtask_callback_survives_collections_while_an_earlier_one_runs() {
+        // Microtasks waiting in the page event loop are reachable only from
+        // that loop. The runtime must be told about them, or a collection
+        // inside the first callback sweeps the second one's bound callable and
+        // the second task fails as "not callable".
+        let options = PageOptions {
+            runtime_limits: RuntimeLimits {
+                max_heap_objects: 4_096,
+                ..RuntimeLimits::default()
+            },
+            ..PageOptions::default()
+        };
+        let mut page = Page::with_options("<!doctype html><p id=message>before</p>", options);
+        page.queue_script(
+            "const target = document.getElementById('message');
+             queueMicrotask(function () {
+                 for (var i = 0; i < 8000; i++) { var junk = { i: i, pad: [i] }; }
+             });
+             queueMicrotask(function () { target.textContent = 'second-ran'; });",
+        )
+        .expect("script task fits");
+
+        let turn = page
+            .run_one_turn_reference()
+            .expect("invalidation succeeds")
+            .expect("script task is ready");
+        assert!(
+            turn.executions
+                .iter()
+                .all(|execution| execution.result.is_ok())
+        );
+        let message = element_with_id(page.document().dom(), "message");
+        let text = page.document().dom().children(message).unwrap()[0];
+        assert!(matches!(
+            page.document().dom().node(text).map(crate::dom::Node::kind),
+            Some(NodeKind::Text(value)) if value == "second-ran"
         ));
     }
 

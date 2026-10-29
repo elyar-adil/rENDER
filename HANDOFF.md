@@ -1,3 +1,44 @@
+# 交接文档 (2026-10-29, 续六) — 媒体 EventTarget、微任务 GC 根与 JS 预算
+
+接续同日"临时被调函数被 GC 回收"会话。这一轮把 JD 的脚本层从"勉强跑"推进到
+**除第三方 aria.js 外全部通过**,同时补上媒体元素的事件接口与微任务队列的 GC 根。
+
+## 本轮已完成
+
+| 内容 | 落点 |
+|---|---|
+| **媒体元素是 EventTarget** | `Audio`/`Video` 实例现在有 `addEventListener` / `removeEventListener` / `dispatchEvent`。注册表在运行时内(`media_event_listeners`),`queue_video_event` 同时派发 `on*` 属性与监听器,支持 `once`、`handleEvent` 对象;GC 标记监听回调并回收已死目标的条目 |
+| **空值成员调用按规范抛 TypeError** | `null.foo()` 此前走可选链的 lenient 路径,报 "value of callee is undefined or not callable";现在按 ECMA-262 13.3.3 抛 `Cannot read properties of null (reading 'foo')`,计算属性键先求值;`a?.b()` 仍正确短路 |
+| **微任务队列的 GC 根** | 页面把微任务移入事件循环后,回调只在嵌入方的容器里,收集器看不到;一个回调执行中的分配会把它后面的回调扫成空对象(表现为 `stack []` 的 "not callable")。运行时新增 `set_external_microtask_roots` / `take_next_microtask`,页面在每个 runnable 前同步根集合,`invoke_microtask` 也 pin 当前任务;直接 drain 改为逐个取出 |
+| **每次调用 pin callee/receiver/arguments** | 统一在 `call_in_current_realm` 入口 pin,覆盖解释器调用、原生内建回调、微任务、定时器等所有路径。之前只在 `Expr::Call` 的参数求值阶段 pin,原生内建持有时仍可能被回收 |
+| **JS 步数预算 10M → 50M** | `js_security_v3` 不是死循环:用 charAt/charCodeAt 计数探针确认 6.3 万次字符访问、脚本在 30M 步内正常完成;12M 不够、15M 够。默认提到 50M,并新增 `RENDER_JS_STEPS`(覆盖预算)与 `RENDER_JS_STEP_TRACE`(每百万步打印 offset + 调用栈) |
+| **诊断** | 资源上限错误带上最后一条语句的偏移;浏览器错误行打印 `at line/column`;`RENDER_JS_FRAME_OFFSETS` 下调用点消息带 `(call ke at byte N)` |
+
+## 测量(隐藏截图,12 秒)
+
+| 站点 | dom_elements | boxes | scripts_failed | scripts_threw |
+|---|---|---|---|---|
+| jd(本轮前) | 667 | 120 | 6 | 3 |
+| jd(本轮后) | **1139** | 117(截图时主区仍空) | 11(含 JSONP/传输) | **1**(仅第三方 aria.js) |
+
+JD 的安全脚本、主 bundle 均执行完成,页脚/搜索/导航真实文本已渲染;主商品区仍依赖
+`api.m.jd.com` 的 403 风控响应(与浏览器指纹/token 有关),不是脚本崩溃。截图时 boxes
+偏低是因为主区仍是空白骨架,页脚内容已从 0 变成完整链接表。
+
+## 明确未做 / 下一步
+
+- `api.m.jd.com` 的 403:请求已带 h5st / x-api-eid-token,但服务端仍拒绝;下一步对比
+  Chrome 的请求头(尤其 Cookie、Referer、`sec-ch-ua` 与 TLS 指纹),先确认是否缺少
+  风控 cookie。
+- 京东主区骨架未填充:依赖上一条;也可能是 React 渲染在等待被 403 的接口。
+- `aria.js` 的 `Cannot read properties of undefined (reading 'replace')`:第三方无障碍
+  脚本,定位到 byte 100291;需要看它读取的 UA/特性检测在哪个元素上返回 undefined。
+- 脚本栈仍只有函数名/偏移,没有跨 bundle 的 file:line;`RENDER_JS_FRAME_OFFSETS` 已经
+  能给出脚本 URL + 字节偏移,后续可接 source map。
+- 传输层:本机对 HN/GitHub 的 TCP 连接被网络层阻断(curl -4/-6 同样超时),不是预算问题。
+
+---
+
 # 交接文档 (2026-10-29, 续五) — 临时被调函数在实参求值期间被 GC 回收
 
 接续同日"core-js Map 迭代器"会话。上一轮修好 Map 之后,JD 主 bundle 只剩一个

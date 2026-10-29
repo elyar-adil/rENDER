@@ -1782,6 +1782,12 @@ impl BrowserApp {
         self.tabs.set_loading(id, true);
     }
 
+    /// The interpreter budget for this page. `RENDER_JS_STEPS` overrides the
+    /// default step limit for diagnosis of a bundle that exceeds it.
+    fn runtime_limits() -> RuntimeLimits {
+        crate::page_state::runtime_limits()
+    }
+
     pub(super) fn start_classic_scripts(&mut self, id: TabId) {
         let mut rerender = false;
         let mut loading_complete = false;
@@ -1843,7 +1849,7 @@ impl BrowserApp {
                     page.page.document(),
                     &plan,
                     Vec::new(),
-                    &RuntimeLimits::default(),
+                    &Self::runtime_limits(),
                 );
                 let module_requests =
                     PageState::module_round_requests(&mut preparation, &self.cookies);
@@ -2213,7 +2219,7 @@ impl BrowserApp {
                     eprintln!("browser cookie rejected: {}", issue.message);
                 }
             }
-            let limits = RuntimeLimits::default();
+            let limits = Self::runtime_limits();
             let mut preparation = match pending.module_phase {
                 Some(phase) => {
                     let mut preparation = phase.preparation;

@@ -502,6 +502,28 @@ impl JsRuntime {
                 *listeners,
             );
         }
+        for root in &self.external_microtask_roots {
+            mark_object(
+                self,
+                &mut marked,
+                &mut work,
+                &mut marked_environments,
+                *root,
+            );
+        }
+        for listeners in self
+            .media_event_listeners
+            .values()
+            .flat_map(listener_values)
+        {
+            mark_object(
+                self,
+                &mut marked,
+                &mut work,
+                &mut marked_environments,
+                *listeners,
+            );
+        }
         for context in self.canvas_contexts.values() {
             mark_object(
                 self,
@@ -753,6 +775,10 @@ impl JsRuntime {
             }
         }
 
+        // A media element's registrations do not keep the element itself
+        // alive: a dead target's listeners go with it.
+        self.media_event_listeners
+            .retain(|object, _| marked.get(object.0).copied().unwrap_or(false));
         let before = self.realm.object_count();
         let reclaimed = self.realm.sweep_unmarked(&marked);
         if gc_trace_enabled() {

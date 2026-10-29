@@ -33,6 +33,7 @@ use render_core::navigation::SessionHistory;
 use render_core::page::Page;
 use render_core::page::PageDomEvent;
 use render_core::page::PageJob;
+use render_core::page::PageOptions;
 use render_core::paint::Color;
 use render_core::paint::DisplayList;
 use render_core::paint::PaintScene;
@@ -225,13 +226,37 @@ impl<H> PageNavigation<H> {
 /// The number of the first document a page shows.
 const FIRST_DOCUMENT_SERIAL: u64 = 1;
 
+/// The interpreter budget for a page. `RENDER_JS_STEPS` overrides the
+/// per-script step limit, so an anti-bot bundle that legitimately needs more
+/// interpreted steps can be diagnosed without rebuilding.
+pub(super) fn runtime_limits() -> render_core::js::RuntimeLimits {
+    let mut limits = render_core::js::RuntimeLimits::default();
+    if let Ok(value) = std::env::var("RENDER_JS_STEPS")
+        && let Ok(steps) = value.parse::<usize>()
+    {
+        limits.max_execution_steps = steps;
+    }
+    limits
+}
+
+fn page_options() -> PageOptions {
+    PageOptions {
+        runtime_limits: runtime_limits(),
+        ..PageOptions::default()
+    }
+}
+
 impl PageState {
     pub(super) fn new(source: PageSource) -> Self {
         let mut first_entry = HistoryEntry::new(source.target.history_url());
         first_entry.document = Some(FIRST_DOCUMENT_SERIAL);
         let history = SessionHistory::new(first_entry, NavigationLimits::default())
             .expect("browser-created page URLs fit the session-history limits");
-        let page = Page::with_url_unrendered(&source.html, &source.target.history_url());
+        let page = Page::with_options_and_url_unrendered(
+            &source.html,
+            page_options(),
+            &source.target.history_url(),
+        );
         let interaction =
             interaction_state::initial_state(page.document().dom(), &source.target.history_url());
         Self {
@@ -314,7 +339,11 @@ impl PageState {
     pub(super) fn set_source(&mut self, source: PageSource) {
         self.cancel_style_sheets();
         self.cancel_scripts();
-        self.page = Page::with_url_unrendered(&source.html, &source.target.history_url());
+        self.page = Page::with_options_and_url_unrendered(
+            &source.html,
+            page_options(),
+            &source.target.history_url(),
+        );
         self.navigation.commit(source);
         // The new document gets a number of its own, and the entry being shown
         // now belongs to it. Entries made in the old document keep its number, so
@@ -616,6 +645,10 @@ impl PageState {
         let detail = thrown
             .and_then(|value| self.page.runtime().error_message(value))
             .unwrap_or_else(|| error.message().to_owned());
+        let position = error
+            .position()
+            .map(|(line, column)| format!(" at line {line}, column {column}"))
+            .unwrap_or_default();
         let stack = thrown
             .and_then(|value| self.page.runtime().error_stack(value))
             .map(|stack| format!("\n{stack}"))
@@ -623,10 +656,10 @@ impl PageState {
         if let Some((owner, source_order, final_url)) = origin {
             let url = final_url.as_ref().map_or("inline", Url::as_str);
             eprintln!(
-                "render-browser classic script node {owner:?} source {source_order} {url} failed: {detail}{stack}"
+                "render-browser classic script node {owner:?} source {source_order} {url} failed: {detail}{position}{stack}"
             );
         } else {
-            eprintln!("render-browser classic script failed: {detail}{stack}");
+            eprintln!("render-browser classic script failed: {detail}{position}{stack}");
         }
     }
 
