@@ -1,3 +1,75 @@
+# 交接文档 (2026-10-31, 续四十) — 节点移除 transitioncancel 与精确反向
+
+接续 WAAPI 统一时间线会话。这一轮补节点移除/文档切换的 transitioncancel、
+精确 reversing-adjusted start value,并修复无单位零长度无法插值的问题。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **node removal cancel** | `sample_transitions` 对不在本帧 computed styles 的活动节点生成 `transitioncancel`,elapsedTime 为已运行时长 |
+| **document switch cancel** | `TransitionState::cancel_all`;`PageState::set_source` 在替换旧 Page 前排队事件并运行旧 runtime |
+| **detached dispatch** | `PageDomEvent::from_transition` 统一事件构造;已测试 target 从文档移除后监听器仍收到事件 |
+| **精确 reversing-adjusted start** | `ActiveTransition.reversing_adjusted_start`;正常 transition 为 start value,反向 transition 为旧 end value;再次反向按 §3.1 识别并缩短 |
+| **transitioncancel** | 反向/中断/节点移除/文档切换均使用同一 `TransitionEventKind::Cancel` 路径 |
+| **零长度插值** | `width: 0` 等无单位零长度在长度属性中按 `0px` 归一,修复 `0 -> 100px` 无法启动 transition |
+| **测试** | 节点移除 cancel、detached 监听器、document-switch cancel_all、重复反向、unitless zero 插值 |
+
+## 证据
+
+本地页面:元素在 transition 进行到约 0.62s 时被 `remove()`:
+
+```
+transition start width 0 -> 100px
+transition state active=1 ...
+TRANSITIONCANCEL width 0.621999979019165
+标题栏: cancel:width:0.62
+health scripts_failed=0 scripts_threw=0
+```
+
+同一 session 的 `transitionend` 页面仍输出 `end:width:1`,说明移除前的事件没有误报。
+
+单元测试:
+
+```
+0px -> 100px @0.5s -> 反向 0px @0.5s -> 再次反向 100px
+最终 1.5s 到达 100px, transitionend.elapsedTime = 0.75s(按 0.75 factor)
+detached element listener: detached:width:0.25
+cancel_all: 1 Cancel event, state empty
+unitless width 0 -> 100px @0.5 = 50px
+```
+
+真实站点:
+
+```
+Bing:  ready=Complete  dom_elements=471 boxes=166
+       scripts_failed=0 scripts_threw=0 css_warnings=7 images_failed=0
+Baidu: ready=Complete  dom_elements=450 boxes=156
+       scripts_failed=0 scripts_threw=0 css_warnings=1 images_failed=0
+JD:    ready=Interactive dom_elements=1001 boxes=117
+       scripts_failed=10 scripts_threw=2 css_warnings=36 images_failed=1
+```
+
+## 验证
+
+```
+cargo test --workspace                       2813 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+## 明确未做 / 下一步
+
+- `transitionrun`/`transitionstart` 事件仍未发出;文档切换 cancel 的端到端脚本证据受
+  本机导航入口限制,当前由 cancel_all/detached dispatch 单元测试覆盖。
+- WAAPI 仍通过 inline style 写入,effect stack/group、逐关键帧 easing、完整 timing
+  模型未对齐。
+- JD 主商品区仍受 403;GitHub/HN 本机链路阻断;高级渐变、SVG filter 其余原语、
+  IndexedDB 值类型覆盖仍未完成。
+
+---
+
 # 交接文档 (2026-10-31, 续三十九) — WAAPI 速率/反向、合成与统一时间线
 
 接续 Web Animations 核心会话。这一轮补 `playbackRate`/`reverse`、add/accumulate

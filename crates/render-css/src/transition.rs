@@ -38,6 +38,10 @@ struct ActiveTransition {
     /// The reversing shortening factor. 1 for a normal transition, smaller
     /// when an interrupted transition is reversed back toward its start.
     shortening: f32,
+    /// The logical start state used to recognize a later reversal. For a
+    /// normal transition this is `from`; for a reversed transition it is the
+    /// old transition's end value (CSS Transitions 1 §3.1).
+    reversing_adjusted_start: String,
     /// Whether a property with no numeric interpolator may step discretely.
     allow_discrete: bool,
 }
@@ -74,6 +78,26 @@ impl TransitionState {
     #[must_use]
     pub fn active_count(&self) -> usize {
         self.nodes.values().map(|node| node.active.len()).sum()
+    }
+
+    /// Cancel every running transition, as a document switch requires, and
+    /// return the `transitioncancel` events for the old document's runtime.
+    #[must_use]
+    pub fn cancel_all(&mut self, time: f32) -> Vec<TransitionEvent> {
+        let mut events = Vec::new();
+        for (node, node_state) in &self.nodes {
+            for (property, active) in &node_state.active {
+                events.push(transition_event(
+                    *node,
+                    property,
+                    active,
+                    time,
+                    TransitionEventKind::Cancel,
+                ));
+            }
+        }
+        self.nodes.clear();
+        events
     }
 }
 
@@ -120,7 +144,7 @@ pub fn sample_transitions(
                     if duration > 0.0 {
                         let from = sample_active(&property, active, time)
                             .unwrap_or_else(|| active.from.clone());
-                        let reversing = target == active.from;
+                        let reversing = target == active.reversing_adjusted_start;
                         let shortening = if reversing {
                             reversing_factor(active, time)
                         } else {
@@ -129,7 +153,7 @@ pub fn sample_transitions(
                         if shortening > 0.001 {
                             let delay = plan.delay_for(&property);
                             *active = ActiveTransition {
-                                from,
+                                from: from.clone(),
                                 to: target,
                                 start: time,
                                 delay: if delay < 0.0 {
@@ -140,6 +164,11 @@ pub fn sample_transitions(
                                 duration: duration * shortening,
                                 timing: plan.timing_for(&property),
                                 shortening,
+                                reversing_adjusted_start: if reversing {
+                                    active.to.clone()
+                                } else {
+                                    from.clone()
+                                },
                                 allow_discrete: plan.allow_discrete(&property),
                             };
                             continue;
@@ -166,13 +195,14 @@ pub fn sample_transitions(
             node_state.active.insert(
                 property.clone(),
                 ActiveTransition {
-                    from: previous,
+                    from: previous.clone(),
                     to: target,
                     start: time,
                     delay: plan.delay_for(&property),
                     duration,
                     timing: plan.timing_for(&property),
                     shortening: 1.0,
+                    reversing_adjusted_start: previous.clone(),
                     allow_discrete,
                 },
             );
@@ -200,6 +230,33 @@ pub fn sample_transitions(
         for property in ended {
             node_state.active.remove(&property);
         }
+    }
+    let removed: Vec<(NodeId, Vec<(String, TransitionEvent)>)> = state
+        .nodes
+        .iter()
+        .filter(|(node, _)| !live.contains(node))
+        .map(|(node, node_state)| {
+            let cancellations = node_state
+                .active
+                .iter()
+                .map(|(property, active)| {
+                    (
+                        property.clone(),
+                        transition_event(
+                            *node,
+                            property,
+                            active,
+                            time,
+                            TransitionEventKind::Cancel,
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (*node, cancellations)
+        })
+        .collect();
+    for (_, cancellations) in removed {
+        events.extend(cancellations.into_iter().map(|(_, event)| event));
     }
     state.nodes.retain(|node, _| live.contains(node));
     events
@@ -740,5 +797,103 @@ mod tests {
             styles[&node].get("display").map(|value| value.css_text()),
             Some("none")
         );
+    }
+    #[test]
+    fn repeated_reversals_use_the_adjusted_start_value() {
+        let node = NodeId::from_u64(8);
+        let base = |width: &str| {
+            style_with(&[
+                ("width", width),
+                ("transition-property", "width"),
+                ("transition-duration", "1s"),
+                ("transition-timing-function", "linear"),
+            ])
+        };
+        let mut styles = BTreeMap::new();
+        styles.insert(node, base("0px"));
+        let mut state = TransitionState::default();
+        sample_transitions(&mut styles, &mut state, 0.0);
+        styles.insert(node, base("100px"));
+        sample_transitions(&mut styles, &mut state, 0.0);
+        styles.insert(node, base("100px"));
+        sample_transitions(&mut styles, &mut state, 0.5);
+        styles.insert(node, base("0px"));
+        let first_cancel = sample_transitions(&mut styles, &mut state, 0.5);
+        assert_eq!(first_cancel[0].kind, TransitionEventKind::Cancel);
+        styles.insert(node, base("0px"));
+        sample_transitions(&mut styles, &mut state, 0.75);
+        styles.insert(node, base("100px"));
+        let second_cancel = sample_transitions(&mut styles, &mut state, 0.75);
+        assert_eq!(second_cancel[0].kind, TransitionEventKind::Cancel);
+        styles.insert(node, base("100px"));
+        let events = sample_transitions(&mut styles, &mut state, 1.5);
+        assert_eq!(
+            styles[&node].get("width").map(|value| value.css_text()),
+            Some("100px")
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, TransitionEventKind::End);
+        assert!((events[0].elapsed_time - 0.75).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn removing_a_node_cancels_its_running_transition() {
+        let node = NodeId::from_u64(9);
+        let mut styles = BTreeMap::new();
+        styles.insert(
+            node,
+            style_with(&[
+                ("opacity", "1"),
+                ("transition-property", "opacity"),
+                ("transition-duration", "1s"),
+            ]),
+        );
+        let mut state = TransitionState::default();
+        sample_transitions(&mut styles, &mut state, 0.0);
+        styles.insert(
+            node,
+            style_with(&[
+                ("opacity", "0"),
+                ("transition-property", "opacity"),
+                ("transition-duration", "1s"),
+            ]),
+        );
+        sample_transitions(&mut styles, &mut state, 0.0);
+        styles.clear();
+        let events = sample_transitions(&mut styles, &mut state, 0.5);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, TransitionEventKind::Cancel);
+        assert_eq!(events[0].node, node);
+        assert_eq!(events[0].property, "opacity");
+        assert!(!state.has_active());
+    }
+
+    #[test]
+    fn a_document_switch_cancels_all_running_transitions() {
+        let node = NodeId::from_u64(10);
+        let mut styles = BTreeMap::new();
+        styles.insert(
+            node,
+            style_with(&[
+                ("width", "0px"),
+                ("transition-property", "width"),
+                ("transition-duration", "1s"),
+            ]),
+        );
+        let mut state = TransitionState::default();
+        sample_transitions(&mut styles, &mut state, 0.0);
+        styles.insert(
+            node,
+            style_with(&[
+                ("width", "100px"),
+                ("transition-property", "width"),
+                ("transition-duration", "1s"),
+            ]),
+        );
+        sample_transitions(&mut styles, &mut state, 0.0);
+        let events = state.cancel_all(0.25);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, TransitionEventKind::Cancel);
+        assert!(!state.has_active());
     }
 }

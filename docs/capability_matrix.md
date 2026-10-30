@@ -232,8 +232,9 @@ them would break more real pages than everything else combined:
    out or painted, so any embedded content is invisible
 2. **Animations and transitions** - `@keyframes` and CSS transitions are sampled by a
    browser-driven clock with multi-animation lists, transform:none interpolation,
-   reversing shortening, allow-discrete and transitioncancel, but there is no
-   compositor thread. A self-hosted WAAPI core shares that document clock and
+   reversing shortening, reversing-adjusted start values, allow-discrete and
+   transitioncancel on style changes/node removal/document switches, but there is
+   no compositor thread. A self-hosted WAAPI core shares that document clock and
    covers element.animate, play/pause/finish/cancel, playbackRate/reverse,
    add/accumulate composition and finish/cancel events; several easing and
    effect-composition edge cases remain incomplete

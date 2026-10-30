@@ -391,6 +391,19 @@ impl PageState {
     pub(super) fn set_source(&mut self, source: PageSource) {
         self.cancel_style_sheets();
         self.cancel_scripts();
+        // A document switch cancels every running CSS transition. Dispatch the
+        // cancellations in the old document before replacing its runtime.
+        let cancellations = self
+            .transition_state
+            .cancel_all(self.created_at.elapsed().as_secs_f32());
+        for event in &cancellations {
+            let _ = self
+                .page
+                .queue_dom_event(PageDomEvent::from_transition(event));
+        }
+        if !cancellations.is_empty() {
+            let _ = self.run_page_turns();
+        }
         self.page = Page::with_options_and_url_unrendered(
             &source.html,
             page_options(),

@@ -401,7 +401,68 @@ pub(crate) fn interpolate_property(
     {
         return Some(value);
     }
-    interpolate(from, to, progress)
+    let from = normalize_zero_length(property, from);
+    let to = normalize_zero_length(property, to);
+    interpolate(&from, &to, progress)
+}
+
+/// CSS computes a unitless zero length as `0`, while the other endpoint often
+/// carries a unit. Treat the zero as `0px` for length properties so the two
+/// endpoints share a literal skeleton.
+fn normalize_zero_length<'a>(property: &str, value: &'a str) -> std::borrow::Cow<'a, str> {
+    if value.trim() == "0" && is_length_property(property) {
+        std::borrow::Cow::Borrowed("0px")
+    } else {
+        std::borrow::Cow::Borrowed(value)
+    }
+}
+
+fn is_length_property(property: &str) -> bool {
+    matches!(
+        property,
+        "width"
+            | "height"
+            | "min-width"
+            | "min-height"
+            | "max-width"
+            | "max-height"
+            | "top"
+            | "right"
+            | "bottom"
+            | "left"
+            | "margin-top"
+            | "margin-right"
+            | "margin-bottom"
+            | "margin-left"
+            | "padding-top"
+            | "padding-right"
+            | "padding-bottom"
+            | "padding-left"
+            | "border-top-width"
+            | "border-right-width"
+            | "border-bottom-width"
+            | "border-left-width"
+            | "border-top-left-radius"
+            | "border-top-right-radius"
+            | "border-bottom-right-radius"
+            | "border-bottom-left-radius"
+            | "font-size"
+            | "line-height"
+            | "letter-spacing"
+            | "word-spacing"
+            | "text-indent"
+            | "flex-basis"
+            | "gap"
+            | "row-gap"
+            | "column-gap"
+            | "outline-offset"
+            | "background-position"
+            | "background-size"
+            | "mask-position"
+            | "mask-size"
+            | "stroke-width"
+            | "stroke-dashoffset"
+    )
 }
 
 fn interpolate_transform(from: &str, to: &str, progress: f32) -> Option<String> {
@@ -784,6 +845,17 @@ mod tests {
         assert_eq!(
             interpolate_property("transform", "rotate(90deg)", "none", 0.5),
             Some("rotate(45deg)".to_owned())
+        );
+    }
+    #[test]
+    fn unitless_zero_interpolates_to_a_length() {
+        assert_eq!(
+            interpolate_property("width", "0", "100px", 0.5),
+            Some("50px".to_owned())
+        );
+        assert_eq!(
+            interpolate_property("opacity", "0", "1", 0.5),
+            Some("0.5".to_owned())
         );
     }
 }

@@ -130,6 +130,29 @@ impl PageDomEvent {
         self.composed = composed;
         self
     }
+
+    /// A bubbling `transitionend`/`transitioncancel` for `event`.
+    #[must_use]
+    pub fn from_transition(event: &crate::css::transition::TransitionEvent) -> Self {
+        let event_type = match event.kind {
+            crate::css::transition::TransitionEventKind::End => "transitionend",
+            crate::css::transition::TransitionEventKind::Cancel => "transitioncancel",
+        };
+        let mut dom_event = Self::new(event.node, event_type).bubbles(true);
+        dom_event.properties.push((
+            "propertyName".to_owned(),
+            JsValue::String(event.property.clone().into()),
+        ));
+        dom_event.properties.push((
+            "elapsedTime".to_owned(),
+            JsValue::Number(f64::from(event.elapsed_time)),
+        ));
+        dom_event.properties.push((
+            "pseudoElement".to_owned(),
+            JsValue::String(String::new().into()),
+        ));
+        dom_event
+    }
 }
 
 impl PageTask {
@@ -2940,6 +2963,43 @@ mod tests {
         assert_eq!(
             page.document_title(),
             Some("cancel:width:0.25:true".to_owned())
+        );
+    }
+
+    #[test]
+    fn transitioncancel_reaches_a_detached_element_listener() {
+        let mut page = Page::new("<!doctype html><html><body><div id='box'></div></body></html>");
+        let target = element_with_id(page.document().dom(), "box");
+        page.queue_script(
+            "document.getElementById('box').addEventListener('transitioncancel', function (event) {
+                 document.title = 'detached:' + event.propertyName + ':' + event.elapsedTime;
+             });",
+        )
+        .expect("listener script queues");
+        page.pump_until_idle_reference(Duration::ZERO)
+            .expect("listener installs");
+        let parent = page
+            .document()
+            .dom()
+            .parent(target)
+            .expect("target has a parent");
+        page.document_mut()
+            .dom_mut()
+            .remove_child(parent, target)
+            .expect("target detaches");
+        let event = crate::css::transition::TransitionEvent {
+            kind: crate::css::transition::TransitionEventKind::Cancel,
+            node: target,
+            property: "width".to_owned(),
+            elapsed_time: 0.25,
+        };
+        page.queue_dom_event(PageDomEvent::from_transition(&event))
+            .expect("cancel queues");
+        page.pump_until_idle_reference(Duration::ZERO)
+            .expect("detached cancel dispatches");
+        assert_eq!(
+            page.document_title(),
+            Some("detached:width:0.25".to_owned())
         );
     }
 
