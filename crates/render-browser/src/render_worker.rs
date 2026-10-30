@@ -283,7 +283,7 @@ pub(super) fn process_page_render(
                         style
                             .get("height")
                             .map(render_core::css::computed::ComputedValue::css_text),
-                        style.properties().len(),
+                        style.property_count(),
                     );
                 }
                 let dom = document.dom();

@@ -120,10 +120,13 @@ struct AnimationEntry {
 }
 
 fn animation_entries(style: &ComputedStyle) -> Vec<AnimationEntry> {
-    let names = split_top_level_commas(
-        &property_text(style, "animation-name").unwrap_or_else(|| "none".to_owned()),
-    );
-    if names.is_empty() {
+    let Some(name_value) = style.get("animation-name") else {
+        return Vec::new();
+    };
+    let names = split_top_level_commas(name_value.css_text());
+    if names.is_empty()
+        || (names.len() == 1 && (names[0].is_empty() || names[0].eq_ignore_ascii_case("none")))
+    {
         return Vec::new();
     }
     let durations =

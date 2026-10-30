@@ -24,7 +24,7 @@ use render_dom::Dom;
 use render_dom::Node;
 use render_dom::NodeId;
 use render_dom::NodeKind;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 mod block;
 mod columns;
@@ -356,6 +356,9 @@ fn run_reference_layout(
         fragment_limit_reported: false,
         table_columns: BTreeMap::new(),
         collapsed_edges: BTreeMap::new(),
+        flex_intrinsic_cache: HashMap::new(),
+        flex_intrinsic_hits: 0,
+        flex_intrinsic_misses: 0,
         sticky_boxes: Vec::new(),
         clipping_boxes: Vec::new(),
     };
@@ -398,6 +401,12 @@ fn run_reference_layout(
     solver.set_children(root, children);
     let sticky = solver.sticky_constraints();
     let clips = solver.scrollport_geometries(root);
+    if std::env::var_os("RENDER_DEBUG_FLEX_CACHE").is_some() {
+        eprintln!(
+            "render-layout flex intrinsic cache hits={} misses={}",
+            solver.flex_intrinsic_hits, solver.flex_intrinsic_misses
+        );
+    }
     let fragments = FragmentTree::new(
         formatting.dom_revision,
         options.viewport,
@@ -430,6 +439,13 @@ struct Solver<'a> {
     /// The border and padding the table algorithm collapsed for a cell, keyed by
     /// the element they belong to.
     collapsed_edges: BTreeMap<NodeId, CollapsedEdges>,
+    /// Flexbox §9.9 intrinsic measurements already taken during this layout
+    /// pass. A flex container asks for its children's min/max-content sizes
+    /// several times (line breaking, flex base size, min/max clamping), and each
+    /// miss clones a `ComputedStyle` that contains every computed property.
+    flex_intrinsic_cache: HashMap<FlexIntrinsicKey, f32>,
+    flex_intrinsic_hits: u64,
+    flex_intrinsic_misses: u64,
     /// Boxes whose computed `position` is `sticky`, in allocation order. The
     /// displacement itself is not applied here (§4.1): it depends on the scroll
     /// offset, which layout never sees, so these are resolved into constraints
@@ -503,6 +519,15 @@ struct FloatArea {
 struct AutoEdge {
     value: f32,
     auto: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct FlexIntrinsicKey {
+    node: FormattingNodeId,
+    horizontal: bool,
+    basis: u32,
+    depth: usize,
+    minimum: bool,
 }
 
 #[derive(Clone, Copy)]

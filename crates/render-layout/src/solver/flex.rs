@@ -829,11 +829,36 @@ impl Solver<'_> {
     /// take, so a consumer that wants the smaller one must ask for it: §9.9.1's
     /// max-content main size is the preferred width of a flex item, while §4.5's
     /// content-based minimum size is its min-content width.
+    pub(super) fn flex_intrinsic_size(
+        &mut self,
+        node: FormattingNodeId,
+        horizontal: bool,
+        basis: f32,
+        depth: usize,
+        minimum: bool,
+    ) -> f32 {
+        let key = super::FlexIntrinsicKey {
+            node,
+            horizontal,
+            basis: basis.to_bits(),
+            depth,
+            minimum,
+        };
+        if let Some(size) = self.flex_intrinsic_cache.get(&key).copied() {
+            self.flex_intrinsic_hits += 1;
+            return size;
+        }
+        self.flex_intrinsic_misses += 1;
+        let size = self.flex_intrinsic_size_uncached(node, horizontal, basis, depth, minimum);
+        self.flex_intrinsic_cache.insert(key, size);
+        size
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "one measurement walks text, replaced elements, flex and block items"
     )]
-    pub(super) fn flex_intrinsic_size(
+    fn flex_intrinsic_size_uncached(
         &mut self,
         node: FormattingNodeId,
         horizontal: bool,

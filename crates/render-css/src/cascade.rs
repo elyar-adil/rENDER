@@ -6,14 +6,15 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use render_dom::{Dom, NodeId};
+use render_dom::{Dom, Node, NodeId, NodeKind};
 
 use super::properties::{
     expand_columns_shorthand, expand_flex_shorthand, expand_gap_shorthand,
     expand_grid_axis_shorthand, parse_typed_property,
 };
-use super::selector::{MatchContext, Specificity, matching_specificity};
+use super::selector::{MatchContext, Specificity, SubjectKey, SubjectPseudo, matching_specificity};
 use super::stylesheet::{CssWideKeyword, Declaration, LayerName, StyleSheet, css_wide_keyword};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -27,6 +28,149 @@ pub enum CascadeOrigin {
 pub struct CascadeInput<'a> {
     pub sheet: &'a StyleSheet,
     pub origin: CascadeOrigin,
+}
+
+/// Per-source buckets of rules keyed by their selector's rightmost compound.
+///
+/// Without this, every element is tested against every rule in every sheet:
+/// GitHub's 28 stylesheets put tens of thousands of rules in front of ~2,600
+/// elements, which took 42 seconds in a release build. A rule can only match
+/// when the element carries at least one id, class or type named by the
+/// selector's rightmost compound, so the buckets cut the candidate set before
+/// any combinator or `:has`/`:not` work happens.
+#[derive(Debug, Default)]
+pub(crate) struct CascadeRuleIndex {
+    sources: Vec<RuleBuckets>,
+    rules: usize,
+    keyed_entries: usize,
+    universal_entries: usize,
+    debug: bool,
+    elements: AtomicU64,
+    candidate_rules: AtomicU64,
+    selectors_tried: AtomicU64,
+    matched_rules: AtomicU64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RuleBuckets {
+    /// Keyed by the pseudo-element context (`""` for ordinary elements).
+    contexts: HashMap<String, ContextBuckets>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ContextBuckets {
+    keyed: HashMap<SubjectKey, Vec<usize>>,
+    /// Rules whose subject has no id, class, type or attribute key (`*`,
+    /// `:root`, a bare `:not(...)`).
+    universal: Vec<usize>,
+}
+
+impl CascadeRuleIndex {
+    pub(crate) fn new(sources: &[CascadeInput<'_>]) -> Self {
+        let mut indexed = Self {
+            sources: Vec::with_capacity(sources.len()),
+            debug: std::env::var_os("RENDER_DEBUG_CSS_INDEX").is_some(),
+            ..Self::default()
+        };
+        for source in sources {
+            let mut buckets = RuleBuckets::default();
+            indexed.rules += source.sheet.rules.len();
+            for (rule_index, rule) in source.sheet.rules.iter().enumerate() {
+                let mut inserts: Vec<(String, Vec<SubjectKey>)> = Vec::new();
+                for selector in rule.selectors.selectors() {
+                    let pseudo = match selector.subject_pseudo() {
+                        SubjectPseudo::Never => continue,
+                        SubjectPseudo::None => String::new(),
+                        SubjectPseudo::Named(name) => name.to_ascii_lowercase(),
+                    };
+                    let mut keys = Vec::new();
+                    selector.subject_keys(&mut keys);
+                    inserts.push((pseudo, keys));
+                }
+                for (pseudo, keys) in inserts {
+                    let context = buckets.contexts.entry(pseudo).or_default();
+                    if keys.is_empty() {
+                        if context.universal.last() != Some(&rule_index) {
+                            context.universal.push(rule_index);
+                            indexed.universal_entries += 1;
+                        }
+                        continue;
+                    }
+                    for key in keys {
+                        let list = context.keyed.entry(key).or_default();
+                        // Rules arrive in ascending order, so a duplicate from
+                        // another selector in the same rule is always the tail.
+                        if list.last() != Some(&rule_index) {
+                            list.push(rule_index);
+                            indexed.keyed_entries += 1;
+                        }
+                    }
+                }
+            }
+            indexed.sources.push(buckets);
+        }
+        indexed
+    }
+
+    pub(crate) fn stats(&self) -> (usize, usize, usize, u64, u64, u64, u64) {
+        (
+            self.rules,
+            self.keyed_entries,
+            self.universal_entries,
+            self.elements.load(Ordering::Relaxed),
+            self.candidate_rules.load(Ordering::Relaxed),
+            self.selectors_tried.load(Ordering::Relaxed),
+            self.matched_rules.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Appends every rule of `source_index` whose subject could match `keys` in
+    /// the `pseudo` context (`""` for ordinary elements).
+    fn candidates(
+        &self,
+        source_index: usize,
+        pseudo: &str,
+        keys: &[SubjectKey],
+        out: &mut Vec<usize>,
+    ) {
+        let Some(buckets) = self.sources.get(source_index) else {
+            return;
+        };
+        let Some(context) = buckets.contexts.get(pseudo) else {
+            return;
+        };
+        out.extend_from_slice(&context.universal);
+        for key in keys {
+            if let Some(list) = context.keyed.get(key) {
+                out.extend_from_slice(list);
+            }
+        }
+    }
+}
+
+/// The id, class and type keys carried by one element.
+fn element_subject_keys(dom: &Dom, element: NodeId) -> Vec<SubjectKey> {
+    let mut keys = Vec::new();
+    let Some(NodeKind::Element(data)) = dom.node(element).map(Node::kind) else {
+        return keys;
+    };
+    keys.push(SubjectKey::Type(data.local_name.to_ascii_lowercase()));
+    if let Ok(Some(id)) = dom.attribute(element, "id")
+        && !id.is_empty()
+    {
+        keys.push(SubjectKey::Id(id.to_ascii_lowercase()));
+    }
+    if let Ok(Some(class)) = dom.attribute(element, "class") {
+        for name in class.split_ascii_whitespace() {
+            keys.push(SubjectKey::Class(name.to_ascii_lowercase()));
+        }
+    }
+    for attribute in &data.attributes {
+        keys.push(SubjectKey::Attribute(
+            attribute.local_name.to_ascii_lowercase(),
+        ));
+    }
+    keys
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +281,52 @@ pub fn cascade_element_with_origins(
     ua_declarations: &[Declaration],
     inline_declarations: &[Declaration],
 ) -> CascadedStyle {
+    cascade_element_with_origins_impl(
+        dom,
+        element,
+        sources,
+        context,
+        ua_declarations,
+        inline_declarations,
+        None,
+    )
+}
+
+/// [`cascade_element_with_origins`] with a prebuilt rule index.
+///
+/// [`compute_document_styles_with_hints`](super::computed::compute_document_styles_with_hints)
+/// builds the index once per document; building it inside this function would
+/// repeat that work for every element, and skipping it entirely would restore
+/// the quadratic scan this index exists to avoid.
+pub(crate) fn cascade_element_with_origins_indexed(
+    dom: &Dom,
+    element: NodeId,
+    sources: &[CascadeInput<'_>],
+    context: &MatchContext,
+    ua_declarations: &[Declaration],
+    inline_declarations: &[Declaration],
+    index: &CascadeRuleIndex,
+) -> CascadedStyle {
+    cascade_element_with_origins_impl(
+        dom,
+        element,
+        sources,
+        context,
+        ua_declarations,
+        inline_declarations,
+        Some(index),
+    )
+}
+
+fn cascade_element_with_origins_impl(
+    dom: &Dom,
+    element: NodeId,
+    sources: &[CascadeInput<'_>],
+    context: &MatchContext,
+    ua_declarations: &[Declaration],
+    inline_declarations: &[Declaration],
+    rule_index: Option<&CascadeRuleIndex>,
+) -> CascadedStyle {
     let layer_orders = collect_layer_orders(sources);
     let mut candidates: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
     let mut source_order = 0_u64;
@@ -146,11 +336,39 @@ pub fn cascade_element_with_origins(
     // user-agent and user origins still apply there. Shadow-tree sheets are not
     // collected yet, so no author rule applies inside a shadow tree.
     let in_shadow_tree = dom.shadow_host(dom.root_node(element, false)).is_some();
+    let subject_keys = rule_index.map(|_| element_subject_keys(dom, element));
+    if let Some(index) = rule_index
+        && index.debug
+    {
+        index.elements.fetch_add(1, Ordering::Relaxed);
+    }
     for (source_index, source) in sources.iter().enumerate() {
         if in_shadow_tree && source.origin == CascadeOrigin::Author {
             continue;
         }
-        for rule in &source.sheet.rules {
+        let mut candidate_rules = Vec::new();
+        if let (Some(index), Some(keys)) = (rule_index, subject_keys.as_ref()) {
+            index.candidates(
+                source_index,
+                context.pseudo_element.as_deref().unwrap_or(""),
+                keys,
+                &mut candidate_rules,
+            );
+            candidate_rules.sort_unstable();
+            candidate_rules.dedup();
+            if let Some(index) = rule_index
+                && index.debug
+            {
+                index.candidate_rules.fetch_add(
+                    u64::try_from(candidate_rules.len()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
+        } else {
+            candidate_rules.extend(0..source.sheet.rules.len());
+        }
+        for candidate_rule in candidate_rules {
+            let rule = &source.sheet.rules[candidate_rule];
             if !rule
                 .media
                 .iter()
@@ -158,12 +376,25 @@ pub fn cascade_element_with_origins(
             {
                 continue;
             }
-            let specificity = matching_specificity(dom, element, &rule.selectors, context);
+            if let Some(index) = rule_index
+                && index.debug
+            {
+                index.selectors_tried.fetch_add(
+                    u64::try_from(rule.selectors.selectors().len()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
+            let Some(specificity) = matching_specificity(dom, element, &rule.selectors, context)
+            else {
+                continue;
+            };
+            if let Some(index) = rule_index
+                && index.debug
+            {
+                index.matched_rules.fetch_add(1, Ordering::Relaxed);
+            }
             for declaration in &rule.declarations {
                 source_order = source_order.saturating_add(1);
-                let Some(specificity) = specificity else {
-                    continue;
-                };
                 let priority = Priority {
                     important: declaration.important,
                     origin: origin_rank(source.origin, declaration.important),

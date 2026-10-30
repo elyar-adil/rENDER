@@ -1423,6 +1423,7 @@ fn render_dom(
         origin: CascadeOrigin::Author,
     }));
 
+    let cascade_match_started = std::time::Instant::now();
     let mut styles = compute_document_styles_with_hints(
         dom,
         &cascade_inputs,
@@ -1431,13 +1432,24 @@ fn render_dom(
         &match_context,
         &|node| presentational_hint_declarations(dom, node, quirks_mode),
     );
+    if stage_timing {
+        eprintln!("stage cascade-match: {:?}", cascade_match_started.elapsed());
+    }
+    let transitions_started = std::time::Instant::now();
     let transition_events = sample_transitions(&mut styles, transitions, options.animation_time);
+    if stage_timing {
+        eprintln!("stage transitions: {:?}", transitions_started.elapsed());
+    }
+    let animations_started = std::time::Instant::now();
     apply_animations(
         &mut styles,
         &cascade_inputs,
         &match_context,
         options.animation_time,
     );
+    if stage_timing {
+        eprintln!("stage animations: {:?}", animations_started.elapsed());
+    }
     stage_elapsed("cascade", &mut stage_mark);
     // An inline `svg` is rasterised from its own markup, so it needs no fetch
     // and is discovered here, after the cascade has given every `svg` element

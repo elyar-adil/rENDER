@@ -7,12 +7,15 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::sync::Arc;
 
 use cssparser::{ParseError, Parser, ParserInput, Token};
 
 use render_dom::{Dom, Node, NodeId, NodeKind};
 
-use super::cascade::{CascadeInput, CascadedStyle, cascade_element_with_origins};
+use super::cascade::{
+    CascadeInput, CascadeRuleIndex, CascadedStyle, cascade_element_with_origins_indexed,
+};
 use super::properties::{TypedPropertyValue, parse_typed_property};
 use super::pseudo::{self, PseudoElement};
 use super::selector::MatchContext;
@@ -318,15 +321,26 @@ impl ComputedValue {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ComputedStyle {
-    properties: BTreeMap<String, ComputedValue>,
-    typed_properties: BTreeMap<String, TypedPropertyValue>,
-    custom_properties: BTreeMap<String, ComputedValue>,
-    invalid_custom_properties: BTreeSet<String>,
+    // These maps are shared behind `Arc` because layout copies a style when it
+    // needs one alive across a recursive `&mut self` call. Cloning every
+    // computed property (hundreds of entries per element) made GitHub's flex
+    // intrinsic sizing spend seconds in `BTreeMap::clone`; an `Arc` bump keeps
+    // those copies cheap. Mutation goes through `Arc::make_mut`, so a style
+    // that is not shared is still updated in place.
+    properties: Arc<BTreeMap<String, ComputedValue>>,
+    typed_properties: Arc<BTreeMap<String, TypedPropertyValue>>,
+    custom_properties: Arc<BTreeMap<String, ComputedValue>>,
+    invalid_custom_properties: Arc<BTreeSet<String>>,
     /// Properties whose value came from a declaration in the document itself,
     /// as opposed to the initial value, an inherited value, or the user-agent
     /// stylesheet. See [`ComputedStyle::specified`].
-    specified: BTreeSet<String>,
-    diagnostics: Vec<ComputationDiagnostic>,
+    specified: Arc<BTreeSet<String>>,
+    /// Initial values shared by every style built from one registry. An
+    /// unspecified non-inherited property is not copied into `properties`; the
+    /// accessors fall back to this table. That avoids hundreds of `BTreeMap`
+    /// inserts and value clones per element on large pages.
+    initial: Option<Arc<InitialValues>>,
+    diagnostics: Arc<Vec<ComputationDiagnostic>>,
 }
 
 impl ComputedStyle {
@@ -364,13 +378,42 @@ impl ComputedStyle {
         if property.starts_with("--") {
             self.custom_properties.get(property)
         } else {
-            self.properties.get(property)
+            self.properties.get(property).or_else(|| {
+                self.initial
+                    .as_ref()
+                    .and_then(|initial| initial.values.get(property))
+                    .filter(|value| !value.rejected)
+                    .and_then(|value| value.value.as_ref())
+            })
         }
     }
 
+    /// Every property name this style can answer, including the shared
+    /// initial values it does not store per element.
+    pub fn property_names(&self) -> impl Iterator<Item = &str> {
+        self.properties
+            .keys()
+            .map(String::as_str)
+            .chain(self.initial.iter().flat_map(|initial| {
+                initial
+                    .values
+                    .iter()
+                    .filter(|(name, value)| !value.rejected && !self.properties.contains_key(*name))
+                    .map(|(name, _)| name.as_str())
+            }))
+    }
+
+    /// The number of distinct properties [`Self::property_names`] yields.
     #[must_use]
-    pub const fn properties(&self) -> &BTreeMap<String, ComputedValue> {
-        &self.properties
+    pub fn property_count(&self) -> usize {
+        self.properties.len()
+            + self.initial.as_ref().map_or(0, |initial| {
+                initial
+                    .values
+                    .iter()
+                    .filter(|(name, value)| !value.rejected && !self.properties.contains_key(*name))
+                    .count()
+            })
     }
 
     /// Layout-facing values whose property grammars are implemented by this
@@ -387,35 +430,39 @@ impl ComputedStyle {
         let Ok(tokens) = tokenize(css, &ComputationLimits::default()) else {
             return;
         };
-        self.properties
-            .insert(property.to_owned(), ComputedValue::new(tokens));
+        Arc::make_mut(&mut self.properties).insert(property.to_owned(), ComputedValue::new(tokens));
         match parse_typed_property(property, css) {
             Some(Ok(value)) => {
-                self.typed_properties.insert(property.to_owned(), value);
+                Arc::make_mut(&mut self.typed_properties).insert(property.to_owned(), value);
             }
             _ => {
-                self.typed_properties.remove(property);
+                Arc::make_mut(&mut self.typed_properties).remove(property);
             }
         }
     }
 
     #[must_use]
-    pub const fn typed_properties(&self) -> &BTreeMap<String, TypedPropertyValue> {
+    pub fn typed_properties(&self) -> &BTreeMap<String, TypedPropertyValue> {
         &self.typed_properties
     }
 
     #[must_use]
     pub fn typed(&self, property: &str) -> Option<&TypedPropertyValue> {
-        self.typed_properties.get(property)
+        self.typed_properties.get(property).or_else(|| {
+            self.initial
+                .as_ref()
+                .and_then(|initial| initial.values.get(property))
+                .and_then(|value| value.typed.as_ref())
+        })
     }
 
     #[must_use]
-    pub const fn custom_properties(&self) -> &BTreeMap<String, ComputedValue> {
+    pub fn custom_properties(&self) -> &BTreeMap<String, ComputedValue> {
         &self.custom_properties
     }
 
     #[must_use]
-    pub const fn invalid_custom_properties(&self) -> &BTreeSet<String> {
+    pub fn invalid_custom_properties(&self) -> &BTreeSet<String> {
         &self.invalid_custom_properties
     }
 
@@ -472,7 +519,7 @@ impl ComputedStyle {
 
     /// Every property the document set on this element, in name order.
     #[must_use]
-    pub const fn specified_properties(&self) -> &BTreeSet<String> {
+    pub fn specified_properties(&self) -> &BTreeSet<String> {
         &self.specified
     }
 }
@@ -885,6 +932,11 @@ fn find_cycles(
 struct CustomResolver<'a> {
     sources: &'a BTreeMap<String, CustomSource>,
     invalid: &'a BTreeSet<String>,
+    /// Resolved custom properties inherited from the parent. When the element
+    /// declares no custom properties of its own, these are consulted directly
+    /// instead of cloning the whole inherited map into `sources`.
+    inherited: Option<&'a BTreeMap<String, ComputedValue>>,
+    inherited_invalid: Option<&'a BTreeSet<String>>,
     memo: BTreeMap<String, Option<TokenStream>>,
     limits: &'a ComputationLimits,
     diagnostics: &'a mut Vec<ComputationDiagnostic>,
@@ -905,6 +957,20 @@ impl CustomResolver<'_> {
             }
             self.memo.insert(name.to_owned(), None);
             return None;
+        }
+        if !self.sources.contains_key(name) {
+            let resolved = if self
+                .inherited_invalid
+                .is_some_and(|invalid| invalid.contains(name))
+            {
+                None
+            } else {
+                self.inherited
+                    .and_then(|values| values.get(name))
+                    .map(|value| value.tokens.clone())
+            };
+            self.memo.insert(name.to_owned(), resolved.clone());
+            return resolved;
         }
         let source = self.sources.get(name)?.clone();
         let resolved = match source {
@@ -1020,10 +1086,12 @@ const DEFAULT_ROOT_FONT_SIZE: f32 = 16.0;
 /// value, whatever its parent or ancestors are, so the work of producing it
 /// (tokenising the initial text and parsing its grammar) is done once per
 /// document rather than once per element.
+#[derive(Debug, PartialEq)]
 struct InitialValues {
     values: BTreeMap<String, InitialValue>,
 }
 
+#[derive(Debug, PartialEq)]
 struct InitialValue {
     value: Option<ComputedValue>,
     typed: Option<TypedPropertyValue>,
@@ -1076,7 +1144,7 @@ pub fn compute_style(
         parent,
         registry,
         limits,
-        &InitialValues::new(registry, limits),
+        &Arc::new(InitialValues::new(registry, limits)),
     )
 }
 
@@ -1086,27 +1154,41 @@ fn compute_style_with_initials(
     parent: Option<&ComputedStyle>,
     registry: &PropertyRegistry,
     limits: &ComputationLimits,
-    initials: &InitialValues,
+    initials: &Arc<InitialValues>,
 ) -> ComputedStyle {
     let mut diagnostics = Vec::new();
-    let mut invalid = parent
-        .map(|style| style.invalid_custom_properties.clone())
-        .unwrap_or_default();
-    let mut sources: BTreeMap<String, CustomSource> = parent
-        .map(|style| {
-            style
-                .custom_properties
-                .iter()
-                .map(|(name, value)| (name.clone(), CustomSource::Resolved(value.tokens.clone())))
-                .collect()
-        })
-        .unwrap_or_default();
-
     let cascaded_custom = cascaded
         .properties()
         .iter()
         .filter(|(name, _)| name.starts_with("--"))
         .collect::<Vec<_>>();
+    // An element that declares no custom properties inherits the parent's
+    // resolved map unchanged. Sharing it avoids copying and re-resolving every
+    // inherited variable for every element; the resolver falls back to the
+    // parent map for `var()` references in this element's declarations.
+    let inherits_custom = cascaded_custom.is_empty() && parent.is_some();
+    let mut invalid = if inherits_custom {
+        BTreeSet::new()
+    } else {
+        parent
+            .map(|style| (*style.invalid_custom_properties).clone())
+            .unwrap_or_default()
+    };
+    let mut sources: BTreeMap<String, CustomSource> = if inherits_custom {
+        BTreeMap::new()
+    } else {
+        parent
+            .map(|style| {
+                style
+                    .custom_properties
+                    .iter()
+                    .map(|(name, value)| {
+                        (name.clone(), CustomSource::Resolved(value.tokens.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     if cascaded_custom.len() > limits.max_custom_properties {
         diagnostics.push(ComputationDiagnostic {
             property: None,
@@ -1162,64 +1244,74 @@ fn compute_style_with_initials(
         }
     }
 
-    let mut graph = BTreeMap::new();
-    for (name, source) in &sources {
-        if let CustomSource::Specified(tokens) = source {
-            let mut dependencies = BTreeSet::new();
-            if collect_dependencies(tokens, &mut dependencies) {
-                graph.insert(
-                    name.clone(),
-                    dependencies
-                        .into_iter()
-                        .filter(|dependency| {
-                            matches!(sources.get(dependency), Some(CustomSource::Specified(_)))
-                        })
-                        .collect(),
-                );
-            } else {
-                invalid.insert(name.clone());
-                diagnostics.push(ComputationDiagnostic {
-                    property: Some(name.clone()),
-                    message: "invalid var() syntax".to_owned(),
-                });
+    let mut custom_properties = BTreeMap::new();
+    let mut resolution_invalid = BTreeSet::new();
+    if !inherits_custom {
+        let mut graph = BTreeMap::new();
+        for (name, source) in &sources {
+            if let CustomSource::Specified(tokens) = source {
+                let mut dependencies = BTreeSet::new();
+                if collect_dependencies(tokens, &mut dependencies) {
+                    graph.insert(
+                        name.clone(),
+                        dependencies
+                            .into_iter()
+                            .filter(|dependency| {
+                                matches!(sources.get(dependency), Some(CustomSource::Specified(_)))
+                            })
+                            .collect(),
+                    );
+                } else {
+                    invalid.insert(name.clone());
+                    diagnostics.push(ComputationDiagnostic {
+                        property: Some(name.clone()),
+                        message: "invalid var() syntax".to_owned(),
+                    });
+                }
             }
         }
+        let (cycles, depth_limited) = find_cycles(&graph, limits.max_dependency_depth);
+        for name in &cycles {
+            diagnostics.push(ComputationDiagnostic {
+                property: Some(name.clone()),
+                message: "custom-property dependency cycle".to_owned(),
+            });
+        }
+        for name in &depth_limited {
+            diagnostics.push(ComputationDiagnostic {
+                property: Some(name.clone()),
+                message: "custom-property dependency depth exceeded".to_owned(),
+            });
+        }
+        invalid.extend(cycles);
+        invalid.extend(depth_limited);
     }
-    let (cycles, depth_limited) = find_cycles(&graph, limits.max_dependency_depth);
-    for name in &cycles {
-        diagnostics.push(ComputationDiagnostic {
-            property: Some(name.clone()),
-            message: "custom-property dependency cycle".to_owned(),
-        });
-    }
-    for name in &depth_limited {
-        diagnostics.push(ComputationDiagnostic {
-            property: Some(name.clone()),
-            message: "custom-property dependency depth exceeded".to_owned(),
-        });
-    }
-    invalid.extend(cycles);
-    invalid.extend(depth_limited);
 
-    let source_names = sources.keys().cloned().collect::<Vec<_>>();
     let mut resolver = CustomResolver {
         sources: &sources,
         invalid: &invalid,
+        inherited: inherits_custom.then(|| {
+            parent
+                .map(|style| &*style.custom_properties)
+                .expect("inherits_custom implies a parent")
+        }),
+        inherited_invalid: parent.map(|style| &*style.invalid_custom_properties),
         memo: BTreeMap::new(),
         limits,
         diagnostics: &mut diagnostics,
         diagnosed: BTreeSet::new(),
     };
-    let mut custom_properties = BTreeMap::new();
-    let mut resolution_invalid = BTreeSet::new();
-    for name in source_names {
-        if let Some(value) = resolver
-            .resolve(&name, 0)
-            .and_then(|tokens| ComputedValue::within_limits(tokens, limits))
-        {
-            custom_properties.insert(name, value);
-        } else {
-            resolution_invalid.insert(name);
+    if !inherits_custom {
+        let source_names = sources.keys().cloned().collect::<Vec<_>>();
+        for name in source_names {
+            if let Some(value) = resolver
+                .resolve(&name, 0)
+                .and_then(|tokens| ComputedValue::within_limits(tokens, limits))
+            {
+                custom_properties.insert(name, value);
+            } else {
+                resolution_invalid.insert(name);
+            }
         }
     }
 
@@ -1230,18 +1322,28 @@ fn compute_style_with_initials(
         // An unspecified, non-inherited property is its initial value, and the
         // table already holds that value and its typed parse. The inherited and
         // specified cases need the element's own parent or declarations.
-        if cascaded.get(name).is_none()
-            && !definition.inherited
-            && let Some(initial) = initials.values.get(name)
-            && !initial.rejected
-        {
-            if let Some(value) = &initial.value {
+        if cascaded.get(name).is_none() {
+            if !definition.inherited {
+                if let Some(initial) = initials.values.get(name)
+                    && !initial.rejected
+                {
+                    // Initial values are shared through `ComputedStyle::initial`,
+                    // so they are not copied into every element's property maps.
+                    continue;
+                }
+            } else if let Some(parent) = parent
+                && let Some(value) = parent.get(name)
+            {
+                // No declaration on this element: the inherited computed value
+                // is exactly the parent's. Copy it together with its already
+                // parsed typed value instead of re-tokenizing and re-parsing
+                // the CSS text for every descendant.
                 properties.insert(name.clone(), value.clone());
+                if let Some(typed) = parent.typed(name) {
+                    typed_properties.insert(name.clone(), typed.clone());
+                }
+                continue;
             }
-            if let Some(typed) = &initial.typed {
-                typed_properties.insert(name.clone(), typed.clone());
-            }
-            continue;
         }
         let mut computed =
             compute_registered_property(name, definition, cascaded, parent, &mut resolver, limits);
@@ -1346,12 +1448,27 @@ fn compute_style_with_initials(
     invalid.extend(resolution_invalid);
 
     ComputedStyle {
-        properties,
-        typed_properties,
-        custom_properties,
-        invalid_custom_properties: invalid,
-        specified,
-        diagnostics,
+        properties: Arc::new(properties),
+        typed_properties: Arc::new(typed_properties),
+        custom_properties: if inherits_custom {
+            parent.map_or_else(
+                || Arc::new(BTreeMap::new()),
+                |style| Arc::clone(&style.custom_properties),
+            )
+        } else {
+            Arc::new(custom_properties)
+        },
+        invalid_custom_properties: if inherits_custom {
+            parent.map_or_else(
+                || Arc::new(BTreeSet::new()),
+                |style| Arc::clone(&style.invalid_custom_properties),
+            )
+        } else {
+            Arc::new(invalid)
+        },
+        specified: Arc::new(specified),
+        initial: Some(Arc::clone(initials)),
+        diagnostics: Arc::new(diagnostics),
     }
 }
 
@@ -1362,7 +1479,7 @@ fn registered_unset_value(
     limits: &ComputationLimits,
 ) -> Option<ComputedValue> {
     if definition.inherited
-        && let Some(value) = parent.and_then(|style| style.properties.get(name))
+        && let Some(value) = parent.and_then(|style| style.get(name))
     {
         return Some(value.clone());
     }
@@ -1439,7 +1556,14 @@ pub fn compute_document_styles_with_hints(
     hints: &dyn Fn(NodeId) -> Vec<Declaration>,
 ) -> BTreeMap<NodeId, ComputedStyle> {
     let mut styles = BTreeMap::new();
-    let initials = InitialValues::new(registry, limits);
+    let initials = Arc::new(InitialValues::new(registry, limits));
+    let registry_size = registry.iter().count();
+    let initial_count = initials.values.len();
+    let debug_index = std::env::var_os("RENDER_DEBUG_CSS_INDEX").is_some();
+    let index_started = debug_index.then(std::time::Instant::now);
+    let rule_index = CascadeRuleIndex::new(sources);
+    let index_build = index_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
+    let loop_started = debug_index.then(std::time::Instant::now);
     // Pseudo-element cascade is opt-in per document: most stylesheets never
     // mention `::before`/`::after`, and walking every element twice more would
     // be a visible cost on large pages.
@@ -1460,6 +1584,10 @@ pub fn compute_document_styles_with_hints(
         })
     });
     let mut stack = vec![(dom.document(), None)];
+    let mut cascade_time = std::time::Duration::ZERO;
+    let mut compute_time = std::time::Duration::ZERO;
+    let mut pseudo_cascade_time = std::time::Duration::ZERO;
+    let mut pseudo_compute_time = std::time::Duration::ZERO;
     while let Some((node, parent_element)) = stack.pop() {
         let current_parent = if matches!(dom.node(node).map(Node::kind), Some(NodeKind::Element(_)))
         {
@@ -1469,8 +1597,20 @@ pub fn compute_document_styles_with_hints(
                 .flatten()
                 .map_or_else(Vec::new, |source| parse_declaration_list(source).0);
             let ua_hints = hints(node);
-            let cascaded =
-                cascade_element_with_origins(dom, node, sources, context, &ua_hints, &inline);
+            let cascade_started = debug_index.then(std::time::Instant::now);
+            let cascaded = cascade_element_with_origins_indexed(
+                dom,
+                node,
+                sources,
+                context,
+                &ua_hints,
+                &inline,
+                &rule_index,
+            );
+            if let Some(started) = cascade_started {
+                cascade_time += started.elapsed();
+            }
+            let compute_started = debug_index.then(std::time::Instant::now);
             let style = compute_style_with_initials(
                 &cascaded,
                 parent_element.and_then(|parent| styles.get(&parent)),
@@ -1478,6 +1618,9 @@ pub fn compute_document_styles_with_hints(
                 limits,
                 &initials,
             );
+            if let Some(started) = compute_started {
+                compute_time += started.elapsed();
+            }
             for (pseudo_element, enabled) in [
                 (PseudoElement::Before, generate_before),
                 (PseudoElement::After, generate_after),
@@ -1487,8 +1630,27 @@ pub fn compute_document_styles_with_hints(
                 }
                 let mut pseudo_context = context.clone();
                 pseudo_context.pseudo_element = Some(pseudo_element.name().to_owned());
-                let pseudo_cascaded =
-                    cascade_element_with_origins(dom, node, sources, &pseudo_context, &[], &[]);
+                let pseudo_started = debug_index.then(std::time::Instant::now);
+                let pseudo_cascaded = cascade_element_with_origins_indexed(
+                    dom,
+                    node,
+                    sources,
+                    &pseudo_context,
+                    &[],
+                    &[],
+                    &rule_index,
+                );
+                if let Some(started) = pseudo_started {
+                    pseudo_cascade_time += started.elapsed();
+                }
+                // No matched pseudo rule means no `content`, so there is
+                // nothing to generate. Computing an initial style for every
+                // element's ::before and ::after was the largest remaining
+                // cost on GitHub's 2,600-element page.
+                if pseudo_cascaded.properties().is_empty() {
+                    continue;
+                }
+                let pseudo_compute_started = debug_index.then(std::time::Instant::now);
                 let pseudo_style = compute_style_with_initials(
                     &pseudo_cascaded,
                     Some(&style),
@@ -1496,6 +1658,9 @@ pub fn compute_document_styles_with_hints(
                     limits,
                     &initials,
                 );
+                if let Some(started) = pseudo_compute_started {
+                    pseudo_compute_time += started.elapsed();
+                }
                 if pseudo::generated_content(&pseudo_style).is_some() {
                     styles.insert(pseudo::style_source(node, pseudo_element), pseudo_style);
                 }
@@ -1510,6 +1675,14 @@ pub fn compute_document_styles_with_hints(
         for child in dom.flat_children(node).into_iter().rev() {
             stack.push((child, current_parent));
         }
+    }
+    if debug_index {
+        let (rules, keyed, universal, elements, candidates, selectors, matched) =
+            rule_index.stats();
+        eprintln!(
+            "render-css rule index rules={rules} keyed={keyed} universal={universal} build={index_build:?} loop={:?} elements={elements} candidates={candidates} selectors={selectors} matched={matched} cascade={cascade_time:?} pseudo_cascade={pseudo_cascade_time:?} compute={compute_time:?} pseudo_compute={pseudo_compute_time:?} registry={registry_size} initials={initial_count}",
+            loop_started.map_or(std::time::Duration::ZERO, |started| started.elapsed())
+        );
     }
     styles
 }
@@ -1531,6 +1704,74 @@ mod tests {
     fn target_id(dom: &render_dom::Dom, selector: &str) -> render_dom::NodeId {
         let selector = parse_selector_list(selector).expect("valid test selector");
         select_all(dom, dom.document(), &selector, &MatchContext::default())[0]
+    }
+
+    #[test]
+    fn the_rule_index_preserves_selector_list_universal_and_type_matches() {
+        let output = parse_document(
+            "<!doctype html><div id='root'>\
+             <span class='foo' data-x='1'></span>\
+             <span class='bar'></span>\
+             <p></p>\
+             </div>",
+        );
+        let sheet = parse_stylesheet(
+            "span.foo, span.bar { color: red }\
+             [data-x] { background-color: blue }\
+             :is(.foo, p) { font-weight: 700 }\
+             p { color: green }\
+             * { border-top-width: 3px }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+
+        let foo = &styles[&target_id(&output.dom, "span.foo")];
+        let bar = &styles[&target_id(&output.dom, "span.bar")];
+        let paragraph = &styles[&target_id(&output.dom, "p")];
+        assert_eq!(
+            foo.get("color").map(super::ComputedValue::css_text),
+            Some("red"),
+            "the second selector in the list still matches"
+        );
+        assert_eq!(
+            bar.get("color").map(super::ComputedValue::css_text),
+            Some("red")
+        );
+        assert_eq!(
+            foo.get("background-color")
+                .map(super::ComputedValue::css_text),
+            Some("blue"),
+            "attribute-only subjects stay in the universal bucket"
+        );
+        assert_eq!(
+            paragraph.get("color").map(super::ComputedValue::css_text),
+            Some("green")
+        );
+        assert_eq!(
+            foo.get("font-weight").map(super::ComputedValue::css_text),
+            Some("700"),
+            "a key inside :is() narrows the rule without losing the match"
+        );
+        assert_eq!(
+            paragraph
+                .get("font-weight")
+                .map(super::ComputedValue::css_text),
+            Some("700")
+        );
+        assert_eq!(
+            foo.get("border-top-width")
+                .map(super::ComputedValue::css_text),
+            Some("3px"),
+            "a universal selector is not lost by the index"
+        );
     }
 
     /// `ComputedStyle::get` cannot answer the support question, and this is the

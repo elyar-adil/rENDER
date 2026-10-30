@@ -121,6 +121,66 @@ impl ComplexSelector {
                 total.add(compound.specificity())
             })
     }
+
+    /// Appends the rightmost compound's id, class and type keys.
+    ///
+    /// An empty result means the selector has no subject key (a universal,
+    /// attribute-only or pseudo-only subject) and must always be tried.
+    pub(crate) fn subject_keys(&self, keys: &mut Vec<SubjectKey>) {
+        let Some(compound) = self.compounds.last() else {
+            return;
+        };
+        if let Some(name) = compound
+            .type_selector
+            .as_ref()
+            .and_then(|selector| selector.name.as_ref())
+        {
+            keys.push(SubjectKey::Type(name.to_ascii_lowercase()));
+        }
+        for simple in &compound.simple {
+            match simple {
+                SimpleSelector::Id(id) => keys.push(SubjectKey::Id(id.to_ascii_lowercase())),
+                SimpleSelector::Class(class) => {
+                    keys.push(SubjectKey::Class(class.to_ascii_lowercase()));
+                }
+                SimpleSelector::Attribute(attribute) => {
+                    keys.push(SubjectKey::Attribute(attribute.name.to_ascii_lowercase()));
+                }
+                SimpleSelector::Pseudo(
+                    PseudoClass::Is(selectors) | PseudoClass::Where(selectors),
+                ) => {
+                    for selector in selectors.selectors() {
+                        selector.subject_keys(keys);
+                    }
+                }
+                SimpleSelector::Pseudo(
+                    PseudoClass::NthChild(expression) | PseudoClass::NthLastChild(expression),
+                ) => {
+                    if let Some(selectors) = expression.of.as_ref() {
+                        for selector in selectors.selectors() {
+                            selector.subject_keys(keys);
+                        }
+                    }
+                }
+                SimpleSelector::Pseudo(_) => {}
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+    }
+
+    /// The pseudo-element the rightmost compound selects, if any.
+    pub(crate) fn subject_pseudo(&self) -> SubjectPseudo<'_> {
+        match self
+            .compounds
+            .last()
+            .and_then(|compound| compound.pseudo_element.as_ref())
+        {
+            None => SubjectPseudo::None,
+            Some(element) if element.argument.is_some() => SubjectPseudo::Never,
+            Some(element) => SubjectPseudo::Named(&element.name),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +189,33 @@ pub enum Combinator {
     Child,
     NextSibling,
     SubsequentSibling,
+}
+
+/// A key on the rightmost compound of a selector.
+///
+/// The subject of a selector is its rightmost compound, so an element that
+/// lacks every id, class and type mentioned there cannot match. The cascade
+/// uses these keys to visit only rules that could possibly apply instead of
+/// every rule in every stylesheet. Keys are lowercased: a collision only adds a
+/// candidate that the real match then rejects, never removes one.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum SubjectKey {
+    Id(String),
+    Class(String),
+    Type(String),
+    Attribute(String),
+}
+
+/// The rightmost compound's pseudo-element, if any.
+///
+/// `None` and `Named` select differently; `Never` marks a functional
+/// pseudo-element (`::view-transition-new(root)`), which this renderer never
+/// generates and which therefore cannot match in any context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SubjectPseudo<'a> {
+    None,
+    Named(&'a str),
+    Never,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1271,6 +1358,9 @@ fn matches_complex(
     selector: &ComplexSelector,
     context: &MatchContext,
 ) -> bool {
+    if !subject_may_match(dom, element, selector, context) {
+        return false;
+    }
     matches_complex_at(
         dom,
         element,
@@ -1278,6 +1368,70 @@ fn matches_complex(
         selector.compounds.len() - 1,
         context,
     )
+}
+
+/// Cheap rejection before walking a selector's combinators.
+///
+/// The rightmost compound names the subject, so a mismatching type, id or
+/// class cannot match regardless of the ancestors. This avoids the expensive
+/// `:has`/`:not`/descendant walk for the overwhelming majority of rules on a
+/// large page; every rejection here is exact (no speculative exclusions).
+fn subject_may_match(
+    dom: &Dom,
+    element: NodeId,
+    selector: &ComplexSelector,
+    context: &MatchContext,
+) -> bool {
+    let Some(compound) = selector.compounds.last() else {
+        return false;
+    };
+    let Some(data) = element_data(dom, element) else {
+        return false;
+    };
+    if let Some(type_selector) = &compound.type_selector
+        && let Some(expected) = &type_selector.name
+    {
+        let matches = if data.namespace == Namespace::Html {
+            data.local_name.eq_ignore_ascii_case(expected)
+        } else {
+            data.local_name == *expected
+        };
+        if !matches {
+            return false;
+        }
+    }
+    for simple in &compound.simple {
+        match simple {
+            SimpleSelector::Id(expected) => {
+                let matches = attribute_value(data, "id").is_some_and(|actual| {
+                    if context.quirks_mode {
+                        actual.eq_ignore_ascii_case(expected)
+                    } else {
+                        actual == expected
+                    }
+                });
+                if !matches {
+                    return false;
+                }
+            }
+            SimpleSelector::Class(expected) => {
+                let matches = attribute_value(data, "class").is_some_and(|classes| {
+                    classes.split_ascii_whitespace().any(|actual| {
+                        if context.quirks_mode {
+                            actual.eq_ignore_ascii_case(expected)
+                        } else {
+                            actual == expected
+                        }
+                    })
+                });
+                if !matches {
+                    return false;
+                }
+            }
+            SimpleSelector::Attribute(_) | SimpleSelector::Pseudo(_) => {}
+        }
+    }
+    true
 }
 
 fn matches_complex_at(

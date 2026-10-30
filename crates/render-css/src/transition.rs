@@ -461,9 +461,9 @@ impl TransitionPlan {
         let mut candidates = BTreeSet::new();
         match &self.properties {
             PropertyList::All => {
-                for name in style.properties().keys() {
+                for name in style.property_names() {
                     if is_common_transition_property(name) {
-                        candidates.insert(name.clone());
+                        candidates.insert(name.to_owned());
                     }
                 }
             }
