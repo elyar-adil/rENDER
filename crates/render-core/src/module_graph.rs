@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use url::Url;
 
+use crate::import_map::{ImportMap, ImportMapMiss};
 use crate::js::{CompiledScript, RuntimeLimits};
 
 /// Upper bound on distinct modules one graph will accept.
@@ -46,6 +47,7 @@ pub struct ModuleEntry {
 pub struct ModuleGraph {
     modules: BTreeMap<String, GraphModule>,
     requested: BTreeSet<String>,
+    import_map: ImportMap,
     diagnostics: Vec<String>,
 }
 
@@ -61,6 +63,17 @@ impl ModuleGraph {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Install the document's import map before any dependency is resolved.
+    pub fn set_import_map(&mut self, import_map: ImportMap) {
+        self.import_map = import_map;
+    }
+
+    /// The map currently used for bare specifiers.
+    #[must_use]
+    pub const fn import_map(&self) -> &ImportMap {
+        &self.import_map
     }
 
     /// Register an already-compiled module. `base` is what its specifiers
@@ -91,11 +104,20 @@ impl ModuleGraph {
                 if self.modules[&key].resolutions.contains_key(&request) {
                     continue;
                 }
-                let Some(target) = resolve_specifier(&base, &request) else {
-                    self.diagnostics.push(format!(
-                        "module specifier {request:?} in {key} is not a URL; import maps are not implemented"
-                    ));
-                    continue;
+                let target = match self.import_map.resolve(&base, &request) {
+                    Ok(target) => target,
+                    Err(ImportMapMiss::Blocked) => {
+                        self.diagnostics.push(format!(
+                            "module specifier {request:?} in {key} is blocked by the import map"
+                        ));
+                        continue;
+                    }
+                    Err(ImportMapMiss::Unmapped) => {
+                        self.diagnostics.push(format!(
+                            "module specifier {request:?} in {key} is not a URL and has no import-map entry"
+                        ));
+                        continue;
+                    }
                 };
                 let target_key = module_key(&target);
                 if let Some(module) = self.modules.get_mut(&key) {
@@ -180,16 +202,6 @@ impl ModuleGraph {
             units,
         })
     }
-}
-
-fn resolve_specifier(base: &Url, specifier: &str) -> Option<Url> {
-    if let Ok(absolute) = Url::parse(specifier) {
-        return Some(absolute);
-    }
-    if specifier.starts_with('/') || specifier.starts_with("./") || specifier.starts_with("../") {
-        return base.join(specifier).ok();
-    }
-    None
 }
 
 #[cfg(test)]
@@ -309,5 +321,34 @@ mod tests {
         let mut keys: Vec<_> = entry.units.iter().map(|unit| unit.key.as_str()).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["https://a.test/x.js", "main"]);
+    }
+    #[test]
+    fn import_map_maps_exact_and_prefix_specifiers_to_fetch_urls() {
+        use crate::import_map::ImportMap;
+
+        let map = ImportMap::parse(
+            r#"{"imports":{"widgets":"./bundles/widget.js","pkg/":"./vendor/pkg/"}}"#,
+            &url("https://a.test/app/"),
+        )
+        .expect("import map parses");
+        let mut graph = ModuleGraph::new();
+        graph.set_import_map(map);
+        graph.add(
+            "https://a.test/app/main.js",
+            url("https://a.test/app/main.js"),
+            compile("import 'widgets'; import 'pkg/deep/x.js';"),
+        );
+        assert_eq!(
+            graph
+                .take_pending()
+                .iter()
+                .map(Url::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "https://a.test/app/bundles/widget.js",
+                "https://a.test/app/vendor/pkg/deep/x.js"
+            ]
+        );
+        assert!(graph.take_diagnostics().is_empty());
     }
 }

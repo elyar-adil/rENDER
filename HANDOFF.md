@@ -1,3 +1,81 @@
+# 交接文档 (2026-10-31, 续三十) — Import maps 与模块说明符解析
+
+接续 `@keyframes` 会话。这一轮实现 `<script type="importmap">` 的解析与静态
+模块图的 bare specifier 解析。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **ImportMap** | 新 `render-core/src/import_map.rs`;`serde_json` 解析,失败整张表作废 |
+| **imports** | 精确匹配优先,其次最长 `/` 前缀;`null` 表示显式阻止 |
+| **scopes** | 按 referrer URL 选择最长匹配 scope;scope 优先于顶层 imports |
+| **URL 规范化** | URL-like key 相对文档 base 归一化并去 fragment;bare key 保持原样 |
+| **回退** | 无映射时仍按 URL-like 规则相对模块 URL 解析 |
+| **脚本发现** | `type=importmap` 不再报 Unsupported,而是解析为 `ScriptDiscovery.import_map`;非法 JSON 报 `InvalidImportMap` |
+| **模块图** | `ModuleGraph::set_import_map`;`take_pending` 用 map 解析每个 specifier |
+| **浏览器管线** | `ScriptFetchPlan` 携带 map,`prepare_script_batch` 在建模前安装 |
+| **测试** | import map 解析/前缀/作用域/null/非法 JSON、脚本发现、模块图、浏览器端到端模块执行 |
+
+## 证据
+
+本地 import-map 页面:
+
+```html
+<script type="importmap">{"imports":{"lib":"./lib.js"}}</script>
+<script type="module">
+  import { value, color } from 'lib';
+  document.body.textContent = value;
+  document.body.style.background = color;
+</script>
+```
+
+隐藏截图 + `RENDER_DEBUG_EVAL`:
+
+```
+[console.log] IMPORTMAP bodyText="mapped-ok" bg=rgb(0,128,0) attr=background: rgb(0,128,0);
+health ready=Complete dom_elements=7 boxes=2 scripts_failed=0 scripts_threw=0
+背景像素 (5,195) = (0,128,0)
+```
+
+即 bare specifier `lib` 经 import map 解析为 `./lib.js`,模块成功 fetch、链接、
+执行,并改变了 DOM 与绘制。
+
+Bing 不再出现 `import maps are not implemented`;健康线:
+
+```
+Bing:  ready=Complete  dom_elements=472 boxes=167
+       scripts_failed=0 scripts_threw=0 css_warnings=9 images_failed=0
+Baidu: ready=Complete  dom_elements=450 boxes=156
+       scripts_failed=0 scripts_threw=0 css_warnings=5 images_failed=0
+JD:    ready=Loading   dom_elements=1157 boxes=117
+       scripts_failed=8 scripts_threw=2 css_warnings=36 images_failed=1
+```
+
+Bing 仍加载 es-module-shims,其 `importShim` 走动态加载路径;静态模块图与
+import map 已通,但浏览器侧动态 `import()` loader 仍是下一步。
+
+## 验证
+
+```
+cargo test --workspace                       2778 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+## 明确未做 / 下一步
+
+- 只应用第一张 import map;标准的多张 map 合并与"map 必须在模块之前"的时序
+  仍按文档顺序宽松处理。
+- `integrity` 元数据忽略;`src` 形式的 import map 非法,当前按空内容处理并报错。
+- 动态 `import()` 仍缺浏览器侧异步 loader;Bing 的 `importShim` 因此还不能加载
+  其 bundle。`text/rms`、import maps 后的模块脚本类型仍待补。
+- JD 主商品区仍受 403 风控;GitHub/HN 本机链路阻断;高级渐变、SVG filter
+  其余原语、IndexedDB 值类型覆盖仍未完成。
+
+---
+
 # 交接文档 (2026-10-31, 续二十九) — CSS @keyframes 动画采样
 
 接续 Bing/Baidu 脚本与 mask 几何会话。这一轮把 `@keyframes` 从“解析后丢弃”
@@ -125,8 +203,8 @@ real_site_tasks                              66 passed, 0 failed
 ## 明确未做 / 下一步
 
 - JD 主商品区仍受 403 风控;GitHub/HN 本机链路阻断。
-- Bing 仍有 import maps、`text/rms` 脚本类型等能力缺口;`@keyframes` 已在
-  续二十九由时间参数化样式采样执行,但没有持续运行的合成器时钟。
+- Bing 的 import map 已在续三十接入静态模块图;`text/rms` 脚本类型仍未支持。
+  `@keyframes` 已在续二十九由时间参数化样式采样执行,但没有持续运行的合成器时钟。
 - CSS `mask-mode`、多层 mask、`mask-composite`、`space`/`round` 精确平铺未做;
   filter 仍缺 `contrast`/`hue-rotate`/`invert`/`sepia`/`url(#filter)`。
 - 高级渐变、SVG filter 其余原语、IndexedDB 值类型覆盖仍未完成。

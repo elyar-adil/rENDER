@@ -9,6 +9,7 @@ use url::Url;
 
 use crate::document::Document;
 use crate::dom::{Dom, DomRevision, ElementData, NodeId, NodeKind};
+use crate::import_map::ImportMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScriptDiscoveryLimits {
@@ -60,7 +61,7 @@ pub enum ScriptDiagnosticCode {
     ExternalUrlBytesLimit,
     EmptyExternalSource,
     UnresolvedExternalSource,
-    ImportMapUnsupported,
+    InvalidImportMap,
     UnsupportedType,
 }
 
@@ -76,6 +77,8 @@ pub struct ScriptDiagnostic {
 pub struct ScriptDiscovery {
     pub revision: DomRevision,
     pub scripts: Vec<ClassicScript>,
+    /// The first valid `<script type="importmap">` in document order.
+    pub import_map: ImportMap,
     pub diagnostics: Vec<ScriptDiagnostic>,
 }
 
@@ -134,6 +137,8 @@ fn discover_dom_scripts(
 struct DiscoveryState {
     revision: DomRevision,
     scripts: Vec<ClassicScript>,
+    import_map: ImportMap,
+    saw_import_map: bool,
     diagnostics: Vec<ScriptDiagnostic>,
     source_order: usize,
     inline_bytes: usize,
@@ -142,10 +147,12 @@ struct DiscoveryState {
 }
 
 impl DiscoveryState {
-    const fn new(revision: DomRevision) -> Self {
+    fn new(revision: DomRevision) -> Self {
         Self {
             revision,
             scripts: Vec::new(),
+            import_map: ImportMap::default(),
+            saw_import_map: false,
             diagnostics: Vec::new(),
             source_order: 0,
             inline_bytes: 0,
@@ -165,6 +172,25 @@ impl DiscoveryState {
         let source_order = self.source_order;
         self.source_order = self.source_order.saturating_add(1);
         if !self.accept_element(owner, source_order, limits.max_script_elements) {
+            return;
+        }
+        if attribute(element, "type")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("importmap"))
+        {
+            if self.saw_import_map {
+                return;
+            }
+            self.saw_import_map = true;
+            let source = descendant_text(dom, owner);
+            match ImportMap::parse(&source, base_url) {
+                Ok(import_map) => self.import_map = import_map,
+                Err(message) => self.diagnose(
+                    owner,
+                    source_order,
+                    ScriptDiagnosticCode::InvalidImportMap,
+                    message,
+                ),
+            }
             return;
         }
         let Some(scheduling) = self.classify_script(owner, source_order, element) else {
@@ -208,12 +234,7 @@ impl DiscoveryState {
         element: &ElementData,
     ) -> Option<ScriptScheduling> {
         let script_type = attribute(element, "type").map_or("", str::trim);
-        let unsupported = if script_type.eq_ignore_ascii_case("importmap") {
-            Some((
-                ScriptDiagnosticCode::ImportMapUnsupported,
-                "import maps are not implemented".to_owned(),
-            ))
-        } else if !script_type.eq_ignore_ascii_case("module")
+        let unsupported = if !script_type.eq_ignore_ascii_case("module")
             && !is_classic_javascript_type(script_type)
         {
             Some((
@@ -362,6 +383,7 @@ impl DiscoveryState {
         ScriptDiscovery {
             revision: self.revision,
             scripts: self.scripts,
+            import_map: self.import_map,
             diagnostics: self.diagnostics,
         }
     }
@@ -500,6 +522,50 @@ mod tests {
             ]
         );
         assert_eq!(codes, [ScriptDiagnosticCode::UnsupportedType,]);
+    }
+
+    #[test]
+    fn an_import_map_is_parsed_and_not_executed_as_a_script() {
+        let document = Document::parse(
+            r#"<script type="importmap">
+                 {"imports": {"widgets": "/bundles/widget.js"}}
+               </script>
+               <script type="module">import "widgets";</script>"#,
+        );
+        let discovery = discover_scripts(&document, &base_url(), ScriptDiscoveryLimits::default());
+        assert!(
+            discovery.diagnostics.is_empty(),
+            "{:?}",
+            discovery.diagnostics
+        );
+        assert_eq!(discovery.scripts.len(), 1);
+        assert!(discovery.scripts[0].module);
+        assert_eq!(
+            discovery
+                .import_map
+                .resolve(&base_url(), "widgets")
+                .expect("mapped")
+                .as_str(),
+            "https://example.test/bundles/widget.js"
+        );
+    }
+
+    #[test]
+    fn an_invalid_import_map_is_reported_without_hiding_module_scripts() {
+        let document = Document::parse(
+            r#"<script type="importmap">{ not json }</script>
+               <script type="module">export const ok = 1;</script>"#,
+        );
+        let discovery = discover_scripts(&document, &base_url(), ScriptDiscoveryLimits::default());
+        assert_eq!(discovery.scripts.len(), 1);
+        assert_eq!(
+            discovery
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [ScriptDiagnosticCode::InvalidImportMap]
+        );
     }
 
     #[test]

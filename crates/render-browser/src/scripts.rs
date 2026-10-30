@@ -11,6 +11,7 @@ use std::hash::BuildHasher;
 
 use render_core::document::Document;
 use render_core::dom::{DomRevision, NodeId};
+use render_core::import_map::ImportMap;
 use render_core::js::{CompiledScript, JsError, RuntimeLimits};
 use render_core::module_graph::{ModuleEntry, ModuleGraph, module_key};
 use render_core::page::PreparedPageScript;
@@ -50,6 +51,7 @@ pub struct ScriptFetchPlan {
     base_url: Url,
     pub resources: Vec<ScriptFetch>,
     pub discovery_diagnostics: Vec<ScriptDiagnostic>,
+    import_map: ImportMap,
     scripts: Vec<PlannedScript>,
 }
 
@@ -251,6 +253,7 @@ pub fn plan_unstarted_classic_scripts<S: BuildHasher>(
         base_url: base_url.clone(),
         resources,
         discovery_diagnostics: discovery.diagnostics,
+        import_map: discovery.import_map,
         scripts,
     }
 }
@@ -312,12 +315,14 @@ pub fn prepare_script_batch(
     results: Vec<FetchResult>,
     limits: &RuntimeLimits,
 ) -> ScriptBatchPreparation {
+    let mut graph = ModuleGraph::new();
+    graph.set_import_map(plan.import_map.clone());
     let mut preparation = ScriptBatchPreparation {
         revision: plan.revision,
         scripts: Vec::new(),
         discovery_diagnostics: plan.discovery_diagnostics.clone(),
         diagnostics: Vec::new(),
-        graph: ModuleGraph::new(),
+        graph,
     };
     let current_revision = document.dom().revision();
     if current_revision != plan.revision {
@@ -836,6 +841,77 @@ mod tests {
             .value
             .to_js_string();
         assert!(out.to_lossy().starts_with("ab"), "{out}");
+    }
+
+    #[test]
+    fn import_map_resolves_bare_module_specifiers_in_the_browser_pipeline() {
+        let (base, server) = serve(1, |path| match path {
+            "/lib/a.js" => response(
+                "200 OK",
+                Some("text/javascript"),
+                b"export const a = 'mapped';",
+            ),
+            _ => response("404 Not Found", Some("text/javascript"), b""),
+        });
+        let mut document = Document::parse(
+            r#"<script type="importmap">
+                 {"imports": {"lib": "./lib/a.js"}}
+               </script>
+               <script type="module">
+                 import { a } from 'lib';
+                 globalThis.out = a;
+               </script>"#,
+        );
+        let plan = plan_classic_scripts(&document, &base, ScriptDiscoveryLimits::default());
+        assert!(
+            plan.resources.is_empty(),
+            "an inline module needs no first-round fetch"
+        );
+        let transport = HttpTransport::new(FetchConfig {
+            timeout: Duration::from_secs(2),
+            ..FetchConfig::default()
+        });
+        let limits = RuntimeLimits::default();
+        let mut preparation = prepare_script_batch(&document, &plan, Vec::new(), &limits);
+        let requests = preparation.pending_module_requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the bare specifier resolves to one module"
+        );
+        assert_eq!(
+            requests[0].url.as_str(),
+            base.join("/lib/a.js").expect("resolved").as_str()
+        );
+        let results = transport.fetch_batch(
+            requests.clone(),
+            &BatchOptions::default(),
+            &CancelToken::default(),
+        );
+        preparation.absorb_module_results(&requests, results, &limits);
+        preparation.finish_modules();
+        server.join().expect("server thread");
+        assert!(
+            preparation.diagnostics.is_empty(),
+            "{:?}",
+            preparation.diagnostics
+        );
+        let entry = preparation.scripts[0].module.clone().expect("linked entry");
+        let mut runtime = JsRuntime::new(document.dom());
+        for unit in &entry.units {
+            runtime
+                .declare_module(&unit.key, &unit.compiled, unit.resolutions.clone())
+                .expect("declares");
+        }
+        runtime
+            .evaluate_module(document.dom_mut(), &entry.key)
+            .expect("module graph runs");
+        let out = runtime
+            .execute(document.dom_mut(), "out;")
+            .expect("reads result")
+            .value
+            .to_js_string();
+        assert_eq!(out.to_lossy(), "mapped");
     }
 
     #[test]

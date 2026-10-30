@@ -19,6 +19,7 @@ pub mod html {
     pub use render_html::*;
 }
 pub mod image;
+pub mod import_map;
 pub mod interaction;
 pub mod invalidation;
 pub mod js {
