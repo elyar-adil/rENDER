@@ -1,3 +1,76 @@
+# 交接文档 (2026-10-31, 续十七) — SVG `<use>` / `<symbol>`
+
+接续 `clipPath` 会话。这一轮补上 SVG 图标系统最常用的间接引用:
+`<use href="#id">` 与 `<symbol>`。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **收集引用目标** | 按 `id` 索引整棵 XML 树,供 `use` 查找 |
+| **`href` / `xlink:href`** | 支持 `#id` 与 `url(#id)` 两种写法 |
+| **阴影树** | 克隆目标子树后用 `walk` 绘制;目标自身的 `fill`/`stroke`/`transform`/`clip-path` 照常生效 |
+| **继承与定位** | `use` 的 paint 传给目标;`x`/`y` 作为平移;`use` 的 transform 先于平移 |
+| **`<symbol>` / `<svg>`** | 目标有 `viewBox` 且 `use`/目标给出 `width`/`height` 时,按 viewBox 缩放 |
+| **递归保护** | `Raster.use_depth` 限制 16 层,自引用不会无限递归 |
+| **测试** | 基本引用、`xlink:href`、paint 继承、symbol viewBox 缩放、自引用终止,共 5 个 |
+
+## 证据
+
+端到端 `<use>` 页面(`useprobe.html`,64×64 视口):
+
+```
+health ready=Complete dom_elements=9 boxes=3 scripts_failed=0
+lime pixels = 4096, bounds = (0,192)..(63,255)
+```
+
+即 `<symbol viewBox="0 0 10 10">` 被 `<use width=20 height=20>` 放大到
+64×64 的 SVG 视口内,像素完整覆盖。
+
+Bing(隐藏截图,15 秒):
+
+```
+health page=https://cn.bing.com/ ready=Complete dom_elements=468 boxes=167
+       scripts_failed=0 scripts_threw=0 css_errors=0 css_warnings=25 images_failed=3
+layout <div> id=rh_rwm 105.5×42
+layout <svg> class=medal-newlevel-circled 32×32
+paint #266 source=.medal-newlevel-circled … image
+```
+
+勋章区域 418 个近白像素,`bing147-rewards.png` 中 T5 勋章、汉堡菜单、九宫格
+均正常。
+
+Baidu / JD 冒烟:
+
+```
+Baidu: ready=Complete dom_elements=453 boxes=156 scripts_failed=0
+JD:    ready=Loading   dom_elements=1158 boxes=117 scripts_failed=8
+```
+
+JD 主商品区仍为空(风控 403,同机 Edge 也 403)。
+
+## 验证
+
+```
+cargo test --workspace                       2724 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+image::svg                                   28 passed
+```
+
+## 明确未做 / 下一步
+
+- `<use>` 仅支持同文档引用;外部文档 URL、CSS `width`/`height`(需要计算样式)
+  和 `use` 上的 `clip-path` 复杂坐标仍未完全覆盖。
+- `mask`/`filter`、`<text>`、CSS `clip-path`/`clip-rule`、组级 `opacity` 离屏
+  合成仍未实现。
+- 渐变高级特性(`xlink:href` 继承、`spreadMethod`、径向焦点)仍未做。
+- `content` 仍只支持字符串;IndexedDB 仍是内存子集;JD 主商品区仍受风控 403;
+  GitHub/HN 本机链路阻断;AVIF 未实现。
+
+---
+
 # 交接文档 (2026-10-31, 续十六) — SVG `clipPath`
 
 接续 SVG 渐变会话。T5 勋章的整棵图形位于
@@ -56,7 +129,7 @@ Baidu smoke: dom_elements=455  boxes=156
 
 - `clip-path` 仅支持 **属性**,不支持 CSS `style="clip-path:..."`;`clip-rule`
   固定 even-odd,未区分 nonzero。
-- `clipPath` 内容的 `text`/`use` 不参与裁剪;`mask`/`filter`/`<use>` 仍未实现。
+- `clipPath` 内容的 `text` 不参与裁剪;`mask`/`filter` 仍未实现;`<use>` 已在续十七实现。
 - 渐变高级特性(`xlink:href` 继承、`spreadMethod`、径向焦点)与组级 `opacity`
   离屏合成仍未做。
 - `content` 仍只支持字符串;IndexedDB 仍是内存子集;JD 主商品区仍受风控 403;
@@ -128,7 +201,7 @@ Baidu smoke: dom_elements=453  boxes=156
   `fx`/`fy` 焦点、`userSpaceOnUse` 下的百分比坐标。
 - `<g opacity>` 仍按每个子形状独立绘制,未做组级离屏合成;T2 的 0.7 透明度
   叠加会比 Edge 略强。
-- `mask`/`filter`/`<use>` 仍未实现;`clipPath` 已在续十六实现。
+- `mask`/`filter` 仍未实现;`clipPath` 已在续十六、`<use>` 已在续十七实现。
 - `content` 仍只支持字符串;IndexedDB 仍是内存子集;JD 主商品区仍受风控 403;
   GitHub/HN 本机链路阻断;AVIF 未实现。
 
@@ -193,8 +266,8 @@ real_site_tasks                              66 passed, 0 failed
 
 - **Rewards 模板差异**:Bing 对 Edge 与本机 rENDER 返回不同勋章模板(T2 vs T5),
   这是页面实验/状态差异;本轮保证两种模板都能被光栅化。
-- **SVG 特性子集**:`mask`、`filter` 和 `<use>` 仍未实现;渐变已在续十五、
-  `clipPath` 已在续十六实现。
+- **SVG 特性子集**:`mask`、`filter` 仍未实现;渐变已在续十五、`clipPath`
+  已在续十六、`<use>` 已在续十七实现。
 - `content` 仍只支持字符串;`attr()`/`counter()` 未实现。
 - JD 主商品区仍受风控 403(同机 Edge 也 403);IndexedDB 仍是内存子集;GitHub/HN
   的本机 TCP 链路仍被阻断;AVIF 解码未实现(images_failed=3 是能力探测)。

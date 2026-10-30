@@ -33,11 +33,6 @@
 //!
 //! # What is deliberately not done
 //!
-//! * `use` / `symbol` / `defs` indirection. SVG 2 §3.2.4 renders a `use` as a
-//!   shadow tree cloned from its target, which needs the clone to resolve its
-//!   own styles and its own geometry. This rasteriser has no shadow tree, so
-//!   a `<use>` contributes nothing. An honest absence is better than a global
-//!   that silently returns an empty image.
 //! * `text`, `mask`, `filter` and `<image>`: outside the rasteriser's
 //!   documented subset, so they contribute nothing there either. Gradients and
 //!   attribute `clip-path` references are supported, but `xlink:href`

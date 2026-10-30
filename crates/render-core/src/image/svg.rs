@@ -15,17 +15,16 @@
 //!   strokes;
 //! - `clipPath` references on shapes and groups, with `clipPathUnits` and
 //!   transforms;
+//! - same-document `<use>` references through `href`/`xlink:href`, including
+//!   `x`/`y`, inherited paint, and `<symbol>` viewBox scaling by the use
+//!   element's `width`/`height`;
 //! - root sizing by `width`/`height` (percentages resolve against the
 //!   `viewBox`), falling back to `viewBox`, then the spec default 300×150.
 //!
 //! Everything outside the subset (text, masks, filters, embedded images,
-//! scripting, gradient `xlink:href` inheritance and spread modes other than
-//! `pad`) contributes nothing, matching how an `<img>`-loaded SVG must
-//! render: static and script-free.
-//!
-//! `use` and `symbol` indirection is outside the subset too, so a `<use>`
-//! contributes nothing: SVG 2 §3.2.4 renders it as a shadow tree cloned from
-//! its target, which needs the clone to resolve its own styles and geometry.
+//! scripting, external-document `<use>` references, gradient `xlink:href`
+//! inheritance and spread modes other than `pad`) contributes nothing,
+//! matching how an `<img>`-loaded SVG must render: static and script-free.
 //!
 //! Two things about the document are easy to get wrong and are pinned by
 //! tests: it is XML, so an attribute name is case-sensitive and `viewBox` is
@@ -391,6 +390,7 @@ fn decode_viewport(
         height,
         pixels: vec![Color::rgba(0, 0, 0, 0); width as usize * height as usize],
         clip: ClipStack::default(),
+        use_depth: 0,
     };
 
     // Root viewBox-to-viewport mapping, composed ahead of every shape.
@@ -428,6 +428,7 @@ fn decode_viewport(
     // initial value in force.
     let (gradients, gradient_index) = collect_gradients(root, current_color);
     let clip_paths = collect_clip_paths(root);
+    let ids = collect_element_ids(root);
     let fill = root_paint(
         root,
         "fill",
@@ -445,6 +446,7 @@ fn decode_viewport(
         &gradients,
         &gradient_index,
         &clip_paths,
+        &ids,
         &mut raster,
     );
     DecodedImage::from_pixels(width, height, raster.pixels)
@@ -455,6 +457,7 @@ struct Raster {
     height: u32,
     pixels: Vec<Color>,
     clip: ClipStack,
+    use_depth: usize,
 }
 
 impl Raster {
@@ -582,6 +585,7 @@ fn walk(
     gradients: &[Gradient],
     gradient_index: &BTreeMap<String, usize>,
     clip_paths: &BTreeMap<String, &XmlNode>,
+    ids: &BTreeMap<String, &XmlNode>,
     raster: &mut Raster,
 ) {
     let clipped = push_element_clip(raster, element, transform, None, clip_paths);
@@ -797,6 +801,100 @@ fn walk(
                     raster.clip.pop();
                 }
             }
+            "use" => {
+                let Some(reference) = attribute("href").or_else(|| attribute("xlink:href")) else {
+                    continue;
+                };
+                let Some(id) = fragment_id(reference) else {
+                    continue;
+                };
+                let Some(target) = ids.get(id) else {
+                    continue;
+                };
+                if raster.use_depth >= 16 {
+                    continue;
+                }
+                let x = attribute("x").and_then(parse_length).unwrap_or(0.0);
+                let y = attribute("y").and_then(parse_length).unwrap_or(0.0);
+                let mut use_transform = child_transform.then(Affine {
+                    a: 1.0,
+                    b: 0.0,
+                    c: 0.0,
+                    d: 1.0,
+                    e: x,
+                    f: y,
+                });
+                if matches!(target.name.as_str(), "symbol" | "svg")
+                    && let Some((min_x, min_y, view_width, view_height)) = root_view_box(target)
+                    && view_width > 0.0
+                    && view_height > 0.0
+                {
+                    let width = attribute("width")
+                        .and_then(parse_length)
+                        .or_else(|| {
+                            target
+                                .attributes
+                                .iter()
+                                .find(|(name, _)| name == "width")
+                                .and_then(|(_, value)| parse_length(value))
+                        })
+                        .unwrap_or(view_width);
+                    let height = attribute("height")
+                        .and_then(parse_length)
+                        .or_else(|| {
+                            target
+                                .attributes
+                                .iter()
+                                .find(|(name, _)| name == "height")
+                                .and_then(|(_, value)| parse_length(value))
+                        })
+                        .unwrap_or(view_height);
+                    let scale_x = width / view_width;
+                    let scale_y = height / view_height;
+                    use_transform = use_transform.then(
+                        Affine::IDENTITY
+                            .then(Affine {
+                                a: scale_x,
+                                b: 0.0,
+                                c: 0.0,
+                                d: scale_y,
+                                e: 0.0,
+                                f: 0.0,
+                            })
+                            .then(Affine {
+                                a: 1.0,
+                                b: 0.0,
+                                c: 0.0,
+                                d: 1.0,
+                                e: -min_x * scale_x,
+                                f: -min_y * scale_y,
+                            }),
+                    );
+                }
+                let mut attributes = Vec::new();
+                if let Some(clip) = attribute("clip-path") {
+                    attributes.push(("clip-path".to_owned(), clip.to_owned()));
+                }
+                let shadow = XmlNode {
+                    name: "use-shadow".to_owned(),
+                    attributes,
+                    children: vec![(*target).clone()],
+                };
+                raster.use_depth += 1;
+                walk(
+                    &shadow,
+                    use_transform,
+                    child_fill,
+                    child_stroke,
+                    current_color,
+                    gradients,
+                    gradient_index,
+                    clip_paths,
+                    ids,
+                    raster,
+                );
+                raster.use_depth -= 1;
+            }
             "svg" | "g" | "a" | "switch" => {
                 if attribute("display").is_some_and(|value| value.eq_ignore_ascii_case("none")) {
                     continue;
@@ -810,6 +908,7 @@ fn walk(
                     gradients,
                     gradient_index,
                     clip_paths,
+                    ids,
                     raster,
                 );
             }
@@ -824,6 +923,7 @@ fn walk(
                     gradients,
                     gradient_index,
                     clip_paths,
+                    ids,
                     raster,
                 );
             }
@@ -1011,7 +1111,7 @@ fn polyline_segments(points: &[(f32, f32)], closed: bool) -> Vec<Segment> {
 /// A minimal XML element tree: SVG loaded through `<img>` is an XML
 /// document, so the tree honors self-closing elements, quoted attributes,
 /// comments, processing instructions, and CDATA.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct XmlNode {
     pub name: String,
     pub attributes: Vec<(String, String)>,
@@ -1240,6 +1340,16 @@ fn rect_polygon(
     ])
 }
 
+/// The id in an `href="#id"` or `xlink:href="#id"` reference.
+fn fragment_id(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if let Some(id) = reference_id(trimmed) {
+        return Some(id);
+    }
+    let id = trimmed.strip_prefix('#')?;
+    (!id.is_empty()).then_some(id)
+}
+
 /// The id in a `url(#id)` paint or `clip-path` reference.
 fn reference_id(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
@@ -1323,6 +1433,25 @@ fn collect_clip_paths_into<'a>(element: &'a XmlNode, paths: &mut BTreeMap<String
             paths.entry(id.to_owned()).or_insert(child);
         }
         collect_clip_paths_into(child, paths);
+    }
+}
+
+/// Index every element with an id, for `<use>` references.
+fn collect_element_ids(root: &XmlNode) -> BTreeMap<String, &XmlNode> {
+    let mut ids = BTreeMap::new();
+    collect_element_ids_into(root, &mut ids);
+    ids
+}
+
+fn collect_element_ids_into<'a>(element: &'a XmlNode, ids: &mut BTreeMap<String, &'a XmlNode>) {
+    for child in &element.children {
+        if let Some(id) = attribute(child, "id")
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            ids.entry(id.to_owned()).or_insert(child);
+        }
+        collect_element_ids_into(child, ids);
     }
 }
 
@@ -2421,6 +2550,53 @@ mod tests {
         }
         assert!(visible > 150, "only {visible} visible pixels");
         assert!(white > 50, "only {white} white pixels");
+    }
+
+    #[test]
+    fn use_renders_a_referenced_shape_at_its_x_and_y() {
+        let svg = br##"<svg width="10" height="10"><defs>
+            <path id="p" d="M0 0h5v5H0z" fill="red"/></defs>
+            <use href="#p" x="3" y="2"/></svg>"##;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(4, 3), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(1, 1), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn use_accepts_the_legacy_xlink_href_spelling() {
+        let svg = br##"<svg width="10" height="10"><defs>
+            <rect id="r" width="4" height="4" fill="blue"/></defs>
+            <use xlink:href="#r" x="2" y="2"/></svg>"##;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(3, 3), Some(Color::rgb(0, 0, 255)));
+    }
+
+    #[test]
+    fn use_passes_its_paint_to_the_referenced_shape() {
+        let svg = br##"<svg width="10" height="10"><defs>
+            <rect id="r" width="4" height="4"/></defs>
+            <use href="#r" fill="#00ff00"/></svg>"##;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(1, 1), Some(Color::rgb(0, 255, 0)));
+    }
+
+    #[test]
+    fn use_scales_a_symbol_view_box_to_its_width_and_height() {
+        let svg = br##"<svg width="20" height="20"><defs>
+            <symbol id="s" viewBox="0 0 10 10"><rect width="10" height="10" fill="red"/></symbol>
+            </defs><use href="#s" width="20" height="20"/></svg>"##;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(15, 15), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(2, 2), Some(Color::rgb(255, 0, 0)));
+    }
+
+    #[test]
+    fn a_self_referential_use_stops_at_the_depth_limit() {
+        let svg = br##"<svg width="10" height="10"><defs>
+            <g id="loop"><use href="#loop"/></g></defs>
+            <use href="#loop"/></svg>"##;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(5, 5), Some(Color::TRANSPARENT));
     }
 
     #[test]
