@@ -351,6 +351,8 @@ const PRELUDE_SOURCE: &str = include_str!("../prelude.js");
 /// `IndexedDB`, self-hosted in `prelude_indexeddb.js` and installed after the
 /// other built-ins.
 const INDEXEDDB_PRELUDE_SOURCE: &str = include_str!("../prelude_indexeddb.js");
+/// Web Animations API core, self-hosted after the DOM and CSSOM preludes.
+const WEB_ANIMATIONS_PRELUDE_SOURCE: &str = include_str!("../prelude_web_animations.js");
 /// The ECMAScript built-ins written in JavaScript, which every realm gets.
 const INTRINSICS_PRELUDE_SOURCE: &str = include_str!("../prelude_intrinsics.js");
 
@@ -1406,6 +1408,14 @@ impl JsRuntime {
         {
             if std::env::var_os("RENDER_JS_TRACE").is_some() {
                 eprintln!("[render-js IndexedDB prelude failed: {error}]");
+            }
+            self.prelude_error = Some(error);
+        }
+        if self.prelude_error.is_none()
+            && let Err(error) = self.run_self_hosted(dom, WEB_ANIMATIONS_PRELUDE_SOURCE)
+        {
+            if std::env::var_os("RENDER_JS_TRACE").is_some() {
+                eprintln!("[render-js Web Animations prelude failed: {error}]");
             }
             self.prelude_error = Some(error);
         }

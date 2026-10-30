@@ -867,6 +867,179 @@ fn request_animation_frame_registers_zero_delay_one_shot() {
 }
 
 #[test]
+fn web_animation_animate_samples_and_finishes() {
+    let mut parsed = parse_document("<!doctype html><div id='box'></div>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.fakeNow = 0;
+                performance.now = function () { return window.fakeNow; };
+                window.log = [];
+                var box = document.getElementById('box');
+                var animation = box.animate(
+                    [{ opacity: 0 }, { opacity: 1 }],
+                    { duration: 1000, fill: 'both' }
+                );
+                animation.onfinish = function (event) { log.push('finish:' + event.type); };
+                window.animation = animation;
+            ",
+        )
+        .expect("Web Animation starts");
+    let first = runtime.take_pending_timer_requests();
+    assert_eq!(first.len(), 1, "{first:?}");
+    let id = match first[0] {
+        crate::TimerRequest::Schedule { id, .. } => id,
+        other @ crate::TimerRequest::Cancel { .. } => {
+            panic!("unexpected timer request {other:?}")
+        }
+    };
+    runtime
+        .execute(&mut parsed.dom, "window.fakeNow = 500;")
+        .expect("advance fake time");
+    runtime.fire_timer(&mut parsed.dom, id).expect("tick runs");
+    let midpoint = runtime
+        .execute(
+            &mut parsed.dom,
+            "document.getElementById('box').style.getPropertyValue('opacity')",
+        )
+        .expect("reads opacity")
+        .value
+        .to_js_string();
+    assert_eq!(midpoint.to_lossy(), "0.5");
+
+    let second = runtime.take_pending_timer_requests();
+    let id = match second[0] {
+        crate::TimerRequest::Schedule { id, .. } => id,
+        other @ crate::TimerRequest::Cancel { .. } => {
+            panic!("unexpected timer request {other:?}")
+        }
+    };
+    runtime
+        .execute(&mut parsed.dom, "window.fakeNow = 1000;")
+        .expect("advance fake time");
+    runtime
+        .fire_timer(&mut parsed.dom, id)
+        .expect("finish tick runs");
+    let result = runtime
+        .execute(
+            &mut parsed.dom,
+            r"[
+                document.getElementById('box').style.getPropertyValue('opacity'),
+                animation.playState,
+                log.join(',')
+            ].join('|')",
+        )
+        .expect("reads finish state")
+        .value
+        .to_js_string();
+    assert_eq!(result.to_lossy(), "1|finished|finish:finish");
+}
+
+#[test]
+fn web_animation_pause_finish_and_cancel_update_style_and_events() {
+    let mut parsed = parse_document("<!doctype html><div id='box'></div>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.fakeNow = 0;
+                performance.now = function () { return window.fakeNow; };
+                window.log = [];
+                var box = document.getElementById('box');
+                var animation = box.animate(
+                    [{ width: '0px' }, { width: '100px' }],
+                    { duration: 1000, fill: 'both' }
+                );
+                animation.oncancel = function (event) { log.push('cancel:' + event.type); };
+                window.animation = animation;
+                animation.pause();
+                window.fakeNow = 300;
+                animation.currentTime = 250;
+            ",
+        )
+        .expect("paused animation samples");
+    let paused_state = runtime
+        .execute(
+            &mut parsed.dom,
+            "[document.getElementById('box').style.getPropertyValue('width'), animation.playState].join('|')",
+        )
+        .expect("reads paused state")
+        .value
+        .to_js_string();
+    assert_eq!(paused_state.to_lossy(), "25px|paused");
+
+    runtime
+        .execute(&mut parsed.dom, "animation.finish();")
+        .expect("finish runs");
+    let finished = runtime
+        .execute(
+            &mut parsed.dom,
+            "[document.getElementById('box').style.getPropertyValue('width'), animation.playState].join('|')",
+        )
+        .expect("reads finished state")
+        .value
+        .to_js_string();
+    assert_eq!(finished.to_lossy(), "100px|finished");
+
+    runtime
+        .execute(&mut parsed.dom, "animation.cancel();")
+        .expect("cancel runs");
+    let canceled = runtime
+        .execute(
+            &mut parsed.dom,
+            "[document.getElementById('box').style.getPropertyValue('width'), animation.playState, log.join(',')].join('|')",
+        )
+        .expect("reads canceled state")
+        .value
+        .to_js_string();
+    assert_eq!(canceled.to_lossy(), "|idle|cancel:cancel");
+}
+
+#[test]
+fn web_animation_transform_none_uses_the_identity() {
+    let mut parsed = parse_document("<!doctype html><div id='box'></div>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.fakeNow = 0;
+                performance.now = function () { return window.fakeNow; };
+                var box = document.getElementById('box');
+                var animation = box.animate(
+                    [{ transform: 'none' }, { transform: 'translateY(20px)' }],
+                    { duration: 1000, fill: 'both' }
+                );
+                window.animation = animation;
+            ",
+        )
+        .expect("transform animation starts");
+    let requests = runtime.take_pending_timer_requests();
+    let id = match requests[0] {
+        crate::TimerRequest::Schedule { id, .. } => id,
+        other @ crate::TimerRequest::Cancel { .. } => {
+            panic!("unexpected timer request {other:?}")
+        }
+    };
+    runtime
+        .execute(&mut parsed.dom, "window.fakeNow = 500;")
+        .expect("advance fake time");
+    runtime.fire_timer(&mut parsed.dom, id).expect("tick runs");
+    let transform = runtime
+        .execute(
+            &mut parsed.dom,
+            "document.getElementById('box').style.getPropertyValue('transform')",
+        )
+        .expect("reads transform")
+        .value
+        .to_js_string();
+    assert_eq!(transform.to_lossy(), "translateY(10px)");
+}
+
+#[test]
 fn inner_html_round_trips_and_setter_replaces_children() {
     let mut parsed = parse_document("<!doctype html><div id='host'><p>old</p></div>");
     let mut runtime = JsRuntime::new(&parsed.dom);

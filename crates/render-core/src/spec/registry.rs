@@ -522,9 +522,11 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 The browser drives a 16 ms resampling clock while an animation is \
                 active and stops it after finite animations. Comma-separated animation \
                 lists are sampled in order and `transform: none` interpolates from the \
-                identity. There is no compositor thread and the Web Animations API is \
-                missing; per-animation pause/resume bookkeeping and some discrete/easing \
-                edge cases remain approximate.",
+                identity. A self-hosted Web Animations core supplies element.animate, \
+                play/pause/finish/cancel, finish/cancel events and a frame-driven \
+                timeline, but it is not yet unified with the CSS animation timeline and \
+                lacks playbackRate/reverse, effect composition and per-keyframe easing. \
+                There is no compositor thread.",
         dependencies: &[CSS_SYNTAX],
         tests: &[ConformanceTest::new("rust", "css::animation::tests")],
     },
@@ -543,7 +545,9 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 `transform: none` interpolates from the identity. \
                 `transition-behavior: allow-discrete` steps discrete properties and both \
                 transitionend and transitioncancel are reported. Exact reversing-adjusted \
-                start values and the Web Animations API remain missing.",
+                start values remain missing. The self-hosted Web Animations core \
+                covers element.animate and playback control but is not yet unified with \
+                this transition timeline.",
         dependencies: &[CSS_SYNTAX],
         tests: &[ConformanceTest::new("rust", "css::transition::tests")],
     },

@@ -307,10 +307,12 @@ fn removing_an_iframe_drops_its_browsing_context() {
 #[test]
 fn a_frame_that_cannot_get_a_realm_is_refused_and_the_page_keeps_running() {
     // With room for two realms, the third frame has no window, and nothing panics.
+    // The self-hosted preludes consume heap objects too; 7000 still admits
+    // exactly two nested realms at this engine revision.
     let mut dom = parse_document("<body></body>").dom;
     let url = Url::parse(PAGE_URL).expect("valid URL");
     let limits = RuntimeLimits {
-        max_heap_objects: 6_000,
+        max_heap_objects: 7000,
         ..RuntimeLimits::default()
     };
     let mut runtime = JsRuntime::with_limits_and_url(&dom, limits, &url);

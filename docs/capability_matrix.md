@@ -233,7 +233,9 @@ them would break more real pages than everything else combined:
 2. **Animations and transitions** - `@keyframes` and CSS transitions are sampled by a
    browser-driven clock with multi-animation lists, transform:none interpolation,
    reversing shortening, allow-discrete and transitioncancel, but there is no
-   compositor thread; WAAPI and several easing edge cases remain incomplete
+   compositor thread. A self-hosted WAAPI core covers element.animate,
+   play/pause/finish/cancel and finish/cancel events; unified CSS/WAAPI
+   timelines, playbackRate/reverse and several easing edge cases remain incomplete
 3. **Shadow-scoped styling** - shadow trees exist, but a `<style>` inside a shadow root applies
    nowhere and `:host`/`::slotted` match nothing
 4. **Selection, bidi, workers and compositing** - the remaining structural absences. The

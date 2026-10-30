@@ -1,3 +1,82 @@
+# 交接文档 (2026-10-31, 续三十八) — Web Animations API 核心
+
+接续 transitioncancel/allow-discrete 会话。这一轮实现 `Element.animate` 的
+播放控制、关键帧采样、动画事件和帧驱动时间线。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **自托管 WAAPI** | 新 `prelude_web_animations.js`,在 DOM/CSSOM/IndexedDB prelude 之后安装 |
+| **Element.animate** | 支持数组关键帧和对象-of-数组;camelCase 属性名转 kebab-case |
+| **时间参数** | duration/delay/endDelay/iterations/direction/fill/easing;Infinity 迭代 |
+| **采样** | 16ms `setTimeout` 驱动,`performance.now()` 时间线;数字/长度/颜色/transform 插值,`transform:none` 以 identity 处理 |
+| **播放控制** | `play`/`pause`/`finish`/`cancel`,`playState`,`currentTime` |
+| **事件** | `onfinish`/`oncancel` 与 `addEventListener`/`removeEventListener`;`finished` promise |
+| **样式联动** | 采样值写入 inline style,沿用现有 DOM revision → render 管线 |
+| **测试** | 迁移到 0.5/1.0s 的 opacity、pause/currentTime、finish、cancel、transform none |
+
+## 证据
+
+本地 WAAPI 页面:
+
+```js
+var animation = box.animate(
+  [{ opacity: 0, transform: 'translateY(0px)' },
+   { opacity: 1, transform: 'translateY(20px)' }],
+  { duration: 1000, fill: 'both' }
+);
+animation.onfinish = function () { document.title = 'waapi-finished'; };
+```
+
+运行日志/截图:
+
+```
+WAAPIPROBE state=running current=479.693084
+            opacity=0.4793 transform=translateY(9.5856px)
+1500ms 标题: waapi-finished
+health ready=Complete scripts_failed=0 scripts_threw=0
+```
+
+即时间线在约 480ms 采样到 opacity≈0.48、translateY≈9.59px,结束事件在
+截图前触发。700/900ms 截图也显示部分透明、位置偏移的方块。
+
+真实站点:
+
+```
+Bing:  ready=Complete  dom_elements=474 boxes=166
+       scripts_failed=0 scripts_threw=0 css_warnings=13 images_failed=0
+Baidu: ready=Complete  dom_elements=450 boxes=156
+       scripts_failed=0 scripts_threw=0 css_warnings=5 images_failed=0
+JD:    ready=Loading   dom_elements=1158 boxes=117
+       scripts_failed=8 scripts_threw=2 css_warnings=36 images_failed=1
+```
+
+## 验证
+
+```
+cargo test --workspace                       2805 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+注:prelude 增加对象后,`a_frame_that_cannot_get_a_realm...` 的测试堆预算从
+6000 调到 7000,仍保持"只容纳两个嵌套 realm"的测试意图。
+
+## 明确未做 / 下一步
+
+- WAAPI 与 CSS Animations/Transitions 的时间线和合成尚未统一;WAAPI 值写入
+  inline style,会覆盖/干扰作者内联样式,多个动画写同一属性时恢复顺序仍简单。
+- `playbackRate`、`reverse`、effect composition、逐关键帧 easing、
+  `getComputedTiming` 完整字段、`Animation.timeline` 未实现。
+- 节点移除/文档切换时的 transitioncancel 仍未完整;精确 reversing-adjusted
+  start value 未做。
+- JD 主商品区仍受 403;GitHub/HN 本机链路阻断;高级渐变、SVG filter 其余原语、
+  IndexedDB 值类型覆盖仍未完成。
+
+---
+
 # 交接文档 (2026-10-31, 续三十七) — transitioncancel 与 allow-discrete
 
 接续多动画/反向 transition 会话。这一轮补 `transitioncancel` 事件和

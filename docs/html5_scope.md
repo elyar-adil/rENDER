@@ -358,9 +358,9 @@ Microdata、`is=""`、`<dialog>` 完整模态语义、Drag & Drop API、可访�
 | `transform: translate / translateX/Y / scale / scaleX/Y / rotate / skew / matrix` | ✅ 端到端。类型在 `crates/render-css/src/properties.rs`（`TransformFunction` / `TransformList` / `TransformOrigin`），数学在 `render-core` 的 `Transform2D`，显示列表发射在 `display_list.rs:764-800`（`fragment_transform`，`transform` 读取在 `:771`），`PushTransform`/`PopTransform` 命令在 `:318-319`，光栅化有纯平移快路径与通用仿射离屏 warp（`raster.rs`）。`calc()` 参与 translate（`properties.rs` 的 transform 测试） |
 | `transform-origin` | ✅ `display_list.rs:790-793` |
 | `transition` | ✅ `transition` 简写与 longhand 解析；`render-css/src/transition.rs` 记住上一帧目标值，采样 duration/delay/timing，支持 `allow-discrete`、反向缩短，并生成 `transitionend`/`transitioncancel`；浏览器按 16ms 时钟重绘 |
-| `animation` + `@keyframes` | ✅ `@keyframes` 保留并按时间采样；浏览器驱动 16ms 时钟；多动画列表按 source order 合成，`transform:none` 按 identity 插值；WAAPI 与部分 easing 仍未完成 |
+| `animation` + `@keyframes` | ✅ `@keyframes` 保留并按时间采样；浏览器驱动 16ms 时钟；多动画列表按 source order 合成，`transform:none` 按 identity 插值；WAAPI 核心已自托管，部分 easing 仍未完成 |
 | `will-change` | ⛔ |
-| Web Animations API | ⛔ |
+| Web Animations API | 🟡 `element.animate`、play/pause/finish/cancel、finish/cancel 事件与 16ms 时间线采样已自托管实现；playbackRate/reverse、effect composition、逐关键帧 easing 与 CSS/WAAPI 统一时间线未完成 |
 
 ### 4.8 媒体查询
 
