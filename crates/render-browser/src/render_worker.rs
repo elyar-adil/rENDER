@@ -176,7 +176,19 @@ pub(super) fn process_page_render(
                 )
             });
             cancellation.check()?;
-            let mut options = DocumentRenderOptions::default();
+            // Static screenshots sample one animation frame. A page's entry
+            // animations settle after a second, so the default snapshot is that
+            // settled frame rather than the blank 0% state; a caller measuring a
+            // specific instant can override it without adding a compositor clock
+            // to this worker.
+            let animation_time = env::var("RENDER_ANIMATION_TIME_MS")
+                .ok()
+                .and_then(|value| value.parse::<f32>().ok())
+                .map_or(1.0, |milliseconds| milliseconds / 1000.0);
+            let mut options = DocumentRenderOptions {
+                animation_time,
+                ..DocumentRenderOptions::default()
+            };
             options.layout.viewport = PhysicalSize {
                 width: viewport_dimension(job.identity.viewport.width),
                 height: viewport_dimension(job.identity.viewport.height),

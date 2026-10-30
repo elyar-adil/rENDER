@@ -589,6 +589,7 @@ fn expand_legacy_longhands(name: &str, value: &str) -> Vec<(String, String)> {
         && name != "flex-flow"
         && name != "overflow"
         && name != "columns"
+        && name != "animation"
     {
         return vec![(name.to_owned(), value.to_owned())];
     }
@@ -603,6 +604,17 @@ fn expand_legacy_longhands(name: &str, value: &str) -> Vec<(String, String)> {
             vec!["flex-direction", "flex-wrap"]
         } else if name == "columns" {
             vec!["column-width", "column-count"]
+        } else if name == "animation" {
+            vec![
+                "animation-name",
+                "animation-duration",
+                "animation-timing-function",
+                "animation-delay",
+                "animation-iteration-count",
+                "animation-direction",
+                "animation-fill-mode",
+                "animation-play-state",
+            ]
         } else {
             vec!["overflow-x", "overflow-y"]
         };
@@ -649,6 +661,8 @@ fn expand_legacy_longhands(name: &str, value: &str) -> Vec<(String, String)> {
                 ]
             },
         ),
+        "animation" => expand_animation_shorthand(value)
+            .unwrap_or_else(|| vec![(name.to_owned(), value.to_owned())]),
         "flex-flow" => {
             let lower = value.to_ascii_lowercase();
             let mut direction = None;
@@ -745,6 +759,109 @@ fn expand_background_shorthand(value: &str) -> Vec<(String, String)> {
         ("background-position".to_owned(), position),
         ("background-size".to_owned(), size),
     ]
+}
+
+/// Expand the `animation` shorthand into its eight longhands.
+///
+/// The first `<time>` is the duration and the second is the delay (CSS
+/// Animations 1 §3.1). A function component (`cubic-bezier(...)`,
+/// `steps(...)`) is one token, which is why the splitter is bracket-aware.
+fn expand_animation_shorthand(value: &str) -> Option<Vec<(String, String)>> {
+    let mut duration = None;
+    let mut delay = None;
+    let mut timing = None;
+    let mut iterations = None;
+    let mut direction = None;
+    let mut fill = None;
+    let mut play = None;
+    let mut name = None;
+    for component in split_css_components(value) {
+        let lower = component.to_ascii_lowercase();
+        if is_animation_time(component) {
+            if duration.is_none() {
+                duration = Some(component);
+            } else if delay.is_none() {
+                delay = Some(component);
+            } else {
+                return None;
+            }
+        } else if is_animation_timing(&lower) {
+            timing = Some(component);
+        } else if lower == "infinite"
+            || lower
+                .parse::<f32>()
+                .is_ok_and(|number| number.is_finite() && number >= 0.0)
+        {
+            iterations = Some(component);
+        } else if matches!(
+            lower.as_str(),
+            "normal" | "reverse" | "alternate" | "alternate-reverse"
+        ) {
+            direction = Some(component);
+        } else if matches!(lower.as_str(), "none" | "forwards" | "backwards" | "both") {
+            fill = Some(component);
+        } else if matches!(lower.as_str(), "running" | "paused") {
+            play = Some(component);
+        } else if name.is_none() {
+            name = Some(component);
+        } else {
+            return None;
+        }
+    }
+    Some(vec![
+        (
+            "animation-name".to_owned(),
+            name.unwrap_or("none").to_owned(),
+        ),
+        (
+            "animation-duration".to_owned(),
+            duration.unwrap_or("0s").to_owned(),
+        ),
+        (
+            "animation-timing-function".to_owned(),
+            timing.unwrap_or("ease").to_owned(),
+        ),
+        (
+            "animation-delay".to_owned(),
+            delay.unwrap_or("0s").to_owned(),
+        ),
+        (
+            "animation-iteration-count".to_owned(),
+            iterations.unwrap_or("1").to_owned(),
+        ),
+        (
+            "animation-direction".to_owned(),
+            direction.unwrap_or("normal").to_owned(),
+        ),
+        (
+            "animation-fill-mode".to_owned(),
+            fill.unwrap_or("none").to_owned(),
+        ),
+        (
+            "animation-play-state".to_owned(),
+            play.unwrap_or("running").to_owned(),
+        ),
+    ])
+}
+
+fn is_animation_time(value: &str) -> bool {
+    let value = value.trim();
+    let number = value.strip_suffix("ms").or_else(|| value.strip_suffix('s'));
+    number.is_some_and(|number| {
+        number
+            .trim()
+            .parse::<f32>()
+            .is_ok_and(|number| number.is_finite())
+    })
+}
+
+fn is_animation_timing(value: &str) -> bool {
+    matches!(
+        value,
+        "linear" | "ease" | "ease-in" | "ease-out" | "ease-in-out" | "step-start" | "step-end"
+    ) || value.starts_with("cubic-bezier(")
+        || value.starts_with("steps(")
+        || value.starts_with("linear(")
 }
 
 fn split_css_components(value: &str) -> Vec<&str> {
@@ -2519,5 +2636,25 @@ mod tests {
             style.get("margin-left").map(|value| value.value.as_str()),
             Some("auto")
         );
+    }
+    #[test]
+    fn animation_shorthand_expands_duration_delay_and_easing() {
+        let expansion: std::collections::BTreeMap<_, _> = super::expand_shorthand(
+            "animation",
+            "wave .5s cubic-bezier(.1, .2, .3, 1) 100ms alternate infinite both",
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(expansion["animation-name"], "wave");
+        assert_eq!(expansion["animation-duration"], ".5s");
+        assert_eq!(expansion["animation-delay"], "100ms");
+        assert_eq!(
+            expansion["animation-timing-function"],
+            "cubic-bezier(.1, .2, .3, 1)"
+        );
+        assert_eq!(expansion["animation-direction"], "alternate");
+        assert_eq!(expansion["animation-iteration-count"], "infinite");
+        assert_eq!(expansion["animation-fill-mode"], "both");
+        assert_eq!(expansion["animation-play-state"], "running");
     }
 }

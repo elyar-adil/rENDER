@@ -515,14 +515,15 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
         family: StandardFamily::Css,
         specification: "CSS Animations Level 1 and Web Animations Level 1",
         section: "@keyframes and the Animation interface",
-        status: SupportStatus::Missing,
-        notes: "Nothing. A `@keyframes` block is parsed and then discarded, and there \
-                is no animation clock, so no declaration of `animation` or \
-                `animation-*` has any effect. 249 `@keyframes` blocks occur in the \
-                production corpus. The same at-rule-swallowing defect as \
-                `css.font-face`: no diagnostic is reported.",
+        status: SupportStatus::Partial,
+        notes: "`@keyframes` blocks and the `animation` shorthand are parsed and \
+                sampled by a time-parameterised style pass; opacity, colour, \
+                transform, lengths and other computed properties are interpolated. \
+                A compositor clock, independent comma-separated animation lists, \
+                the Web Animations API and some discrete/easing edge cases remain \
+                missing.",
         dependencies: &[CSS_SYNTAX],
-        tests: &[],
+        tests: &[ConformanceTest::new("rust", "css::animation::tests")],
     },
     FeatureDefinition {
         id: CSS_TRANSITIONS,

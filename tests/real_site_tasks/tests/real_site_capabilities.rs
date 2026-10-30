@@ -313,9 +313,6 @@ fn expected_diagnostics(fixture: &str) -> Option<Expectation> {
             kinds: vec![
                 // Four `@font-face` blocks, in each of two external sheets.
                 (Kind::AtRuleNotEvaluated("font-face".to_owned()), 8),
-                // `@keyframes` and its `-webkit-` spelling, once each per sheet.
-                (Kind::AtRuleNotEvaluated("keyframes".to_owned()), 2),
-                (Kind::AtRuleNotEvaluated("-webkit-keyframes".to_owned()), 2),
                 // `@-moz-document` is in no specification, so it answers
                 // `Unrecognised`, which is a different fact from "cannot do it
                 // yet" and gets different words.
@@ -1077,8 +1074,8 @@ fn a_multi_column_property_produces_more_than_one_column() {
 /// against S4/S9 because the registry had no entry for web fonts or animations, so the gaps
 /// could not be tracked or reported as progress. Both are now registered - `css.font-face`
 /// and `css.animations`, both `SupportStatus::Missing`, which is the truth: `@font-face` is
-/// parsed and discarded, and `@keyframes` likewise. Registering them as `Missing` rather than
-/// editing this test is what keeps the gate honest.
+/// parsed and discarded, while `@keyframes` is now sampled. Registering them rather
+/// than editing this test is what keeps the gate honest.
 ///
 /// The promotion from `#[ignore]` to a permanent assertion is deliberate. A test that asserts
 /// "the gap is registered" keeps failing the day someone fixes the gap without updating the

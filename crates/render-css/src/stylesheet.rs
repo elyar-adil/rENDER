@@ -120,6 +120,27 @@ impl StyleRule {
     }
 }
 
+/// One keyframe of an `@keyframes` rule.
+///
+/// `offset` is stored in ten-thousandths so the whole stylesheet model keeps
+/// `Eq` and the sampler has exact integer ordering (`0`, `2500`, ... `10000`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Keyframe {
+    pub offset: u32,
+    pub declarations: Vec<Declaration>,
+}
+
+/// One `@keyframes` rule, kept for the animation sampler.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyframesRule {
+    pub name: String,
+    pub keyframes: Vec<Keyframe>,
+    /// Enclosing `@media` queries, so a keyframes rule inside a false media
+    /// query does not become visible to elements outside it.
+    pub media: Vec<String>,
+    pub layer: Option<LayerName>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StyleSheetDiagnostic {
     pub line: u32,
@@ -131,6 +152,7 @@ pub struct StyleSheetDiagnostic {
 pub struct StyleSheet {
     pub rules: Vec<StyleRule>,
     pub layer_order: Vec<LayerName>,
+    pub keyframes: Vec<KeyframesRule>,
     pub diagnostics: Vec<StyleSheetDiagnostic>,
 }
 
@@ -234,10 +256,12 @@ enum ParsedRule {
     /// with false syntax diagnostics.
     KeyframesBlock {
         name: String,
-        /// The at-keyword as written, so the diagnostic quotes the spelling the
-        /// author used: `@-webkit-keyframes` is not `@keyframes` to someone
-        /// grepping their stylesheet.
+        /// The at-keyword as written, so a syntax diagnostic can quote the
+        /// spelling the author used: `@-webkit-keyframes` is not `@keyframes`
+        /// to someone grepping their stylesheet.
         at_keyword: String,
+        keyframes: Vec<Keyframe>,
+        diagnostics: Vec<StyleSheetDiagnostic>,
         location: SourceLocation,
     },
     /// An at-rule whose block is a `<declaration-list>`: `@font-face`'s
@@ -464,10 +488,12 @@ fn parse_at_rule_block<'i, 't>(
     }
 
     if prelude.name.ends_with("keyframes") {
-        consume_raw(input);
+        let (keyframes, diagnostics) = parse_keyframes_body(input);
         return Ok(ParsedRule::KeyframesBlock {
             name: prelude.value.trim().to_owned(),
             at_keyword: prelude.name,
+            keyframes,
+            diagnostics,
             location,
         });
     }
@@ -1456,6 +1482,74 @@ fn capability_diagnostic(location: SourceLocation, message: String) -> StyleShee
     from_location(location, message)
 }
 
+/// Parse an `@keyframes` block body: a list of `<keyframe-selector> { ... }`
+/// blocks. The declarations are kept for the animation sampler rather than
+/// dropped, and malformed selectors are reported without poisoning siblings.
+fn parse_keyframes_body(input: &mut Parser<'_, '_>) -> (Vec<Keyframe>, Vec<StyleSheetDiagnostic>) {
+    let mut keyframes = Vec::new();
+    let mut diagnostics = Vec::new();
+    while !input.is_exhausted() {
+        let location = input.current_source_location();
+        let selector = input.parse_until_before(Delimiter::CurlyBracketBlock, |input| {
+            Ok::<_, ParseError<'_, RuleParseError>>(consume_raw(input))
+        });
+        let selector = match selector {
+            Ok(selector) => selector,
+            Err(error) => {
+                diagnostics.push(diagnostic(&error));
+                break;
+            }
+        };
+        if input.expect_curly_bracket_block().is_err() {
+            break;
+        }
+        let declarations = match input.parse_nested_block(|input| {
+            Ok::<_, ParseError<'_, RuleParseError>>(parse_declarations(input))
+        }) {
+            Ok(declarations) => declarations,
+            Err(error) => {
+                diagnostics.push(diagnostic(&error));
+                continue;
+            }
+        };
+        diagnostics.extend(declarations.diagnostics);
+        let Some(offsets) = keyframe_offsets(&selector) else {
+            diagnostics.push(capability_diagnostic(
+                location,
+                format!("invalid keyframe selector \"{selector}\""),
+            ));
+            continue;
+        };
+        for offset in offsets {
+            keyframes.push(Keyframe {
+                offset,
+                declarations: declarations.declarations.clone(),
+            });
+        }
+    }
+    (keyframes, diagnostics)
+}
+
+fn keyframe_offsets(text: &str) -> Option<Vec<u32>> {
+    let mut offsets = Vec::new();
+    for part in text.split(',') {
+        let part = part.trim().to_ascii_lowercase();
+        let offset = if part == "from" {
+            0
+        } else if part == "to" {
+            10_000
+        } else {
+            let percent = part.strip_suffix('%')?.trim().parse::<f32>().ok()?;
+            if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
+                return None;
+            }
+            (percent * 100.0).round() as u32
+        };
+        offsets.push(offset);
+    }
+    (!offsets.is_empty()).then_some(offsets)
+}
+
 fn consume_raw(input: &mut Parser<'_, '_>) -> String {
     let start = input.position();
     while input.next_including_whitespace_and_comments().is_ok() {}
@@ -1644,17 +1738,24 @@ fn flatten_rules(
             ParsedRule::KeyframesBlock {
                 name,
                 at_keyword,
+                keyframes,
+                diagnostics,
                 location,
             } => {
-                // The current paint pipeline has no animation clock, but the
-                // at-rule is still valid and must not make a stylesheet fail.
-                // The block's contents are dropped for the reported reason
-                // below, so they need no diagnostics of their own.
-                let _ = name;
-                sheet.diagnostics.push(capability_diagnostic(
-                    location,
-                    at_rule_diagnostic(&at_keyword),
-                ));
+                sheet.diagnostics.extend(diagnostics);
+                if name.is_empty() || keyframes.is_empty() {
+                    sheet.diagnostics.push(capability_diagnostic(
+                        location,
+                        format!("@{at_keyword} needs a name and at least one keyframe"),
+                    ));
+                } else {
+                    sheet.keyframes.push(KeyframesRule {
+                        name,
+                        keyframes,
+                        media: media.to_vec(),
+                        layer: layer.cloned(),
+                    });
+                }
             }
             ParsedRule::DeclarationListBlock {
                 at_keyword,
@@ -2072,6 +2173,24 @@ mod tests {
     /// CSS Fonts 3 §2.2: an `@font-face` block is a descriptor list, so its
     /// contents are never selector syntax, and it must not swallow or poison
     /// the rules around it.
+    #[test]
+    fn keyframes_keep_offsets_and_declarations() {
+        let sheet = parse_stylesheet(
+            "@keyframes spin { from { transform: rotate(0deg) } 50%, 75% { opacity: .5 } \
+             to { transform: rotate(360deg) } } a { color: red }",
+        );
+        assert!(sheet.diagnostics.is_empty(), "{:?}", sheet.diagnostics);
+        assert_eq!(sheet.keyframes.len(), 1);
+        let rule = &sheet.keyframes[0];
+        assert_eq!(rule.name, "spin");
+        let offsets: Vec<u32> = rule.keyframes.iter().map(|frame| frame.offset).collect();
+        assert_eq!(offsets, [0, 5_000, 7_500, 10_000]);
+        assert_eq!(rule.keyframes[0].declarations[0].value, "rotate(0deg)");
+        assert_eq!(rule.keyframes[1].declarations[0].value, ".5");
+        assert_eq!(rule.keyframes[3].declarations[0].value, "rotate(360deg)");
+        assert_eq!(sheet.rules.len(), 1);
+    }
+
     #[test]
     fn font_face_bodies_are_descriptor_lists() {
         let sheet = parse_stylesheet(
@@ -2547,8 +2666,6 @@ mod tests {
     fn every_recognised_but_unimplemented_at_rule_is_reported() {
         for name in [
             "font-face",
-            "keyframes",
-            "-webkit-keyframes",
             "page",
             "property",
             "counter-style",
@@ -2597,7 +2714,6 @@ mod tests {
     fn every_unimplemented_at_rule_is_covered_by_the_reporting_test() {
         for name in [
             "font-face",
-            "keyframes",
             "page",
             "property",
             "counter-style",
@@ -2663,11 +2779,11 @@ mod tests {
         for source in [
             "@media screen { @font-face { font-family: 'X' } }",
             "@supports (display: grid) { @font-face { font-family: 'X' } }",
-            "@media screen { @supports (display: grid) { @keyframes spin { to { opacity: 1 } } } }",
-            "@supports (display: grid) { @media screen { @keyframes spin { to { opacity: 1 } } } }",
+            "@media screen { @supports (display: grid) { @font-face { font-family: 'X' } } }",
+            "@supports (display: grid) { @media screen { @font-face { font-family: 'X' } } }",
             // And inside a cascade layer, which is a group rule too.
             "@layer base { @font-face { font-family: 'X' } }",
-            "@media screen { @layer base { @keyframes spin { to { opacity: 1 } } } }",
+            "@media screen { @layer base { @font-face { font-family: 'X' } } }",
             // Nested in a style rule, where the block is a `<block-contents>`.
             "a { @media screen { @font-face { font-family: 'X' } } }",
         ] {

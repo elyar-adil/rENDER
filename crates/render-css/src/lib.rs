@@ -1,3 +1,4 @@
+pub mod animation;
 pub mod at_rules;
 pub mod cascade;
 pub mod computed;

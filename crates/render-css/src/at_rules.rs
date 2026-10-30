@@ -58,7 +58,7 @@ const RECOGNISED_AT_RULES: &[(&str, &str)] = &[
 
 /// The recognised at-rules whose contents reach the cascade. Everything else in
 /// [`RECOGNISED_AT_RULES`] parses and is then dropped.
-const EVALUATED_AT_RULES: &[&str] = &["layer", "media", "supports"];
+const EVALUATED_AT_RULES: &[&str] = &["keyframes", "layer", "media", "supports"];
 
 /// The recognised at-rules whose block is a `<declaration-list>` rather than a
 /// `<rule-list>`, with the section that defines each block's contents.
@@ -243,7 +243,7 @@ mod tests {
             "-moz-keyframes",
             "-o-keyframes",
         ] {
-            assert_eq!(at_rule_support(name), AtRuleSupport::Unimplemented);
+            assert_eq!(at_rule_support(name), AtRuleSupport::Evaluated);
             assert_eq!(at_rule_specification(name), Some("CSS Animations 1 §3"));
         }
         assert_eq!(
@@ -251,8 +251,8 @@ mod tests {
             AtRuleSupport::Unimplemented
         );
         assert_eq!(
-            at_rule_diagnostic("-webkit-keyframes"),
-            "@-webkit-keyframes is parsed but not evaluated yet"
+            at_rule_diagnostic("-ms-viewport"),
+            "@-ms-viewport is parsed but not evaluated yet"
         );
     }
 
@@ -271,17 +271,17 @@ mod tests {
         );
     }
 
-    /// The three at-rules whose contents reach the cascade. A new at-rule is not
-    /// evaluated by appearing here; it becomes evaluated by being implemented,
-    /// and this test is what stops the list from growing by accident.
+    /// The at-rules this engine evaluates. A new at-rule is not evaluated by
+    /// appearing here; it becomes evaluated by being implemented, and this test
+    /// is what stops the list from growing by accident.
     #[test]
-    fn only_three_at_rules_are_evaluated() {
+    fn only_the_implemented_at_rules_are_evaluated() {
         let evaluated: Vec<&str> = super::RECOGNISED_AT_RULES
             .iter()
             .map(|(name, _)| *name)
             .filter(|name| at_rule_support(name) == AtRuleSupport::Evaluated)
             .collect();
-        assert_eq!(evaluated, ["layer", "media", "supports"]);
+        assert_eq!(evaluated, ["keyframes", "layer", "media", "supports"]);
     }
 
     /// Every at-rule whose block is read as a declaration list has to be an

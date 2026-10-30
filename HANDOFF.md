@@ -1,3 +1,72 @@
+# 交接文档 (2026-10-31, 续二十九) — CSS @keyframes 动画采样
+
+接续 Bing/Baidu 脚本与 mask 几何会话。这一轮把 `@keyframes` 从“解析后丢弃”
+推进到按时间参数采样并参与布局/绘制。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **保留 keyframes** | `StyleSheet.keyframes`;`Keyframe { offset(万分比), declarations }`、`KeyframesRule { name, keyframes, media, layer }` |
+| **解析关键帧块** | `from`/`to`/百分比、逗号选择器列表、每帧声明;非法选择器告警但不吞后续规则 |
+| **`animation` 简写** | 展开为 name/duration/timing-function/delay/iteration-count/direction/fill-mode/play-state;支持 `cubic-bezier(...)`、`steps(...)` |
+| **动画属性注册** | `animation-name`、`-duration`、`-delay`、`-timing-function`、`-iteration-count`、`-direction`、`-fill-mode`、`-play-state` |
+| **时间采样** | delay、有限/无限迭代、alternate/reverse、fill-mode、逐帧 timing function |
+| **插值** | 数字/长度/角度/矩阵函数、sRGB 颜色;无法插值的离散属性在 50% 翻转;缺失端点用基础计算值补齐 |
+| **写回样式** | `ComputedStyle::set_animated_property` 同时更新 token 与 typed 值,布局看到动画 width/height,绘制看到 opacity/transform/颜色 |
+| **浏览器快照** | 静态截图默认采样 1.0s(页面入场动画已稳定);`RENDER_ANIMATION_TIME_MS` 可指定任意时刻 |
+| **能力登记** | `css.animations` 从 `Missing` 改为 `Partial`,并登记 `css::animation::tests` |
+
+## 证据
+
+`animationprobe.html` 同一页面在三个时刻的像素:
+
+```
+t=0ms     fade(10,202) = (255,255,255)   grow x=15 白, x=30 白
+t=500ms   fade(10,202) = (255,128,128)   grow x=15 蓝, x=30 白
+t=1000ms  fade(10,202) = (255,0,0)       grow x=15 蓝, x=30 蓝
+```
+
+即 opacity 0→1 按 0.5 线性插值,width 20px 在 500ms、40px 在 1000ms 进入布局。
+
+真实站点(默认 1s 快照):
+
+```
+Bing:  ready=Complete  dom_elements=465 boxes=166 scripts_failed=0 scripts_threw=0
+       images_failed=0 css_warnings=8(实现前 19;@keyframes 诊断消失)
+Baidu: ready=Complete  dom_elements=450 boxes=156 scripts_failed=0 scripts_threw=0
+JD:    ready=Interactive dom_elements=1158 boxes=117 scripts_failed=11 scripts_threw=2
+       css_warnings=36(实现前 156)
+```
+
+Bing 截图在 0s 时页头会被入场动画隐藏,1s 采样后页头、Rewards、导航均恢复;
+说明动画确实作用到了真实页面,而不是只通过测试。
+
+## 验证
+
+```
+cargo test --workspace                       2771 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+新增测试覆盖 keyframes 解析、animation 简写展开、数字/颜色插值、keyframe
+属性采样、delay/fill/direction、opacity 动画像素与 width/transform 布局。
+
+## 明确未做 / 下一步
+
+- 没有持续运行的动画时钟/合成器;每个静态帧只按一个时间点采样。滚动或脚本
+  更新触发的重绘会重新采样,但不会自动以 60fps 推进。
+- 只取第一个 `animation-name`;逗号分隔的多动画、Web Animations API、
+  `animation-composition`、CSS Transitions 未实现。
+- `transform: none` 到具体变换按离散处理;`steps()`/`linear()` 为近似实现;
+  继承属性(如父级 `color`)的动画不会重新传播给已计算的子元素。
+- JD 主商品区仍受 403 风控;GitHub/HN 本机链路阻断;高级渐变、SVG filter
+  其余原语、IndexedDB 值类型覆盖仍未完成。
+
+---
+
 # 交接文档 (2026-10-31, 续二十八) — Bing/Baidu 脚本异常与 mask 几何
 
 接续 CSS mask 会话。这一轮先修掉 Bing/Baidu 的脚本异常,再补齐 CSS
@@ -56,8 +125,8 @@ real_site_tasks                              66 passed, 0 failed
 ## 明确未做 / 下一步
 
 - JD 主商品区仍受 403 风控;GitHub/HN 本机链路阻断。
-- Bing 仍有 import maps、`text/rms` 脚本类型、`@keyframes` 未执行等能力缺口;
-  这些不再是抛异常,但会限制动态效果。
+- Bing 仍有 import maps、`text/rms` 脚本类型等能力缺口;`@keyframes` 已在
+  续二十九由时间参数化样式采样执行,但没有持续运行的合成器时钟。
 - CSS `mask-mode`、多层 mask、`mask-composite`、`space`/`round` 精确平铺未做;
   filter 仍缺 `contrast`/`hue-rotate`/`invert`/`sepia`/`url(#filter)`。
 - 高级渐变、SVG filter 其余原语、IndexedDB 值类型覆盖仍未完成。

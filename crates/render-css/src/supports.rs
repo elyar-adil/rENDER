@@ -918,6 +918,8 @@ mod tests {
         assert!(evaluates("at-rule(@media)"));
         assert!(evaluates("at-rule(@supports)"));
         assert!(evaluates("at-rule(@layer)"));
+        assert!(evaluates("at-rule(@keyframes)"));
+        assert!(evaluates("at-rule(@-webkit-keyframes)"));
         // An at-rule no specification defines.
         assert!(!evaluates("at-rule(@nonesuch)"));
         // Not an `<at-keyword-token>`, so the feature does not parse and the
@@ -927,8 +929,6 @@ mod tests {
         // The two that must NOT be answered here.
         for source in [
             "at-rule(@font-face)",
-            "at-rule(@keyframes)",
-            "at-rule(@-webkit-keyframes)",
             "at-rule(@page)",
             "font-tech(color-COLRv1)",
             "font-format(woff2)",

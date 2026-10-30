@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use url::Url;
 
+use crate::css::animation::sample_animations;
 use crate::css::cascade::{
     CascadeInput, CascadeOrigin, media_query_list_is_supported, media_query_list_matches,
 };
@@ -782,6 +783,9 @@ pub struct DocumentRenderOptions {
     /// Document-space origin painted into the layout viewport. Layout itself
     /// always uses `layout.viewport`; this offset only affects compositing.
     pub scroll_offset: PhysicalPoint,
+    /// How far into the CSS Animations timeline this frame samples, in seconds.
+    /// `0.0` is the first frame; a caller with a clock passes the elapsed time.
+    pub animation_time: f32,
     pub display_list: DisplayListBuilderOptions,
     pub raster_background: Color,
     /// The document's scripting mode, as HTML 13.2.4.5 defines it.
@@ -811,6 +815,7 @@ impl Default for DocumentRenderOptions {
             formatting_limits: FormattingLimits::default(),
             layout: LayoutOptions::default(),
             scroll_offset: PhysicalPoint::default(),
+            animation_time: 0.0,
             raster_background: display_list.palette.canvas,
             display_list,
             scripting_enabled: true,
@@ -1360,13 +1365,19 @@ fn render_dom(
         origin: CascadeOrigin::Author,
     }));
 
-    let styles = compute_document_styles_with_hints(
+    let mut styles = compute_document_styles_with_hints(
         dom,
         &cascade_inputs,
         &PropertyRegistry::standard_baseline(),
         &options.computation_limits,
         &match_context,
         &|node| presentational_hint_declarations(dom, node, quirks_mode),
+    );
+    apply_animations(
+        &mut styles,
+        &cascade_inputs,
+        &match_context,
+        options.animation_time,
     );
     stage_elapsed("cascade", &mut stage_mark);
     // An inline `svg` is rasterised from its own markup, so it needs no fetch
@@ -1559,6 +1570,40 @@ impl ClipPathResolver for DomClipPathResolver<'_> {
                 ClipFillRule::NonZero
             },
         ))
+    }
+}
+
+/// Sample every element's active CSS animation at `time` seconds and replace
+/// the animated properties on its computed style.
+///
+/// Keyframes from a `@media` block the cascade did not match are ignored. Later
+/// definitions of the same name win, matching the cascade's order-of-appearance
+/// rule for `@keyframes`.
+fn apply_animations(
+    styles: &mut BTreeMap<NodeId, ComputedStyle>,
+    sheets: &[CascadeInput<'_>],
+    context: &MatchContext,
+    time: f32,
+) {
+    let mut keyframes = BTreeMap::new();
+    for input in sheets {
+        for rule in &input.sheet.keyframes {
+            if rule
+                .media
+                .iter()
+                .all(|query| media_query_list_matches(query, context))
+            {
+                keyframes.insert(rule.name.clone(), rule.clone());
+            }
+        }
+    }
+    if keyframes.is_empty() {
+        return;
+    }
+    for style in styles.values_mut() {
+        for (property, value) in sample_animations(&keyframes, style, time) {
+            style.set_animated_property(&property, &value);
+        }
     }
 }
 
@@ -3496,6 +3541,81 @@ mod tests {
         let outside = output.raster.surface.pixel(12, 5).expect("blurred edge");
         assert_eq!(centre.red, 255);
         assert!(outside.red > 200 && outside.green > 0, "{outside:?}");
+    }
+
+    /// CSS Animations: the sampler asked for 0s, 0.5s and 1s paints the
+    /// interpolated opacity instead of the static computed value.
+    #[test]
+    fn css_animation_samples_opacity_at_the_requested_time() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0; background: white }
+               #box { width: 20px; height: 20px; background: red;
+                      animation: fade 1s linear forwards }
+               @keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+               </style><div id="box"></div>"#,
+        );
+        let at = |time: f32| {
+            document.render_reference(DocumentRenderOptions {
+                animation_time: time,
+                ..DocumentRenderOptions::default()
+            })
+        };
+        assert_eq!(at(0.0).raster.surface.pixel(10, 10), Some(Color::WHITE));
+        let half = at(0.5)
+            .raster
+            .surface
+            .pixel(10, 10)
+            .expect("mid-animation pixel");
+        assert!(
+            half.red == 255 && (120..=135).contains(&half.green),
+            "{half:?}"
+        );
+        assert_eq!(
+            at(1.0).raster.surface.pixel(10, 10),
+            Some(Color::rgb(255, 0, 0))
+        );
+    }
+
+    /// Animated layout and transform values reach the typed computed style, so
+    /// layout sees the interpolated width and paint sees the interpolated
+    /// translate.
+    #[test]
+    fn css_animation_interpolates_width_and_transform() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0 }
+               #box { height: 20px; background: red;
+                      animation: grow 1s linear forwards }
+               @keyframes grow {
+                 from { width: 0px; transform: translateX(0px) }
+                 to { width: 20px; transform: translateX(10px) }
+               }
+               </style><div id="box"></div>"#,
+        );
+        let output = document.render_reference(DocumentRenderOptions {
+            animation_time: 0.5,
+            ..DocumentRenderOptions::default()
+        });
+        let node = target_id(document.dom(), "#box");
+        let style = output.styles.get(&node).expect("box style");
+        assert_eq!(
+            style
+                .get("transform")
+                .map(render_css::computed::ComputedValue::css_text),
+            Some("translateX(5px)")
+        );
+        let fragment = output
+            .layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(node))
+            .expect("box fragment");
+        assert!(
+            (fragment.rect.size.width - 10.0).abs() < 0.01,
+            "{:?}",
+            fragment.rect
+        );
     }
 
     /// CSS `filter: grayscale(1)` replaces colour by its luminance.

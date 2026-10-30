@@ -119,6 +119,14 @@ impl PropertyRegistry {
             ("mask-size", "auto"),
             ("mask-position", "0% 0%"),
             ("mask-repeat", "repeat"),
+            ("animation-name", "none"),
+            ("animation-duration", "0s"),
+            ("animation-delay", "0s"),
+            ("animation-timing-function", "ease"),
+            ("animation-iteration-count", "1"),
+            ("animation-direction", "normal"),
+            ("animation-fill-mode", "none"),
+            ("animation-play-state", "running"),
             ("background-color", "transparent"),
             ("background-image", "none"),
             ("background-repeat", "repeat"),
@@ -363,6 +371,29 @@ impl ComputedStyle {
     /// Layout-facing values whose property grammars are implemented by this
     /// migration slice. Unsupported properties remain available only through
     /// the token-level map and are never mistaken for typed values.
+    /// Replace one property with an animated value.
+    ///
+    /// The animation sampler works in CSS text because keyframes may name any
+    /// property, including ones this engine keeps only token-level. The typed
+    /// map is updated when the property has a grammar, so layout and paint see
+    /// the same value the cascade would have produced. A value the grammar
+    /// rejects drops the typed entry rather than leaving a stale one behind.
+    pub fn set_animated_property(&mut self, property: &str, css: &str) {
+        let Ok(tokens) = tokenize(css, &ComputationLimits::default()) else {
+            return;
+        };
+        self.properties
+            .insert(property.to_owned(), ComputedValue::new(tokens));
+        match parse_typed_property(property, css) {
+            Some(Ok(value)) => {
+                self.typed_properties.insert(property.to_owned(), value);
+            }
+            _ => {
+                self.typed_properties.remove(property);
+            }
+        }
+    }
+
     #[must_use]
     pub const fn typed_properties(&self) -> &BTreeMap<String, TypedPropertyValue> {
         &self.typed_properties
