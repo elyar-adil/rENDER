@@ -20,13 +20,16 @@
 //!   element's `width`/`height`;
 //! - `mask` references on shapes and groups, with offscreen alpha or
 //!   luminance compositing, `maskUnits` and `maskContentUnits`;
+//! - `filter` references with `feGaussianBlur` and `feColorMatrix`,
+//!   composited through offscreen buffers;
 //! - root sizing by `width`/`height` (percentages resolve against the
 //!   `viewBox`), falling back to `viewBox`, then the spec default 300×150.
 //!
-//! Everything outside the subset (text, filters, embedded images, scripting,
-//! external-document `<use>` references, gradient `xlink:href` inheritance
-//! and spread modes other than `pad`) contributes nothing, matching how an
-//! `<img>`-loaded SVG must render: static and script-free.
+//! Everything outside the subset (text, filter primitives other than blur
+//! and color matrix, embedded images, scripting, external-document `<use>`
+//! references, gradient `xlink:href` inheritance and spread modes other than
+//! `pad`) contributes nothing, matching how an `<img>`-loaded SVG must
+//! render: static and script-free.
 //!
 //! Two things about the document are easy to get wrong and are pinned by
 //! tests: it is XML, so an attribute name is case-sensitive and `viewBox` is
@@ -394,6 +397,7 @@ fn decode_viewport(
         clip: ClipStack::default(),
         use_depth: 0,
         mask_depth: 0,
+        filter_depth: 0,
     };
 
     // Root viewBox-to-viewport mapping, composed ahead of every shape.
@@ -432,6 +436,7 @@ fn decode_viewport(
     let (gradients, gradient_index) = collect_gradients(root, current_color);
     let clip_paths = collect_clip_paths(root);
     let mask_paths = collect_masks(root);
+    let filter_paths = collect_filters(root);
     let ids = collect_element_ids(root);
     let fill = root_paint(
         root,
@@ -451,6 +456,7 @@ fn decode_viewport(
         &gradient_index,
         &clip_paths,
         &mask_paths,
+        &filter_paths,
         &ids,
         &mut raster,
     );
@@ -464,6 +470,7 @@ struct Raster {
     clip: ClipStack,
     use_depth: usize,
     mask_depth: usize,
+    filter_depth: usize,
 }
 
 impl Raster {
@@ -592,6 +599,7 @@ fn walk(
     gradient_index: &BTreeMap<String, usize>,
     clip_paths: &BTreeMap<String, &XmlNode>,
     mask_paths: &BTreeMap<String, &XmlNode>,
+    filter_paths: &BTreeMap<String, &XmlNode>,
     ids: &BTreeMap<String, &XmlNode>,
     raster: &mut Raster,
 ) {
@@ -626,6 +634,24 @@ fn walk(
             gradient_index,
             clip_paths,
             mask_paths,
+            filter_paths,
+            ids,
+        ) {
+            continue;
+        }
+        if paint_filtered_element(
+            raster,
+            child_node,
+            transform,
+            child_transform,
+            child_fill,
+            child_stroke,
+            current_color,
+            gradients,
+            gradient_index,
+            clip_paths,
+            mask_paths,
+            filter_paths,
             ids,
         ) {
             continue;
@@ -917,6 +943,7 @@ fn walk(
                     gradient_index,
                     clip_paths,
                     mask_paths,
+                    filter_paths,
                     ids,
                     raster,
                 );
@@ -936,6 +963,7 @@ fn walk(
                     gradient_index,
                     clip_paths,
                     mask_paths,
+                    filter_paths,
                     ids,
                     raster,
                 );
@@ -952,6 +980,7 @@ fn walk(
                     gradient_index,
                     clip_paths,
                     mask_paths,
+                    filter_paths,
                     ids,
                     raster,
                 );
@@ -986,6 +1015,7 @@ fn paint_masked_element(
     gradient_index: &BTreeMap<String, usize>,
     clip_paths: &BTreeMap<String, &XmlNode>,
     mask_paths: &BTreeMap<String, &XmlNode>,
+    filter_paths: &BTreeMap<String, &XmlNode>,
     ids: &BTreeMap<String, &XmlNode>,
 ) -> bool {
     let Some(reference) = attribute(element, "mask") else {
@@ -1011,6 +1041,7 @@ fn paint_masked_element(
         clip: raster.clip.clone(),
         use_depth: raster.use_depth,
         mask_depth: raster.mask_depth,
+        filter_depth: raster.filter_depth,
     };
     let mut clone = element.clone();
     clone.attributes.retain(|(name, _)| name != "mask");
@@ -1029,6 +1060,7 @@ fn paint_masked_element(
         gradient_index,
         clip_paths,
         mask_paths,
+        filter_paths,
         ids,
         &mut content,
     );
@@ -1056,6 +1088,7 @@ fn paint_masked_element(
         clip: ClipStack::default(),
         use_depth: 0,
         mask_depth: raster.mask_depth + 1,
+        filter_depth: raster.filter_depth,
     };
     walk(
         mask,
@@ -1067,6 +1100,7 @@ fn paint_masked_element(
         gradient_index,
         clip_paths,
         mask_paths,
+        filter_paths,
         ids,
         &mut mask_raster,
     );
@@ -1160,6 +1194,403 @@ fn paint_masked_element(
         }
     }
     true
+}
+
+/// Render one element through an SVG filter.
+///
+/// Like masks, the element is painted into an offscreen buffer with its
+/// `filter` attribute removed. The filter primitives then transform that
+/// buffer, and the result is composited through the filter region. The first
+/// supported primitives are `feGaussianBlur` and `feColorMatrix`; a chain is
+/// processed in document order, and `in="SourceGraphic"` resets the chain.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one filtered element needs content, primitive chain and region passes"
+)]
+fn paint_filtered_element(
+    raster: &mut Raster,
+    element: &XmlNode,
+    parent_transform: Affine,
+    element_transform: Affine,
+    fill: Paint,
+    stroke: Paint,
+    current_color: Color,
+    gradients: &[Gradient],
+    gradient_index: &BTreeMap<String, usize>,
+    clip_paths: &BTreeMap<String, &XmlNode>,
+    mask_paths: &BTreeMap<String, &XmlNode>,
+    filter_paths: &BTreeMap<String, &XmlNode>,
+    ids: &BTreeMap<String, &XmlNode>,
+) -> bool {
+    let Some(reference) = attribute(element, "filter") else {
+        return false;
+    };
+    let Some(id) = reference_id(reference) else {
+        return false;
+    };
+    let Some(filter) = filter_paths.get(id) else {
+        return false;
+    };
+    if raster.filter_depth >= 8 {
+        return false;
+    }
+    let Some(bounds) = element_bounds(element) else {
+        return true;
+    };
+
+    let mut content = Raster {
+        width: raster.width,
+        height: raster.height,
+        pixels: vec![Color::TRANSPARENT; raster.width as usize * raster.height as usize],
+        clip: raster.clip.clone(),
+        use_depth: raster.use_depth,
+        mask_depth: raster.mask_depth,
+        filter_depth: raster.filter_depth + 1,
+    };
+    let mut clone = element.clone();
+    clone.attributes.retain(|(name, _)| name != "filter");
+    let shadow = XmlNode {
+        name: "filtered-content".to_owned(),
+        attributes: Vec::new(),
+        children: vec![clone],
+    };
+    walk(
+        &shadow,
+        parent_transform,
+        fill,
+        stroke,
+        current_color,
+        gradients,
+        gradient_index,
+        clip_paths,
+        mask_paths,
+        filter_paths,
+        ids,
+        &mut content,
+    );
+
+    let original = content.pixels.clone();
+    let mut pixels = content.pixels;
+    let object_primitives = attribute(filter, "primitiveUnits")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("objectBoundingBox"));
+    let transform_scale = affine_scale(element_transform);
+    for primitive in &filter.children {
+        if attribute(primitive, "in")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("SourceGraphic"))
+        {
+            pixels.clone_from(&original);
+        }
+        match primitive.name.as_str() {
+            "feGaussianBlur" => {
+                let (mut sigma_x, mut sigma_y) =
+                    parse_std_deviation(attribute(primitive, "stdDeviation").unwrap_or("0"));
+                if object_primitives {
+                    sigma_x *= bounds.width;
+                    sigma_y *= bounds.height;
+                }
+                pixels = blur_pixels(
+                    &pixels,
+                    raster.width,
+                    raster.height,
+                    sigma_x * transform_scale,
+                    sigma_y * transform_scale,
+                );
+            }
+            "feColorMatrix" => {
+                let matrix = parse_color_matrix(primitive);
+                for pixel in &mut pixels {
+                    *pixel = apply_color_matrix(*pixel, &matrix);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let object_units = !attribute(filter, "filterUnits")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("userSpaceOnUse"));
+    let (x, y, width, height) = if object_units {
+        (
+            attribute(filter, "x")
+                .and_then(parse_fraction)
+                .unwrap_or(-0.1),
+            attribute(filter, "y")
+                .and_then(parse_fraction)
+                .unwrap_or(-0.1),
+            attribute(filter, "width")
+                .and_then(parse_fraction)
+                .unwrap_or(1.2),
+            attribute(filter, "height")
+                .and_then(parse_fraction)
+                .unwrap_or(1.2),
+        )
+    } else {
+        (
+            attribute(filter, "x")
+                .and_then(parse_length)
+                .unwrap_or(bounds.x - 0.1 * bounds.width),
+            attribute(filter, "y")
+                .and_then(parse_length)
+                .unwrap_or(bounds.y - 0.1 * bounds.height),
+            attribute(filter, "width")
+                .and_then(parse_length)
+                .unwrap_or(1.2 * bounds.width),
+            attribute(filter, "height")
+                .and_then(parse_length)
+                .unwrap_or(1.2 * bounds.height),
+        )
+    };
+    if width <= 0.0 || height <= 0.0 {
+        return true;
+    }
+    let (region_x, region_y, region_width, region_height) = if object_units {
+        (
+            bounds.x + x * bounds.width,
+            bounds.y + y * bounds.height,
+            width * bounds.width,
+            height * bounds.height,
+        )
+    } else {
+        (x, y, width, height)
+    };
+    let region = [
+        (region_x, region_y),
+        (region_x + region_width, region_y),
+        (region_x + region_width, region_y + region_height),
+        (region_x, region_y + region_height),
+    ]
+    .map(|(x, y)| element_transform.apply(x, y));
+
+    for y in 0..raster.height {
+        for x in 0..raster.width {
+            if !point_in_polygon(&region, x as f32 + 0.5, y as f32 + 0.5) {
+                continue;
+            }
+            let index = y as usize * raster.width as usize + x as usize;
+            let pixel = pixels[index];
+            if pixel.alpha > 0 {
+                raster.put(i64::from(x), i64::from(y), pixel);
+            }
+        }
+    }
+    true
+}
+
+fn parse_std_deviation(raw: &str) -> (f32, f32) {
+    let values: Vec<f32> = raw
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<f32>().ok())
+        .collect();
+    let first = values.first().copied().unwrap_or(0.0);
+    (first, values.get(1).copied().unwrap_or(first))
+}
+
+fn affine_scale(transform: Affine) -> f32 {
+    let scale_x = transform.a.hypot(transform.b);
+    let scale_y = transform.c.hypot(transform.d);
+    scale_x.midpoint(scale_y).max(0.0001)
+}
+
+fn blur_pixels(
+    source: &[Color],
+    width: u32,
+    height: u32,
+    sigma_x: f32,
+    sigma_y: f32,
+) -> Vec<Color> {
+    if source.is_empty() || width == 0 || height == 0 {
+        return source.to_vec();
+    }
+    let sigma_x = sigma_x.clamp(0.0, 64.0);
+    let sigma_y = sigma_y.clamp(0.0, 64.0);
+    if sigma_x < 0.05 && sigma_y < 0.05 {
+        return source.to_vec();
+    }
+    let mut premultiplied: Vec<[f32; 4]> = source
+        .iter()
+        .map(|pixel| {
+            let alpha = f32::from(pixel.alpha) / 255.0;
+            [
+                f32::from(pixel.red) / 255.0 * alpha,
+                f32::from(pixel.green) / 255.0 * alpha,
+                f32::from(pixel.blue) / 255.0 * alpha,
+                alpha,
+            ]
+        })
+        .collect();
+    premultiplied = blur_axis(&premultiplied, width, height, sigma_x, true);
+    premultiplied = blur_axis(&premultiplied, width, height, sigma_y, false);
+    premultiplied
+        .into_iter()
+        .map(|pixel| {
+            let alpha = pixel[3].clamp(0.0, 1.0);
+            if alpha <= 0.0001 {
+                return Color::TRANSPARENT;
+            }
+            Color::rgba(
+                u8::try_from((pixel[0] / alpha * 255.0).round().clamp(0.0, 255.0) as i32)
+                    .unwrap_or(255),
+                u8::try_from((pixel[1] / alpha * 255.0).round().clamp(0.0, 255.0) as i32)
+                    .unwrap_or(255),
+                u8::try_from((pixel[2] / alpha * 255.0).round().clamp(0.0, 255.0) as i32)
+                    .unwrap_or(255),
+                u8::try_from((alpha * 255.0).round().clamp(0.0, 255.0) as i32).unwrap_or(255),
+            )
+        })
+        .collect()
+}
+
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "image dimensions are bounded by ImageLimits"
+)]
+fn blur_axis(
+    source: &[[f32; 4]],
+    width: u32,
+    height: u32,
+    sigma: f32,
+    horizontal: bool,
+) -> Vec<[f32; 4]> {
+    if sigma < 0.05 {
+        return source.to_vec();
+    }
+    let radius = (sigma * 3.0).ceil().clamp(1.0, 64.0) as i32;
+    let mut weights = Vec::with_capacity((radius * 2 + 1) as usize);
+    let mut total = 0.0_f32;
+    for offset in -radius..=radius {
+        let weight = (-(offset as f32).powi(2) / (2.0 * sigma * sigma)).exp();
+        weights.push(weight);
+        total += weight;
+    }
+    if total > 0.0 {
+        for weight in &mut weights {
+            *weight /= total;
+        }
+    }
+    let mut output = vec![[0.0_f32; 4]; source.len()];
+    for y in 0..height as i32 {
+        for x in 0..width as i32 {
+            let mut sum = [0.0_f32; 4];
+            for (index, offset) in (-radius..=radius).enumerate() {
+                let (sample_x, sample_y) = if horizontal {
+                    (x + offset, y)
+                } else {
+                    (x, y + offset)
+                };
+                if sample_x < 0
+                    || sample_y < 0
+                    || sample_x >= width as i32
+                    || sample_y >= height as i32
+                {
+                    continue;
+                }
+                let pixel = source[sample_y as usize * width as usize + sample_x as usize];
+                let weight = weights[index];
+                for channel in 0..4 {
+                    sum[channel] += pixel[channel] * weight;
+                }
+            }
+            output[y as usize * width as usize + x as usize] = sum;
+        }
+    }
+    output
+}
+
+fn parse_color_matrix(element: &XmlNode) -> [f32; 20] {
+    let values: Vec<f32> = attribute(element, "values")
+        .unwrap_or("")
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<f32>().ok())
+        .collect();
+    let kind = attribute(element, "type")
+        .unwrap_or("matrix")
+        .trim()
+        .to_ascii_lowercase();
+    match kind.as_str() {
+        "matrix" if values.len() >= 20 => {
+            let mut matrix = [0.0; 20];
+            matrix.copy_from_slice(&values[..20]);
+            matrix
+        }
+        "saturate" => {
+            let saturation = values.first().copied().unwrap_or(1.0);
+            [
+                0.213 + 0.787 * saturation,
+                0.715 - 0.715 * saturation,
+                0.072 - 0.072 * saturation,
+                0.0,
+                0.0,
+                0.213 - 0.213 * saturation,
+                0.715 + 0.285 * saturation,
+                0.072 - 0.072 * saturation,
+                0.0,
+                0.0,
+                0.213 - 0.213 * saturation,
+                0.715 - 0.715 * saturation,
+                0.072 + 0.928 * saturation,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+            ]
+        }
+        "huerotate" => {
+            let radians = values.first().copied().unwrap_or(0.0).to_radians();
+            let (sin, cos) = radians.sin_cos();
+            [
+                0.213 + cos * 0.787 - sin * 0.213,
+                0.715 - cos * 0.715 - sin * 0.715,
+                0.072 - cos * 0.072 + sin * 0.928,
+                0.0,
+                0.0,
+                0.213 - cos * 0.213 + sin * 0.143,
+                0.715 + cos * 0.285 + sin * 0.140,
+                0.072 - cos * 0.072 - sin * 0.283,
+                0.0,
+                0.0,
+                0.213 - cos * 0.213 - sin * 0.787,
+                0.715 - cos * 0.715 + sin * 0.715,
+                0.072 + cos * 0.928 + sin * 0.072,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+            ]
+        }
+        "luminancetoalpha" => [
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2126,
+            0.7152, 0.0722, 0.0, 0.0,
+        ],
+        _ => [
+            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+        ],
+    }
+}
+
+fn apply_color_matrix(pixel: Color, matrix: &[f32; 20]) -> Color {
+    let red = f32::from(pixel.red) / 255.0;
+    let green = f32::from(pixel.green) / 255.0;
+    let blue = f32::from(pixel.blue) / 255.0;
+    let alpha = f32::from(pixel.alpha) / 255.0;
+    let channel = |row: usize| -> u8 {
+        let offset = row * 5;
+        let value = matrix[offset] * red
+            + matrix[offset + 1] * green
+            + matrix[offset + 2] * blue
+            + matrix[offset + 3] * alpha
+            + matrix[offset + 4];
+        (value.clamp(0.0, 1.0) * 255.0).round() as u8
+    };
+    Color::rgba(channel(0), channel(1), channel(2), channel(3))
 }
 
 /// Fill one shape with a solid colour or a gradient.
@@ -1700,6 +2131,26 @@ fn collect_masks_into<'a>(element: &'a XmlNode, masks: &mut BTreeMap<String, &'a
             masks.entry(id.to_owned()).or_insert(child);
         }
         collect_masks_into(child, masks);
+    }
+}
+
+/// Index every `filter` definition by id, including forward references.
+fn collect_filters(root: &XmlNode) -> BTreeMap<String, &XmlNode> {
+    let mut filters = BTreeMap::new();
+    collect_filters_into(root, &mut filters);
+    filters
+}
+
+fn collect_filters_into<'a>(element: &'a XmlNode, filters: &mut BTreeMap<String, &'a XmlNode>) {
+    for child in &element.children {
+        if child.name == "filter"
+            && let Some(id) = attribute(child, "id")
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+        {
+            filters.entry(id.to_owned()).or_insert(child);
+        }
+        collect_filters_into(child, filters);
     }
 }
 
@@ -2924,6 +3375,48 @@ mod tests {
         let pixel = image.pixel(2, 2).expect("masked pixel");
         assert!(pixel.alpha > 100 && pixel.alpha < 200, "{pixel:?}");
         assert!(pixel.red > 200, "{pixel:?}");
+    }
+
+    #[test]
+    fn a_gaussian_blur_spreads_alpha_beyond_the_source_shape() {
+        let svg = br#"<svg width="20" height="20"><defs>
+            <filter id="f"><feGaussianBlur stdDeviation="1"/></filter></defs>
+            <rect x="8" y="8" width="4" height="4" fill="red" filter="url(#f)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        let centre = image.pixel(10, 10).expect("centre pixel");
+        let edge = image.pixel(8, 10).expect("blurred edge pixel");
+        assert_eq!(centre.red, 255);
+        assert!(centre.alpha > 180, "centre alpha={}", centre.alpha);
+        assert!(edge.alpha > 0, "blur did not extend the shape edge");
+        assert!(edge.alpha < 255, "edge should be partially transparent");
+        assert_eq!(
+            image.pixel(2, 2).map(|pixel| pixel.alpha),
+            Some(0),
+            "the filter region should clip the far edge"
+        );
+    }
+
+    #[test]
+    fn a_saturate_color_matrix_desaturates_the_source() {
+        let svg = br#"<svg width="10" height="10"><defs>
+            <filter id="f"><feColorMatrix type="saturate" values="0"/></filter></defs>
+            <rect x="2" y="2" width="6" height="6" fill="red" filter="url(#f)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        let pixel = image.pixel(4, 4).expect("filtered pixel");
+        assert_eq!(pixel.alpha, 255);
+        assert!((i16::from(pixel.red) - i16::from(pixel.green)).abs() <= 1);
+        assert!((i16::from(pixel.green) - i16::from(pixel.blue)).abs() <= 1);
+        assert!(pixel.red < 100, "{pixel:?}");
+    }
+
+    #[test]
+    fn a_color_matrix_can_swap_channels() {
+        let svg = br#"<svg width="10" height="10"><defs>
+            <filter id="f"><feColorMatrix type="matrix"
+              values="0 1 0 0 0  1 0 0 0 0  0 0 1 0 0  0 0 0 1 0"/></filter></defs>
+            <rect x="2" y="2" width="6" height="6" fill="red" filter="url(#f)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(4, 4), Some(Color::rgb(0, 255, 0)));
     }
 
     #[test]
