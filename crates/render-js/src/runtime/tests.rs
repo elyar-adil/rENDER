@@ -1349,6 +1349,283 @@ fn web_animation_group_children_keep_independent_timing() {
 }
 
 #[test]
+fn web_animation_nested_group_applies_its_own_timing() {
+    let mut parsed = parse_document("<!doctype html><div id='box'></div>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.fakeNow = 0;
+                performance.now = function () { return window.fakeNow; };
+                var box = document.getElementById('box');
+                var inner = new KeyframeEffect(
+                    box,
+                    [{ opacity: 0 }, { opacity: 1 }],
+                    { duration: 1000, fill: 'both' }
+                );
+                var nested = new GroupEffect([inner], {
+                    duration: 400,
+                    delay: 200,
+                    iterations: 2,
+                    direction: 'alternate',
+                    fill: 'both'
+                });
+                var outer = new GroupEffect([nested], { duration: 2000, fill: 'both' });
+                new Animation(outer, document.timeline).play();
+                window.inner = inner;
+                window.nested = nested;
+            ",
+        )
+        .expect("nested group timing starts");
+    for (time, expected) in [(100.0, "0"), (400.0, "0.2"), (700.0, "0.3"), (1000.0, "0")] {
+        runtime
+            .execute(
+                &mut parsed.dom,
+                &format!("window.fakeNow = {time}; __renderTickWebAnimations({time});"),
+            )
+            .expect("nested group tick runs");
+        let opacity = runtime
+            .execute(
+                &mut parsed.dom,
+                "document.getElementById('box').style.getPropertyValue('opacity')",
+            )
+            .expect("reads nested group opacity")
+            .value
+            .to_js_string();
+        assert_eq!(opacity.to_lossy(), expected, "at {time}ms");
+    }
+    let computed = runtime
+        .execute(
+            &mut parsed.dom,
+            "[nested.getComputedTiming().endTime, inner.getTiming().duration].join('|')",
+        )
+        .expect("reads nested group timing")
+        .value
+        .to_js_string();
+    assert_eq!(computed.to_lossy(), "1000|1000");
+
+    runtime
+        .execute(&mut parsed.dom, "nested.updateTiming({ delay: 600 });")
+        .expect("updates nested group timing");
+    let updated = runtime
+        .execute(
+            &mut parsed.dom,
+            r"[
+                document.getElementById('box').style.getPropertyValue('opacity'),
+                nested.getTiming().delay
+            ].join('|')",
+        )
+        .expect("reads updated nested group timing")
+        .value
+        .to_js_string();
+    assert_eq!(updated.to_lossy(), "0.4|600");
+}
+
+#[test]
+fn web_animation_group_without_duration_tracks_child_end_time() {
+    let mut parsed = parse_document("<!doctype html><div id='box'></div>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.fakeNow = 0;
+                performance.now = function () { return window.fakeNow; };
+                var box = document.getElementById('box');
+                var child = new KeyframeEffect(
+                    box,
+                    [{ opacity: 0 }, { opacity: 1 }],
+                    { duration: 1000, fill: 'both' }
+                );
+                var group = new GroupEffect([child], { fill: 'both' });
+                var animation = new Animation(group, document.timeline);
+                animation.play();
+                window.group = group;
+                window.animation = animation;
+            ",
+        )
+        .expect("auto-duration group starts");
+    runtime
+        .execute(&mut parsed.dom, "window.fakeNow = 500;")
+        .expect("advance auto-duration timeline");
+    tick_web_animations(&mut runtime, &mut parsed.dom, 500.0);
+    let middle = runtime
+        .execute(
+            &mut parsed.dom,
+            r"[
+                document.getElementById('box').style.getPropertyValue('opacity'),
+                animation.playState,
+                group.getComputedTiming().endTime
+            ].join('|')",
+        )
+        .expect("reads auto-duration midpoint")
+        .value
+        .to_js_string();
+    assert_eq!(middle.to_lossy(), "0.5|running|1000");
+
+    runtime
+        .execute(&mut parsed.dom, "window.fakeNow = 1000;")
+        .expect("advance auto-duration end");
+    tick_web_animations(&mut runtime, &mut parsed.dom, 1000.0);
+    let end = runtime
+        .execute(
+            &mut parsed.dom,
+            "[document.getElementById('box').style.getPropertyValue('opacity'), animation.playState].join('|')",
+        )
+        .expect("reads auto-duration end")
+        .value
+        .to_js_string();
+    assert_eq!(end.to_lossy(), "1|finished");
+}
+
+#[test]
+fn web_animation_update_timing_recomputes_the_effect() {
+    let mut parsed = parse_document("<!doctype html><div id='box'></div>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.fakeNow = 0;
+                performance.now = function () { return window.fakeNow; };
+                var box = document.getElementById('box');
+                var effect = new KeyframeEffect(
+                    box,
+                    [{ width: '0px' }, { width: '100px' }],
+                    { duration: 1000, fill: 'both' }
+                );
+                var animation = new Animation(effect, document.timeline);
+                animation.play();
+                window.effect = effect;
+                window.animation = animation;
+            ",
+        )
+        .expect("timing update animation starts");
+    runtime
+        .execute(&mut parsed.dom, "window.fakeNow = 250;")
+        .expect("advance initial timeline");
+    tick_web_animations(&mut runtime, &mut parsed.dom, 250.0);
+    let before = runtime
+        .execute(
+            &mut parsed.dom,
+            "document.getElementById('box').style.getPropertyValue('width')",
+        )
+        .expect("reads width before timing update")
+        .value
+        .to_js_string();
+    assert_eq!(before.to_lossy(), "25px");
+
+    runtime
+        .execute(&mut parsed.dom, "effect.updateTiming({ duration: 500 });")
+        .expect("updates effect timing");
+    let updated = runtime
+        .execute(
+            &mut parsed.dom,
+            r"[
+                document.getElementById('box').style.getPropertyValue('width'),
+                effect.getTiming().duration,
+                animation.effect === effect
+            ].join('|')",
+        )
+        .expect("reads updated timing result")
+        .value
+        .to_js_string();
+    assert_eq!(updated.to_lossy(), "50px|500|true");
+
+    runtime
+        .execute(&mut parsed.dom, "window.fakeNow = 500;")
+        .expect("advance shortened timeline");
+    tick_web_animations(&mut runtime, &mut parsed.dom, 500.0);
+    let finished = runtime
+        .execute(
+            &mut parsed.dom,
+            "[document.getElementById('box').style.getPropertyValue('width'), animation.playState].join('|')",
+        )
+        .expect("reads shortened finish state")
+        .value
+        .to_js_string();
+    assert_eq!(finished.to_lossy(), "100px|finished");
+}
+
+#[test]
+fn web_animation_replacing_effect_clears_old_values_and_applies_new_ones() {
+    let mut parsed = parse_document("<!doctype html><div id='box' style='opacity: 0.2'></div>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.fakeNow = 0;
+                performance.now = function () { return window.fakeNow; };
+                var box = document.getElementById('box');
+                var effect = new KeyframeEffect(
+                    box,
+                    [{ opacity: 0 }, { opacity: 1 }],
+                    { duration: 1000, fill: 'both' }
+                );
+                var animation = new Animation(effect, document.timeline);
+                animation.play();
+                window.animation = animation;
+            ",
+        )
+        .expect("effect replacement animation starts");
+    runtime
+        .execute(&mut parsed.dom, "window.fakeNow = 500;")
+        .expect("advance replacement timeline");
+    tick_web_animations(&mut runtime, &mut parsed.dom, 500.0);
+    let before = runtime
+        .execute(
+            &mut parsed.dom,
+            "document.getElementById('box').style.getPropertyValue('opacity')",
+        )
+        .expect("reads old effect value")
+        .value
+        .to_js_string();
+    assert_eq!(before.to_lossy(), "0.5");
+
+    let replaced = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var replacement = new KeyframeEffect(
+                    box,
+                    [{ width: '0px' }, { width: '100px' }],
+                    { duration: 1000, fill: 'both' }
+                );
+                animation.effect = replacement;
+                window.replacement = replacement;
+                [
+                    document.getElementById('box').style.getPropertyValue('opacity'),
+                    document.getElementById('box').style.getPropertyValue('width'),
+                    animation.effect === replacement
+                ].join('|');
+            ",
+        )
+        .expect("replaces the animation effect")
+        .value
+        .to_js_string();
+    assert_eq!(replaced.to_lossy(), "0.2|50px|true");
+
+    runtime
+        .execute(&mut parsed.dom, "window.fakeNow = 750;")
+        .expect("advance replaced timeline");
+    tick_web_animations(&mut runtime, &mut parsed.dom, 750.0);
+    let advanced = runtime
+        .execute(
+            &mut parsed.dom,
+            r"[
+                document.getElementById('box').style.getPropertyValue('opacity'),
+                document.getElementById('box').style.getPropertyValue('width')
+            ].join('|')",
+        )
+        .expect("reads replaced effect values")
+        .value
+        .to_js_string();
+    assert_eq!(advanced.to_lossy(), "0.2|75px");
+}
+
+#[test]
 fn inner_html_round_trips_and_setter_replaces_children() {
     let mut parsed = parse_document("<!doctype html><div id='host'><p>old</p></div>");
     let mut runtime = JsRuntime::new(&parsed.dom);

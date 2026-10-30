@@ -42,6 +42,26 @@
     };
   }
 
+  function applyTimingOptions(timing, options) {
+    options = options || {};
+    if (options.duration !== undefined) {
+      timing.duration = String(options.duration) === 'auto'
+        ? 0
+        : Math.max(0, number(options.duration, timing.duration));
+    }
+    if (options.delay !== undefined) timing.delay = number(options.delay, timing.delay);
+    if (options.endDelay !== undefined) timing.endDelay = number(options.endDelay, timing.endDelay);
+    if (options.iterations !== undefined) {
+      timing.iterations = options.iterations === Infinity
+        ? Infinity
+        : Math.max(0, number(options.iterations, timing.iterations));
+    }
+    if (options.direction !== undefined) timing.direction = options.direction || 'normal';
+    if (options.fill !== undefined) timing.fill = options.fill || 'none';
+    if (options.easing !== undefined) timing.easing = options.easing || 'linear';
+    return timing;
+  }
+
   function camelToKebab(name) {
     if (name === 'cssFloat') return 'float';
     return String(name).replace(/[A-Z]/g, function (letter) {
@@ -402,6 +422,26 @@
     targets.forEach(renderTarget);
   }
 
+  function effectContains(root, effect) {
+    if (!root) return false;
+    if (root === effect) return true;
+    if (root._kind !== 'group') return false;
+    for (var i = 0; i < root._children.length; i++) {
+      if (effectContains(root._children[i], effect)) return true;
+    }
+    return false;
+  }
+
+  // A timing change mutates the effect's timing object in place, so every
+  // animation that owns the effect (directly or through a group) can resample
+  // with the new end time without rebuilding the effect.
+  function notifyEffectUpdated(effect) {
+    for (var i = 0; i < animations.length; i++) {
+      var animation = animations[i];
+      if (effectContains(animation._effect, effect)) animation._refresh();
+    }
+  }
+
   // The embedding drives this function once per document animation frame. It
   // uses the same document timestamp as the CSS animation sampler, so CSS and
   // WAAPI share one timeline instead of running on separate timers.
@@ -465,6 +505,10 @@
     timing.endTime = timing.delay + timing.activeDuration + timing.endDelay;
     return timing;
   };
+  KeyframeEffect.prototype.updateTiming = function (options) {
+    applyTimingOptions(this._timing, options);
+    notifyEffectUpdated(this);
+  };
   KeyframeEffect.prototype._properties = function () {
     return this._tracks.map(function (track) { return track.property; });
   };
@@ -491,6 +535,7 @@
     this._kind = 'group';
     this._children = [];
     this._timing = timingFrom(options);
+    this._autoDuration = !options || options.duration === undefined || String(options.duration) === 'auto';
     (effects || []).forEach(function (effect) { this.append(effect); }, this);
   }
 
@@ -513,6 +558,30 @@
     if (index >= 0) this._children.splice(index, 1);
   };
   GroupEffect.prototype.getChildren = function () { return this._children.slice(); };
+  // A group's duration is "auto" when omitted or explicitly "auto", matching
+  // the duration of its longest child. This keeps a default-constructed group
+  // driving the full child timeline instead of collapsing to a zero-length
+  // interval.
+  GroupEffect.prototype._intrinsicDuration = function () {
+    var duration = 0;
+    this._children.forEach(function (child) {
+      var endTime = child.getComputedTiming().endTime;
+      if (endTime > duration) duration = endTime;
+    });
+    return duration;
+  };
+  GroupEffect.prototype._timingForSample = function () {
+    if (!this._autoDuration) return this._timing;
+    return {
+      duration: this._intrinsicDuration(),
+      delay: this._timing.delay,
+      endDelay: this._timing.endDelay,
+      iterations: this._timing.iterations,
+      direction: this._timing.direction,
+      fill: this._timing.fill,
+      easing: this._timing.easing
+    };
+  };
   GroupEffect.prototype.getTiming = function () {
     return {
       duration: this._timing.duration,
@@ -525,10 +594,17 @@
     };
   };
   GroupEffect.prototype.getComputedTiming = function () {
-    var timing = this.getTiming();
+    var timing = this._timingForSample();
     timing.activeDuration = timing.duration * timing.iterations;
     timing.endTime = timing.delay + timing.activeDuration + timing.endDelay;
     return timing;
+  };
+  GroupEffect.prototype.updateTiming = function (options) {
+    if (options && options.duration !== undefined) {
+      this._autoDuration = String(options.duration) === 'auto';
+    }
+    applyTimingOptions(this._timing, options);
+    notifyEffectUpdated(this);
   };
   GroupEffect.prototype._properties = function () {
     var result = [];
@@ -552,10 +628,18 @@
     return null;
   };
   GroupEffect.prototype._sampleAtTime = function (localTime) {
+    var timing = this._timingForSample();
+    var active = activeProgress(timing, localTime, 1);
+    if (active.progress === null) return null;
+    // The group timing turns its own local time into an iteration progress;
+    // direction and easing transform that progress, then the group duration
+    // maps it back to the local time its children sample against. Children
+    // still apply their own delay/duration/iterations/direction/fill.
+    var childTime = easing(timing.easing, active.progress) * timing.duration;
     var values = Object.create(null);
     var composites = Object.create(null);
     this._children.forEach(function (child) {
-      var result = child._sampleAtTime(localTime);
+      var result = child._sampleAtTime(childTime);
       if (!result) return;
       Object.keys(result.values).forEach(function (property) {
         if (!(property in values)) values[property] = '';
@@ -603,7 +687,6 @@
       playbackOptions = options || {};
     }
     this._effect = effect;
-    this.effect = effect;
     this._target = effect._kind === 'group' ? effect._target() : effect._target;
     this._timing = effect._timing;
     this._tracks = effect._kind === 'keyframe' ? effect._tracks : [];
@@ -618,15 +701,7 @@
     this._listeners = Object.create(null);
     this._values = null;
     this._valueComposite = null;
-    if (this._target) {
-      var base = animationBase(this._target);
-      effect._properties().forEach(function (property) {
-        if (!(property in base.properties)) {
-          try { base.properties[property] = this._target.style.getPropertyValue(property); }
-          catch (error) { base.properties[property] = ''; }
-        }
-      }, this);
-    }
+    this._captureBase();
     var self = this;
     this.finished = new Promise(function (resolve, reject) {
       self._resolveFinished = resolve;
@@ -636,8 +711,59 @@
     animations.push(this);
   }
 
+  Animation.prototype._captureBase = function () {
+    if (!this._target || !this._effect) return;
+    var base = animationBase(this._target);
+    this._effect._properties().forEach(function (property) {
+      if (!(property in base.properties)) {
+        try { base.properties[property] = this._target.style.getPropertyValue(property); }
+        catch (error) { base.properties[property] = ''; }
+      }
+    }, this);
+  };
+
+  // Replacing an effect must first clear the old effect's sampled values so
+  // the inline style is back to its base before the new effect captures it.
+  Animation.prototype._attachEffect = function (effect) {
+    var previousTarget = this._target;
+    this._values = null;
+    this._valueComposite = null;
+    if (previousTarget) renderTarget(previousTarget);
+    this._effect = effect;
+    this._target = effect ? (effect._kind === 'group' ? effect._target() : effect._target) : null;
+    this._timing = effect ? effect._timing : timingFrom({});
+    this._tracks = effect && effect._kind === 'keyframe' ? effect._tracks : [];
+    this._composite = (effect && effect._composite) || 'replace';
+    this._captureBase();
+    this._refresh();
+  };
+
+  Animation.prototype._refresh = function () {
+    if (!this._target) return;
+    if (this._playState === 'idle') {
+      this._values = null;
+      this._valueComposite = null;
+      renderTarget(this._target);
+      return;
+    }
+    if (this._playState === 'running') {
+      // Inline the running sample so updateTiming does not add another JS
+      // call frame on top of the effect/group sampling recursion.
+      var nowTime = now();
+      var elapsed = (nowTime - this._startTime) * this._playbackRate;
+      this._currentTime = elapsed;
+      var active = activeProgress(this._timingForSample(), elapsed, this._playbackRate);
+      this._apply(active.progress, elapsed);
+      if (active.finished) this._finish();
+    } else {
+      var result = activeProgress(this._timingForSample(), this._currentTime, this._playbackRate);
+      this._apply(result.progress, this._currentTime);
+    }
+    renderTarget(this._target);
+  };
+
   Animation.prototype._apply = function (progress, elapsed) {
-    if (progress === null) {
+    if (progress === null || !this._effect) {
       this._values = null;
       this._valueComposite = null;
       return;
@@ -647,16 +773,24 @@
     this._valueComposite = result ? result.composites : null;
   };
 
+  Animation.prototype._timingForSample = function () {
+    if (this._effect && this._effect._kind === 'group') return this._effect._timingForSample();
+    return this._timing;
+  };
+
   Animation.prototype._endTime = function () {
-    var total = this._timing.duration * this._timing.iterations;
-    return this._timing.delay + (total === Infinity ? Infinity : total + this._timing.endDelay);
+    if (!this._effect) return 0;
+    var timing = this._timingForSample();
+    var total = timing.duration * timing.iterations;
+    return timing.delay + (total === Infinity ? Infinity : total + timing.endDelay);
   };
 
   Animation.prototype._finish = function () {
     if (this._playState === 'finished') return;
     this._playState = 'finished';
     this._currentTime = this._playbackRate < 0 ? 0 : this._endTime();
-    if (this._timing.fill.indexOf('forwards') < 0 && this._timing.fill.indexOf('both') < 0) {
+    var timing = this._timingForSample();
+    if (timing.fill.indexOf('forwards') < 0 && timing.fill.indexOf('both') < 0) {
       this._values = null;
       this._valueComposite = null;
     }
@@ -670,7 +804,8 @@
     if (this._playState !== 'running') return;
     var elapsed = (time - this._startTime) * this._playbackRate;
     this._currentTime = elapsed;
-    var result = activeProgress(this._timing, elapsed, this._playbackRate);
+    var timing = this._timingForSample();
+    var result = activeProgress(timing, elapsed, this._playbackRate);
     this._apply(result.progress, elapsed);
     if (result.finished) this._finish();
   };
@@ -737,6 +872,22 @@
     if (list) this._listeners[String(type)] = list.filter(function (listener) { return listener !== callback; });
   };
 
+  defineProperty(Animation.prototype, 'effect', {
+    get: function () { return this._effect; },
+    set: function (effect) {
+      if (effect === null || effect === undefined) {
+        if (this._effect) this._attachEffect(null);
+        return;
+      }
+      if (effect._kind !== 'keyframe' && effect._kind !== 'group') {
+        throw new TypeError('Animation effect must be a KeyframeEffect or GroupEffect');
+      }
+      if (effect === this._effect) return;
+      this._attachEffect(effect);
+    },
+    configurable: true
+  });
+
   defineProperty(Animation.prototype, 'playState', {
     get: function () { return this._playState; },
     configurable: true
@@ -755,7 +906,7 @@
       if (this._playState === 'running' && this._playbackRate !== 0) {
         this._startTime = now() - next / this._playbackRate;
       }
-      var result = activeProgress(this._timing, next, this._playbackRate);
+      var result = activeProgress(this._timingForSample(), next, this._playbackRate);
       this._apply(result.progress, next);
       renderTarget(this._target);
     },
