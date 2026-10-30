@@ -251,6 +251,7 @@ pub(super) fn mark_host(
         | ObjectHost::AudioConstructor
         | ObjectHost::IntersectionObserverConstructor
         | ObjectHost::MutationObserverConstructor
+        | ObjectHost::ResizeObserverConstructor
         | ObjectHost::Location(_)
         | ObjectHost::ErrorConstructor(_)
         | ObjectHost::ErrorInstance
@@ -383,6 +384,7 @@ pub(super) fn mark_host(
             mark_function(runtime, marked, work, marked_environments, *index);
         }
         ObjectHost::IntersectionObserver { callback, .. }
+        | ObjectHost::ResizeObserver { callback, .. }
         | ObjectHost::MutationObserver { callback, .. } => {
             mark_object(runtime, marked, work, marked_environments, *callback);
         }
@@ -621,6 +623,15 @@ impl JsRuntime {
                 *observer,
             );
         }
+        for observer in &self.resize_observers {
+            mark_object(
+                self,
+                &mut marked,
+                &mut work,
+                &mut marked_environments,
+                *observer,
+            );
+        }
         // Pending network transfers keep their promise or XHR object alive so
         // a late settle still reaches registered reactions and callbacks.
         for target in self.pending_fetch_targets.values() {
@@ -658,6 +669,7 @@ impl JsRuntime {
                 // alive; there is no object reference to mark.
                 JsMicrotask::DialogClosed(_) => {}
                 JsMicrotask::IntersectionObserver(observer)
+                | JsMicrotask::ResizeObserver(observer)
                 | JsMicrotask::MutationObserver(observer)
                 | JsMicrotask::MediaQueryListChange(observer) => {
                     mark_object(

@@ -441,6 +441,7 @@ impl JsMicrotask {
         match self {
             Self::Callback(object)
             | Self::IntersectionObserver(object)
+            | Self::ResizeObserver(object)
             | Self::MutationObserver(object)
             | Self::MediaQueryListChange(object) => roots.push(*object),
             Self::PromiseReaction {
@@ -490,6 +491,7 @@ pub enum JsMicrotask {
     /// the event, and this is the queue.
     DialogClosed(NodeId),
     IntersectionObserver(ObjectId),
+    ResizeObserver(ObjectId),
     MutationObserver(ObjectId),
     /// A `MediaQueryList` whose `matches` flipped, so its `change` listeners
     /// have to run. Not an observer and not a callback: the invocation is a
@@ -712,7 +714,7 @@ pub struct ConsoleMessage {
 /// Border-box geometry of one element in CSS pixels, captured from the latest
 /// layout pass and installed into the runtime by the embedding. Values are
 /// stale by at most one render turn; elements without boxes read as zero.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ElementRect {
     pub x: f32,
     pub y: f32,

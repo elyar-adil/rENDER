@@ -1231,6 +1231,30 @@ impl JsRuntime {
                 receiver,
                 arguments,
             ),
+            NativeFunction::ResizeDisconnect => self.dispatch_observers_native(
+                dom,
+                NativeFunction::ResizeDisconnect,
+                receiver,
+                arguments,
+            ),
+            NativeFunction::ResizeObserve => self.dispatch_observers_native(
+                dom,
+                NativeFunction::ResizeObserve,
+                receiver,
+                arguments,
+            ),
+            NativeFunction::ResizeTakeRecords => self.dispatch_observers_native(
+                dom,
+                NativeFunction::ResizeTakeRecords,
+                receiver,
+                arguments,
+            ),
+            NativeFunction::ResizeUnobserve => self.dispatch_observers_native(
+                dom,
+                NativeFunction::ResizeUnobserve,
+                receiver,
+                arguments,
+            ),
             NativeFunction::NamedMapGetNamedItem => self.dispatch_dom_native(
                 dom,
                 NativeFunction::NamedMapGetNamedItem,

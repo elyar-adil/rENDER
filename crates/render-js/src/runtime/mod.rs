@@ -317,6 +317,7 @@ pub struct JsRuntime {
     element_geometry: BTreeMap<u64, ElementRect>,
     viewport: ElementRect,
     intersection_observers: Vec<ObjectId>,
+    resize_observers: Vec<ObjectId>,
     mutation_observers: Vec<ObjectId>,
     /// Every `MediaQueryList` this realm has produced, kept so a viewport change
     /// can re-evaluate them. The list is a *registry*, not a root: a list script
@@ -497,6 +498,7 @@ impl JsRuntime {
                 height: 768.0,
             },
             intersection_observers: Vec::new(),
+            resize_observers: Vec::new(),
             mutation_observers: Vec::new(),
             media_query_lists: Vec::new(),
             mutation_seen_revision: dom.revision(),
@@ -968,6 +970,7 @@ impl JsRuntime {
     pub fn install_element_geometry(&mut self, geometry: BTreeMap<u64, ElementRect>) {
         self.element_geometry = geometry;
         self.queue_intersection_observers();
+        self.queue_resize_observers();
     }
 
     /// Publish the current CSS viewport and document scroll position.
@@ -1120,6 +1123,7 @@ impl JsRuntime {
             JsMicrotask::IntersectionObserver(observer) => {
                 self.notify_intersection_observer(dom, observer)
             }
+            JsMicrotask::ResizeObserver(observer) => self.notify_resize_observer(dom, observer),
             JsMicrotask::MutationObserver(observer) => self.notify_mutation_observer(dom, observer),
             JsMicrotask::DialogClosed(dialog) => self
                 .dispatch_dom_event(dom, dialog, "close", false, false, false, &[])

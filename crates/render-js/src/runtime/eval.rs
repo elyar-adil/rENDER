@@ -5774,6 +5774,18 @@ impl JsRuntime {
             (Some(ObjectHost::UrlConstructor), "revokeObjectURL") => {
                 Some(NativeFunction::UrlRevokeObjectUrl)
             }
+            (Some(ObjectHost::ResizeObserver { .. }), "observe") => {
+                Some(NativeFunction::ResizeObserve)
+            }
+            (Some(ObjectHost::ResizeObserver { .. }), "unobserve") => {
+                Some(NativeFunction::ResizeUnobserve)
+            }
+            (Some(ObjectHost::ResizeObserver { .. }), "disconnect") => {
+                Some(NativeFunction::ResizeDisconnect)
+            }
+            (Some(ObjectHost::ResizeObserver { .. }), "takeRecords") => {
+                Some(NativeFunction::ResizeTakeRecords)
+            }
             (Some(ObjectHost::MutationObserver { .. }), "observe") => {
                 Some(NativeFunction::MutationObserve)
             }
@@ -6175,6 +6187,7 @@ impl JsRuntime {
                 | ObjectHost::ProxyConstructor
                 | ObjectHost::IntersectionObserverConstructor
                 | ObjectHost::MutationObserverConstructor
+                | ObjectHost::ResizeObserverConstructor
                 | ObjectHost::CollectionConstructor(_)
                 | ObjectHost::TypedArrayConstructor(_)
                 | ObjectHost::RegExpConstructor
@@ -6441,6 +6454,9 @@ impl JsRuntime {
             }
             Some(ObjectHost::MutationObserverConstructor) => {
                 self.mutation_observer_constructor(constructor, arguments)
+            }
+            Some(ObjectHost::ResizeObserverConstructor) => {
+                self.resize_observer_constructor(constructor, arguments)
             }
             Some(ObjectHost::CollectionConstructor(kind)) => {
                 self.collection_constructor(dom, constructor, kind, arguments)
@@ -6807,6 +6823,9 @@ impl JsRuntime {
             )),
             Some(ObjectHost::MutationObserverConstructor) => Err(JsError::type_error(
                 "MutationObserver constructor requires 'new'",
+            )),
+            Some(ObjectHost::ResizeObserverConstructor) => Err(JsError::type_error(
+                "ResizeObserver constructor requires 'new'",
             )),
             Some(ObjectHost::CollectionConstructor(_)) => {
                 Err(JsError::type_error("collection constructors require 'new'"))

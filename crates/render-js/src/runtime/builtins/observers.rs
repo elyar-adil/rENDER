@@ -24,6 +24,7 @@ use crate::utf16::JsString;
 use crate::value::MutationWatch;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use crate::value::ResizeWatch;
 use render_css::selector::MatchContext;
 use render_dom::Dom;
 use render_dom::MutationKind;
@@ -44,6 +45,10 @@ impl JsRuntime {
             }
             NativeFunction::IntersectionDisconnect => self.intersection_disconnect(receiver),
             NativeFunction::IntersectionTakeRecords => self.intersection_take_records(receiver),
+            NativeFunction::ResizeObserve => self.resize_observe(receiver, arguments),
+            NativeFunction::ResizeUnobserve => self.resize_unobserve(receiver, arguments),
+            NativeFunction::ResizeDisconnect => self.resize_disconnect(receiver),
+            NativeFunction::ResizeTakeRecords => self.resize_take_records(dom, receiver),
             NativeFunction::MutationObserve => self.mutation_observe(receiver, arguments),
             NativeFunction::MutationDisconnect => self.mutation_disconnect(receiver),
             NativeFunction::MutationTakeRecords => self.mutation_take_records(dom, receiver),
@@ -194,6 +199,282 @@ impl JsRuntime {
             ));
         }
         Ok(JsValue::Object(self.create_array_from_values(&[])?))
+    }
+
+    pub(in crate::runtime) fn resize_observer_constructor(
+        &mut self,
+        constructor: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let callback = Self::require_callable_object(
+            required_argument(arguments, 0, "ResizeObserver")?,
+            &self.realm,
+        )?;
+        let prototype = self
+            .realm
+            .get_property(constructor, "prototype")
+            .and_then(|value| match value {
+                JsValue::Object(object) => Some(object),
+                _ => None,
+            });
+        self.ensure_heap_capacity(2)?;
+        let observer = self.realm.create_object(prototype);
+        *self
+            .realm
+            .host_mut(observer)
+            .expect("newly created observer has host storage") = ObjectHost::ResizeObserver {
+            callback,
+            targets: Vec::new(),
+            queued: Vec::new(),
+        };
+        self.resize_observers.push(observer);
+        Ok(JsValue::Object(observer))
+    }
+
+    pub(in crate::runtime) fn resize_observe(
+        &mut self,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let target = self.value_as_node(required_argument(arguments, 0, "observe")?)?;
+        let rect = self.installed_element_rect(target);
+        let Some(ObjectHost::ResizeObserver {
+            targets, queued, ..
+        }) = self.realm.host_mut(receiver)
+        else {
+            return Err(JsError::type_error("incompatible ResizeObserver receiver"));
+        };
+        // Re-observing an active target is a no-op, not a second initial
+        // notification (Resize Observer §2.2 `observe`).
+        let added = if targets.iter().any(|watch| watch.target == target) {
+            false
+        } else {
+            let watch = ResizeWatch { target, rect };
+            targets.push(watch);
+            // The initial size is delivered through the same queue a later
+            // change uses: `observe()` must call back even before layout runs.
+            queued.push(watch);
+            true
+        };
+        if added {
+            self.queue_resize_observer(receiver);
+        }
+        Ok(JsValue::Undefined)
+    }
+
+    pub(in crate::runtime) fn resize_unobserve(
+        &mut self,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let target = self.value_as_node(required_argument(arguments, 0, "unobserve")?)?;
+        let Some(ObjectHost::ResizeObserver {
+            targets, queued, ..
+        }) = self.realm.host_mut(receiver)
+        else {
+            return Err(JsError::type_error("incompatible ResizeObserver receiver"));
+        };
+        targets.retain(|watch| watch.target != target);
+        // An entry already queued for a target that is no longer observed
+        // must not be delivered.
+        queued.retain(|watch| watch.target != target);
+        let empty = targets.is_empty();
+        if empty {
+            self.pending_microtasks
+                .retain(|task| !matches!(task, JsMicrotask::ResizeObserver(id) if *id == receiver));
+        }
+        Ok(JsValue::Undefined)
+    }
+
+    pub(in crate::runtime) fn resize_disconnect(
+        &mut self,
+        receiver: ObjectId,
+    ) -> Result<JsValue, JsError> {
+        let Some(ObjectHost::ResizeObserver {
+            targets, queued, ..
+        }) = self.realm.host_mut(receiver)
+        else {
+            return Err(JsError::type_error("incompatible ResizeObserver receiver"));
+        };
+        targets.clear();
+        queued.clear();
+        self.pending_microtasks
+            .retain(|task| !matches!(task, JsMicrotask::ResizeObserver(id) if *id == receiver));
+        Ok(JsValue::Undefined)
+    }
+
+    pub(in crate::runtime) fn resize_take_records(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+    ) -> Result<JsValue, JsError> {
+        let Some(ObjectHost::ResizeObserver { queued, .. }) = self.realm.host_mut(receiver) else {
+            return Err(JsError::type_error("incompatible ResizeObserver receiver"));
+        };
+        let drained = std::mem::take(queued);
+        self.pending_microtasks
+            .retain(|task| !matches!(task, JsMicrotask::ResizeObserver(id) if *id == receiver));
+        let values = drained
+            .iter()
+            .map(|watch| self.resize_observer_entry(dom, watch.target, watch.rect))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(JsValue::Object(self.create_array_from_values(&values)?))
+    }
+
+    /// The border-box geometry currently installed for `target`, or zero when
+    /// the embedding has not laid the node out. The same zero is what
+    /// `getBoundingClientRect` reports for an unlaid-out element, so the
+    /// initial observation and a later geometry pass agree on the baseline.
+    fn installed_element_rect(&self, target: NodeId) -> ElementRect {
+        self.element_geometry
+            .get(&target.as_u64())
+            .copied()
+            .unwrap_or(ElementRect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            })
+    }
+
+    /// Compare every observed target against the geometry the last delivery
+    /// used, queueing one entry per changed target and exactly one delivery
+    /// microtask for the observer.
+    pub(in crate::runtime) fn queue_resize_observers(&mut self) {
+        if self.resize_observers.is_empty() {
+            return;
+        }
+        for observer in std::mem::take(&mut self.resize_observers) {
+            let current = match self.realm.host(observer) {
+                Some(ObjectHost::ResizeObserver { targets, .. }) => targets
+                    .iter()
+                    .map(|watch| (watch.target, self.installed_element_rect(watch.target)))
+                    .collect::<Vec<_>>(),
+                _ => continue,
+            };
+            let changed = if let Some(ObjectHost::ResizeObserver {
+                targets, queued, ..
+            }) = self.realm.host_mut(observer)
+            {
+                let mut changed = false;
+                for (target, rect) in current {
+                    let Some(watch) = targets.iter_mut().find(|watch| watch.target == target)
+                    else {
+                        continue;
+                    };
+                    if rect != watch.rect {
+                        watch.rect = rect;
+                        // One entry per target per delivery: a second layout
+                        // pass before the microtask runs updates the pending
+                        // entry instead of appending a duplicate.
+                        if let Some(queued) =
+                            queued.iter_mut().find(|queued| queued.target == target)
+                        {
+                            queued.rect = rect;
+                        } else {
+                            queued.push(ResizeWatch { target, rect });
+                        }
+                        changed = true;
+                    }
+                }
+                changed
+            } else {
+                false
+            };
+            self.resize_observers.push(observer);
+            if changed {
+                self.queue_resize_observer(observer);
+            }
+        }
+    }
+
+    pub(in crate::runtime) fn queue_resize_observer(&mut self, observer: ObjectId) {
+        if !self
+            .pending_microtasks
+            .iter()
+            .any(|task| matches!(task, JsMicrotask::ResizeObserver(id) if *id == observer))
+        {
+            self.pending_microtasks
+                .push(JsMicrotask::ResizeObserver(observer));
+        }
+    }
+
+    pub(in crate::runtime) fn notify_resize_observer(
+        &mut self,
+        dom: &mut Dom,
+        observer: ObjectId,
+    ) -> Result<JsValue, JsError> {
+        let callback = match self.realm.host(observer) {
+            Some(ObjectHost::ResizeObserver { callback, .. }) => callback,
+            _ => return Ok(JsValue::Undefined),
+        };
+        let drained = match self.realm.host_mut(observer) {
+            Some(ObjectHost::ResizeObserver { queued, .. }) => std::mem::take(queued),
+            _ => Vec::new(),
+        };
+        if drained.is_empty() {
+            return Ok(JsValue::Undefined);
+        }
+        let entries = drained
+            .iter()
+            .map(|watch| self.resize_observer_entry(dom, watch.target, watch.rect))
+            .collect::<Result<Vec<_>, _>>()?;
+        let entries = self.create_array_from_values(&entries)?;
+        self.call_with_this(
+            dom,
+            callback,
+            &[JsValue::Object(entries), JsValue::Object(observer)],
+            JsValue::Object(observer),
+        )
+    }
+
+    fn resize_observer_entry(
+        &mut self,
+        dom: &Dom,
+        target: NodeId,
+        rect: ElementRect,
+    ) -> Result<JsValue, JsError> {
+        let constructor = self
+            .realm
+            .global("ResizeObserverEntry")
+            .and_then(|value| match value {
+                JsValue::Object(object) => Some(object),
+                _ => None,
+            });
+        let prototype = constructor
+            .and_then(|object| self.realm.get_property(object, "prototype"))
+            .and_then(|value| match value {
+                JsValue::Object(object) => Some(object),
+                _ => None,
+            });
+        // Build the values first and the entry last, so no allocation after the
+        // entry exists can force a collection that the entry is not rooted for.
+        self.ensure_heap_capacity(8)?;
+        let target = self.wrap_node(dom, target)?;
+        let content_rect = self.rect_value(rect);
+        let border_box = self.resize_size_array(rect)?;
+        let content_box = self.resize_size_array(rect)?;
+        let entry = self.realm.create_object(prototype);
+        for (name, value) in [
+            ("target", target),
+            ("contentRect", content_rect),
+            ("borderBoxSize", JsValue::Object(border_box)),
+            ("contentBoxSize", JsValue::Object(content_box)),
+        ] {
+            self.realm.set_property(entry, name.to_owned(), value);
+        }
+        Ok(JsValue::Object(entry))
+    }
+
+    /// One `ResizeObserverSize` array: the interface exposes a sequence even
+    /// though every current box has exactly one entry.
+    fn resize_size_array(&mut self, rect: ElementRect) -> Result<ObjectId, JsError> {
+        let size = self.realm.create_ordinary_object();
+        for (name, value) in [("inlineSize", rect.width), ("blockSize", rect.height)] {
+            self.realm
+                .set_property(size, name.to_owned(), JsValue::Number(f64::from(value)));
+        }
+        self.create_array_from_values(&[JsValue::Object(size)])
     }
 
     pub(in crate::runtime) fn mutation_observer_constructor(
@@ -881,8 +1162,51 @@ impl JsRuntime {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use render_html::parse_document;
+
+    fn paragraph(dom: &Dom) -> NodeId {
+        let body = crate::runtime::builtins::dom::find_body_node(dom, dom.document())
+            .expect("document has a body");
+        dom.children(body).unwrap_or_default()[0]
+    }
+
+    fn install_rect(
+        runtime: &mut JsRuntime,
+        target: NodeId,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) {
+        let mut geometry = BTreeMap::new();
+        geometry.insert(
+            target.as_u64(),
+            ElementRect {
+                x,
+                y,
+                width,
+                height,
+            },
+        );
+        runtime.install_element_geometry(geometry);
+    }
+
+    fn drain(runtime: &mut JsRuntime, dom: &mut Dom) {
+        for _ in 0..8 {
+            let tasks = runtime.take_pending_microtasks();
+            if tasks.is_empty() {
+                return;
+            }
+            for task in tasks {
+                runtime
+                    .invoke_microtask(dom, task)
+                    .expect("ResizeObserver delivery should execute");
+            }
+        }
+    }
 
     /// Drive the frame loop the way an embedder does: publish a viewport, then
     /// drain whatever the publish queued. This is the whole of the contract
@@ -1286,5 +1610,234 @@ function,function,function"
             .execute(&mut parsed.dom, "seen.join(',')")
             .expect("observer result should be readable");
         assert_eq!(result.value, JsValue::String("LINK".into()));
+    }
+
+    /// `observe()` must deliver the current size before any layout pass runs,
+    /// and the entry must carry the real geometry: `contentRect` for the
+    /// rectangle and `borderBoxSize`/`contentBoxSize` as `ResizeObserverSize`
+    /// sequences, not bare numbers.
+    #[test]
+    fn resize_observer_delivers_initial_entry_from_installed_geometry() {
+        let mut parsed = parse_document("<!doctype html><body><p id='p'>x</p></body>");
+        let target = paragraph(&parsed.dom);
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        install_rect(&mut runtime, target, 12.0, 34.0, 200.0, 100.0);
+        runtime
+            .execute(
+                &mut parsed.dom,
+                r"
+                    window.log = [];
+                    window.target = document.getElementById('p');
+                    window.observer = new ResizeObserver(function (entries, callbackObserver) {
+                        var entry = entries[0];
+                        log.push([
+                            entries.length,
+                            entry.contentRect.width,
+                            entry.contentRect.height,
+                            entry.contentRect.top,
+                            entry.contentRect.left,
+                            entry.borderBoxSize.length,
+                            entry.borderBoxSize[0].inlineSize,
+                            entry.borderBoxSize[0].blockSize,
+                            entry.contentBoxSize[0].inlineSize,
+                            entry.contentBoxSize[0].blockSize,
+                            entry.target === target,
+                            callbackObserver === observer,
+                            entry instanceof ResizeObserverEntry,
+                            Object.getPrototypeOf(entry) === ResizeObserverEntry.prototype,
+                            Object.getPrototypeOf(observer) === ResizeObserver.prototype
+                        ].join(':'));
+                    });
+                    observer.observe(target);
+                ",
+            )
+            .expect("ResizeObserver registration should execute");
+        let pending = runtime.take_pending_microtasks();
+        assert_eq!(
+            pending.len(),
+            1,
+            "the initial observation queues exactly one delivery"
+        );
+        for task in pending {
+            runtime
+                .invoke_microtask(&mut parsed.dom, task)
+                .expect("ResizeObserver delivery should execute");
+        }
+        let outcome = runtime
+            .execute(&mut parsed.dom, "log.join(';')")
+            .expect("log should be readable");
+        assert_eq!(
+            outcome.value,
+            JsValue::String("1:200:100:34:12:1:200:100:200:100:true:true:true:true:true".into())
+        );
+    }
+
+    /// A layout pass only notifies when a target's installed geometry differs
+    /// from the geometry last queued for it. Re-installing the same map is the
+    /// common case - an embedder pushes geometry every frame - and it must be
+    /// silent, or every page would run observer callbacks forever.
+    #[test]
+    fn resize_observer_only_notifies_when_geometry_changes() {
+        let mut parsed = parse_document("<!doctype html><body><p id='p'>x</p></body>");
+        let target = paragraph(&parsed.dom);
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        install_rect(&mut runtime, target, 0.0, 0.0, 100.0, 50.0);
+        runtime
+            .execute(
+                &mut parsed.dom,
+                r"
+                    window.log = [];
+                    window.target = document.getElementById('p');
+                    window.observer = new ResizeObserver(function (entries) {
+                        log.push(entries[0].contentRect.width);
+                    });
+                    observer.observe(target);
+                ",
+            )
+            .expect("ResizeObserver registration should execute");
+        drain(&mut runtime, &mut parsed.dom);
+
+        install_rect(&mut runtime, target, 0.0, 0.0, 100.0, 50.0);
+        assert!(
+            runtime.take_pending_microtasks().is_empty(),
+            "unchanged geometry must not queue a delivery"
+        );
+
+        install_rect(&mut runtime, target, 0.0, 0.0, 120.0, 60.0);
+        let pending = runtime.take_pending_microtasks();
+        assert_eq!(
+            pending.len(),
+            1,
+            "changed geometry queues exactly one delivery"
+        );
+        for task in pending {
+            runtime
+                .invoke_microtask(&mut parsed.dom, task)
+                .expect("ResizeObserver delivery should execute");
+        }
+
+        install_rect(&mut runtime, target, 0.0, 0.0, 120.0, 60.0);
+        assert!(
+            runtime.take_pending_microtasks().is_empty(),
+            "re-installing the new geometry must not loop"
+        );
+        let outcome = runtime
+            .execute(&mut parsed.dom, "log.join(',')")
+            .expect("log should be readable");
+        assert_eq!(outcome.value, JsValue::String("100,120".into()));
+    }
+
+    #[test]
+    fn resize_observer_unobserve_and_disconnect_stop_delivery() {
+        let mut parsed = parse_document("<!doctype html><body><p id='p'>x</p></body>");
+        let target = paragraph(&parsed.dom);
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        install_rect(&mut runtime, target, 0.0, 0.0, 100.0, 50.0);
+        runtime
+            .execute(
+                &mut parsed.dom,
+                r"
+                    window.hits = 0;
+                    window.target = document.getElementById('p');
+                    window.observer = new ResizeObserver(function () { hits += 1; });
+                    observer.observe(target);
+                ",
+            )
+            .expect("ResizeObserver registration should execute");
+        drain(&mut runtime, &mut parsed.dom);
+
+        runtime
+            .execute(&mut parsed.dom, "observer.unobserve(target);")
+            .expect("unobserve should execute");
+        install_rect(&mut runtime, target, 0.0, 0.0, 140.0, 70.0);
+        assert!(
+            runtime.take_pending_microtasks().is_empty(),
+            "an unobserved target must not queue a delivery"
+        );
+        drain(&mut runtime, &mut parsed.dom);
+
+        // Observing again queues the initial entry, and `disconnect()` must
+        // clear both the target and that pending delivery.
+        runtime
+            .execute(&mut parsed.dom, "observer.observe(target);")
+            .expect("re-observe should execute");
+        runtime
+            .execute(&mut parsed.dom, "observer.disconnect();")
+            .expect("disconnect should execute");
+        assert!(
+            runtime.take_pending_microtasks().is_empty(),
+            "disconnect clears the queued delivery"
+        );
+        install_rect(&mut runtime, target, 0.0, 0.0, 160.0, 80.0);
+        drain(&mut runtime, &mut parsed.dom);
+        let outcome = runtime
+            .execute(&mut parsed.dom, "hits")
+            .expect("hits should be readable");
+        assert_eq!(outcome.value, JsValue::Number(1.0));
+    }
+
+    #[test]
+    fn resize_observer_take_records_drains_the_queue() {
+        let mut parsed = parse_document("<!doctype html><body><p id='p'>x</p></body>");
+        let target = paragraph(&parsed.dom);
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        install_rect(&mut runtime, target, 0.0, 0.0, 200.0, 100.0);
+        runtime
+            .execute(
+                &mut parsed.dom,
+                r"
+                    window.hits = 0;
+                    window.target = document.getElementById('p');
+                    window.observer = new ResizeObserver(function () { hits += 1; });
+                    observer.observe(target);
+                    var records = observer.takeRecords();
+                    window.taken = [
+                        records.length,
+                        records[0].contentRect.width,
+                        records[0] instanceof ResizeObserverEntry
+                    ].join(':');
+                ",
+            )
+            .expect("takeRecords should execute");
+        assert_eq!(
+            runtime
+                .execute(&mut parsed.dom, "taken")
+                .expect("taken should be readable")
+                .value,
+            JsValue::String("1:200:true".into())
+        );
+        drain(&mut runtime, &mut parsed.dom);
+        let outcome = runtime
+            .execute(&mut parsed.dom, "hits")
+            .expect("hits should be readable");
+        assert_eq!(
+            outcome.value,
+            JsValue::Number(0.0),
+            "takeRecords removes the entry the delivery would have carried"
+        );
+    }
+
+    #[test]
+    fn resize_observer_requires_new_and_node_targets() {
+        assert_eq!(
+            run("[typeof ResizeObserver, typeof ResizeObserverEntry, \
+                 typeof ResizeObserver.prototype.observe, \
+                 typeof ResizeObserver.prototype.unobserve, \
+                 typeof ResizeObserver.prototype.disconnect, \
+                 typeof ResizeObserver.prototype.takeRecords].join(',')"),
+            "function,function,function,function,function,function"
+        );
+        assert_eq!(
+            run("var threw = 'no'; try { ResizeObserver(function () {}); } \
+                 catch (error) { threw = error.name + ':' + (error instanceof TypeError); } threw"),
+            "TypeError:true"
+        );
+        assert_eq!(
+            run(
+                "var threw = 'no'; try { new ResizeObserver(function () {}).observe({}); } \
+                 catch (error) { threw = error.name; } threw"
+            ),
+            "TypeError"
+        );
     }
 }

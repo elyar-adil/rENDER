@@ -12,6 +12,7 @@ use crate::bigint::JsBigInt;
 use crate::parser::FunctionKind;
 use crate::runtime::builtins::temporal::{TemporalKind, TemporalMethod, TemporalValue};
 use crate::runtime::types::ArgumentsMap;
+use crate::runtime::types::ElementRect;
 use crate::utf16::JsString;
 
 /// Stable identity for an object allocated in a [`Realm`].
@@ -1059,6 +1060,10 @@ pub(crate) enum NativeFunction {
     IntersectionUnobserve,
     IntersectionDisconnect,
     IntersectionTakeRecords,
+    ResizeObserve,
+    ResizeUnobserve,
+    ResizeDisconnect,
+    ResizeTakeRecords,
     StyleGetProperty,
     StyleSetProperty,
     StyleRemoveProperty,
@@ -2412,6 +2417,17 @@ pub(crate) enum ObjectHost {
         callback: ObjectId,
         targets: Vec<NodeId>,
     },
+    ResizeObserverConstructor,
+    ResizeObserver {
+        callback: ObjectId,
+        /// Observed targets with the geometry most recently queued or
+        /// delivered for each one, so an unchanged layout pass produces no
+        /// second notification.
+        targets: Vec<ResizeWatch>,
+        /// Entries accumulated since the last delivery, drained by the
+        /// microtask that invokes `callback` with the entry list.
+        queued: Vec<ResizeWatch>,
+    },
     MutationObserverConstructor,
     MutationObserver {
         callback: ObjectId,
@@ -2745,6 +2761,7 @@ impl ObjectHost {
                 | Self::PromiseConstructor
                 | Self::AggregateErrorConstructor
                 | Self::MutationObserverConstructor
+                | Self::ResizeObserverConstructor
                 | Self::UrlConstructor
                 | Self::UrlSearchParamsConstructor
                 | Self::XmlHttpRequestConstructor
@@ -2877,6 +2894,15 @@ pub(crate) struct MutationWatch {
     pub child_list: bool,
     pub attributes: bool,
     pub character_data: bool,
+}
+
+/// One `ResizeObserver` observation: the target and the border-box geometry
+/// last queued for it. The geometry is the baseline a later layout pass is
+/// compared against, which is what keeps an unchanged pass from notifying.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ResizeWatch {
+    pub target: NodeId,
+    pub rect: ElementRect,
 }
 
 /// Constructors used by bootstrap and by the surface modules that add objects.
@@ -3503,6 +3529,7 @@ impl Realm {
                     | ObjectHost::VideoConstructor
                     | ObjectHost::IntersectionObserverConstructor
                     | ObjectHost::MutationObserverConstructor
+                    | ObjectHost::ResizeObserverConstructor
                     | ObjectHost::ErrorConstructor(_)
                     | ObjectHost::PromiseSettler { .. }
                     | ObjectHost::AsyncResume { .. }
@@ -4250,6 +4277,82 @@ impl Realm {
                 getter: None,
                 setter: None,
                 value: JsValue::Object(entry_constructor),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        let resize_observer_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (name, function) in [
+            ("observe", NativeFunction::ResizeObserve),
+            ("unobserve", NativeFunction::ResizeUnobserve),
+            ("disconnect", NativeFunction::ResizeDisconnect),
+            ("takeRecords", NativeFunction::ResizeTakeRecords),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[resize_observer_prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        let resize_observer = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::ResizeObserverConstructor,
+            ..JsObject::default()
+        });
+        objects[resize_observer.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(resize_observer_prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        objects[global.0].properties.insert(
+            "ResizeObserver".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(resize_observer),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        let resize_entry_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        let resize_entry_constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::DomConstructor,
+            ..JsObject::default()
+        });
+        objects[resize_entry_constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(resize_entry_prototype)),
+        );
+        objects[global.0].properties.insert(
+            "ResizeObserverEntry".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(resize_entry_constructor),
                 writable: true,
                 enumerable: false,
                 configurable: true,
