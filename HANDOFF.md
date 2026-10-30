@@ -1,3 +1,70 @@
+# 交接文档 (2026-10-31, 续三十二) — Bing `text/rms` 延迟脚本
+
+接续动态 import 会话。这一轮让 Bing 的 `<script type="text/rms">` 真正执行。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **类型识别** | `text/rms` 加入 classic JavaScript MIME 集合,不再报 `UnsupportedType` |
+| **调度** | 作为 `ScriptScheduling::Defer` 执行;这些块位于 `#aRmsDefer` 容器,语义上是页面尾部的延迟脚本 |
+| **执行** | 复用现有 classic script 编译/执行管线,内容里的 `//<![CDATA[` 行注释照常解析 |
+| **测试** | 内联/外链 `text/rms` 都被发现且调度为 Defer,无诊断 |
+
+## 证据
+
+Bing 页面有 9 个 `text/rms` 块。隐藏截图 + `RENDER_DEBUG_EVAL`:
+
+```
+RMSPROBE count=9 mcp=function bm=object feedback=undefined zoom=object share=object aRms=present
+health ready=Complete dom_elements=465 boxes=166
+       scripts_failed=0 scripts_threw=1 css_warnings=7 images_failed=0
+```
+
+即 `mcp_banner`、`BMTrigger`、`AccessibilityZoomDesktop`、`ShareDialogConfig`
+等全局已由这些延迟脚本定义,说明块确实执行了。
+
+唯一未捕获异常来自 Feedback 初始化:
+
+```
+classic script node NodeId(331) source 16 inline failed: Feedback is not defined at line 3, column 10
+```
+
+`Feedback` 的定义在 `rms:answers:Feedback:FeedbackBootstrapBundle` 懒加载 bundle 中;
+该 bundle 未在本轮页面加载,故这个块依赖缺失。其余 text/rms 块正常完成。
+
+Baidu / JD:
+
+```
+Baidu: ready=Complete   dom_elements=450 boxes=156
+       scripts_failed=0 scripts_threw=0 css_warnings=5 images_failed=0
+JD:    ready=Interactive dom_elements=1001 boxes=117
+       scripts_failed=10 scripts_threw=2 css_warnings=36 images_failed=1
+```
+
+## 验证
+
+```
+cargo test --workspace                       2782 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+注:`app_tests::a_cross_origin_put_is_sent_only_after_its_preflight_allows_it`
+在首次全量并行运行时出现过一次网络时序抖动,单测与第二次全量均通过。
+
+## 明确未做 / 下一步
+
+- Bing 的 RMS 依赖加载器(`rms.js`/`rms.start`)仍未接入;`text/rms` 块如果依赖
+  尚未加载的懒 bundle(如 Feedback),会抛 `ReferenceError` 并计入 scripts_threw。
+- 更正确的做法是把 text/rms 绑定到 RMS 资源图,在依赖 bundle 到达后执行;当前
+  只保证块本身按页面尾部顺序执行。
+- JD 主商品区仍受 403;GitHub/HN 本机链路阻断;连续动画时钟、高级渐变、
+  SVG filter 其余原语、IndexedDB 值类型覆盖仍未完成。
+
+---
+
 # 交接文档 (2026-10-31, 续三十一) — 浏览器侧异步 dynamic import
 
 接续 import map 会话。这一轮把动态 `import()` 从“没有 loader 就拒绝”推进到
@@ -153,7 +220,7 @@ real_site_tasks                              66 passed, 0 failed
   仍按文档顺序宽松处理。
 - `integrity` 元数据忽略;`src` 形式的 import map 非法,当前按空内容处理并报错。
 - 动态 `import()` 已在续三十一接入浏览器异步 loader;跨域模块 CORS、import
-  attributes 的语义仍未完整。`text/rms` 脚本类型仍待补。
+  attributes 的语义仍未完整。`text/rms` 已在续三十二按延迟经典脚本执行。
 - JD 主商品区仍受 403 风控;GitHub/HN 本机链路阻断;高级渐变、SVG filter
   其余原语、IndexedDB 值类型覆盖仍未完成。
 
@@ -286,7 +353,8 @@ real_site_tasks                              66 passed, 0 failed
 ## 明确未做 / 下一步
 
 - JD 主商品区仍受 403 风控;GitHub/HN 本机链路阻断。
-- Bing 的 import map 已在续三十接入静态模块图;`text/rms` 脚本类型仍未支持。
+- Bing 的 import map 已在续三十接入静态模块图;`text/rms` 已在续三十二按延迟
+  经典脚本执行。
   `@keyframes` 已在续二十九由时间参数化样式采样执行,但没有持续运行的合成器时钟。
 - CSS `mask-mode`、多层 mask、`mask-composite`、`space`/`round` 精确平铺未做;
   filter 仍缺 `contrast`/`hue-rotate`/`invert`/`sepia`/`url(#filter)`。

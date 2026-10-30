@@ -255,7 +255,13 @@ impl DiscoveryState {
             // script; static imports are handled by the parser's module
             // recovery path and dynamic import is provided by the realm.
             let is_module = script_type.eq_ignore_ascii_case("module");
-            Some(if is_module {
+            // Bing's `text/rms` blocks are ordinary JavaScript placed in the
+            // deferred RMS container (`#aRmsDefer`); the custom MIME type is a
+            // marker for Bing's loader, not a different language. Treat them
+            // as deferred classic scripts so their widget bootstrap runs after
+            // the rest of the document has parsed.
+            let is_rms = script_type.eq_ignore_ascii_case("text/rms");
+            Some(if is_module || is_rms {
                 ScriptScheduling::Defer
             } else if has_attribute(element, "nomodule") {
                 // A module-capable browser must not execute the legacy
@@ -418,6 +424,7 @@ fn is_classic_javascript_type(value: &str) -> bool {
             "text/javascript1.5",
             "text/jscript",
             "text/livescript",
+            "text/rms",
             "text/x-ecmascript",
             "text/x-javascript",
         ]
@@ -522,6 +529,30 @@ mod tests {
             ]
         );
         assert_eq!(codes, [ScriptDiagnosticCode::UnsupportedType,]);
+    }
+
+    #[test]
+    fn bing_text_rms_blocks_are_deferred_classic_javascript() {
+        let document = Document::parse(
+            "<script type=text/rms>var widget = 1;</script>             <script type=text/rms src=widget.js></script>",
+        );
+        let discovery = discover_scripts(&document, &base_url(), ScriptDiscoveryLimits::default());
+        assert!(
+            discovery.diagnostics.is_empty(),
+            "{:?}",
+            discovery.diagnostics
+        );
+        assert_eq!(discovery.scripts.len(), 2);
+        assert!(
+            discovery
+                .scripts
+                .iter()
+                .all(|script| script.scheduling == ScriptScheduling::Defer)
+        );
+        assert!(matches!(
+            &discovery.scripts[0].source,
+            ScriptSource::Inline { source } if source == "var widget = 1;"
+        ));
     }
 
     #[test]
