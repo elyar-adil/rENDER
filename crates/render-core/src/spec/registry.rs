@@ -540,8 +540,10 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 numbers, lengths, transform functions and sRGB colours, honours duration, \
                 delay and the shipped timing functions, and reports transitionend. \
                 Interrupted reversals use the reversing shortening factor, and \
-                `transform: none` interpolates from the identity. allow-discrete, exact \
-                reversing-adjusted start values and the Web Animations API remain missing.",
+                `transform: none` interpolates from the identity. \
+                `transition-behavior: allow-discrete` steps discrete properties and both \
+                transitionend and transitioncancel are reported. Exact reversing-adjusted \
+                start values and the Web Animations API remain missing.",
         dependencies: &[CSS_SYNTAX],
         tests: &[ConformanceTest::new("rust", "css::transition::tests")],
     },

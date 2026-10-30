@@ -108,6 +108,7 @@ use render_core::image::ImageSource;
 use render_core::interaction::FocusNavigationDirection;
 use render_core::navigation::HistoryEntry;
 
+use render_core::css::transition::TransitionEventKind;
 use render_core::import_map::ImportMapMiss;
 use render_core::js::RuntimeLimits;
 use render_core::js::{DynamicModuleUnit, FetchOutcome, HistoryRequest, JsValue, PendingFetch};
@@ -575,7 +576,11 @@ impl BrowserApp {
                 page.transition_state = transition_state;
             }
             for event in frame.transition_events {
-                let mut dom_event = PageDomEvent::new(event.node, "transitionend").bubbles(true);
+                let event_type = match event.kind {
+                    TransitionEventKind::End => "transitionend",
+                    TransitionEventKind::Cancel => "transitioncancel",
+                };
+                let mut dom_event = PageDomEvent::new(event.node, event_type).bubbles(true);
                 dom_event.properties.push((
                     "propertyName".to_owned(),
                     JsValue::String(event.property.clone().into()),

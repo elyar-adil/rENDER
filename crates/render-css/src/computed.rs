@@ -131,6 +131,7 @@ impl PropertyRegistry {
             ("transition-duration", "0s"),
             ("transition-timing-function", "ease"),
             ("transition-delay", "0s"),
+            ("transition-behavior", "normal"),
             ("background-color", "transparent"),
             ("background-image", "none"),
             ("background-repeat", "repeat"),

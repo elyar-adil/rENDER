@@ -3821,6 +3821,60 @@ mod tests {
         );
     }
 
+    /// `transition-behavior: allow-discrete` keeps a disappearing display box
+    /// painted until the end, then applies `display: none`.
+    #[test]
+    fn css_transition_allow_discrete_steps_display() {
+        let mut document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0 }
+               #box { width: 20px; height: 20px; background: red;
+                      display: block;
+                      transition: display 1s linear allow-discrete; }
+               #box.hidden { display: none; }
+               </style><div id="box"></div>"#,
+        );
+        let node = target_id(document.dom(), "#box");
+        let mut transitions = TransitionState::default();
+        let initial = render_with_transitions(&document, &mut transitions, 0.0);
+        assert_eq!(
+            initial.styles[&node]
+                .get("display")
+                .map(render_css::computed::ComputedValue::css_text),
+            Some("block")
+        );
+        document
+            .dom_mut()
+            .set_attribute(node, "class", "hidden")
+            .expect("class attribute");
+        let start = render_with_transitions(&document, &mut transitions, 0.0);
+        assert_eq!(
+            start.styles[&node]
+                .get("display")
+                .map(render_css::computed::ComputedValue::css_text),
+            Some("block")
+        );
+        let middle = render_with_transitions(&document, &mut transitions, 0.5);
+        assert_eq!(
+            middle.styles[&node]
+                .get("display")
+                .map(render_css::computed::ComputedValue::css_text),
+            Some("block")
+        );
+        let end = render_with_transitions(&document, &mut transitions, 1.0);
+        assert_eq!(
+            end.styles[&node]
+                .get("display")
+                .map(render_css::computed::ComputedValue::css_text),
+            Some("none")
+        );
+        assert_eq!(end.transition_events.len(), 1);
+        assert_eq!(
+            end.transition_events[0].kind,
+            render_css::transition::TransitionEventKind::End
+        );
+    }
+
     /// CSS `filter: grayscale(1)` replaces colour by its luminance.
     #[test]
     fn css_filter_grayscale_removes_colour() {

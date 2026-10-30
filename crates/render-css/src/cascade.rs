@@ -622,6 +622,7 @@ fn expand_legacy_longhands(name: &str, value: &str) -> Vec<(String, String)> {
                 "transition-duration",
                 "transition-timing-function",
                 "transition-delay",
+                "transition-behavior",
             ]
         } else {
             vec!["overflow-x", "overflow-y"]
@@ -917,11 +918,13 @@ fn expand_transition_shorthand(value: &str) -> Option<Vec<(String, String)>> {
     let mut durations = Vec::new();
     let mut timings = Vec::new();
     let mut delays = Vec::new();
+    let mut behaviors = Vec::new();
     for layer in split_top_level_commas(value) {
         let mut property = None;
         let mut duration = None;
         let mut delay = None;
         let mut timing = None;
+        let mut behavior = None;
         for component in split_css_components(&layer) {
             let lower = component.to_ascii_lowercase();
             if is_animation_time(component) {
@@ -934,6 +937,8 @@ fn expand_transition_shorthand(value: &str) -> Option<Vec<(String, String)>> {
                 }
             } else if is_animation_timing(&lower) {
                 timing = Some(component);
+            } else if matches!(lower.as_str(), "normal" | "allow-discrete") {
+                behavior = Some(component);
             } else if property.is_none() {
                 property = Some(component);
             } else {
@@ -944,6 +949,7 @@ fn expand_transition_shorthand(value: &str) -> Option<Vec<(String, String)>> {
         durations.push(duration.unwrap_or("0s").to_owned());
         timings.push(timing.unwrap_or("ease").to_owned());
         delays.push(delay.unwrap_or("0s").to_owned());
+        behaviors.push(behavior.unwrap_or("normal").to_owned());
     }
     if properties.is_empty() {
         return None;
@@ -953,6 +959,7 @@ fn expand_transition_shorthand(value: &str) -> Option<Vec<(String, String)>> {
         ("transition-duration".to_owned(), durations.join(", ")),
         ("transition-timing-function".to_owned(), timings.join(", ")),
         ("transition-delay".to_owned(), delays.join(", ")),
+        ("transition-behavior".to_owned(), behaviors.join(", ")),
     ])
 }
 
@@ -2779,7 +2786,7 @@ mod tests {
     fn transition_shorthand_expands_each_layer() {
         let expansion: std::collections::BTreeMap<_, _> = super::expand_shorthand(
             "transition",
-            "opacity 200ms linear, transform 1s cubic-bezier(.1, .2, .3, 1) 100ms",
+            "opacity 200ms linear allow-discrete, transform 1s cubic-bezier(.1, .2, .3, 1) 100ms",
         )
         .into_iter()
         .collect();
@@ -2790,6 +2797,7 @@ mod tests {
             "linear, cubic-bezier(.1, .2, .3, 1)"
         );
         assert_eq!(expansion["transition-delay"], "0s, 100ms");
+        assert_eq!(expansion["transition-behavior"], "allow-discrete, normal");
     }
     #[test]
     fn animation_shorthand_expands_each_layer() {

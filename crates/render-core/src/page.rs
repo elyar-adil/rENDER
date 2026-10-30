@@ -2873,6 +2873,36 @@ mod tests {
     }
 
     #[test]
+    fn transitioncancel_reaches_a_listener_with_its_properties() {
+        let mut page = Page::new("<!doctype html><html><body><div id='box'></div></body></html>");
+        let target = element_with_id(page.document().dom(), "box");
+        page.queue_script(
+            "document.getElementById('box').addEventListener('transitioncancel', function (event) {
+                 document.title = 'cancel:' + event.propertyName + ':' + event.elapsedTime + ':' + event.bubbles;
+             });",
+        )
+        .expect("listener script queues");
+        page.pump_until_idle_reference(Duration::ZERO)
+            .expect("listener installs");
+        let mut event = PageDomEvent::new(target, "transitioncancel").bubbles(true);
+        event.properties.push((
+            "propertyName".to_owned(),
+            crate::js::JsValue::String("width".into()),
+        ));
+        event
+            .properties
+            .push(("elapsedTime".to_owned(), crate::js::JsValue::Number(0.25)));
+        page.queue_dom_event(event)
+            .expect("transitioncancel queues");
+        page.pump_until_idle_reference(Duration::ZERO)
+            .expect("transitioncancel dispatches");
+        assert_eq!(
+            page.document_title(),
+            Some("cancel:width:0.25:true".to_owned())
+        );
+    }
+
+    #[test]
     fn an_async_dynamic_import_settles_through_the_page_api() {
         let mut page = Page::new("<!doctype html><html><body></body></html>");
         page.queue_script("import('widgets').then(function (m) { document.title = m.value; });")

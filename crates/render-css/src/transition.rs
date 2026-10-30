@@ -38,11 +38,21 @@ struct ActiveTransition {
     /// The reversing shortening factor. 1 for a normal transition, smaller
     /// when an interrupted transition is reversed back toward its start.
     shortening: f32,
+    /// Whether a property with no numeric interpolator may step discretely.
+    allow_discrete: bool,
 }
 
-/// One `transitionend` the sampler observed while rendering.
+/// Which transition event this is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransitionEventKind {
+    End,
+    Cancel,
+}
+
+/// One `transitionend` or `transitioncancel` the sampler observed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TransitionEvent {
+    pub kind: TransitionEventKind,
     pub node: NodeId,
     pub property: String,
     /// The transition's own duration, excluding its delay, in seconds.
@@ -98,6 +108,13 @@ pub fn sample_transitions(
                 if active.to == target {
                     continue;
                 }
+                events.push(transition_event(
+                    *node,
+                    &property,
+                    active,
+                    time,
+                    TransitionEventKind::Cancel,
+                ));
                 if covered {
                     let duration = plan.duration_for(&property);
                     if duration > 0.0 {
@@ -123,6 +140,7 @@ pub fn sample_transitions(
                                 duration: duration * shortening,
                                 timing: plan.timing_for(&property),
                                 shortening,
+                                allow_discrete: plan.allow_discrete(&property),
                             };
                             continue;
                         }
@@ -138,7 +156,10 @@ pub fn sample_transitions(
                 continue;
             }
             let duration = plan.duration_for(&property);
-            if duration <= 0.0 || interpolate_property(&property, &previous, &target, 0.0).is_none()
+            let allow_discrete = plan.allow_discrete(&property);
+            if duration <= 0.0
+                || (!allow_discrete
+                    && interpolate_property(&property, &previous, &target, 0.0).is_none())
             {
                 continue;
             }
@@ -152,6 +173,7 @@ pub fn sample_transitions(
                     duration,
                     timing: plan.timing_for(&property),
                     shortening: 1.0,
+                    allow_discrete,
                 },
             );
         }
@@ -165,6 +187,7 @@ pub fn sample_transitions(
             if time >= end {
                 style.set_animated_property(property, &active.to);
                 events.push(TransitionEvent {
+                    kind: TransitionEventKind::End,
                     node: *node,
                     property: property.clone(),
                     elapsed_time: active.duration,
@@ -198,7 +221,43 @@ fn sample_active(property: &str, active: &ActiveTransition, time: f32) -> Option
     let local = time - active.start - active.delay;
     let progress = (local / active.duration).clamp(0.0, 1.0);
     let eased = timing_function(&active.timing, progress);
-    interpolate_property(property, &active.from, &active.to, eased)
+    interpolate_property(property, &active.from, &active.to, eased).or_else(|| {
+        active
+            .allow_discrete
+            .then(|| discrete_value(property, &active.from, &active.to, eased))
+    })
+}
+
+fn discrete_value(property: &str, from: &str, to: &str, progress: f32) -> String {
+    if property.eq_ignore_ascii_case("display") {
+        // CSS Transitions 2: content must be visible for the whole transition.
+        if from.eq_ignore_ascii_case("none") {
+            return to.to_owned();
+        }
+        if to.eq_ignore_ascii_case("none") {
+            return from.to_owned();
+        }
+    }
+    if progress < 0.5 {
+        from.to_owned()
+    } else {
+        to.to_owned()
+    }
+}
+
+fn transition_event(
+    node: NodeId,
+    property: &str,
+    active: &ActiveTransition,
+    time: f32,
+    kind: TransitionEventKind,
+) -> TransitionEvent {
+    TransitionEvent {
+        kind,
+        node,
+        property: property.to_owned(),
+        elapsed_time: (time - active.start - active.delay).clamp(0.0, active.duration),
+    }
 }
 
 struct TransitionPlan {
@@ -206,6 +265,7 @@ struct TransitionPlan {
     durations: Vec<f32>,
     delays: Vec<f32>,
     timings: Vec<String>,
+    behaviors: Vec<String>,
 }
 
 enum PropertyList {
@@ -246,11 +306,20 @@ impl TransitionPlan {
         if timings.is_empty() {
             timings.push("ease".to_owned());
         }
+        let mut behaviors = split_top_level_commas(
+            &style
+                .get("transition-behavior")
+                .map_or_else(|| "normal".to_owned(), |value| value.css_text().to_owned()),
+        );
+        if behaviors.is_empty() {
+            behaviors.push("normal".to_owned());
+        }
         Self {
             properties,
             durations,
             delays,
             timings,
+            behaviors,
         }
     }
 
@@ -280,13 +349,12 @@ impl TransitionPlan {
     }
 
     fn timing_for(&self, property: &str) -> String {
-        self.timings
-            .get(
-                self.index_for(property)
-                    .min(self.timings.len().saturating_sub(1)),
-            )
-            .cloned()
-            .unwrap_or_else(|| "ease".to_owned())
+        list_value(&self.timings, self.index_for(property)).unwrap_or_else(|| "ease".to_owned())
+    }
+
+    fn allow_discrete(&self, property: &str) -> bool {
+        list_value(&self.behaviors, self.index_for(property))
+            .is_some_and(|value| value.eq_ignore_ascii_case("allow-discrete"))
     }
 
     fn candidates(&self, style: &ComputedStyle, node_state: &NodeTransitions) -> Vec<String> {
@@ -317,11 +385,11 @@ impl TransitionPlan {
     }
 }
 
-fn list_value(values: &[f32], index: usize) -> Option<f32> {
+fn list_value<T: Clone>(values: &[T], index: usize) -> Option<T> {
     if values.is_empty() {
         return None;
     }
-    values.get(index.min(values.len() - 1)).copied()
+    values.get(index.min(values.len() - 1)).cloned()
 }
 
 fn time_list(text: &str) -> Vec<f32> {
@@ -441,7 +509,7 @@ fn is_common_transition_property(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{TransitionState, sample_transitions};
+    use super::{TransitionEventKind, TransitionState, sample_transitions};
     use crate::computed::ComputedStyle;
     use render_dom::NodeId;
     use std::collections::BTreeMap;
@@ -582,5 +650,95 @@ mod tests {
         );
         assert_eq!(events.len(), 1);
         assert!((events[0].elapsed_time - 0.5).abs() < 1.0e-6);
+    }
+    #[test]
+    fn an_interrupted_third_value_cancels_the_old_transition() {
+        let node = NodeId::from_u64(5);
+        let base = |width: &str| {
+            style_with(&[
+                ("width", width),
+                ("transition-property", "width"),
+                ("transition-duration", "1s"),
+                ("transition-timing-function", "linear"),
+            ])
+        };
+        let mut styles = BTreeMap::new();
+        styles.insert(node, base("0px"));
+        let mut state = TransitionState::default();
+        sample_transitions(&mut styles, &mut state, 0.0);
+        styles.insert(node, base("100px"));
+        sample_transitions(&mut styles, &mut state, 0.0);
+        styles.insert(node, base("100px"));
+        sample_transitions(&mut styles, &mut state, 0.5);
+
+        // A third value replaces the running transition and cancels it.
+        styles.insert(node, base("75px"));
+        let events = sample_transitions(&mut styles, &mut state, 0.5);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, TransitionEventKind::Cancel);
+        assert_eq!(events[0].property, "width");
+        assert!((events[0].elapsed_time - 0.5).abs() < 1.0e-6);
+        assert_eq!(
+            styles[&node].get("width").map(|value| value.css_text()),
+            Some("50px")
+        );
+    }
+
+    #[test]
+    fn allow_discrete_steps_display_at_the_endpoints() {
+        let node = NodeId::from_u64(6);
+        let base = |display: &str| {
+            style_with(&[
+                ("display", display),
+                ("transition-property", "display"),
+                ("transition-duration", "1s"),
+                ("transition-timing-function", "linear"),
+                ("transition-behavior", "allow-discrete"),
+            ])
+        };
+        let mut styles = BTreeMap::new();
+        styles.insert(node, base("block"));
+        let mut state = TransitionState::default();
+        sample_transitions(&mut styles, &mut state, 0.0);
+        styles.insert(node, base("none"));
+        sample_transitions(&mut styles, &mut state, 0.0);
+        styles.insert(node, base("none"));
+        sample_transitions(&mut styles, &mut state, 0.5);
+        assert_eq!(
+            styles[&node].get("display").map(|value| value.css_text()),
+            Some("block")
+        );
+        styles.insert(node, base("none"));
+        let events = sample_transitions(&mut styles, &mut state, 1.0);
+        assert_eq!(
+            styles[&node].get("display").map(|value| value.css_text()),
+            Some("none")
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, TransitionEventKind::End);
+    }
+
+    #[test]
+    fn without_allow_discrete_a_discrete_change_is_immediate() {
+        let node = NodeId::from_u64(7);
+        let base = |display: &str| {
+            style_with(&[
+                ("display", display),
+                ("transition-property", "display"),
+                ("transition-duration", "1s"),
+            ])
+        };
+        let mut styles = BTreeMap::new();
+        styles.insert(node, base("block"));
+        let mut state = TransitionState::default();
+        sample_transitions(&mut styles, &mut state, 0.0);
+        styles.insert(node, base("none"));
+        let events = sample_transitions(&mut styles, &mut state, 0.5);
+        assert!(events.is_empty());
+        assert!(!state.has_active());
+        assert_eq!(
+            styles[&node].get("display").map(|value| value.css_text()),
+            Some("none")
+        );
     }
 }

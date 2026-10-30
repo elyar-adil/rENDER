@@ -1,3 +1,69 @@
+# 交接文档 (2026-10-31, 续三十七) — transitioncancel 与 allow-discrete
+
+接续多动画/反向 transition 会话。这一轮补 `transitioncancel` 事件和
+`transition-behavior: allow-discrete`。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **transitioncancel** | `TransitionEventKind::{End,Cancel}`;切换目标/属性不再覆盖时发出 cancel,`elapsedTime` 为已运行时长 |
+| **事件映射** | 浏览器按 kind 派发 `transitionend` 或冒泡 `transitioncancel`,继续带 `propertyName`/`elapsedTime`/`pseudoElement` |
+| **allow-discrete** | 注册 `transition-behavior: normal`;简写可写 `transition: display 1s allow-discrete`;显式列表按下标匹配 |
+| **离散采样** | 无插值器的属性在 allow-discrete 下按离散值处理;`display:none` 隐藏延迟到结束,出现时立即显示 |
+| **默认行为** | 未声明 allow-discrete 时离散属性仍立即变化,不产生 transition |
+| **测试** | cancel kind/elapsedTime、allow-discrete 显隐、默认离散立即生效、transitioncancel 监听器参数 |
+
+## 证据
+
+本地页面:红色 `#a` 使用 `transition: display 1s linear allow-discrete` 并
+在 100ms 后加 `hide`;蓝色 `#b` 的 width 在 100ms 变 120px、400ms 再变 60px,
+监听 `transitioncancel` 写标题。
+
+```
+500ms  a=(255,0,0) 红仍可见   b=(0,0,255) 蓝
+1500ms a 已隐藏              b=(0,0,255)
+标题   cancel:width:0.32
+health scripts_failed=0 scripts_threw=0 css_errors=0
+```
+
+即 display 的消失等到 transition 结束才生效;中途改 width 触发
+`transitioncancel`,`elapsedTime≈0.32s`。
+
+真实站点:
+
+```
+Bing:  ready=Complete  dom_elements=474 boxes=166
+       scripts_failed=0 scripts_threw=0 css_warnings=13 images_failed=0
+Baidu: ready=Complete  dom_elements=450 boxes=156
+       scripts_failed=0 scripts_threw=0 css_warnings=5 images_failed=0
+JD:    ready=Loading   dom_elements=1158 boxes=117
+       scripts_failed=8 scripts_threw=2 css_warnings=36 images_failed=1
+```
+
+Bing 页头正常。JD 此次又停在 Loading,主商品区仍受 403 风控,站点响应有波动。
+
+## 验证
+
+```
+cargo test --workspace                       2802 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+## 明确未做 / 下一步
+
+- `transitioncancel` 对节点被移除/文档切换的派发还未完整;当前主要覆盖样式变更取消。
+- `allow-discrete` 只对无插值器属性做离散,`display` 的 start/end 特例按规范近似;
+  其它离散属性的 50% 翻转仍是简化实现。
+- 精确 reversing-adjusted start value、WAAPI、多动画 pause/resume 计时账本未做。
+- 动画/过渡时钟只驱动当前标签页,无独立合成器线程。
+- JD 主商品区仍受 403;GitHub/HN 本机链路阻断;高级渐变、SVG filter 其余原语、
+  IndexedDB 值类型覆盖仍未完成。
+
+---
+
 # 交接文档 (2026-10-31, 续三十六) — 多动画列表、transform:none 与 transition 反向
 
 接续 CSS Transitions 会话。这一轮补多动画列表、`transform: none` 的 identity
