@@ -360,7 +360,7 @@ Microdata、`is=""`、`<dialog>` 完整模态语义、Drag & Drop API、可访�
 | `transition` | ✅ `transition` 简写与 longhand 解析；`render-css/src/transition.rs` 记住上一帧目标值，采样 duration/delay/timing，支持 `allow-discrete`、反向缩短，并生成 `transitionend`/`transitioncancel`；浏览器按 16ms 时钟重绘 |
 | `animation` + `@keyframes` | ✅ `@keyframes` 保留并按时间采样；浏览器驱动 16ms 时钟；多动画列表按 source order 合成，`transform:none` 按 identity 插值；WAAPI 核心已自托管，部分 easing 仍未完成 |
 | `will-change` | ⛔ |
-| Web Animations API | 🟡 `element.animate`、play/pause/finish/cancel、finish/cancel 事件与 16ms 时间线采样已自托管实现；playbackRate/reverse、effect composition、逐关键帧 easing 与 CSS/WAAPI 统一时间线未完成 |
+| Web Animations API | 🟡 `element.animate`、play/pause/finish/cancel、playbackRate/reverse、add/accumulate 合成、finish/cancel 事件与 CSS/WAAPI 共用 document clock 已自托管实现；逐关键帧 easing、完整 effect grouping 与部分 timing 模型未完成 |
 
 ### 4.8 媒体查询
 

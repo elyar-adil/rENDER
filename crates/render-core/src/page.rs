@@ -385,6 +385,9 @@ pub struct Page {
     /// Last `document.title` value this page applied to the document, so a
     /// repeated own-property read is not mistaken for a fresh assignment.
     script_title_override: Option<String>,
+    /// Whether the self-hosted Web Animations core reported a running animation
+    /// at the last tick.
+    web_animations_active: bool,
 }
 
 impl Page {
@@ -477,6 +480,7 @@ impl Page {
             video_frames: ImageResources::default(),
             video_frames_dirty: false,
             script_title_override: None,
+            web_animations_active: false,
         }
     }
 
@@ -529,6 +533,7 @@ impl Page {
             video_frames: ImageResources::default(),
             video_frames_dirty: false,
             script_title_override: None,
+            web_animations_active: false,
         };
         page.refresh_geometry_index();
         page
@@ -1120,6 +1125,7 @@ impl Page {
     ) -> Result<PagePumpOutcome, PageError> {
         self.event_loop.advance_time_to(now)?;
         self.advance_video_playback();
+        self.sync_web_animations(now);
         let mut executed_turns = 0;
         let mut rendered_turns = 0;
         let mut task_results = Vec::new();
@@ -1140,6 +1146,9 @@ impl Page {
         if self.video_frames_dirty {
             self.render_update(backends);
             rendered_turns += 1;
+        }
+        if executed_turns > 0 {
+            self.sync_web_animations(now);
         }
         self.drain_runtime_microtasks();
         Ok(PagePumpOutcome {
@@ -1184,6 +1193,35 @@ impl Page {
         self.pump_at_most_without_render(now, MAX_PUMP_TURNS)
     }
 
+    /// Whether the Web Animations core still has a running animation.
+    #[must_use]
+    pub const fn has_active_web_animations(&self) -> bool {
+        self.web_animations_active
+    }
+
+    /// Tick the self-hosted Web Animations timeline at the page's document
+    /// time and report whether animations remain active.
+    ///
+    /// The tiny script calls the prelude's internal hook. It is deliberately
+    /// not a page script: its mutations still go through the ordinary DOM
+    /// revision check, but it does not become `document.currentScript`.
+    pub fn sync_web_animations(&mut self, now: Duration) -> bool {
+        let millis = now.as_secs_f64() * 1000.0;
+        let source = format!("__renderTickWebAnimations({millis});");
+        match self.runtime.execute(self.document.dom_mut(), &source) {
+            Ok(outcome) => {
+                self.web_animations_active =
+                    matches!(outcome.value, crate::js::JsValue::Boolean(true));
+                self.web_animations_active
+            }
+            Err(error) => {
+                eprintln!("web-animation tick failed: {error}");
+                self.web_animations_active = false;
+                false
+            }
+        }
+    }
+
     /// Advance the virtual clock and run no more than `turn_budget` turns
     /// without synchronously laying out or painting.
     ///
@@ -1205,6 +1243,9 @@ impl Page {
         // Presentation clocks advance even without a raster; the frame store
         // marks itself dirty for the next rendering pass.
         self.advance_video_playback();
+        // CSS animations and WAAPI share this document timestamp. Tick before
+        // tasks so a frame with no task still samples the running animation.
+        self.sync_web_animations(now);
         let mut executed_turns = 0;
         let mut rendered_turns = 0;
         let mut task_results = Vec::new();
@@ -2900,6 +2941,52 @@ mod tests {
             page.document_title(),
             Some("cancel:width:0.25:true".to_owned())
         );
+    }
+
+    #[test]
+    fn web_animations_tick_on_the_page_document_clock() {
+        let mut page = Page::new("<!doctype html><html><body><div id='box'></div></body></html>");
+        page.queue_script(
+            "performance.now = function () { return 0; };\
+             var box = document.getElementById('box');\
+             var animation = box.animate(\
+                 [{ width: '0px' }, { width: '100px' }],\
+                 { duration: 1000, fill: 'both' });\
+             window.animation = animation;",
+        )
+        .expect("animation script queues");
+        page.pump_until_idle_reference(Duration::ZERO)
+            .expect("animation starts");
+        assert!(page.has_active_web_animations());
+        let box_node = element_with_id(page.document().dom(), "box");
+        assert!(
+            page.document()
+                .dom()
+                .attribute(box_node, "style")
+                .expect("style lookup")
+                .is_some_and(|style| style.contains("width: 0px"))
+        );
+
+        page.pump_at_most_without_render(Duration::from_millis(500), 1)
+            .expect("midpoint tick");
+        let midpoint = page
+            .document()
+            .dom()
+            .attribute(box_node, "style")
+            .expect("style lookup")
+            .expect("style attribute");
+        assert!(midpoint.contains("width: 50px"), "{midpoint}");
+
+        page.pump_at_most_without_render(Duration::from_millis(1500), 1)
+            .expect("finish tick");
+        assert!(!page.has_active_web_animations());
+        let end = page
+            .document()
+            .dom()
+            .attribute(box_node, "style")
+            .expect("style lookup")
+            .expect("style attribute");
+        assert!(end.contains("width: 100px"), "{end}");
     }
 
     #[test]

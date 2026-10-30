@@ -546,8 +546,8 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 `transition-behavior: allow-discrete` steps discrete properties and both \
                 transitionend and transitioncancel are reported. Exact reversing-adjusted \
                 start values remain missing. The self-hosted Web Animations core \
-                covers element.animate and playback control but is not yet unified with \
-                this transition timeline.",
+                covers element.animate, playbackRate/reverse and composition on the \
+                same document clock as this transition timeline.",
         dependencies: &[CSS_SYNTAX],
         tests: &[ConformanceTest::new("rust", "css::transition::tests")],
     },

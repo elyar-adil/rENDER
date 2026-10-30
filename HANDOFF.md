@@ -1,3 +1,75 @@
+# 交接文档 (2026-10-31, 续三十九) — WAAPI 速率/反向、合成与统一时间线
+
+接续 Web Animations 核心会话。这一轮补 `playbackRate`/`reverse`、add/accumulate
+合成，并让 WAAPI 与 CSS 动画共用页面的 document clock。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **统一时间线** | WAAPI 不再自己 `setTimeout`;`Page::sync_web_animations(now)` 在页面 pump/帧中用 `created_at.elapsed()` 调用 `__renderTickWebAnimations(time)` |
+| **时钟激活** | `PageState.has_active_timeline` 增加 `Page::has_active_web_animations`;浏览器继续按 16ms 调度同一帧循环 |
+| **playbackRate** | getter/setter、`updatePlaybackRate`;改变速率时保持 currentTime,速率 0 冻结 |
+| **reverse** | 翻转 playbackRate;finished/idle 时从正确端点重新播放 |
+| **负速率** | currentTime 从 end 向 0 采样,到达 0 时 finish |
+| **合成** | `composite: replace/add/accumulate`;数字/长度相加、transform 函数串接;后者读取当前 inline 值 |
+| **document.timeline** | WAAPI 暴露 `document.timeline.currentTime` 与 `Animation.timeline`,与页面 document clock 同源 |
+| **测试** | 2x 速率、负速率/currentTime、reverse、add 合成、Page 时钟 tick、既有 pause/finish/cancel |
+
+## 证据
+
+本地 WAAPI 页面(`duration:1000, fill:both`),外部时钟每帧 tick:
+
+```
+500ms  WAAPIPROBE state=running current=494.8699
+       opacity=0.4734 transform=translateY(9.468px)
+1600ms 标题: waapi-finished
+       health ready=Complete scripts_failed=0 scripts_threw=0
+500ms  截图/最终截图显示方块从半透明偏移位置过渡到不透明最终位置
+```
+
+单元测试:
+
+```
+playbackRate 0.5s -> 2x 后 0.75s 到达 100px/finished
+playbackRate:-1 在 2.5s 时 currentTime=500、width=50px
+reverse() -> playbackRate 1、state running
+add composite: first 50px + second 25px = 75px
+Page: pump 500ms -> style width 50px, pump 1500ms -> finished
+```
+
+真实站点:
+
+```
+Bing:  ready=Complete  dom_elements=480 boxes=167
+       scripts_failed=0 scripts_threw=0 css_warnings=7 images_failed=0
+Baidu: ready=Complete  dom_elements=450 boxes=156
+       scripts_failed=0 scripts_threw=0 css_warnings=5 images_failed=0
+JD:    ready=Loading   dom_elements=969 boxes=117
+       scripts_failed=8 scripts_threw=2 css_warnings=36 images_failed=1
+```
+
+## 验证
+
+```
+cargo test --workspace                       2808 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+## 明确未做 / 下一步
+
+- WAAPI 仍通过 inline style 写入,多个动画/作者内联样式会互相覆盖;完整 effect
+  stack/group、composite order 与替换恢复仍不完整。
+- 逐关键帧 easing、`getComputedTiming` 全字段、`Animation.timeline` 的完整
+  timeline object、`playbackRate` 0 的规范 pending 状态仍未对齐。
+- 节点移除/文档切换的 transitioncancel、精确 reversing-adjusted start value 未做。
+- JD 主商品区仍受 403;GitHub/HN 本机链路阻断;高级渐变、SVG filter 其余原语、
+  IndexedDB 值类型覆盖仍未完成。
+
+---
+
 # 交接文档 (2026-10-31, 续三十八) — Web Animations API 核心
 
 接续 transitioncancel/allow-discrete 会话。这一轮实现 `Element.animate` 的

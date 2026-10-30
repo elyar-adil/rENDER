@@ -3,21 +3,25 @@
 //
 // The rendering pipeline is single-shot, so an animation writes the sampled
 // value into the element's inline style and the normal DOM invalidation path
-// repaints it. The scheduler is a 16 ms timer; the timeline reads
-// `performance.now()` so a slow frame does not slow the animation down.
+// repaints it. The embedding calls `__renderTickWebAnimations` with the same
+// document timestamp used by the CSS animation sampler, giving CSS and WAAPI a
+// single timeline. `performance.now()` remains the fallback clock for a realm
+// without an embedding frame.
 (function (global) {
   if (typeof Element === 'undefined' || typeof Element.prototype === 'undefined') return;
   if (typeof Element.prototype.animate === 'function') return;
 
   var defineProperty = Object.defineProperty;
   var animations = [];
-  var timer = null;
+  var timelineStart = null;
 
   function now() {
     return typeof performance !== 'undefined' && typeof performance.now === 'function'
       ? performance.now()
       : Date.now();
   }
+
+  if (timelineStart === null) timelineStart = now();
 
   function number(value, fallback) {
     var result = Number(value);
@@ -54,13 +58,17 @@
   // A property track is a sorted list of {offset, value}; keyframes may use the
   // array form ([{opacity: 0}, {opacity: 1}]) or the property-list form
   // ({opacity: [0, 1]}).
-  function buildTracks(keyframes) {
+  function buildTracks(keyframes, defaultComposite) {
     var tracks = Object.create(null);
     var meta = { offset: true, easing: true, composite: true };
-    function add(name, offset, value) {
+    function add(name, offset, value, composite) {
       if (meta[name] || value === undefined || value === null) return;
       name = camelToKebab(name);
-      (tracks[name] || (tracks[name] = [])).push({ offset: offset, value: value });
+      (tracks[name] || (tracks[name] = [])).push({
+        offset: offset,
+        value: value,
+        composite: composite || defaultComposite || 'replace'
+      });
     }
     if (Array.isArray(keyframes)) {
       var count = keyframes.length;
@@ -71,7 +79,9 @@
         }
         var offset = keyframeOffset(frame.offset, index, count);
         var names = Object.keys(frame);
-        for (var n = 0; n < names.length; n++) add(names[n], offset, frame[names[n]]);
+        for (var n = 0; n < names.length; n++) {
+          add(names[n], offset, frame[names[n]], frame.composite);
+        }
       }
     } else if (keyframes && typeof keyframes === 'object') {
       var names = Object.keys(keyframes);
@@ -79,7 +89,7 @@
         var values = keyframes[names[n]];
         if (!Array.isArray(values)) values = [values];
         for (var index = 0; index < values.length; index++) {
-          add(names[n], keyframeOffset(null, index, values.length), values[index]);
+          add(names[n], keyframeOffset(null, index, values.length), values[index], defaultComposite);
         }
       }
     }
@@ -87,7 +97,11 @@
     Object.keys(tracks).forEach(function (name) {
       var points = tracks[name];
       points.sort(function (a, b) { return a.offset - b.offset; });
-      result.push({ property: name, points: points });
+      result.push({
+        property: name,
+        points: points,
+        composite: points[points.length - 1].composite || 'replace'
+      });
     });
     return result;
   }
@@ -173,6 +187,24 @@
     return progress < 0.5 ? a : b;
   }
 
+  function addValues(base, value) {
+    if (base === '' || base === 'none') return value;
+    if (value === '' || value === 'none') return base;
+    var a = splitNumbers(base);
+    var b = splitNumbers(value);
+    if (a.count > 0 && a.count === b.count && sameLiterals(a, b)) {
+      var output = '';
+      for (var i = 0; i < a.count; i++) {
+        output += a.literals[i] + formatNumber(a.numbers[i] + b.numbers[i]);
+      }
+      return output + a.literals[a.literals.length - 1];
+    }
+    if (/^[a-zA-Z]+\(/.test(base) && /^[a-zA-Z]+\(/.test(value)) {
+      return base + ' ' + value;
+    }
+    return value;
+  }
+
   function cubicBezier(x1, y1, x2, y2, x) {
     function coordinate(t, first, second) {
       var inverse = 1 - t;
@@ -229,12 +261,22 @@
     return points[points.length - 1].value;
   }
 
-  function activeProgress(timing, elapsed) {
+  function activeProgress(timing, elapsed, playbackRate) {
     var start = timing.delay;
     var total = timing.duration * timing.iterations;
     var backwards = timing.fill.indexOf('backwards') >= 0 || timing.fill.indexOf('both') >= 0;
     var forwards = timing.fill.indexOf('forwards') >= 0 || timing.fill.indexOf('both') >= 0;
-    if (elapsed < start) return { progress: backwards ? 0 : null, finished: false };
+    if (playbackRate < 0 && elapsed <= 0) {
+      return { progress: backwards ? 0 : null, finished: true };
+    }
+    if (elapsed < start) return { progress: backwards ? 0 : null, finished: playbackRate < 0 };
+    if (playbackRate < 0 && elapsed >= start + total) {
+      var finalIteration = Math.max(0, Math.ceil(timing.iterations) - 1);
+      var finalReverse = timing.direction === 'reverse' ||
+        (timing.direction === 'alternate' && finalIteration % 2 === 1) ||
+        (timing.direction === 'alternate-reverse' && finalIteration % 2 === 0);
+      return { progress: forwards ? (finalReverse ? 0 : 1) : null, finished: false };
+    }
     if (total === 0) return { progress: forwards ? 1 : null, finished: true };
     var active = elapsed - start;
     if (total !== Infinity && active >= total) {
@@ -278,19 +320,12 @@
     }
   }
 
-  function schedule() {
-    if (timer !== null) return;
-    for (var i = 0; i < animations.length; i++) {
-      if (animations[i]._playState === 'running') {
-        timer = setTimeout(tick, 16);
-        return;
-      }
-    }
-  }
-
-  function tick() {
-    timer = null;
-    var sampleTime = now();
+  // The embedding drives this function once per document animation frame. It
+  // uses the same document timestamp as the CSS animation sampler, so CSS and
+  // WAAPI share one timeline instead of running on separate timers.
+  global.__renderTickWebAnimations = function (time) {
+    var sampleTime = Number(time);
+    if (!isFinite(sampleTime)) sampleTime = now();
     var running = false;
     for (var i = 0; i < animations.length; i++) {
       var animation = animations[i];
@@ -299,13 +334,16 @@
         if (animation._playState === 'running') running = true;
       }
     }
-    if (running) schedule();
-  }
+    return running;
+  };
 
   function Animation(target, keyframes, options) {
     this._target = target;
-    this._tracks = buildTracks(keyframes);
     this._timing = timingFrom(options);
+    this._playbackRate = options && options.playbackRate !== undefined ? number(options.playbackRate, 1) : 1;
+    this._composite = (options && options.composite) || 'replace';
+    this._tracks = buildTracks(keyframes, this._composite);
+    this.timeline = timeline;
     this._playState = 'idle';
     this._startTime = 0;
     this._holdTime = 0;
@@ -362,7 +400,13 @@
     var self = this;
     this._tracks.forEach(function (track) {
       var value = sampleTrack(track.points, easing(self._timing.easing, progress));
-      if (value !== undefined && value !== null) self._target.style.setProperty(track.property, String(value));
+      if (value === undefined || value === null) return;
+      var composite = track.composite || self._composite;
+      if (composite === 'add' || composite === 'accumulate') {
+        var base = self._target.style.getPropertyValue(track.property);
+        value = addValues(base, String(value));
+      }
+      self._target.style.setProperty(track.property, String(value));
     });
   };
 
@@ -374,7 +418,7 @@
   Animation.prototype._finish = function () {
     if (this._playState === 'finished') return;
     this._playState = 'finished';
-    this._currentTime = this._endTime();
+    this._currentTime = this._playbackRate < 0 ? 0 : this._endTime();
     if (this._timing.fill.indexOf('forwards') < 0 && this._timing.fill.indexOf('both') < 0) this._restore();
     this._finished = true;
     if (this._resolveFinished) this._resolveFinished(this);
@@ -383,24 +427,27 @@
 
   Animation.prototype._sample = function (time) {
     if (this._playState !== 'running') return;
-    var elapsed = time - this._startTime;
+    var elapsed = (time - this._startTime) * this._playbackRate;
     this._currentTime = elapsed;
-    var result = activeProgress(this._timing, elapsed);
+    var result = activeProgress(this._timing, elapsed, this._playbackRate);
     this._apply(result.progress);
     if (result.finished) this._finish();
   };
 
   Animation.prototype.play = function () {
     if (this._playState === 'running') return;
+    var rate = this._playbackRate;
+    if (rate === 0) return;
     if (this._playState === 'paused') {
-      this._startTime = now() - this._holdTime;
+      this._startTime = now() - this._holdTime / rate;
     } else {
-      this._startTime = now();
-      this._currentTime = 0;
+      var start = rate < 0 ? this._endTime() : 0;
+      this._startTime = now() - start / rate;
+      this._currentTime = start;
     }
+    this._finished = false;
     this._playState = 'running';
     this._sample(now());
-    schedule();
   };
 
   Animation.prototype.pause = function () {
@@ -411,8 +458,10 @@
   };
 
   Animation.prototype.finish = function () {
+    var end = this._playbackRate < 0 ? 0 : this._endTime();
     this._playState = 'running';
-    this._startTime = now() - this._endTime();
+    this._startTime = now() - end / this._playbackRate;
+    this._currentTime = end;
     this._sample(now());
     if (this._playState !== 'finished') this._finish();
   };
@@ -449,7 +498,7 @@
 
   defineProperty(Animation.prototype, 'currentTime', {
     get: function () {
-      if (this._playState === 'running') return now() - this._startTime;
+      if (this._playState === 'running') return (now() - this._startTime) * this._playbackRate;
       return this._currentTime;
     },
     set: function (value) {
@@ -457,12 +506,43 @@
       if (next !== next) return;
       this._holdTime = next;
       this._currentTime = next;
-      if (this._playState === 'running') this._startTime = now() - next;
-      var result = activeProgress(this._timing, next);
+      if (this._playState === 'running' && this._playbackRate !== 0) {
+        this._startTime = now() - next / this._playbackRate;
+      }
+      var result = activeProgress(this._timing, next, this._playbackRate);
       this._apply(result.progress);
     },
     configurable: true
   });
+
+  defineProperty(Animation.prototype, 'playbackRate', {
+    get: function () { return this._playbackRate; },
+    set: function (value) {
+      var next = Number(value);
+      if (next !== next) return;
+      var current = this.currentTime;
+      this._playbackRate = next;
+      if (next === 0) {
+        if (this._playState === 'running') {
+          this._holdTime = current;
+          this._currentTime = current;
+          this._playState = 'paused';
+        }
+      } else if (this._playState === 'running') {
+        this._startTime = now() - current / next;
+      }
+    },
+    configurable: true
+  });
+
+  Animation.prototype.updatePlaybackRate = function (value) {
+    this.playbackRate = value;
+  };
+
+  Animation.prototype.reverse = function () {
+    this.playbackRate = -this._playbackRate;
+    if (this._playState === 'finished' || this._playState === 'idle') this.play();
+  };
 
   defineProperty(Element.prototype, 'animate', {
     value: function animate(keyframes, options) {
@@ -484,6 +564,16 @@
     writable: true,
     configurable: true
   });
+
+  var timeline = {
+    get currentTime() { return now() - timelineStart; }
+  };
+  if (typeof Document !== 'undefined' && Document.prototype && !Document.prototype.timeline) {
+    defineProperty(Document.prototype, 'timeline', {
+      get: function () { return timeline; },
+      configurable: true
+    });
+  }
 
   defineProperty(global, 'Animation', {
     value: Animation,

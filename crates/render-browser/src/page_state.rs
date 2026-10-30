@@ -918,6 +918,7 @@ impl PageState {
             self.computed_styles.values(),
             now.as_secs_f32(),
         ) || self.transition_state.has_active()
+            || self.page.has_active_web_animations()
     }
 
     /// Whether the page still has script work that requires future turns.

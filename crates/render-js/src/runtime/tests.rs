@@ -16,6 +16,12 @@ fn drain_microtasks(runtime: &mut JsRuntime, dom: &mut render_dom::Dom) {
     }
 }
 
+fn tick_web_animations(runtime: &mut JsRuntime, dom: &mut render_dom::Dom, time: f64) {
+    runtime
+        .execute(dom, &format!("__renderTickWebAnimations({time});"))
+        .expect("web animation tick runs");
+}
+
 #[test]
 fn location_exposes_normalized_committed_url_components() {
     let mut parsed = parse_document("<!doctype html><p></p>");
@@ -887,18 +893,10 @@ fn web_animation_animate_samples_and_finishes() {
             ",
         )
         .expect("Web Animation starts");
-    let first = runtime.take_pending_timer_requests();
-    assert_eq!(first.len(), 1, "{first:?}");
-    let id = match first[0] {
-        crate::TimerRequest::Schedule { id, .. } => id,
-        other @ crate::TimerRequest::Cancel { .. } => {
-            panic!("unexpected timer request {other:?}")
-        }
-    };
     runtime
         .execute(&mut parsed.dom, "window.fakeNow = 500;")
         .expect("advance fake time");
-    runtime.fire_timer(&mut parsed.dom, id).expect("tick runs");
+    tick_web_animations(&mut runtime, &mut parsed.dom, 500.0);
     let midpoint = runtime
         .execute(
             &mut parsed.dom,
@@ -909,19 +907,10 @@ fn web_animation_animate_samples_and_finishes() {
         .to_js_string();
     assert_eq!(midpoint.to_lossy(), "0.5");
 
-    let second = runtime.take_pending_timer_requests();
-    let id = match second[0] {
-        crate::TimerRequest::Schedule { id, .. } => id,
-        other @ crate::TimerRequest::Cancel { .. } => {
-            panic!("unexpected timer request {other:?}")
-        }
-    };
     runtime
         .execute(&mut parsed.dom, "window.fakeNow = 1000;")
         .expect("advance fake time");
-    runtime
-        .fire_timer(&mut parsed.dom, id)
-        .expect("finish tick runs");
+    tick_web_animations(&mut runtime, &mut parsed.dom, 1000.0);
     let result = runtime
         .execute(
             &mut parsed.dom,
@@ -974,7 +963,7 @@ fn web_animation_pause_finish_and_cancel_update_style_and_events() {
     runtime
         .execute(&mut parsed.dom, "animation.finish();")
         .expect("finish runs");
-    let finished = runtime
+    let finished_state = runtime
         .execute(
             &mut parsed.dom,
             "[document.getElementById('box').style.getPropertyValue('width'), animation.playState].join('|')",
@@ -982,12 +971,12 @@ fn web_animation_pause_finish_and_cancel_update_style_and_events() {
         .expect("reads finished state")
         .value
         .to_js_string();
-    assert_eq!(finished.to_lossy(), "100px|finished");
+    assert_eq!(finished_state.to_lossy(), "100px|finished");
 
     runtime
         .execute(&mut parsed.dom, "animation.cancel();")
         .expect("cancel runs");
-    let canceled = runtime
+    let canceled_state = runtime
         .execute(
             &mut parsed.dom,
             "[document.getElementById('box').style.getPropertyValue('width'), animation.playState, log.join(',')].join('|')",
@@ -995,7 +984,7 @@ fn web_animation_pause_finish_and_cancel_update_style_and_events() {
         .expect("reads canceled state")
         .value
         .to_js_string();
-    assert_eq!(canceled.to_lossy(), "|idle|cancel:cancel");
+    assert_eq!(canceled_state.to_lossy(), "|idle|cancel:cancel");
 }
 
 #[test]
@@ -1017,17 +1006,10 @@ fn web_animation_transform_none_uses_the_identity() {
             ",
         )
         .expect("transform animation starts");
-    let requests = runtime.take_pending_timer_requests();
-    let id = match requests[0] {
-        crate::TimerRequest::Schedule { id, .. } => id,
-        other @ crate::TimerRequest::Cancel { .. } => {
-            panic!("unexpected timer request {other:?}")
-        }
-    };
     runtime
         .execute(&mut parsed.dom, "window.fakeNow = 500;")
         .expect("advance fake time");
-    runtime.fire_timer(&mut parsed.dom, id).expect("tick runs");
+    tick_web_animations(&mut runtime, &mut parsed.dom, 500.0);
     let transform = runtime
         .execute(
             &mut parsed.dom,
@@ -1037,6 +1019,128 @@ fn web_animation_transform_none_uses_the_identity() {
         .value
         .to_js_string();
     assert_eq!(transform.to_lossy(), "translateY(10px)");
+}
+
+#[test]
+fn web_animation_playback_rate_and_reverse_adjust_the_timeline() {
+    let mut parsed = parse_document("<!doctype html><div id='box'></div>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.fakeNow = 0;
+                performance.now = function () { return window.fakeNow; };
+                var box = document.getElementById('box');
+                var animation = box.animate(
+                    [{ width: '0px' }, { width: '100px' }],
+                    { duration: 1000, fill: 'both' }
+                );
+                window.animation = animation;
+            ",
+        )
+        .expect("animation starts");
+    runtime
+        .execute(&mut parsed.dom, "window.fakeNow = 500;")
+        .expect("advance time");
+    tick_web_animations(&mut runtime, &mut parsed.dom, 500.0);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            "animation.playbackRate = 2; window.fakeNow = 750;",
+        )
+        .expect("set playback rate");
+    tick_web_animations(&mut runtime, &mut parsed.dom, 750.0);
+    let result = runtime
+        .execute(
+            &mut parsed.dom,
+            "[document.getElementById('box').style.getPropertyValue('width'), animation.playState].join('|')",
+        )
+        .expect("reads rate result")
+        .value
+        .to_js_string();
+    assert_eq!(result.to_lossy(), "100px|finished");
+
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.fakeNow = 2000;
+                var reverse = document.getElementById('box').animate(
+                    [{ width: '0px' }, { width: '100px' }],
+                    { duration: 1000, fill: 'both', playbackRate: -1 }
+                );
+                window.reverse = reverse;
+            ",
+        )
+        .expect("reverse animation starts");
+    runtime
+        .execute(&mut parsed.dom, "window.fakeNow = 2500;")
+        .expect("advance reverse time");
+    tick_web_animations(&mut runtime, &mut parsed.dom, 2500.0);
+    let reversed = runtime
+        .execute(
+            &mut parsed.dom,
+            "[document.getElementById('box').style.getPropertyValue('width'), reverse.currentTime].join('|')",
+        )
+        .expect("reads reverse result")
+        .value
+        .to_js_string();
+    assert_eq!(reversed.to_lossy(), "50px|500");
+    runtime
+        .execute(&mut parsed.dom, "reverse.reverse();")
+        .expect("reverse method flips playback direction");
+    assert_eq!(
+        runtime
+            .execute(
+                &mut parsed.dom,
+                "[reverse.playbackRate, reverse.playState].join('|')"
+            )
+            .expect("reads reversed rate")
+            .value
+            .to_js_string()
+            .to_lossy(),
+        "1|running"
+    );
+}
+
+#[test]
+fn web_animation_add_composition_uses_the_previous_value() {
+    let mut parsed = parse_document("<!doctype html><div id='box'></div>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.fakeNow = 0;
+                performance.now = function () { return window.fakeNow; };
+                var box = document.getElementById('box');
+                var first = box.animate(
+                    [{ width: '0px' }, { width: '100px' }],
+                    { duration: 1000, fill: 'both' }
+                );
+                var second = box.animate(
+                    [{ width: '0px' }, { width: '50px' }],
+                    { duration: 1000, fill: 'both', composite: 'add' }
+                );
+                window.first = first;
+                window.second = second;
+            ",
+        )
+        .expect("composed animations start");
+    runtime
+        .execute(&mut parsed.dom, "window.fakeNow = 500;")
+        .expect("advance time");
+    tick_web_animations(&mut runtime, &mut parsed.dom, 500.0);
+    let width = runtime
+        .execute(
+            &mut parsed.dom,
+            "document.getElementById('box').style.getPropertyValue('width')",
+        )
+        .expect("reads composed width")
+        .value
+        .to_js_string();
+    assert_eq!(width.to_lossy(), "75px");
 }
 
 #[test]
