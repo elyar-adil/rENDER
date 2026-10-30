@@ -777,6 +777,61 @@ fn expand_background_shorthand(value: &str) -> Vec<(String, String)> {
 /// Animations 1 §3.1). A function component (`cubic-bezier(...)`,
 /// `steps(...)`) is one token, which is why the splitter is bracket-aware.
 fn expand_animation_shorthand(value: &str) -> Option<Vec<(String, String)>> {
+    let layers = split_top_level_commas(value);
+    if layers.is_empty() {
+        return None;
+    }
+    let mut names = Vec::new();
+    let mut durations = Vec::new();
+    let mut timings = Vec::new();
+    let mut delays = Vec::new();
+    let mut iterations = Vec::new();
+    let mut directions = Vec::new();
+    let mut fills = Vec::new();
+    let mut plays = Vec::new();
+    for layer in layers {
+        let (name, duration, timing, delay, iteration, direction, fill, play) =
+            expand_animation_layer(&layer)?;
+        names.push(name);
+        durations.push(duration);
+        timings.push(timing);
+        delays.push(delay);
+        iterations.push(iteration);
+        directions.push(direction);
+        fills.push(fill);
+        plays.push(play);
+    }
+    Some(vec![
+        ("animation-name".to_owned(), names.join(", ")),
+        ("animation-duration".to_owned(), durations.join(", ")),
+        ("animation-timing-function".to_owned(), timings.join(", ")),
+        ("animation-delay".to_owned(), delays.join(", ")),
+        (
+            "animation-iteration-count".to_owned(),
+            iterations.join(", "),
+        ),
+        ("animation-direction".to_owned(), directions.join(", ")),
+        ("animation-fill-mode".to_owned(), fills.join(", ")),
+        ("animation-play-state".to_owned(), plays.join(", ")),
+    ])
+}
+
+#[allow(
+    clippy::type_complexity,
+    reason = "one animation layer expands to the same eight longhand values in order"
+)]
+fn expand_animation_layer(
+    value: &str,
+) -> Option<(
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+)> {
     let mut duration = None;
     let mut delay = None;
     let mut timing = None;
@@ -818,40 +873,16 @@ fn expand_animation_shorthand(value: &str) -> Option<Vec<(String, String)>> {
             return None;
         }
     }
-    Some(vec![
-        (
-            "animation-name".to_owned(),
-            name.unwrap_or("none").to_owned(),
-        ),
-        (
-            "animation-duration".to_owned(),
-            duration.unwrap_or("0s").to_owned(),
-        ),
-        (
-            "animation-timing-function".to_owned(),
-            timing.unwrap_or("ease").to_owned(),
-        ),
-        (
-            "animation-delay".to_owned(),
-            delay.unwrap_or("0s").to_owned(),
-        ),
-        (
-            "animation-iteration-count".to_owned(),
-            iterations.unwrap_or("1").to_owned(),
-        ),
-        (
-            "animation-direction".to_owned(),
-            direction.unwrap_or("normal").to_owned(),
-        ),
-        (
-            "animation-fill-mode".to_owned(),
-            fill.unwrap_or("none").to_owned(),
-        ),
-        (
-            "animation-play-state".to_owned(),
-            play.unwrap_or("running").to_owned(),
-        ),
-    ])
+    Some((
+        name.unwrap_or("none").to_owned(),
+        duration.unwrap_or("0s").to_owned(),
+        timing.unwrap_or("ease").to_owned(),
+        delay.unwrap_or("0s").to_owned(),
+        iterations.unwrap_or("1").to_owned(),
+        direction.unwrap_or("normal").to_owned(),
+        fill.unwrap_or("none").to_owned(),
+        play.unwrap_or("running").to_owned(),
+    ))
 }
 
 fn is_animation_time(value: &str) -> bool {
@@ -2759,5 +2790,21 @@ mod tests {
             "linear, cubic-bezier(.1, .2, .3, 1)"
         );
         assert_eq!(expansion["transition-delay"], "0s, 100ms");
+    }
+    #[test]
+    fn animation_shorthand_expands_each_layer() {
+        let expansion: std::collections::BTreeMap<_, _> = super::expand_shorthand(
+            "animation",
+            "fade 1s linear both, slide 2s ease-in 100ms infinite alternate",
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(expansion["animation-name"], "fade, slide");
+        assert_eq!(expansion["animation-duration"], "1s, 2s");
+        assert_eq!(expansion["animation-timing-function"], "linear, ease-in");
+        assert_eq!(expansion["animation-delay"], "0s, 100ms");
+        assert_eq!(expansion["animation-iteration-count"], "1, infinite");
+        assert_eq!(expansion["animation-direction"], "normal, alternate");
+        assert_eq!(expansion["animation-fill-mode"], "both, none");
     }
 }

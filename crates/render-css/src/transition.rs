@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use render_dom::NodeId;
 
-use crate::animation::{interpolate, timing_function};
+use crate::animation::{interpolate_property, timing_function};
 use crate::computed::ComputedStyle;
 
 /// Per-document transition state, carried from one render to the next.
@@ -35,6 +35,9 @@ struct ActiveTransition {
     delay: f32,
     duration: f32,
     timing: String,
+    /// The reversing shortening factor. 1 for a normal transition, smaller
+    /// when an interrupted transition is reversed back toward its start.
+    shortening: f32,
 }
 
 /// One `transitionend` the sampler observed while rendering.
@@ -98,17 +101,31 @@ pub fn sample_transitions(
                 if covered {
                     let duration = plan.duration_for(&property);
                     if duration > 0.0 {
-                        let from =
-                            sample_active(active, time).unwrap_or_else(|| active.from.clone());
-                        *active = ActiveTransition {
-                            from,
-                            to: target,
-                            start: time,
-                            delay: plan.delay_for(&property),
-                            duration,
-                            timing: plan.timing_for(&property),
+                        let from = sample_active(&property, active, time)
+                            .unwrap_or_else(|| active.from.clone());
+                        let reversing = target == active.from;
+                        let shortening = if reversing {
+                            reversing_factor(active, time)
+                        } else {
+                            1.0
                         };
-                        continue;
+                        if shortening > 0.001 {
+                            let delay = plan.delay_for(&property);
+                            *active = ActiveTransition {
+                                from,
+                                to: target,
+                                start: time,
+                                delay: if delay < 0.0 {
+                                    delay * shortening
+                                } else {
+                                    delay
+                                },
+                                duration: duration * shortening,
+                                timing: plan.timing_for(&property),
+                                shortening,
+                            };
+                            continue;
+                        }
                     }
                 }
                 cancel.push(property.clone());
@@ -121,7 +138,8 @@ pub fn sample_transitions(
                 continue;
             }
             let duration = plan.duration_for(&property);
-            if duration <= 0.0 || interpolate(&previous, &target, 0.0).is_none() {
+            if duration <= 0.0 || interpolate_property(&property, &previous, &target, 0.0).is_none()
+            {
                 continue;
             }
             node_state.active.insert(
@@ -133,6 +151,7 @@ pub fn sample_transitions(
                     delay: plan.delay_for(&property),
                     duration,
                     timing: plan.timing_for(&property),
+                    shortening: 1.0,
                 },
             );
         }
@@ -151,7 +170,7 @@ pub fn sample_transitions(
                     elapsed_time: active.duration,
                 });
                 ended.push(property.clone());
-            } else if let Some(value) = sample_active(active, time) {
+            } else if let Some(value) = sample_active(property, active, time) {
                 style.set_animated_property(property, &value);
             }
         }
@@ -163,11 +182,23 @@ pub fn sample_transitions(
     events
 }
 
-fn sample_active(active: &ActiveTransition, time: f32) -> Option<String> {
+/// The portion of the value space an interrupted transition traversed.
+///
+/// CSS Transitions 1 §3.1: the timing output at the interruption, scaled by the
+/// old transition's own shortening factor, plus the unshortened remainder.
+fn reversing_factor(active: &ActiveTransition, time: f32) -> f32 {
+    let progress = ((time - active.start - active.delay) / active.duration).clamp(0.0, 1.0);
+    let output = timing_function(&active.timing, progress);
+    (output.mul_add(active.shortening, 1.0 - active.shortening))
+        .abs()
+        .clamp(0.0, 1.0)
+}
+
+fn sample_active(property: &str, active: &ActiveTransition, time: f32) -> Option<String> {
     let local = time - active.start - active.delay;
     let progress = (local / active.duration).clamp(0.0, 1.0);
     let eased = timing_function(&active.timing, progress);
-    interpolate(&active.from, &active.to, eased)
+    interpolate_property(property, &active.from, &active.to, eased)
 }
 
 struct TransitionPlan {
@@ -509,5 +540,47 @@ mod tests {
             styles[&node].get("opacity").map(|value| value.css_text()),
             Some("0")
         );
+    }
+    #[test]
+    fn reversing_an_interrupted_transition_shortens_its_duration() {
+        let node = NodeId::from_u64(4);
+        let base = |width: &str| {
+            style_with(&[
+                ("width", width),
+                ("transition-property", "width"),
+                ("transition-duration", "1s"),
+                ("transition-timing-function", "linear"),
+            ])
+        };
+        let mut styles = BTreeMap::new();
+        styles.insert(node, base("0px"));
+        let mut state = TransitionState::default();
+        sample_transitions(&mut styles, &mut state, 0.0);
+        styles.insert(node, base("100px"));
+        sample_transitions(&mut styles, &mut state, 0.0);
+        styles.insert(node, base("100px"));
+        sample_transitions(&mut styles, &mut state, 0.5);
+        assert_eq!(
+            styles[&node].get("width").map(|value| value.css_text()),
+            Some("50px")
+        );
+
+        // Reversing at 50% must take the shortened 0.5s back, not another 1s.
+        styles.insert(node, base("0px"));
+        sample_transitions(&mut styles, &mut state, 0.5);
+        styles.insert(node, base("0px"));
+        sample_transitions(&mut styles, &mut state, 0.75);
+        assert_eq!(
+            styles[&node].get("width").map(|value| value.css_text()),
+            Some("25px")
+        );
+        styles.insert(node, base("0px"));
+        let events = sample_transitions(&mut styles, &mut state, 1.0);
+        assert_eq!(
+            styles[&node].get("width").map(|value| value.css_text()),
+            Some("0px")
+        );
+        assert_eq!(events.len(), 1);
+        assert!((events[0].elapsed_time - 0.5).abs() < 1.0e-6);
     }
 }

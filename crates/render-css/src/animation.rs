@@ -8,60 +8,66 @@
 use std::collections::BTreeMap;
 
 use crate::computed::ComputedStyle;
-use crate::properties::{CssColor, TypedPropertyValue, parse_typed_property};
+use crate::properties::{
+    CssColor, TransformFunction, TransformList, TypedPropertyValue, parse_typed_property,
+};
 use crate::stylesheet::KeyframesRule;
 
 /// The declarations one element's animations contribute at `time` seconds.
 ///
 /// Values are CSS text suitable for [`ComputedStyle::set_animated_property`].
-/// Only the first `animation-name` is sampled; a comma-separated list of
-/// independent animations remains a documented gap.
+/// Comma-separated animation lists are sampled in source order; when two
+/// animations name the same property, the later one wins.
 #[must_use]
 pub fn sample_animations(
     keyframes: &BTreeMap<String, KeyframesRule>,
     style: &ComputedStyle,
     time: f32,
 ) -> Vec<(String, String)> {
-    let Some(name) = animation_name(style) else {
-        return Vec::new();
-    };
-    let Some(rule) = keyframes.get(&name) else {
-        return Vec::new();
-    };
-    let duration = animation_time(style, "animation-duration").unwrap_or(0.0);
-    if duration <= 0.0 {
+    let entries = animation_entries(style);
+    if entries.is_empty() {
         return Vec::new();
     }
-    let delay = animation_time(style, "animation-delay").unwrap_or(0.0);
-    let iterations = animation_iterations(style).unwrap_or(1.0);
-    let fill = property_text(style, "animation-fill-mode").unwrap_or_else(|| "none".to_owned());
-    let direction =
-        property_text(style, "animation-direction").unwrap_or_else(|| "normal".to_owned());
-    let Some(progress) = animation_progress(time, delay, duration, iterations, &fill, &direction)
-    else {
-        return Vec::new();
-    };
-    let progress = apply_timing(style, progress);
-
-    let mut properties = BTreeMap::<String, ()>::new();
-    for frame in &rule.keyframes {
-        for declaration in &frame.declarations {
-            if !declaration.important {
-                properties.insert(declaration.name.clone(), ());
+    let mut sampled = BTreeMap::<String, String>::new();
+    for entry in entries {
+        if entry.duration <= 0.0 {
+            continue;
+        }
+        let Some(rule) = keyframes.get(&entry.name) else {
+            continue;
+        };
+        let Some(progress) = animation_progress(
+            time,
+            entry.delay,
+            entry.duration,
+            entry.iterations,
+            &entry.fill,
+            &entry.direction,
+        ) else {
+            continue;
+        };
+        let progress = timing_function(&entry.timing, progress);
+        let mut properties = BTreeMap::<String, ()>::new();
+        for frame in &rule.keyframes {
+            for declaration in &frame.declarations {
+                if !declaration.important {
+                    properties.insert(declaration.name.clone(), ());
+                }
+            }
+        }
+        for property in properties.keys() {
+            if property.starts_with("animation") {
+                continue;
+            }
+            let base = style.get(property).map(|value| value.css_text().to_owned());
+            if let Some(value) =
+                sample_property(&rule.keyframes, property, progress, base.as_deref())
+            {
+                sampled.insert(property.clone(), value);
             }
         }
     }
-    let mut sampled = Vec::new();
-    for property in properties.keys() {
-        if property.starts_with("animation") {
-            continue;
-        }
-        let base = style.get(property).map(|value| value.css_text().to_owned());
-        if let Some(value) = sample_property(&rule.keyframes, property, progress, base.as_deref()) {
-            sampled.push((property.clone(), value));
-        }
-    }
-    sampled
+    sampled.into_iter().collect()
 }
 
 /// Whether any of `styles` still needs animation frames at `time` seconds.
@@ -82,28 +88,17 @@ pub fn any_animation_active<'a>(
 /// Whether one element's animation can still change at `time` seconds.
 #[must_use]
 pub fn animation_is_active(style: &ComputedStyle, time: f32) -> bool {
-    let Some(_name) = animation_name(style) else {
-        return false;
-    };
-    if property_text(style, "animation-play-state")
-        .is_some_and(|value| value.eq_ignore_ascii_case("paused"))
-    {
-        return false;
-    }
-    let Some(duration) = animation_time(style, "animation-duration") else {
-        return false;
-    };
-    if duration <= 0.0 {
-        return false;
-    }
-    let delay = animation_time(style, "animation-delay").unwrap_or(0.0);
-    let iterations = animation_iterations(style).unwrap_or(1.0);
-    let total = delay + duration * iterations;
-    if total.is_finite() {
-        (time as f64) < f64::from(total)
-    } else {
-        true
-    }
+    animation_entries(style).into_iter().any(|entry| {
+        if entry.paused || entry.duration <= 0.0 {
+            return false;
+        }
+        let total = entry.delay + entry.duration * entry.iterations;
+        if total.is_finite() {
+            (time as f64) < f64::from(total)
+        } else {
+            true
+        }
+    })
 }
 
 fn property_text(style: &ComputedStyle, name: &str) -> Option<String> {
@@ -112,19 +107,120 @@ fn property_text(style: &ComputedStyle, name: &str) -> Option<String> {
         .map(|value| value.css_text().trim().to_owned())
 }
 
-fn animation_name(style: &ComputedStyle) -> Option<String> {
-    let text = property_text(style, "animation-name")?;
-    let name = text.split(',').next()?.trim();
-    if name.is_empty() || name.eq_ignore_ascii_case("none") {
-        return None;
-    }
-    Some(name.trim_matches(['\'', '"']).to_owned())
+#[derive(Clone, Debug, PartialEq)]
+struct AnimationEntry {
+    name: String,
+    duration: f32,
+    delay: f32,
+    timing: String,
+    iterations: f32,
+    direction: String,
+    fill: String,
+    paused: bool,
 }
 
-fn animation_time(style: &ComputedStyle, name: &str) -> Option<f32> {
-    let text = property_text(style, name)?;
-    let first = text.split(',').next()?.trim();
-    parse_time(first)
+fn animation_entries(style: &ComputedStyle) -> Vec<AnimationEntry> {
+    let names = split_top_level_commas(
+        &property_text(style, "animation-name").unwrap_or_else(|| "none".to_owned()),
+    );
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let durations =
+        time_list(&property_text(style, "animation-duration").unwrap_or_else(|| "0s".to_owned()));
+    let delays =
+        time_list(&property_text(style, "animation-delay").unwrap_or_else(|| "0s".to_owned()));
+    let timings = string_list(
+        &property_text(style, "animation-timing-function").unwrap_or_else(|| "ease".to_owned()),
+    );
+    let iterations = number_list(
+        &property_text(style, "animation-iteration-count").unwrap_or_else(|| "1".to_owned()),
+        1.0,
+    );
+    let directions = string_list(
+        &property_text(style, "animation-direction").unwrap_or_else(|| "normal".to_owned()),
+    );
+    let fills = string_list(
+        &property_text(style, "animation-fill-mode").unwrap_or_else(|| "none".to_owned()),
+    );
+    let play_states = string_list(
+        &property_text(style, "animation-play-state").unwrap_or_else(|| "running".to_owned()),
+    );
+    let mut entries = Vec::new();
+    for (index, raw_name) in names.iter().enumerate() {
+        let name = raw_name.trim_matches(['\'', '"']);
+        if name.is_empty() || name.eq_ignore_ascii_case("none") {
+            continue;
+        }
+        entries.push(AnimationEntry {
+            name: name.to_owned(),
+            duration: list_value(&durations, index).unwrap_or(0.0),
+            delay: list_value(&delays, index).unwrap_or(0.0),
+            timing: list_value(&timings, index).unwrap_or_else(|| "ease".to_owned()),
+            iterations: list_value(&iterations, index).unwrap_or(1.0),
+            direction: list_value(&directions, index).unwrap_or_else(|| "normal".to_owned()),
+            fill: list_value(&fills, index).unwrap_or_else(|| "none".to_owned()),
+            paused: list_value(&play_states, index)
+                .is_some_and(|value| value.eq_ignore_ascii_case("paused")),
+        });
+    }
+    entries
+}
+
+fn list_value<T: Clone>(values: &[T], index: usize) -> Option<T> {
+    values
+        .get(index.min(values.len().saturating_sub(1)))
+        .cloned()
+}
+
+fn string_list(text: &str) -> Vec<String> {
+    split_top_level_commas(text)
+}
+
+fn time_list(text: &str) -> Vec<f32> {
+    split_top_level_commas(text)
+        .iter()
+        .filter_map(|value| parse_time(value))
+        .collect()
+}
+
+fn number_list(text: &str, default: f32) -> Vec<f32> {
+    split_top_level_commas(text)
+        .iter()
+        .map(|value| {
+            if value.eq_ignore_ascii_case("infinite") {
+                f32::INFINITY
+            } else {
+                value.parse::<f32>().unwrap_or(default)
+            }
+        })
+        .collect()
+}
+
+fn split_top_level_commas(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_u32;
+    let mut quote = None;
+    for (index, character) in value.char_indices() {
+        match (quote, character) {
+            (Some(expected), character) if character == expected => quote = None,
+            (None, '\'' | '"') => quote = Some(character),
+            (None, '(') => depth = depth.saturating_add(1),
+            (None, ')') => depth = depth.saturating_sub(1),
+            (None, ',') if depth == 0 => {
+                parts.push(value[start..index].trim().to_owned());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = value[start..].trim();
+    if !last.is_empty() {
+        parts.push(last.to_owned());
+    }
+    parts.retain(|part| !part.is_empty());
+    parts
 }
 
 fn parse_time(text: &str) -> Option<f32> {
@@ -135,15 +231,6 @@ fn parse_time(text: &str) -> Option<f32> {
         return value.trim().parse::<f32>().ok();
     }
     text.parse::<f32>().ok()
-}
-
-fn animation_iterations(style: &ComputedStyle) -> Option<f32> {
-    let text = property_text(style, "animation-iteration-count")?;
-    let first = text.split(',').next()?.trim();
-    if first.eq_ignore_ascii_case("infinite") {
-        return Some(f32::INFINITY);
-    }
-    first.parse::<f32>().ok().filter(|value| *value >= 0.0)
 }
 
 fn animation_progress(
@@ -179,12 +266,6 @@ fn animation_progress(
         _ => false,
     };
     Some(if reverse { 1.0 - local } else { local })
-}
-
-fn apply_timing(style: &ComputedStyle, progress: f32) -> f32 {
-    let text =
-        property_text(style, "animation-timing-function").unwrap_or_else(|| "ease".to_owned());
-    timing_function(&text, progress)
 }
 
 /// Evaluate one CSS timing function (`linear`, `ease*`, `cubic-bezier`,
@@ -294,7 +375,7 @@ fn sample_property(
     }
     let local = f32::from(u16::try_from(target - before_offset).ok()?)
         / f32::from(u16::try_from(after_offset - before_offset).ok()?);
-    if let Some(value) = interpolate(before_value, after_value, local) {
+    if let Some(value) = interpolate_property(property, before_value, after_value, local) {
         return Some(value);
     }
     Some(if local < 0.5 {
@@ -302,6 +383,95 @@ fn sample_property(
     } else {
         after_value.clone()
     })
+}
+
+/// Interpolate a property, with transform-specific handling for `none`.
+///
+/// `transform: none` is the identity transform, not a discrete value. Its
+/// zero-valued function list is built from the other endpoint so lengths and
+/// units match and the ordinary numeric interpolator can do the work.
+pub(crate) fn interpolate_property(
+    property: &str,
+    from: &str,
+    to: &str,
+    progress: f32,
+) -> Option<String> {
+    if property.eq_ignore_ascii_case("transform")
+        && let Some(value) = interpolate_transform(from, to, progress)
+    {
+        return Some(value);
+    }
+    interpolate(from, to, progress)
+}
+
+fn interpolate_transform(from: &str, to: &str, progress: f32) -> Option<String> {
+    let from_list = parse_transform(from)?;
+    let to_list = parse_transform(to)?;
+    let from_css = if from_list.0.is_empty() {
+        zero_transform(&to_list)
+    } else {
+        from_list.to_css()
+    };
+    let to_css = if to_list.0.is_empty() {
+        zero_transform(&from_list)
+    } else {
+        to_list.to_css()
+    };
+    if from_css == to_css {
+        return Some(from_css);
+    }
+    interpolate_numbers(&from_css, &to_css, progress)
+}
+
+fn parse_transform(value: &str) -> Option<TransformList> {
+    match parse_typed_property("transform", value) {
+        Some(Ok(TypedPropertyValue::Transform(list))) => Some(list),
+        _ => None,
+    }
+}
+
+fn zero_transform(list: &TransformList) -> String {
+    if list.0.is_empty() {
+        return "none".to_owned();
+    }
+    list.0
+        .iter()
+        .map(zero_transform_function)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn zero_transform_function(function: &TransformFunction) -> String {
+    match function {
+        TransformFunction::Matrix(_) => "matrix(1, 0, 0, 1, 0, 0)".to_owned(),
+        TransformFunction::Translate(x, y) => format!(
+            "translate({}, {})",
+            replace_numbers(&x.to_css(), 0.0),
+            replace_numbers(&y.to_css(), 0.0)
+        ),
+        TransformFunction::Scale(x, y) => format!(
+            "scale({}, {})",
+            replace_numbers(&format_number(f64::from(*x)), 1.0),
+            replace_numbers(&format_number(f64::from(*y)), 1.0)
+        ),
+        TransformFunction::Rotate(_) | TransformFunction::Skew(..) => {
+            replace_numbers(&function.to_css(), 0.0)
+        }
+    }
+}
+
+fn replace_numbers(value: &str, replacement: f64) -> String {
+    let Some((literals, numbers)) = split_numbers(value) else {
+        return value.to_owned();
+    };
+    let mut output = String::new();
+    for (index, literal) in literals.iter().enumerate() {
+        output.push_str(literal);
+        if index < numbers.len() {
+            output.push_str(&format_number(replacement));
+        }
+    }
+    output
 }
 
 pub(crate) fn interpolate(from: &str, to: &str, progress: f32) -> Option<String> {
@@ -441,8 +611,12 @@ fn format_number(value: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{animation_progress, interpolate_numbers, sample_property, split_numbers};
-    use crate::stylesheet::{Declaration, Keyframe};
+    use super::{
+        animation_progress, interpolate_numbers, interpolate_property, sample_animations,
+        sample_property, split_numbers,
+    };
+    use crate::computed::ComputedStyle;
+    use crate::stylesheet::{Declaration, Keyframe, KeyframesRule};
 
     fn declaration(name: &str, value: &str) -> Declaration {
         Declaration {
@@ -533,6 +707,83 @@ mod tests {
         assert_eq!(
             animation_progress(1.25, 0.0, 1.0, 2.0, "none", "alternate"),
             Some(0.75)
+        );
+    }
+    #[test]
+    fn multiple_animations_compose_in_list_order() {
+        let mut style = ComputedStyle::default();
+        for (name, value) in [
+            ("animation-name", "first, second"),
+            ("animation-duration", "1s, 1s"),
+            ("animation-timing-function", "linear, linear"),
+            ("animation-fill-mode", "both, both"),
+        ] {
+            style.set_animated_property(name, value);
+        }
+        let keyframes = std::collections::BTreeMap::from([
+            (
+                "first".to_owned(),
+                KeyframesRule {
+                    name: "first".to_owned(),
+                    keyframes: vec![
+                        Keyframe {
+                            offset: 0,
+                            declarations: vec![declaration("opacity", "0")],
+                        },
+                        Keyframe {
+                            offset: 10_000,
+                            declarations: vec![declaration("opacity", "1")],
+                        },
+                    ],
+                    media: Vec::new(),
+                    layer: None,
+                },
+            ),
+            (
+                "second".to_owned(),
+                KeyframesRule {
+                    name: "second".to_owned(),
+                    keyframes: vec![
+                        Keyframe {
+                            offset: 0,
+                            declarations: vec![
+                                declaration("opacity", "0.5"),
+                                declaration("width", "10px"),
+                            ],
+                        },
+                        Keyframe {
+                            offset: 10_000,
+                            declarations: vec![
+                                declaration("opacity", "1"),
+                                declaration("width", "30px"),
+                            ],
+                        },
+                    ],
+                    media: Vec::new(),
+                    layer: None,
+                },
+            ),
+        ]);
+        let sampled: std::collections::BTreeMap<_, _> = sample_animations(&keyframes, &style, 0.5)
+            .into_iter()
+            .collect();
+        assert_eq!(sampled.get("opacity").map(String::as_str), Some("0.75"));
+        assert_eq!(sampled.get("width").map(String::as_str), Some("20px"));
+    }
+
+    #[test]
+    fn transform_none_interpolates_from_the_identity() {
+        assert_eq!(
+            interpolate_property("transform", "none", "translateY(-2px)", 0.5),
+            Some("translate(0px, -1px)".to_owned())
+        );
+        assert_eq!(
+            interpolate_property("transform", "none", "scale(1.2)", 0.5),
+            Some("scale(1.1, 1.1)".to_owned())
+        );
+        assert_eq!(
+            interpolate_property("transform", "rotate(90deg)", "none", 0.5),
+            Some("rotate(45deg)".to_owned())
         );
     }
 }

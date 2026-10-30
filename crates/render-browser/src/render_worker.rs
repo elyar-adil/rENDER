@@ -193,7 +193,10 @@ pub(super) fn process_page_render(
             let animation_time = env::var("RENDER_ANIMATION_TIME_MS")
                 .ok()
                 .and_then(|value| value.parse::<f32>().ok())
-                .unwrap_or(job.identity.animation_time_millis as f32 / 1000.0);
+                .map_or(
+                    job.identity.animation_time_millis as f32 / 1000.0,
+                    |milliseconds| milliseconds / 1000.0,
+                );
             if env::var_os("RENDER_DEBUG_FRAME").is_some() {
                 eprintln!("render-browser animation time={animation_time:.3}s");
             }

@@ -3653,7 +3653,7 @@ mod tests {
             style
                 .get("transform")
                 .map(render_css::computed::ComputedValue::css_text),
-            Some("translateX(5px)")
+            Some("translate(5px, 0px)")
         );
         let fragment = output
             .layout
@@ -3753,6 +3753,72 @@ mod tests {
         assert_eq!(end.transition_events[0].property, "width");
         assert!((end.transition_events[0].elapsed_time - 1.0).abs() < 1.0e-6);
         assert!(!transitions.has_active());
+    }
+
+    /// A comma-separated animation list samples every entry and lets the later
+    /// animation win when both name the same property.
+    #[test]
+    fn css_animation_list_samples_every_entry() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0; background: white }
+               #box { height: 20px; background: red;
+                      animation: grow 1s linear both, fade 1s linear both; }
+               @keyframes grow { from { width: 0px } to { width: 40px } }
+               @keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+               </style><div id="box"></div>"#,
+        );
+        let output = document.render_reference(DocumentRenderOptions {
+            animation_time: 0.5,
+            ..DocumentRenderOptions::default()
+        });
+        let node = target_id(document.dom(), "#box");
+        let fragment = output
+            .layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(node))
+            .expect("box fragment");
+        assert!(
+            (fragment.rect.size.width - 20.0).abs() < 0.01,
+            "{:?}",
+            fragment.rect
+        );
+        assert_eq!(
+            output.styles[&node]
+                .get("opacity")
+                .map(render_css::computed::ComputedValue::css_text),
+            Some("0.5")
+        );
+    }
+
+    /// `transform: none` is the identity, so a transition to a concrete
+    /// transform interpolates instead of flipping at the halfway point.
+    #[test]
+    fn css_transition_interpolates_transform_from_none() {
+        let mut document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0 }
+               #box { width: 20px; height: 20px; background: red;
+                      transform: none; transition: transform 1s linear; }
+               #box.moved { transform: translateY(10px); }
+               </style><div id="box"></div>"#,
+        );
+        let node = target_id(document.dom(), "#box");
+        let mut transitions = TransitionState::default();
+        render_with_transitions(&document, &mut transitions, 0.0);
+        document
+            .dom_mut()
+            .set_attribute(node, "class", "moved")
+            .expect("class attribute");
+        render_with_transitions(&document, &mut transitions, 0.0);
+        let mid = render_with_transitions(&document, &mut transitions, 0.5);
+        assert_eq!(
+            mid.styles[&node]
+                .get("transform")
+                .map(render_css::computed::ComputedValue::css_text),
+            Some("translate(0px, 5px)")
+        );
     }
 
     /// CSS `filter: grayscale(1)` replaces colour by its luminance.

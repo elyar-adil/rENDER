@@ -1,3 +1,81 @@
+# 交接文档 (2026-10-31, 续三十六) — 多动画列表、transform:none 与 transition 反向
+
+接续 CSS Transitions 会话。这一轮补多动画列表、`transform: none` 的 identity
+插值、transition reversing shortening，并修正动画探针时间单位。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **多动画列表** | `animation-name`/duration/delay/timing/iteration/direction/fill/play-state 按下标匹配,短列表循环、长列表截断;按 source order 采样,后者覆盖同名属性 |
+| **animation 简写分层** | `animation: a 1s, b 2s` 正确展开为每个 longhand 的逗号列表 |
+| **transform:none** | 解析 typed `TransformList`,把 `none` 视为 identity;`translate/scale/rotate/skew/matrix` 生成零值端点后走数值插值,用于动画和 transition |
+| **transition 反向** | 目标回到旧 `from` 时计算 CSS Transitions §3.1 reversing shortening factor;duration 乘以 factor,负 delay 同步缩短 |
+| **中断规则** | 目标变为第三种值时从当前采样值重新开始完整 duration,不跳回旧端点 |
+| **探针时间** | 修正 `RENDER_ANIMATION_TIME_MS` 的毫秒→秒换算(此前 500 被当成 500 秒) |
+| **测试** | 多动画组合、animation 简写分层、transform none 动画/过渡、transition reversing、现有动画回归 |
+
+## 证据
+
+多动画 + `transform:none` 探针(`grow` 宽 0→100px + `translateY(0→20px)`,
+`fade` opacity 0→1),同一页面两个固定时刻:
+
+```
+RENDER_ANIMATION_TIME_MS=500   animation time=0.500s
+  (20,215)=(255,128,128)   宽约50px、opacity 0.5
+RENDER_ANIMATION_TIME_MS=1000  animation time=1.000s
+  (20,215)=(255,0,0)       宽100px、opacity 1
+  x=60: 500 时白,1000 时红
+```
+
+即两个动画同时生效,`transform:none` 在中间帧产生 `translate(0px, 5px)`/10px
+的位移,不是 50% 跳变。
+
+transition reversing 单元测试:
+
+```
+0px -> 100px @0.5s   = 50px
+反向回 0px @0.5s
+0.75s                = 25px
+1.0s                 = 0px, transitionend.elapsedTime = 0.5s
+```
+
+即反向只花剩余 0.5s,而不是再走完整 1s。
+
+真实站点:
+
+```
+Bing:  ready=Complete  dom_elements=474 boxes=166
+       scripts_failed=0 scripts_threw=0 css_warnings=1 images_failed=0
+Baidu: ready=Complete  dom_elements=450 boxes=156
+       scripts_failed=0 scripts_threw=0 css_warnings=5 images_failed=0
+JD:    ready=Complete  dom_elements=926 boxes=154
+       scripts_failed=4 scripts_threw=2 css_warnings=36 images_failed=0
+```
+
+JD 已能完成加载且图片失败为 0,但主商品区仍因 `api.m.jd.com` 403 风控为空。
+
+## 验证
+
+```
+cargo test --workspace                       2797 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+## 明确未做 / 下一步
+
+- `transitioncancel` 事件、`allow-discrete`、精确 reversing-adjusted start value
+  仍未实现;多动画的 pause/resume 计时账本也不完整。
+- 多动画只支持 replace 合成,`animation-composition` 的 add/accumulate 未做。
+- `transform:none` 只覆盖 2D typed transform 函数;列表函数数量/顺序不一致时仍离散。
+- 动画/过渡时钟仍只驱动当前标签页;没有独立合成器线程;WAAPI 未实现。
+- JD 主商品区仍受 403;GitHub/HN 本机链路阻断;高级渐变、SVG filter 其余原语、
+  IndexedDB 值类型覆盖仍未完成。
+
+---
+
 # 交接文档 (2026-10-31, 续三十五) — CSS Transitions 与 transitionend
 
 接续动画时钟会话。这一轮实现 `transition`/`transition-*` 的变更检测、时间采样和
