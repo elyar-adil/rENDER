@@ -532,14 +532,16 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
         family: StandardFamily::Css,
         specification: "CSS Transitions Level 1",
         section: "2 Starting and reversing transitions",
-        status: SupportStatus::Missing,
-        notes: "Nothing. `transition` and the `transition-*` longhands parse into the \
-                cascade and no consumer reads them, because the display list and the \
-                rasteriser have no way to be re-run with an interpolated value and the \
-                paint pipeline is single-shot per DOM revision. The same absence of a \
-                diagnostic as `css.font-face`.",
+        status: SupportStatus::Partial,
+        notes: "The `transition` shorthand and its four longhands parse and reach \
+                computed style. A per-document sampler remembers the previous computed \
+                value, starts a transition when a covered property changes, interpolates \
+                numbers, lengths, transform functions and sRGB colours, honours duration, \
+                delay and the shipped timing functions, and reports transitionend. \
+                Reversing shortening, allow-discrete, interrupted-transition ownership \
+                and the Web Animations API remain missing.",
         dependencies: &[CSS_SYNTAX],
-        tests: &[],
+        tests: &[ConformanceTest::new("rust", "css::transition::tests")],
     },
     FeatureDefinition {
         id: CSS_TEXT_DECORATION,

@@ -21,6 +21,7 @@ use render_core::css::computed::ComputedValue;
 use render_core::css::selector::InteractionState;
 use render_core::css::selector::MatchContext;
 use render_core::css::stylesheet::StyleSheet;
+use render_core::css::transition::{TransitionEvent, TransitionState};
 use render_core::document::Document;
 use render_core::document::DocumentBackends;
 use render_core::document::DocumentRenderOptions;
@@ -70,6 +71,8 @@ pub(super) struct FullPageRenderPayload {
     pub(super) discover_external_styles: bool,
     pub(super) images: ImageResources,
     pub(super) interaction: InteractionState,
+    /// CSS transition targets and active transitions for this document.
+    pub(super) transition_state: TransitionState,
 }
 
 #[derive(Debug)]
@@ -87,6 +90,9 @@ pub(super) struct PageRenderFrame {
     pub(super) computed_styles: Option<BTreeMap<render_core::dom::NodeId, ComputedStyle>>,
     pub(super) geometry: Option<BTreeMap<u64, ElementRect>>,
     pub(super) document_revision: u64,
+    /// Updated transition state, returned on a full render.
+    pub(super) transition_state: Option<TransitionState>,
+    pub(super) transition_events: Vec<TransitionEvent>,
 }
 
 pub(super) type PageRenderWorker = RenderWorker<PageRenderPayload, PageRenderFrame>;
@@ -135,6 +141,7 @@ pub(super) fn process_page_render(
                 discover_external_styles,
                 images,
                 interaction,
+                transition_state,
             } = *full;
             cancellation.check()?;
             let (style_sheets, applied_style_sheets, style_diagnostics) =
@@ -203,7 +210,8 @@ pub(super) fn process_page_render(
                 y: job.identity.scroll_offset.y,
             };
             let raster_background = options.raster_background;
-            let output = document.render_with_interaction(
+            let mut transition_state = transition_state;
+            let output = document.render_with_interaction_and_transitions(
                 options,
                 DocumentBackends {
                     text_measurer: fonts,
@@ -214,6 +222,7 @@ pub(super) fn process_page_render(
                 &style_sheets,
                 &images,
                 &interaction,
+                &mut transition_state,
             );
             cancellation.check()?;
             let viewport = WindowSize::new(
@@ -321,6 +330,8 @@ pub(super) fn process_page_render(
                 computed_styles: Some(output.styles),
                 geometry: Some(geometry),
                 document_revision: output.revision.as_u64(),
+                transition_state: Some(transition_state),
+                transition_events: output.transition_events,
             })
         }
         PageRenderPayload::RetainedRaster {
@@ -353,6 +364,8 @@ pub(super) fn process_page_render(
                 computed_styles: None,
                 geometry: None,
                 document_revision: job.identity.dom_revision,
+                transition_state: None,
+                transition_events: Vec::new(),
             })
         }
     }

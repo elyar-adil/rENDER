@@ -2211,7 +2211,7 @@ it is deliberately not expressed as a percentage, because the percentages were r
 | **History API** | `pushState`/`replaceState` change the URL and `history.state` without a load. Back/forward/go within the document fire `popstate` without a load; entries of another document reload. `history.length` reflects the list at each turn's start |
 | **WebSocket / `requestIdleCallback` / `PerformanceObserver`** | absent |
 | **Iframe painting** | S11 - a nested document runs its scripts in its own realm, but it is not laid out or painted, so embedded content is invisible |
-| **Animations and transitions** | `@keyframes` is parsed, diagnosed, and discarded - 249 blocks in the corpus. No clock, so nothing can be time-driven |
+| **Animations and transitions** | `@keyframes` and CSS transitions are sampled by a browser-driven 16 ms timeline clock. Multi-animation lists, CSS Transitions reversing shortening, WAAPI and some discrete/easing edge cases remain open. |
 | **Video pixel decode** | S8 - container parsing only |
 | **Selection / Range** | S13 |
 | **Shadow-scoped styling** | shadow trees, `attachShadow` and autonomous `customElements` exist; shadow-tree stylesheets are not collected, `:host`/`::slotted` match nothing, and `slotchange` is not dispatched |

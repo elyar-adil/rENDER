@@ -590,6 +590,7 @@ fn expand_legacy_longhands(name: &str, value: &str) -> Vec<(String, String)> {
         && name != "overflow"
         && name != "columns"
         && name != "animation"
+        && name != "transition"
     {
         return vec![(name.to_owned(), value.to_owned())];
     }
@@ -614,6 +615,13 @@ fn expand_legacy_longhands(name: &str, value: &str) -> Vec<(String, String)> {
                 "animation-direction",
                 "animation-fill-mode",
                 "animation-play-state",
+            ]
+        } else if name == "transition" {
+            vec![
+                "transition-property",
+                "transition-duration",
+                "transition-timing-function",
+                "transition-delay",
             ]
         } else {
             vec!["overflow-x", "overflow-y"]
@@ -662,6 +670,8 @@ fn expand_legacy_longhands(name: &str, value: &str) -> Vec<(String, String)> {
             },
         ),
         "animation" => expand_animation_shorthand(value)
+            .unwrap_or_else(|| vec![(name.to_owned(), value.to_owned())]),
+        "transition" => expand_transition_shorthand(value)
             .unwrap_or_else(|| vec![(name.to_owned(), value.to_owned())]),
         "flex-flow" => {
             let lower = value.to_ascii_lowercase();
@@ -862,6 +872,83 @@ fn is_animation_timing(value: &str) -> bool {
     ) || value.starts_with("cubic-bezier(")
         || value.starts_with("steps(")
         || value.starts_with("linear(")
+}
+
+/// Expand `transition: <property> <duration> <timing> <delay>, ...` into its
+/// four longhand lists.
+///
+/// The grammar is order-independent for property/timing, and the first time is
+/// the duration while the second is the delay (CSS Transitions 1 §2.4). Each
+/// comma-separated layer contributes one entry per longhand, so a later layer
+/// is not silently collapsed onto the first.
+fn expand_transition_shorthand(value: &str) -> Option<Vec<(String, String)>> {
+    let mut properties = Vec::new();
+    let mut durations = Vec::new();
+    let mut timings = Vec::new();
+    let mut delays = Vec::new();
+    for layer in split_top_level_commas(value) {
+        let mut property = None;
+        let mut duration = None;
+        let mut delay = None;
+        let mut timing = None;
+        for component in split_css_components(&layer) {
+            let lower = component.to_ascii_lowercase();
+            if is_animation_time(component) {
+                if duration.is_none() {
+                    duration = Some(component);
+                } else if delay.is_none() {
+                    delay = Some(component);
+                } else {
+                    return None;
+                }
+            } else if is_animation_timing(&lower) {
+                timing = Some(component);
+            } else if property.is_none() {
+                property = Some(component);
+            } else {
+                return None;
+            }
+        }
+        properties.push(property.unwrap_or("all").to_owned());
+        durations.push(duration.unwrap_or("0s").to_owned());
+        timings.push(timing.unwrap_or("ease").to_owned());
+        delays.push(delay.unwrap_or("0s").to_owned());
+    }
+    if properties.is_empty() {
+        return None;
+    }
+    Some(vec![
+        ("transition-property".to_owned(), properties.join(", ")),
+        ("transition-duration".to_owned(), durations.join(", ")),
+        ("transition-timing-function".to_owned(), timings.join(", ")),
+        ("transition-delay".to_owned(), delays.join(", ")),
+    ])
+}
+
+fn split_top_level_commas(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_u32;
+    let mut quote = None;
+    for (index, character) in value.char_indices() {
+        match (quote, character) {
+            (Some(expected), character) if character == expected => quote = None,
+            (None, '\'' | '"') => quote = Some(character),
+            (None, '(') => depth = depth.saturating_add(1),
+            (None, ')') => depth = depth.saturating_sub(1),
+            (None, ',') if depth == 0 => {
+                parts.push(value[start..index].trim().to_owned());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = value[start..].trim();
+    if !last.is_empty() {
+        parts.push(last.to_owned());
+    }
+    parts.retain(|part| !part.is_empty());
+    parts
 }
 
 fn split_css_components(value: &str) -> Vec<&str> {
@@ -2656,5 +2743,21 @@ mod tests {
         assert_eq!(expansion["animation-iteration-count"], "infinite");
         assert_eq!(expansion["animation-fill-mode"], "both");
         assert_eq!(expansion["animation-play-state"], "running");
+    }
+    #[test]
+    fn transition_shorthand_expands_each_layer() {
+        let expansion: std::collections::BTreeMap<_, _> = super::expand_shorthand(
+            "transition",
+            "opacity 200ms linear, transform 1s cubic-bezier(.1, .2, .3, 1) 100ms",
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(expansion["transition-property"], "opacity, transform");
+        assert_eq!(expansion["transition-duration"], "200ms, 1s");
+        assert_eq!(
+            expansion["transition-timing-function"],
+            "linear, cubic-bezier(.1, .2, .3, 1)"
+        );
+        assert_eq!(expansion["transition-delay"], "0s, 100ms");
     }
 }

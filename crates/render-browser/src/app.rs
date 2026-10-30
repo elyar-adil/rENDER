@@ -110,7 +110,7 @@ use render_core::navigation::HistoryEntry;
 
 use render_core::import_map::ImportMapMiss;
 use render_core::js::RuntimeLimits;
-use render_core::js::{DynamicModuleUnit, FetchOutcome, HistoryRequest, PendingFetch};
+use render_core::js::{DynamicModuleUnit, FetchOutcome, HistoryRequest, JsValue, PendingFetch};
 use render_core::layout::PhysicalPoint;
 use render_core::module_graph::{ModuleGraph, module_key};
 use render_core::page::PageDomEvent;
@@ -482,6 +482,7 @@ impl BrowserApp {
                 discover_external_styles: page.pending_style_sheets.is_none(),
                 images: page.images.clone(),
                 interaction: page.interaction.clone(),
+                transition_state: page.transition_state.clone(),
             }))
         };
         let source_snapshot = Arc::from(page.navigation.committed().html.as_str());
@@ -569,6 +570,25 @@ impl BrowserApp {
             page.raster_background = frame.raster_background;
             if let Some(styles) = frame.computed_styles {
                 page.computed_styles = styles;
+            }
+            if let Some(transition_state) = frame.transition_state {
+                page.transition_state = transition_state;
+            }
+            for event in frame.transition_events {
+                let mut dom_event = PageDomEvent::new(event.node, "transitionend").bubbles(true);
+                dom_event.properties.push((
+                    "propertyName".to_owned(),
+                    JsValue::String(event.property.clone().into()),
+                ));
+                dom_event.properties.push((
+                    "elapsedTime".to_owned(),
+                    JsValue::Number(f64::from(event.elapsed_time)),
+                ));
+                dom_event.properties.push((
+                    "pseudoElement".to_owned(),
+                    JsValue::String(String::new().into()),
+                ));
+                let _ = page.page.queue_dom_event(dom_event);
             }
             page.scroll
                 .update_metrics(frame.content_height, frame.viewport_height);
@@ -4970,7 +4990,7 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
         let animating = self
             .pages
             .get(&active)
-            .is_some_and(|page| page.has_active_animations(page.created_at.elapsed()));
+            .is_some_and(|page| page.has_active_timeline(page.created_at.elapsed()));
         if animating {
             // CSS animations need a clock even when nothing mutates the DOM.
             // The 16 ms cadence is the usual 60 fps frame budget; a busy

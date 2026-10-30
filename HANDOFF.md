@@ -1,3 +1,70 @@
+# 交接文档 (2026-10-31, 续三十五) — CSS Transitions 与 transitionend
+
+接续动画时钟会话。这一轮实现 `transition`/`transition-*` 的变更检测、时间采样和
+`transitionend` 事件。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **解析** | `transition` 简写展开为 property/duration/timing-function/delay 四个 longhand;支持逗号分层与 `cubic-bezier(...)`/`steps(...)` |
+| **初始值** | `transition-property: all`、`transition-duration: 0s`、`transition-timing-function: ease`、`transition-delay: 0s` |
+| **状态** | 新 `render-css/src/transition.rs`:每个文档一份 `TransitionState`,保存上帧目标值与活动 transition |
+| **变更检测** | 比较本帧基础 computed value 与上帧目标;`all` 只跟踪常见可插值属性,显式属性按列表匹配 |
+| **采样** | delay、duration、timing-function;数字/长度/矩阵函数/sRGB 颜色插值;0s 立即生效 |
+| **transitionend** | 结束时返回 `TransitionEvent { node, property, elapsed_time }`;浏览器提交帧时排入 DOM 事件,带 `propertyName`/`elapsedTime`/`pseudoElement`,并冒泡 |
+| **时钟** | `PageState.has_active_timeline` 同时看 CSS 动画和活动 transition,浏览器继续 16ms 采样 |
+| **测试** | 简写分层展开、0/0.5/1s width 采样、delay、0s、transitionend 参数与冒泡、文档端到端 |
+
+## 证据
+
+本地 transition 页面(`transition: width 1s linear, background-color 1s linear`,
+100ms 后加 `wide` 类):
+
+```
+600ms 截图 x=25..50 = (177,0,78) 紫色(红→蓝中间态), x=70 白
+3000ms 最终截图 x=25..110 = (0,0,255), x=130 白
+TRANSPROBE width=120 title=end:width:1
+48 个动画帧, 最后 animation time=1.147s
+```
+
+即宽度 20→120、颜色红→蓝都在真实时钟中插值,`transitionend` 在截图前触发,
+`event.propertyName = "width"`、`event.elapsedTime = 1`。600ms 截图仍可能是上一帧
+(433ms)的像素,但已明确处于过渡中间态。
+
+真实站点:
+
+```
+Bing:  ready=Complete  dom_elements=475 boxes=166
+       scripts_failed=0 scripts_threw=0 css_warnings=9 images_failed=0
+Baidu: ready=Complete  dom_elements=450 boxes=156
+       scripts_failed=0 scripts_threw=0 css_warnings=5 images_failed=0
+JD:    ready=Loading   dom_elements=1158 boxes=117
+       scripts_failed=8 scripts_threw=2 css_warnings=36 images_failed=1
+```
+
+## 验证
+
+```
+cargo test --workspace                       2791 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+## 明确未做 / 下一步
+
+- 未实现 reversing shortening、`transition-behavior: allow-discrete`、
+  中断 transition 的 ownership/composite 规则;`transform: none` 与具体函数之间
+  仍按离散处理。
+- 仍只支持常见可插值属性的列表;部分 shorthand/颜色空间(oklab 等)与
+  `box-shadow` 插值未做。
+- 动画仍是单标签页时钟,无独立合成器;WAAPI、多动画列表、后台标签页推进未做。
+- JD 主商品区仍受 403;GitHub/HN 本机链路阻断;高级渐变、SVG filter 其余原语、
+  IndexedDB 值类型覆盖仍未完成。
+
+---
+
 # 交接文档 (2026-10-31, 续三十四) — 浏览器驱动的 CSS 动画时钟
 
 接续 RMS 依赖加载会话。这一轮把动画从“每个静态帧只取一个时间点”推进到

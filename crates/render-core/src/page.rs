@@ -1858,8 +1858,8 @@ fn collect_text_content(dom: &Dom, root: NodeId, text: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DocumentScriptQueueError, Page, PageJob, PageLimits, PageOptions, PageQueueError, PageTask,
-        PreparedPageScript,
+        DocumentScriptQueueError, Page, PageDomEvent, PageJob, PageLimits, PageOptions,
+        PageQueueError, PageTask, PreparedPageScript,
     };
     use crate::dom::{Dom, NodeId, NodeKind};
     use crate::event_loop::{EventLoopLimits, MicrotaskCheckpoint, RenderingDecision};
@@ -2844,6 +2844,32 @@ mod tests {
             .expect("inline script turn succeeds")
             .expect("inline script is queued");
         assert_eq!(page.document_title(), Some("Script Title".to_owned()));
+    }
+
+    #[test]
+    fn transitionend_carries_the_property_and_elapsed_time() {
+        let mut page = Page::new("<!doctype html><html><body><div id='box'></div></body></html>");
+        let target = element_with_id(page.document().dom(), "box");
+        page.queue_script(
+            "document.getElementById('box').addEventListener('transitionend', function (event) {
+                 document.title = event.propertyName + ':' + event.elapsedTime + ':' + event.bubbles;
+             });",
+        )
+        .expect("listener script queues");
+        page.pump_until_idle_reference(Duration::ZERO)
+            .expect("listener installs");
+        let mut event = PageDomEvent::new(target, "transitionend").bubbles(true);
+        event.properties.push((
+            "propertyName".to_owned(),
+            crate::js::JsValue::String("width".into()),
+        ));
+        event
+            .properties
+            .push(("elapsedTime".to_owned(), crate::js::JsValue::Number(1.0)));
+        page.queue_dom_event(event).expect("transitionend queues");
+        page.pump_until_idle_reference(Duration::ZERO)
+            .expect("transitionend dispatches");
+        assert_eq!(page.document_title(), Some("width:1:true".to_owned()));
     }
 
     #[test]

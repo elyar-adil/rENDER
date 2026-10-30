@@ -8,3 +8,4 @@ pub mod pseudo;
 pub mod selector;
 pub mod stylesheet;
 pub mod supports;
+pub mod transition;

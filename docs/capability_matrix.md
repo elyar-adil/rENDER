@@ -230,8 +230,9 @@ them would break more real pages than everything else combined:
 
 1. **Iframe painting** - nested documents run scripts in their own realm, but they are not laid
    out or painted, so any embedded content is invisible
-2. **Animations and transitions** - `@keyframes` is parsed and discarded, and there is no
-   animation clock, so nothing can be time-driven
+2. **Animations and transitions** - `@keyframes` and CSS transitions are sampled by a
+   browser-driven clock, but there is no compositor thread; multi-animation lists, WAAPI,
+   reversing shortening and several easing/discrete edge cases remain incomplete
 3. **Shadow-scoped styling** - shadow trees exist, but a `<style>` inside a shadow root applies
    nowhere and `:host`/`::slotted` match nothing
 4. **Selection, bidi, workers and compositing** - the remaining structural absences. The

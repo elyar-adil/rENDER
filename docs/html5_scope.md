@@ -357,8 +357,8 @@ Microdata、`is=""`、`<dialog>` 完整模态语义、Drag & Drop API、可访�
 |------|------|
 | `transform: translate / translateX/Y / scale / scaleX/Y / rotate / skew / matrix` | ✅ 端到端。类型在 `crates/render-css/src/properties.rs`（`TransformFunction` / `TransformList` / `TransformOrigin`），数学在 `render-core` 的 `Transform2D`，显示列表发射在 `display_list.rs:764-800`（`fragment_transform`，`transform` 读取在 `:771`），`PushTransform`/`PopTransform` 命令在 `:318-319`，光栅化有纯平移快路径与通用仿射离屏 warp（`raster.rs`）。`calc()` 参与 translate（`properties.rs` 的 transform 测试） |
 | `transform-origin` | ✅ `display_list.rs:790-793` |
-| `transition` | 🔴 零消费者 |
-| `animation` + `@keyframes` | 🔴 `@keyframes` 块解析后丢弃（`stylesheet.rs:552-557`，注释自述"paint pipeline has no animation clock"），`render-core` 内检索 `keyframes`/`animation` 无命中 |
+| `transition` | ✅ `transition` 简写与四个 longhand 解析；`render-css/src/transition.rs` 记住上一帧目标值，采样 duration/delay/timing，并生成 `transitionend`；浏览器按 16ms 时钟重绘 |
+| `animation` + `@keyframes` | ✅ `@keyframes` 保留并按时间采样；浏览器驱动 16ms 时钟；多动画列表、WAAPI 与部分 easing 仍未完成 |
 | `will-change` | ⛔ |
 | Web Animations API | ⛔ |
 

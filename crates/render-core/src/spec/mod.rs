@@ -368,12 +368,16 @@ mod tests {
             .map(|feature| feature.id.as_str())
             .collect();
         assert!(
-            absent.contains(&"css.transitions"),
+            absent.contains(&"css.pseudo-elements"),
             "a feature with no implementation at all must say Missing, not Partial: {absent:?}"
         );
         assert!(
             !absent.contains(&"css.animations"),
             "@keyframes are parsed and sampled now, so animations are Partial, not Missing"
+        );
+        assert!(
+            !absent.contains(&"css.transitions"),
+            "transitions are sampled now, so they are Partial, not Missing"
         );
         assert!(
             !absent.contains(&"css.font-face"),

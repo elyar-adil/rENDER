@@ -184,6 +184,12 @@ fn animation_progress(
 fn apply_timing(style: &ComputedStyle, progress: f32) -> f32 {
     let text =
         property_text(style, "animation-timing-function").unwrap_or_else(|| "ease".to_owned());
+    timing_function(&text, progress)
+}
+
+/// Evaluate one CSS timing function (`linear`, `ease*`, `cubic-bezier`,
+/// `steps`, `step-start`/`step-end`) at `progress`.
+pub(crate) fn timing_function(text: &str, progress: f32) -> f32 {
     let first = text.split(',').next().unwrap_or("ease").trim();
     if let Some(rest) = first.strip_prefix("cubic-bezier(") {
         let rest = rest.trim_end_matches(')');
@@ -288,7 +294,7 @@ fn sample_property(
     }
     let local = f32::from(u16::try_from(target - before_offset).ok()?)
         / f32::from(u16::try_from(after_offset - before_offset).ok()?);
-    if let Some(value) = interpolate(property, before_value, after_value, local) {
+    if let Some(value) = interpolate(before_value, after_value, local) {
         return Some(value);
     }
     Some(if local < 0.5 {
@@ -298,10 +304,8 @@ fn sample_property(
     })
 }
 
-fn interpolate(property: &str, from: &str, to: &str, progress: f32) -> Option<String> {
-    if (property.eq_ignore_ascii_case("color") || property.ends_with("-color"))
-        && let (Some(from), Some(to)) = (parse_color(from), parse_color(to))
-    {
+pub(crate) fn interpolate(from: &str, to: &str, progress: f32) -> Option<String> {
+    if let (Some(from), Some(to)) = (parse_color(from), parse_color(to)) {
         return Some(interpolate_color(from, to, progress).to_css());
     }
     interpolate_numbers(from, to, progress)

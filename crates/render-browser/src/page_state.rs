@@ -17,6 +17,7 @@ use render_browser::scripts::ScriptResourceSeverity;
 use render_browser::worker::RenderIdentity;
 use render_core::css::computed::ComputedStyle;
 use render_core::css::selector::InteractionState;
+use render_core::css::transition::TransitionState;
 use render_core::document::DocumentRenderOptions;
 use render_core::document::ExternalStyleSheetKey;
 use render_core::document::ExternalStyleSheets;
@@ -84,6 +85,8 @@ pub(super) struct PageState {
     /// every paint of the same broken URL.
     pub(super) attempted_images: HashSet<ImageResourceKey>,
     pub(super) computed_styles: BTreeMap<render_core::dom::NodeId, ComputedStyle>,
+    /// CSS transition targets and active transitions for this document.
+    pub(super) transition_state: TransitionState,
     /// The host's current `:hover`, `:active`, `:focus` and `:target` nodes.
     /// Every change schedules a full render, because these states participate
     /// in selector matching and cannot be applied by repainting an old frame.
@@ -291,6 +294,7 @@ impl PageState {
             images: ImageResources::default(),
             attempted_images: HashSet::new(),
             computed_styles: BTreeMap::new(),
+            transition_state: TransitionState::default(),
             interaction,
             keyboard_focus: false,
             script_load_errors: 0,
@@ -405,6 +409,7 @@ impl PageState {
         self.images = ImageResources::default();
         self.attempted_images.clear();
         self.computed_styles.clear();
+        self.transition_state = TransitionState::default();
         self.interaction = interaction_state::initial_state(
             self.page.document().dom(),
             &self.navigation.committed().target.history_url(),
@@ -906,13 +911,13 @@ impl PageState {
             .map(|deadline| self.created_at + deadline)
     }
 
-    /// Whether any element in the committed document still has a CSS
-    /// animation that can change at `now`.
-    pub(super) fn has_active_animations(&self, now: Duration) -> bool {
+    /// Whether the CSS animation clock or an active transition still needs
+    /// frames at `now`.
+    pub(super) fn has_active_timeline(&self, now: Duration) -> bool {
         render_core::css::animation::any_animation_active(
             self.computed_styles.values(),
             now.as_secs_f32(),
-        )
+        ) || self.transition_state.has_active()
     }
 
     /// Whether the page still has script work that requires future turns.

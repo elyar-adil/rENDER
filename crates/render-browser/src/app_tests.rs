@@ -927,6 +927,8 @@ fn script_inserted_stylesheet_is_discovered_after_initial_styles_resolve() {
             computed_styles: None,
             geometry: None,
             document_revision: revision,
+            transition_state: None,
+            transition_events: Vec::new(),
         }),
     });
 
@@ -1234,6 +1236,8 @@ fn gated_render_worker() -> (
                     computed_styles: None,
                     geometry: None,
                     document_revision: job.identity.dom_revision,
+                    transition_state: None,
+                    transition_events: Vec::new(),
                 })
             }
         },

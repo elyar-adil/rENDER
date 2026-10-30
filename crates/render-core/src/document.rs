@@ -21,6 +21,7 @@ use crate::css::computed::{
 use crate::css::properties::TypedPropertyValue;
 use crate::css::selector::{InteractionState, MatchContext};
 use crate::css::stylesheet::{Declaration, StyleSheet, StyleSheetDiagnostic, parse_stylesheet};
+use crate::css::transition::{TransitionEvent, TransitionState, sample_transitions};
 use crate::dom::{Dom, DomRevision, ElementData, Namespace, Node, NodeId, NodeKind};
 use crate::html::{HtmlParseError, QuirksMode, parse_document_with_scripting, serialize_html_node};
 use crate::image::inline_svg::{
@@ -1048,6 +1049,7 @@ impl Document {
         options: DocumentRenderOptions,
         backends: DocumentBackends<'_>,
     ) -> DocumentRenderOutput {
+        let mut transitions = TransitionState::default();
         render_dom(
             &self.dom,
             self.quirks_mode,
@@ -1059,6 +1061,7 @@ impl Document {
                 images: None,
                 interaction: &InteractionState::default(),
             },
+            &mut transitions,
         )
     }
 
@@ -1069,6 +1072,7 @@ impl Document {
         backends: DocumentBackends<'_>,
         images: &ImageResources,
     ) -> DocumentRenderOutput {
+        let mut transitions = TransitionState::default();
         render_dom(
             &self.dom,
             self.quirks_mode,
@@ -1080,6 +1084,7 @@ impl Document {
                 images: Some(images),
                 interaction: &InteractionState::default(),
             },
+            &mut transitions,
         )
     }
 
@@ -1123,6 +1128,7 @@ impl Document {
         base_url: &Url,
         external: &ExternalStyleSheets,
     ) -> DocumentRenderOutput {
+        let mut transitions = TransitionState::default();
         render_dom(
             &self.dom,
             self.quirks_mode,
@@ -1134,6 +1140,7 @@ impl Document {
                 images: None,
                 interaction: &InteractionState::default(),
             },
+            &mut transitions,
         )
     }
 
@@ -1172,6 +1179,7 @@ impl Document {
         images: &ImageResources,
         interaction: &InteractionState,
     ) -> DocumentRenderOutput {
+        let mut transitions = TransitionState::default();
         render_dom(
             &self.dom,
             self.quirks_mode,
@@ -1183,6 +1191,42 @@ impl Document {
                 images: Some(images),
                 interaction,
             },
+            &mut transitions,
+        )
+    }
+
+    /// Renders with dynamic interaction and a document-scoped transition state.
+    ///
+    /// `transitions` must be the same value for every frame of one document:
+    /// it holds the previous target values that let the sampler detect a
+    /// change, plus the active transitions it is interpolating.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the transition-aware render needs the same environment as render_with_interaction plus its state"
+    )]
+    pub fn render_with_interaction_and_transitions(
+        &self,
+        options: DocumentRenderOptions,
+        backends: DocumentBackends<'_>,
+        base_url: &Url,
+        external: &ExternalStyleSheets,
+        images: &ImageResources,
+        interaction: &InteractionState,
+        transitions: &mut TransitionState,
+    ) -> DocumentRenderOutput {
+        render_dom(
+            &self.dom,
+            self.quirks_mode,
+            options,
+            backends,
+            RenderEnvironment {
+                base_url: Some(base_url),
+                external,
+                images: Some(images),
+                interaction,
+            },
+            transitions,
         )
     }
 
@@ -1231,6 +1275,8 @@ pub struct DocumentRenderOutput {
     pub display: DisplayListBuildOutput,
     pub raster: CpuRasterOutput,
     pub diagnostics: DocumentRenderDiagnostics,
+    /// `transitionend` events observed while this frame sampled the timeline.
+    pub transition_events: Vec<TransitionEvent>,
 }
 
 #[derive(Clone, Copy)]
@@ -1314,6 +1360,7 @@ fn render_dom(
     options: DocumentRenderOptions,
     backends: DocumentBackends<'_>,
     environment: RenderEnvironment<'_>,
+    transitions: &mut TransitionState,
 ) -> DocumentRenderOutput {
     let stage_timing = std::env::var_os("RENDER_STAGE_TIMING").is_some();
     let mut stage_mark = std::time::Instant::now();
@@ -1373,6 +1420,7 @@ fn render_dom(
         &match_context,
         &|node| presentational_hint_declarations(dom, node, quirks_mode),
     );
+    let transition_events = sample_transitions(&mut styles, transitions, options.animation_time);
     apply_animations(
         &mut styles,
         &cascade_inputs,
@@ -1488,6 +1536,7 @@ fn render_dom(
         display,
         raster,
         diagnostics,
+        transition_events,
     }
 }
 
@@ -2030,6 +2079,7 @@ mod tests {
     };
     use crate::css::computed::ComputedValue;
     use crate::css::selector::{InteractionState, MatchContext, parse_selector_list, select_all};
+    use crate::css::transition::TransitionState;
     use crate::dom::{Dom, NodeId, NodeKind};
     use crate::image::{DecodedImage, ImageLimits, ImageResources, discover_images};
     use crate::layout::{FragmentKind, PhysicalPoint, PhysicalSize};
@@ -3616,6 +3666,93 @@ mod tests {
             "{:?}",
             fragment.rect
         );
+    }
+
+    fn render_with_transitions(
+        document: &Document,
+        transitions: &mut TransitionState,
+        time: f32,
+    ) -> DocumentRenderOutput {
+        let base_url = Url::parse("https://example.test/").expect("test URL");
+        document.render_with_interaction_and_transitions(
+            DocumentRenderOptions {
+                animation_time: time,
+                ..DocumentRenderOptions::default()
+            },
+            DocumentBackends {
+                text_measurer: &crate::layout::SimpleTextMeasurer,
+                text_shaper: &crate::paint::ReferenceTextShaper,
+                glyph_masks: &crate::paint::NoGlyphMasks,
+            },
+            &base_url,
+            &ExternalStyleSheets::default(),
+            &ImageResources::default(),
+            &InteractionState::default(),
+            transitions,
+        )
+    }
+
+    fn fragment_width(output: &DocumentRenderOutput, node: NodeId) -> f32 {
+        output
+            .layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(node))
+            .map(|fragment| fragment.rect.size.width)
+            .expect("element has a box")
+    }
+
+    /// CSS Transitions interpolate a changed length, reach layout mid-flight,
+    /// and emit one transitionend after the duration.
+    #[test]
+    fn css_transition_samples_width_and_reports_transitionend() {
+        let mut document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0 }
+               #box { width: 20px; height: 20px; background: red;
+                      transition: width 1s linear; }
+               #box.wide { width: 40px; }
+               </style><div id="box"></div>"#,
+        );
+        let node = target_id(document.dom(), "#box");
+        let mut transitions = TransitionState::default();
+        assert!(
+            (fragment_width(
+                &render_with_transitions(&document, &mut transitions, 0.0),
+                node
+            ) - 20.0)
+                .abs()
+                < 0.01
+        );
+
+        document
+            .dom_mut()
+            .set_attribute(node, "class", "wide")
+            .expect("class attribute");
+        assert!(
+            (fragment_width(
+                &render_with_transitions(&document, &mut transitions, 0.0),
+                node
+            ) - 20.0)
+                .abs()
+                < 0.01
+        );
+        assert!(
+            (fragment_width(
+                &render_with_transitions(&document, &mut transitions, 0.5),
+                node
+            ) - 30.0)
+                .abs()
+                < 0.01
+        );
+
+        let end = render_with_transitions(&document, &mut transitions, 1.0);
+        assert!((fragment_width(&end, node) - 40.0).abs() < 0.01);
+        assert_eq!(end.transition_events.len(), 1);
+        assert_eq!(end.transition_events[0].node, node);
+        assert_eq!(end.transition_events[0].property, "width");
+        assert!((end.transition_events[0].elapsed_time - 1.0).abs() < 1.0e-6);
+        assert!(!transitions.has_active());
     }
 
     /// CSS `filter: grayscale(1)` replaces colour by its luminance.
