@@ -428,6 +428,7 @@ fn decode_viewport(
         use_depth: 0,
         mask_depth: 0,
         filter_depth: 0,
+        opacity_depth: 0,
     };
 
     // Root viewBox-to-viewport mapping, composed ahead of every shape.
@@ -501,6 +502,7 @@ struct Raster {
     use_depth: usize,
     mask_depth: usize,
     filter_depth: usize,
+    opacity_depth: usize,
 }
 
 impl Raster {
@@ -650,6 +652,22 @@ fn walk(
             None => transform,
         };
         if attribute("display").is_some_and(|value| value.eq_ignore_ascii_case("none")) {
+            continue;
+        }
+        if paint_opacity_group(
+            raster,
+            child_node,
+            transform,
+            child_fill,
+            child_stroke,
+            current_color,
+            gradients,
+            gradient_index,
+            clip_paths,
+            mask_paths,
+            filter_paths,
+            ids,
+        ) {
             continue;
         }
         if paint_masked_element(
@@ -1022,6 +1040,121 @@ fn walk(
     }
 }
 
+/// Render one element with `opacity < 1` into an offscreen buffer and
+/// composite the result once, so overlapping children inside a group do not
+/// reveal each other through double alpha.
+#[allow(clippy::too_many_arguments)]
+fn paint_opacity_group(
+    raster: &mut Raster,
+    element: &XmlNode,
+    parent_transform: Affine,
+    fill: Paint,
+    stroke: Paint,
+    current_color: Color,
+    gradients: &[Gradient],
+    gradient_index: &BTreeMap<String, usize>,
+    clip_paths: &BTreeMap<String, &XmlNode>,
+    mask_paths: &BTreeMap<String, &XmlNode>,
+    filter_paths: &BTreeMap<String, &XmlNode>,
+    ids: &BTreeMap<String, &XmlNode>,
+) -> bool {
+    let Some(opacity) = element_opacity(element) else {
+        return false;
+    };
+    if opacity >= 1.0 {
+        return false;
+    }
+    if raster.opacity_depth >= 8 {
+        return false;
+    }
+    if opacity <= 0.0 {
+        return true;
+    }
+    let mut content = Raster {
+        width: raster.width,
+        height: raster.height,
+        pixels: vec![Color::TRANSPARENT; raster.width as usize * raster.height as usize],
+        clip: raster.clip.clone(),
+        use_depth: raster.use_depth,
+        mask_depth: raster.mask_depth,
+        filter_depth: raster.filter_depth,
+        opacity_depth: raster.opacity_depth + 1,
+    };
+    let mut clone = element.clone();
+    clone.attributes.retain(|(name, _)| name != "opacity");
+    if let Some((_, style)) = clone
+        .attributes
+        .iter_mut()
+        .find(|(name, _)| name == "style")
+    {
+        *style = strip_opacity_from_style(style);
+    }
+    let shadow = XmlNode {
+        name: "opacity-content".to_owned(),
+        attributes: Vec::new(),
+        children: vec![clone],
+    };
+    walk(
+        &shadow,
+        parent_transform,
+        fill,
+        stroke,
+        current_color,
+        gradients,
+        gradient_index,
+        clip_paths,
+        mask_paths,
+        filter_paths,
+        ids,
+        &mut content,
+    );
+    for y in 0..raster.height {
+        for x in 0..raster.width {
+            let index = y as usize * raster.width as usize + x as usize;
+            let pixel = content.pixels[index];
+            if pixel.alpha > 0 {
+                raster.put(i64::from(x), i64::from(y), pixel.with_opacity(opacity));
+            }
+        }
+    }
+    true
+}
+
+fn element_opacity(element: &XmlNode) -> Option<f32> {
+    if let Some(style) = attribute(element, "style") {
+        for declaration in style.split(';') {
+            let Some((name, value)) = declaration.split_once(':') else {
+                continue;
+            };
+            if name.trim().eq_ignore_ascii_case("opacity") {
+                return parse_group_opacity(value);
+            }
+        }
+    }
+    attribute(element, "opacity").and_then(parse_group_opacity)
+}
+
+fn parse_group_opacity(raw: &str) -> Option<f32> {
+    let value = raw.trim();
+    let parsed = value.strip_suffix('%').map_or_else(
+        || value.parse::<f32>().ok(),
+        |number| number.parse::<f32>().ok().map(|value| value / 100.0),
+    )?;
+    parsed.is_finite().then_some(parsed.clamp(0.0, 1.0))
+}
+
+fn strip_opacity_from_style(style: &str) -> String {
+    style
+        .split(';')
+        .filter(|declaration| {
+            declaration
+                .split_once(':')
+                .is_none_or(|(name, _)| !name.trim().eq_ignore_ascii_case("opacity"))
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 /// Render one element through an SVG mask.
 ///
 /// The element is painted into an offscreen buffer with its `mask` attribute
@@ -1072,6 +1205,7 @@ fn paint_masked_element(
         use_depth: raster.use_depth,
         mask_depth: raster.mask_depth,
         filter_depth: raster.filter_depth,
+        opacity_depth: raster.opacity_depth,
     };
     let mut clone = element.clone();
     clone.attributes.retain(|(name, _)| name != "mask");
@@ -1119,6 +1253,7 @@ fn paint_masked_element(
         use_depth: 0,
         mask_depth: raster.mask_depth + 1,
         filter_depth: raster.filter_depth,
+        opacity_depth: raster.opacity_depth,
     };
     walk(
         mask,
@@ -1283,6 +1418,7 @@ fn paint_filtered_element(
         use_depth: raster.use_depth,
         mask_depth: raster.mask_depth,
         filter_depth: raster.filter_depth + 1,
+        opacity_depth: raster.opacity_depth,
     };
     let mut clone = element.clone();
     clone.attributes.retain(|(name, _)| name != "filter");
@@ -3573,6 +3709,68 @@ mod tests {
             </defs><rect width="10" height="10" fill="red" clip-path="url(#c)"/></svg>"#;
         let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
         assert_eq!(image.pixel(5, 5), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn group_opacity_composites_overlapping_children_once() {
+        let svg = br#"<svg width="20" height="10"><g opacity="0.5">
+            <rect width="10" height="10" fill="red"/><rect x="5" width="10" height="10" fill="red"/>
+            </g></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        let overlap = image.pixel(7, 5).expect("overlap pixel");
+        assert_eq!(overlap.red, 255);
+        assert!(
+            (128..=128).contains(&overlap.alpha),
+            "group opacity overlap alpha={}",
+            overlap.alpha
+        );
+        assert_eq!(image.pixel(1, 5).expect("left pixel").alpha, 128);
+    }
+
+    #[test]
+    fn nested_group_opacity_multiplies() {
+        let svg = br#"<svg width="10" height="10"><g opacity="0.5"><g opacity="0.5">
+            <rect width="10" height="10" fill="red"/></g></g></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        let pixel = image.pixel(5, 5).expect("pixel");
+        assert!(
+            (63..=65).contains(&pixel.alpha),
+            "nested opacity alpha={}",
+            pixel.alpha
+        );
+    }
+
+    #[test]
+    fn group_opacity_combines_with_a_mask() {
+        let svg = br#"<svg width="20" height="10"><defs>
+            <mask id="m" mask-type="alpha"><rect width="10" height="10" fill="white"/></mask>
+            </defs><g opacity="0.5" mask="url(#m)"><rect width="20" height="10" fill="red"/></g></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert!(
+            (127..=129).contains(&image.pixel(2, 5).expect("masked pixel").alpha),
+            "masked alpha={}",
+            image.pixel(2, 5).expect("pixel").alpha
+        );
+        assert_eq!(image.pixel(15, 5).expect("outside pixel").alpha, 0);
+    }
+
+    #[test]
+    fn group_opacity_composes_with_a_filter() {
+        let svg = br#"<svg width="20" height="20"><defs>
+            <filter id="f"><feGaussianBlur stdDeviation="1"/></filter></defs>
+            <g opacity="0.5" filter="url(#f)"><rect x="8" y="8" width="4" height="4" fill="red"/></g>
+            </svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        let pixel = image.pixel(10, 10).expect("pixel");
+        assert!(pixel.alpha > 80 && pixel.alpha < 200, "{pixel:?}");
+    }
+
+    #[test]
+    fn group_opacity_in_the_style_attribute_is_honoured() {
+        let svg = br#"<svg width="10" height="10"><g style="opacity: 0.5">
+            <rect width="10" height="10" fill="red"/></g></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(5, 5).expect("pixel").alpha, 128);
     }
 
     #[test]

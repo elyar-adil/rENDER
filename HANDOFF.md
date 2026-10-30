@@ -1,3 +1,62 @@
+# 交接文档 (2026-10-31, 续二十四) — SVG 组级 opacity
+
+接续 CSS clip-path 会话。这一轮给 SVG `<g opacity>`(以及形状/`use` 的
+`opacity`)加上真正的离屏合成,并验证嵌套、mask 与 filter 组合。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **opacity 读取** | `opacity` 属性与 `style="opacity: …"`;支持数字与百分比,clamp 0..1 |
+| **离屏内容** | 克隆元素并去掉 `opacity` 属性/style 声明,在独立 `Raster` 中绘制 |
+| **单次合成** | 每个源像素 `with_opacity(opacity)` 后 source-over 到目标;重叠子元素不会双重变亮 |
+| **嵌套** | 每个 `<g opacity>` 各开一层离屏,alpha 相乘;深度限制 8 |
+| **顺序** | opacity 先于 mask/filter 拦截,因此先完成内部 mask/filter,再对整组做 opacity |
+| **测试** | 重叠组、嵌套、mask 组合、filter 组合、style 属性,共 5 个 |
+
+## 证据
+
+单元测试中的 alpha 断言:
+
+```
+overlap group opacity=0.5   alpha = 128   # 若不是组级合成会是 191
+nested 0.5 × 0.5            alpha = 64
+group opacity + alpha mask  left alpha = 128, right = 0
+group opacity + blur        center alpha 在 80..200 之间
+style="opacity: 0.5"        alpha = 128
+```
+
+Bing / Baidu / JD 冒烟:
+
+```
+Bing:  ready=Complete    dom_elements=471 boxes=167 images_failed=0
+Baidu: ready=Complete    dom_elements=453 boxes=156 images_failed=0
+JD:    ready=Interactive dom_elements=1001 boxes=117 images_failed=1
+```
+
+JD 主商品区仍为空(风控 403,同机 Edge 也 403)。
+
+## 验证
+
+```
+cargo test --workspace                       2749 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+image::svg                                   43 passed
+```
+
+## 明确未做 / 下一步
+
+- opacity 只处理 SVG 栅格器内的元素;HTML/CSS `opacity` 已有 stacking context
+  实现,但 CSS mask/filter 形式仍未接入。
+- 更多 SVG filter 原语(`feOffset`/`feBlend`/`feComposite` 等)、高级渐变
+  (`xlink:href`/`spreadMethod`/径向焦点)仍未实现。
+- `content` 仍只支持字符串;IndexedDB 值类型覆盖有限;JD 风控、GitHub/HN
+  链路阻断是外部条件。
+
+---
+
 # 交接文档 (2026-10-31, 续二十三) — CSS clip-path url()/path()/reference-box
 
 接续基本形状会话。这一轮把 CSS `clip-path` 从内联基本形状扩展到
@@ -60,7 +119,7 @@ image::svg                                   38 passed
   多条轮廓形成的洞还不支持。
 - `fill-box`/`stroke-box`/`view-box` reference-box、CSS 样式表中的 `clip-rule`
   仍未接入。
-- 组级 `opacity` 离屏合成、更多 SVG filter 原语、高级渐变仍未实现。
+- 更多 SVG filter 原语、高级渐变仍未实现;组级 `opacity` 已在续二十四实现。
 - JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;AVIF 依赖系统 dav1d。
 
 ---
@@ -130,7 +189,7 @@ image::svg                                   38 passed
   `view-box` 仍回退边框盒。
 - SVG 内联 CSS 样式表中的 `clip-rule` 仍未接入(仅属性与 style 属性);`mask`/
   `filter` 的 CSS 形式也未实现。
-- 组级 `opacity` 离屏合成、更多 SVG filter 原语、高级渐变仍未实现。
+- 更多 SVG filter 原语、高级渐变仍未实现;组级 `opacity` 已在续二十四实现。
 - JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;AVIF 依赖系统 dav1d。
 
 ---
@@ -217,7 +276,7 @@ JD:    ready=Loading     dom_elements=968 boxes=117 images_failed=1
   `storage`/`versionchange` 广播,只有同一 realm 内的 `versionchange` 事件。
 - 没有配额管理/驱逐;`indexed-db.txt` 是单文件、全量重写。
 - JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;CSS `clip-path` 已实现(续二十二/二十三)、组级
-  `opacity`、其它 filter 原语等仍未实现。
+  `opacity` 已在续二十四实现;其它 filter 原语等仍未实现。
 
 ---
 
@@ -295,7 +354,7 @@ image::svg                                   36 passed
 - AVIF 解码依赖系统 dav1d,不是纯 Rust 便携路径;AVIF 动画/序列仍未处理。
 - 非图片小响应回退是视觉占位,不会真正解码 BMP/TIFF 等其它未支持格式。
 - SVG `filter` 仍只有 blur/color-matrix;CSS `filter` 未实现;CSS `clip-path`
-  已在续二十二实现,组级 `opacity` 离屏合成、高级渐变仍未实现。
+  已在续二十二实现;组级 `opacity` 已在续二十四实现,高级渐变仍未实现。
 - 其它图片格式/真实 CDN 变体仍需继续抽样;IndexedDB 已持久化(续二十一);JD 风控、
   GitHub/HN 链路阻断是外部条件。
 
@@ -369,7 +428,7 @@ image::svg                                   36 passed
 - `color-interpolation-filters` 固定 sRGB,未做 linearRGB;`feColorMatrix`
   只做单链,不解析命名 `result`。
 - `filter` 只支持属性,不支持 CSS `filter`;filter 内容中的 `<text>` 不绘制。
-- CSS `clip-path` 已在续二十二实现;组级 `opacity` 离屏合成、高级渐变、
+- CSS `clip-path` 已在续二十二实现;高级渐变、
   `content` 字符串以外内容仍未实现。
 - IndexedDB 已持久化(续二十一);JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;
   AVIF 已在续二十实现/回退。
@@ -440,8 +499,8 @@ image::svg                                   33 passed
 
 - `mask` 只支持属性,不支持 CSS `mask-image`/`mask-mode`;mask 内容中的
   `<text>` 仍不绘制;`filter` 已在续十九实现。
-- 除 `feGaussianBlur`/`feColorMatrix` 外的 filter 原语、组级 `opacity`
-  离屏合成仍未实现;CSS `clip-path` 已在续二十二实现。
+- 除 `feGaussianBlur`/`feColorMatrix` 外的 filter 原语仍未实现;组级
+  `opacity` 已在续二十四实现,CSS `clip-path` 已在续二十二实现。
 - 渐变高级特性(`xlink:href` 继承、`spreadMethod`、径向焦点)仍未做。
 - `content` 仍只支持字符串;IndexedDB 已持久化(续二十一);JD 主商品区仍受风控 403;
   GitHub/HN 本机链路阻断;AVIF 未实现。
@@ -513,8 +572,8 @@ image::svg                                   28 passed
 
 - `<use>` 仅支持同文档引用;外部文档 URL、CSS `width`/`height`(需要计算样式)
   和 `use` 上的 `clip-path` 复杂坐标仍未完全覆盖。
-- `<text>`、组级 `opacity` 离屏合成仍未实现;`mask` 已在续十八、`filter`
-  已在续十九、CSS `clip-path` 已在续二十二实现。
+- `<text>` 仍未实现;`mask` 已在续十八、`filter` 已在续十九、CSS
+  `clip-path` 已在续二十二、组级 `opacity` 已在续二十四实现。
 - 渐变高级特性(`xlink:href` 继承、`spreadMethod`、径向焦点)仍未做。
 - `content` 仍只支持字符串;IndexedDB 已持久化(续二十一);JD 主商品区仍受风控 403;
   GitHub/HN 本机链路阻断;AVIF 未实现。
@@ -581,8 +640,8 @@ Baidu smoke: dom_elements=455  boxes=156
   HTML 基本形状与 SVG `clip-rule` 已在续二十二实现。
 - `clipPath` 内容的 `text` 不参与裁剪;`<use>` 已在续十七、`mask` 已在
   续十八、`filter` 已在续十九实现。
-- 渐变高级特性(`xlink:href` 继承、`spreadMethod`、径向焦点)与组级 `opacity`
-  离屏合成仍未做。
+- 渐变高级特性(`xlink:href` 继承、`spreadMethod`、径向焦点)仍未做;组级
+  `opacity` 已在续二十四实现。
 - `content` 仍只支持字符串;IndexedDB 已持久化(续二十一);JD 主商品区仍受风控 403;
   GitHub/HN 本机链路阻断;AVIF 未实现。
 
