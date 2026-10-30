@@ -46,7 +46,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use winit::dpi::PhysicalSize as WindowSize;
 
 /// Upper bound on event-loop turns drained while executing one prepared
@@ -904,6 +904,15 @@ impl PageState {
         self.page
             .next_wake_deadline()
             .map(|deadline| self.created_at + deadline)
+    }
+
+    /// Whether any element in the committed document still has a CSS
+    /// animation that can change at `now`.
+    pub(super) fn has_active_animations(&self, now: Duration) -> bool {
+        render_core::css::animation::any_animation_active(
+            self.computed_styles.values(),
+            now.as_secs_f32(),
+        )
     }
 
     /// Whether the page still has script work that requires future turns.

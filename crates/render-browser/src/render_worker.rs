@@ -114,7 +114,11 @@ pub(super) fn start_render_worker(
     )
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_precision_loss,
+    reason = "millisecond timeline positions are converted to f32 seconds for CSS animation sampling"
+)]
 pub(super) fn process_page_render(
     job: RenderJob<PageRenderPayload>,
     cancellation: &RenderCancellation,
@@ -176,15 +180,16 @@ pub(super) fn process_page_render(
                 )
             });
             cancellation.check()?;
-            // Static screenshots sample one animation frame. A page's entry
-            // animations settle after a second, so the default snapshot is that
-            // settled frame rather than the blank 0% state; a caller measuring a
-            // specific instant can override it without adding a compositor clock
-            // to this worker.
+            // The app's animation clock supplies this frame's timeline position.
+            // RENDER_ANIMATION_TIME_MS remains an explicit probe override for
+            // tests that want a fixed instant.
             let animation_time = env::var("RENDER_ANIMATION_TIME_MS")
                 .ok()
                 .and_then(|value| value.parse::<f32>().ok())
-                .map_or(1.0, |milliseconds| milliseconds / 1000.0);
+                .unwrap_or(job.identity.animation_time_millis as f32 / 1000.0);
+            if env::var_os("RENDER_DEBUG_FRAME").is_some() {
+                eprintln!("render-browser animation time={animation_time:.3}s");
+            }
             let mut options = DocumentRenderOptions {
                 animation_time,
                 ..DocumentRenderOptions::default()

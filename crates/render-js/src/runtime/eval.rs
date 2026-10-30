@@ -5654,6 +5654,9 @@ impl JsRuntime {
             (Some(ObjectHost::Document(_)), "getElementById") => {
                 Some(NativeFunction::GetElementById)
             }
+            (Some(ObjectHost::Document(_)), "elementFromPoint") => {
+                Some(NativeFunction::DocumentElementFromPoint)
+            }
             (Some(ObjectHost::Document(_) | ObjectHost::Node(_)), "querySelector") => {
                 Some(NativeFunction::QuerySelector)
             }

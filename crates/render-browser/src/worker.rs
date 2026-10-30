@@ -23,6 +23,9 @@ pub struct RenderIdentity {
     pub viewport: RenderViewport,
     pub scroll_offset: RenderOffset,
     pub external_styles_generation: u64,
+    /// CSS animation timeline position for this frame, in milliseconds since
+    /// the document started. The render worker samples `@keyframes` there.
+    pub animation_time_millis: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -544,6 +547,7 @@ mod tests {
                 y: scroll_y,
             },
             external_styles_generation: 3,
+            animation_time_millis: 0,
         }
     }
 

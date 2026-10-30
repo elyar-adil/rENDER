@@ -447,6 +447,8 @@ impl BrowserApp {
                 y: page.scroll.offset_y(),
             },
             external_styles_generation: page.external_styles_generation,
+            animation_time_millis: u32::try_from(page.created_at.elapsed().as_millis())
+                .unwrap_or(u32::MAX),
         };
         let can_raster_retained = prefer_retained_raster
             && page.viewport == viewport
@@ -4878,6 +4880,10 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the event-loop turn reads as one ordered pass over network, scripts, animation and wakeups"
+    )]
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_network();
         self.recover_unresolved_render_requests();
@@ -4960,9 +4966,22 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
             event_loop.exit();
             return;
         }
+        let active = self.tabs.active_id();
+        let animating = self
+            .pages
+            .get(&active)
+            .is_some_and(|page| page.has_active_animations(page.created_at.elapsed()));
+        if animating {
+            // CSS animations need a clock even when nothing mutates the DOM.
+            // The 16 ms cadence is the usual 60 fps frame budget; a busy
+            // renderer coalesces this into `render_dirty` rather than
+            // queueing one render per tick.
+            self.schedule_page_render_for_tab(active);
+        }
         if self.has_pending_network()
             || self.has_pending_script_work()
             || self.has_unresolved_render_request()
+            || animating
         {
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(16),

@@ -790,6 +790,7 @@ pub(crate) enum NativeFunction {
     /// A method, accessor or static function of one Temporal class.
     Temporal(TemporalKind, TemporalMethod),
     GetElementById,
+    DocumentElementFromPoint,
     QuerySelector,
     QuerySelectorAll,
     GetElementsByTagName,

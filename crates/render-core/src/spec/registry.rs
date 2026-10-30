@@ -519,9 +519,11 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
         notes: "`@keyframes` blocks and the `animation` shorthand are parsed and \
                 sampled by a time-parameterised style pass; opacity, colour, \
                 transform, lengths and other computed properties are interpolated. \
-                A compositor clock, independent comma-separated animation lists, \
-                the Web Animations API and some discrete/easing edge cases remain \
-                missing.",
+                The browser drives a 16 ms resampling clock while an animation is \
+                active and stops it after finite animations. There is no compositor \
+                thread, independent comma-separated animation lists and the Web \
+                Animations API are missing, and some discrete/easing edge cases \
+                remain approximate.",
         dependencies: &[CSS_SYNTAX],
         tests: &[ConformanceTest::new("rust", "css::animation::tests")],
     },

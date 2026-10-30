@@ -1124,6 +1124,12 @@ impl JsRuntime {
             NativeFunction::GetElementById => {
                 self.dispatch_dom_native(dom, NativeFunction::GetElementById, receiver, arguments)
             }
+            NativeFunction::DocumentElementFromPoint => self.dispatch_dom_native(
+                dom,
+                NativeFunction::DocumentElementFromPoint,
+                receiver,
+                arguments,
+            ),
             NativeFunction::GetElementsByClassName => self.dispatch_dom_native(
                 dom,
                 NativeFunction::GetElementsByClassName,

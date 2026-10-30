@@ -64,6 +64,48 @@ pub fn sample_animations(
     sampled
 }
 
+/// Whether any of `styles` still needs animation frames at `time` seconds.
+///
+/// A finite animation stops driving frames after its last iteration. Fill modes
+/// still paint the final value, but no further sample can change it, so the
+/// browser clock can stop.
+#[must_use]
+pub fn any_animation_active<'a>(
+    styles: impl IntoIterator<Item = &'a ComputedStyle>,
+    time: f32,
+) -> bool {
+    styles
+        .into_iter()
+        .any(|style| animation_is_active(style, time))
+}
+
+/// Whether one element's animation can still change at `time` seconds.
+#[must_use]
+pub fn animation_is_active(style: &ComputedStyle, time: f32) -> bool {
+    let Some(_name) = animation_name(style) else {
+        return false;
+    };
+    if property_text(style, "animation-play-state")
+        .is_some_and(|value| value.eq_ignore_ascii_case("paused"))
+    {
+        return false;
+    }
+    let Some(duration) = animation_time(style, "animation-duration") else {
+        return false;
+    };
+    if duration <= 0.0 {
+        return false;
+    }
+    let delay = animation_time(style, "animation-delay").unwrap_or(0.0);
+    let iterations = animation_iterations(style).unwrap_or(1.0);
+    let total = delay + duration * iterations;
+    if total.is_finite() {
+        (time as f64) < f64::from(total)
+    } else {
+        true
+    }
+}
+
 fn property_text(style: &ComputedStyle, name: &str) -> Option<String> {
     style
         .get(name)
@@ -445,6 +487,25 @@ mod tests {
             sample_property(&frames, "display", 0.75, None),
             Some("none".to_owned())
         );
+    }
+
+    #[test]
+    fn the_browser_clock_stops_after_a_finite_animation() {
+        use crate::computed::ComputedStyle;
+
+        let mut style = ComputedStyle::default();
+        style.set_animated_property("animation-name", "fade");
+        style.set_animated_property("animation-duration", "1s");
+        assert!(super::animation_is_active(&style, 0.0));
+        assert!(super::animation_is_active(&style, 0.5));
+        assert!(!super::animation_is_active(&style, 1.0));
+        assert!(!super::animation_is_active(&style, 2.0));
+
+        style.set_animated_property("animation-iteration-count", "infinite");
+        assert!(super::animation_is_active(&style, 3600.0));
+
+        style.set_animated_property("animation-play-state", "paused");
+        assert!(!super::animation_is_active(&style, 0.5));
     }
 
     #[test]

@@ -1,3 +1,84 @@
+# 交接文档 (2026-10-31, 续三十四) — 浏览器驱动的 CSS 动画时钟
+
+接续 RMS 依赖加载会话。这一轮把动画从“每个静态帧只取一个时间点”推进到
+浏览器按 16ms 重新采样、调度重绘、有限动画结束后自动停表。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **帧时间身份** | `RenderIdentity.animation_time_millis`;每帧记录文档启动以来的毫秒数 |
+| **活动检测** | `animation_is_active`/`any_animation_active`:duration、delay、iteration-count、play-state;有限动画在总时长后停止,无限动画继续 |
+| **浏览器时钟** | `about_to_wait` 检测当前标签页的活动动画,每 16ms 调用 `schedule_page_render_for_tab` 并设置 `WaitUntil` |
+| **worker 采样** | `process_page_render` 默认使用 `identity.animation_time_millis`;`RENDER_ANIMATION_TIME_MS` 仍可固定时刻做探针 |
+| **有限停表** | 动画结束后不再产生空转帧;交互/DOM 变更仍会触发正常重绘 |
+| **`document.elementFromPoint`** | 用已安装的文档坐标 + 滚动偏移命中最小面积元素;修复 Clarity 分析脚本在 Bing 上的 `callee.elementFromPoint is not callable` |
+| **能力登记** | `css.animations` 说明更新为浏览器驱动 16ms 时钟,仍标 `Partial` |
+| **测试** | 有限动画在 0/0.5/1/2s 的活动状态、无限动画、paused;`elementFromPoint` 命中与滚动偏移 |
+
+## 证据
+
+动画探针 `animationprobe.html`(同一页面三个真实时刻,未设置固定覆盖):
+
+```
+clock-300   fade(10,202) = (255,255,255)   grow x=30 白
+clock-700   fade(10,202) = (255,92,92)     grow x=30 白
+clock-1200  fade(10,202) = (255,0,0)       grow x=30 蓝
+```
+
+即 opacity 0→1 连续插值、width 20px→40px 进入布局。
+
+`RENDER_DEBUG_FRAME=1` 的 Bing 截图记录到连续帧时间:
+
+```
+animation time=0.216s
+animation time=0.000s
+animation time=0.876s
+animation time=2.223s
+...
+animation time=7.009s
+animation time=9.088s
+animation frames: 12
+```
+
+说明动画时钟在真实页面上持续调度,而不是只采一个固定时刻。
+
+真实站点最终复跑:
+
+```
+Bing:  ready=Complete  dom_elements=484 boxes=167
+       scripts_failed=0 scripts_threw=0 css_warnings=2 images_failed=0
+Baidu: ready=Complete  dom_elements=450 boxes=156
+       scripts_failed=0 scripts_threw=0 css_warnings=5 images_failed=0
+JD:    ready=Loading   dom_elements=999 boxes=117
+       scripts_failed=7 scripts_threw=2 css_warnings=36 images_failed=1
+```
+
+Bing 截图中页头、导航、Rewards/登录、壁纸均正常;`bing196` 的页头区域
+与 `bing160` 仅有意外的壁纸/变体差异,不再是整块缺失。
+
+## 验证
+
+```
+cargo test --workspace                       2785 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+## 明确未做 / 下一步
+
+- 时钟只驱动当前活动标签页;后台标签页不推进动画。没有独立合成器线程,
+  每个采样帧仍走完整样式/布局/绘制管线。
+- 仍只采样第一个 `animation-name`;逗号分隔的多动画、CSS Transitions、
+  Web Animations API、`animation-composition` 未实现。
+- 动画结束/暂停只按 computed style 判断;脚本直接改 DOM 或 CSSOM 后需要
+  下一帧才会纳入时钟。
+- JD 主商品区仍受 403;GitHub/HN 本机链路阻断;高级渐变、SVG filter
+  其余原语、IndexedDB 值类型覆盖仍未完成。
+
+---
+
 # 交接文档 (2026-10-31, 续三十三) — Bing RMS 依赖加载顺序
 
 接续 `text/rms` 会话。上一轮直接按 Defer 执行这些块,导致依赖 RMS 懒加载 bundle

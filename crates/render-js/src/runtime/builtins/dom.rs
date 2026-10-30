@@ -63,6 +63,47 @@ impl JsRuntime {
                     None => Ok(JsValue::Null),
                 }
             }
+            NativeFunction::DocumentElementFromPoint => {
+                let root = self.require_document(receiver)?;
+                let x = self
+                    .to_number_value(dom, required_argument(arguments, 0, "elementFromPoint")?)?;
+                let y = self
+                    .to_number_value(dom, required_argument(arguments, 1, "elementFromPoint")?)?;
+                if !x.is_finite() || !y.is_finite() {
+                    return Ok(JsValue::Null);
+                }
+                // `install_element_geometry` stores document-space rects, while
+                // elementFromPoint takes viewport coordinates.
+                #[allow(clippy::cast_possible_truncation)]
+                let document_x = (x + f64::from(self.viewport.x)) as f32;
+                #[allow(clippy::cast_possible_truncation)]
+                let document_y = (y + f64::from(self.viewport.y)) as f32;
+                let mut best: Option<(f32, u64, NodeId)> = None;
+                for (raw, rect) in &self.element_geometry {
+                    if document_x < rect.x
+                        || document_y < rect.y
+                        || document_x >= rect.x + rect.width
+                        || document_y >= rect.y + rect.height
+                    {
+                        continue;
+                    }
+                    let node = NodeId::from_u64(*raw);
+                    if dom.root_node(node, false) != root {
+                        continue;
+                    }
+                    let area = rect.width * rect.height;
+                    let replace = best.is_none_or(|(best_area, best_raw, _)| {
+                        area < best_area || (area == best_area && *raw > best_raw)
+                    });
+                    if replace {
+                        best = Some((area, *raw, node));
+                    }
+                }
+                match best {
+                    Some((_, _, node)) => self.wrap_node(dom, node),
+                    None => Ok(JsValue::Null),
+                }
+            }
             NativeFunction::NonElementGetElementById => {
                 let root = self.require_node(receiver)?;
                 let id = required_argument(arguments, 0, "getElementById")?

@@ -964,6 +964,38 @@ fn get_rect_bounds_returns_zeroes_without_layout() {
 }
 
 #[test]
+fn element_from_point_uses_installed_geometry_and_scroll() {
+    let mut parsed = parse_document("<!doctype html><p id='p'>x</p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let body = crate::runtime::builtins::dom::find_body_node(&parsed.dom, parsed.dom.document())
+        .expect("body exists");
+    let paragraph = parsed.dom.children(body).unwrap_or_default()[0];
+    let mut geometry = std::collections::BTreeMap::new();
+    geometry.insert(
+        paragraph.as_u64(),
+        crate::ElementRect {
+            x: 8.0,
+            y: 16.0,
+            width: 100.0,
+            height: 20.0,
+        },
+    );
+    runtime.install_element_geometry(geometry);
+    runtime.install_viewport(800.0, 600.0, 0.0, 10.0);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                    var inside = document.elementFromPoint(10, 7);
+                    var outside = document.elementFromPoint(500, 500);
+                    (inside && inside.id) + "|" + (outside === null);
+                "#,
+        )
+        .expect("elementFromPoint executes");
+    assert_eq!(outcome.value, JsValue::String("p|true".into()));
+}
+
+#[test]
 fn get_rect_bounds_reports_installed_geometry() {
     let mut parsed = parse_document("<!doctype html><p id='p'>x</p>");
     let mut runtime = JsRuntime::new(&parsed.dom);
