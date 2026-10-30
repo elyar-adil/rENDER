@@ -1,3 +1,69 @@
+# 交接文档 (2026-10-31, 续二十八) — Bing/Baidu 脚本异常与 mask 几何
+
+接续 CSS mask 会话。这一轮先修掉 Bing/Baidu 的脚本异常,再补齐 CSS
+`mask-size`/`mask-position`/`mask-repeat`。
+
+## 脚本异常根因与修复
+
+| 站点 | 失败 | 根因 | 修复 |
+|---|---|---|---|
+| Bing | `Cannot read properties of undefined (reading 'versionchange')` | `IDBDatabase` 没有 `_listeners`。升级数据库时 `fire(connection, 'versionchange')` 读取 `target._listeners[type]`,于是报 `versionchange` 属性读错 | `IDBDatabase` 初始化 `_listeners`,并安装 `eventTarget` 的 add/remove/dispatch |
+| Baidu | `Cannot read properties of undefined (reading 'length')` | `navigator.mimeTypes` 未定义,UA 检测直接读 `.length` | 提供空 `navigator.mimeTypes`/`navigator.plugins` 集合(length、item、namedItem) |
+| Baidu | `Storage is not defined` | 只有 `localStorage`/`sessionStorage` 对象,没有全局 `Storage` 接口对象 | 安装不可构造的 `Storage` 构造器,prototype 指向共享 Storage 原型 |
+
+## mask 几何实现
+
+| 内容 | 落点 |
+|---|---|
+| **MaskLayer** | `image + tile + clip + repeat_x/repeat_y`;mask 从单一矩形升级为可平铺层 |
+| **mask-size** | `auto`、单/双长度/百分比、`cover`、`contain`;位图保留固有比例 |
+| **mask-position** | 关键字、百分比、长度;按剩余空间计算偏移 |
+| **mask-repeat** | 默认 `repeat`;`repeat-x`、`repeat-y`、`no-repeat`(space/round 近似 repeat) |
+| **采样** | 每像素先按 clip 判断,再映射到 tile 局部坐标;渐变按 tile 重新求解几何 |
+| **测试** | mask-size+position+no-repeat、repeat 平铺、Bing IDB versionchange、navigator 集合、Storage 全局,共 5 个新增 |
+
+## 证据
+
+脚本健康线:
+
+```
+Bing:  ready=Complete dom_elements=465 boxes=166 scripts_failed=0 scripts_threw=0
+Baidu: ready=Complete dom_elements=450 boxes=156 scripts_failed=0 scripts_threw=0
+JD:    ready=Loading  dom_elements=949 boxes=117 scripts_failed=8 scripts_threw=2
+```
+
+mask 几何像素采样(`cssfilterprobe3.png`,白底):
+
+```
+#tile  mask-size:20x20  mask-position:10px 10px  no-repeat
+  (419,216) 白   (420,212) 红   (439,221) 红   (440,217) 白
+#repeat mask-size:20x20 repeat
+  (495,205) 红   (510,205) 红   (550,237) 白(元素右边界外)
+```
+
+Bing 截图中 Rewards 勋章、搜索框、壁纸均正常;Baidu 首页 logo、搜索框、热搜
+正常。JD 主商品区仍为空。
+
+## 验证
+
+```
+cargo test --workspace                       2764 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+## 明确未做 / 下一步
+
+- JD 主商品区仍受 403 风控;GitHub/HN 本机链路阻断。
+- Bing 仍有 import maps、`text/rms` 脚本类型、`@keyframes` 未执行等能力缺口;
+  这些不再是抛异常,但会限制动态效果。
+- CSS `mask-mode`、多层 mask、`mask-composite`、`space`/`round` 精确平铺未做;
+  filter 仍缺 `contrast`/`hue-rotate`/`invert`/`sepia`/`url(#filter)`。
+- 高级渐变、SVG filter 其余原语、IndexedDB 值类型覆盖仍未完成。
+
+---
+
 # 交接文档 (2026-10-31, 续二十七) — grayscale / saturate / drop-shadow 与 mask URL
 
 接续 CSS filter/mask 会话。这一轮补齐常用 filter 函数,并让 `mask-image` 支持
@@ -57,8 +123,8 @@ real_site_tasks                              66 passed, 0 failed
 
 - CSS filter 仍未实现 `contrast`/`hue-rotate`/`invert`/`sepia`/`url(#filter)` 等;
   `drop-shadow` 目前是单层、无多阴影列表。
-- `mask-image` 仍缺 `mask-size`/`mask-position`/`mask-repeat`/`mask-mode` 与多层
-  mask;URL mask 目前拉伸到元素边框盒。
+- `mask-size`/`mask-position`/`mask-repeat` 已在续二十八实现;`mask-mode`、
+  多层 mask 与 `space`/`round` 的精确平铺仍缺。
 - 高级渐变(`xlink:href`/`spreadMethod`/径向焦点)、IndexedDB 值类型覆盖仍未完成。
 - JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;AVIF 依赖系统 dav1d。
 

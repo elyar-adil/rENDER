@@ -109,11 +109,37 @@ fn navigator_exposes_browser_bootstrap_properties() {
             r#"navigator.appName === "Netscape" &&
                     navigator.userAgent === "Mozilla/5.0 rENDER/0.1" &&
                     navigator.language === "zh-CN" &&
+                    navigator.mimeTypes.length === 0 &&
+                    navigator.plugins.length === 0 &&
+                    typeof navigator.mimeTypes.item === "function" &&
                     navigator.cookieEnabled && navigator.onLine;"#,
         )
         .expect("navigator feature detection should execute");
 
     assert_eq!(outcome.value, JsValue::Boolean(true));
+}
+
+#[test]
+fn storage_is_a_global_interface_object_for_feature_detection() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"typeof Storage === "function" &&
+                    localStorage instanceof Storage &&
+                    sessionStorage instanceof Storage &&
+                    typeof Storage.prototype.getItem === "function" &&
+                    Storage.name === "Storage";"#,
+        )
+        .expect("Storage feature detection executes");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
+
+    let error = runtime
+        .execute(&mut parsed.dom, "Storage();")
+        .expect_err("the Storage interface is not constructible");
+    assert_eq!(error.kind(), crate::JsErrorKind::Type);
+    assert!(error.message().contains("Illegal constructor"));
 }
 
 #[test]
@@ -1349,6 +1375,44 @@ fn indexed_db_opens_upgrades_and_round_trips_values() {
     assert_eq!(
         value,
         JsValue::String("upgrade:0->1|open:1:true|put-a|put-b|get:alpha|count:2|complete".into())
+    );
+}
+
+#[test]
+fn indexed_db_upgrade_notifies_an_open_connection_of_versionchange() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.log = [];
+                var open = indexedDB.open('upgrade-db', 1);
+                open.onupgradeneeded = function () {
+                    open.result.createObjectStore('items');
+                };
+                open.onsuccess = function () {
+                    var first = open.result;
+                    first.onversionchange = function (event) {
+                        log.push('versionchange:' + event.oldVersion + '->' + event.newVersion);
+                    };
+                    var second = indexedDB.open('upgrade-db', 2);
+                    second.onupgradeneeded = function () { log.push('upgrade2'); };
+                    second.onsuccess = function () {
+                        log.push('open2:' + second.result.version);
+                    };
+                };
+            ",
+        )
+        .expect("IndexedDB upgrade script executes");
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    let value = runtime
+        .execute(&mut parsed.dom, "log.join('|')")
+        .expect("log reads")
+        .value;
+    assert_eq!(
+        value,
+        JsValue::String("versionchange:1->2|upgrade2|open2:2".into())
     );
 }
 

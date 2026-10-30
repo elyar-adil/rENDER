@@ -12,7 +12,7 @@ use super::color::{Color, clamped_rounded_u8};
 use super::display_list::{
     BorderPaint, BoxShadowPaint, ClipFillRule, ClipShape, CornerRadii, DisplayCommand, DisplayItem,
     DisplayItemId, DisplayList, FilterEffect, FilterOperation, FontInstanceId, GlyphId, GlyphRun,
-    LinearGradient, ListMarkerPaint, ListMarkerShape, MaskImage, PaintCoordinateSpace,
+    LinearGradient, ListMarkerPaint, ListMarkerShape, MaskImage, MaskLayer, PaintCoordinateSpace,
     RadialGradient, StackingContext, TextDecoration, TextDecorationStyle, TextShadowPaint,
     Transform2D,
 };
@@ -444,7 +444,7 @@ enum StackingFrame {
         coordinate_space: PaintCoordinateSpace,
         opacity: f32,
         filter: Option<FilterEffect>,
-        mask: Option<MaskImage>,
+        mask: Option<MaskLayer>,
     },
 }
 
@@ -1199,7 +1199,7 @@ impl<'a> RasterState<'a> {
         coordinate_space: PaintCoordinateSpace,
         opacity: f32,
         filter: Option<&FilterEffect>,
-        mask: Option<&MaskImage>,
+        mask: Option<&MaskLayer>,
     ) {
         let mut layer = self.layers.pop().expect("layer frame has a surface");
         if let Some(filter) = filter {
@@ -2523,100 +2523,111 @@ fn source_over(source: Color, backdrop: Color) -> Color {
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    reason = "the sampled image coordinates are clamped to the destination region"
+    reason = "the sampled image coordinates are clamped to the tile"
 )]
 fn apply_mask_image(
     surface: &mut Surface,
-    mask: &MaskImage,
+    mask: &MaskLayer,
     offset: PhysicalPoint,
     images: Option<&ImageResources>,
 ) {
-    match mask {
-        MaskImage::Linear(gradient) => apply_linear_mask(surface, gradient, offset),
-        MaskImage::Radial(gradient) => apply_radial_mask(surface, gradient, offset),
-        MaskImage::Raster {
-            resource,
-            destination,
-        } => {
-            let Some(decoded) = images.and_then(|images| images.get(*resource)) else {
-                return;
-            };
-            let (image_width, image_height) = decoded.intrinsic_size();
-            if image_width == 0
-                || image_height == 0
-                || destination.size.width <= 0.0
-                || destination.size.height <= 0.0
+    let tile = mask.tile;
+    if tile.size.width <= 0.0 || tile.size.height <= 0.0 {
+        return;
+    }
+    for y in 0..surface.height() {
+        for x in 0..surface.width() {
+            let document_x = u32_to_f32(x) + 0.5 - offset.x;
+            let document_y = u32_to_f32(y) + 0.5 - offset.y;
+            let mut coverage = 0.0;
+            if document_x >= mask.clip.origin.x
+                && document_y >= mask.clip.origin.y
+                && document_x < mask.clip.origin.x + mask.clip.size.width
+                && document_y < mask.clip.origin.y + mask.clip.size.height
             {
-                return;
-            }
-            for y in 0..surface.height() {
-                for x in 0..surface.width() {
-                    let document_x = u32_to_f32(x) + 0.5 - offset.x;
-                    let document_y = u32_to_f32(y) + 0.5 - offset.y;
-                    if document_x < destination.origin.x
-                        || document_y < destination.origin.y
-                        || document_x >= destination.origin.x + destination.size.width
-                        || document_y >= destination.origin.y + destination.size.height
-                    {
-                        continue;
-                    }
-                    let u = (document_x - destination.origin.x) / destination.size.width;
-                    let v = (document_y - destination.origin.y) / destination.size.height;
-                    let source_x = (u * u32_to_f32(image_width)).floor();
-                    let source_y = (v * u32_to_f32(image_height)).floor();
-                    let coverage = decoded
-                        .pixel(source_x as u32, source_y as u32)
-                        .map_or(0.0, |pixel| f32::from(pixel.alpha) / 255.0);
-                    if let Some(index) = surface.index(x, y) {
-                        surface.pixels[index] = surface.pixels[index].with_opacity(coverage);
-                    }
+                let local_x = tile_axis(document_x, tile.origin.x, tile.size.width, mask.repeat_x);
+                let local_y = tile_axis(document_y, tile.origin.y, tile.size.height, mask.repeat_y);
+                if let (Some(local_x), Some(local_y)) = (local_x, local_y) {
+                    coverage = mask_coverage(&mask.image, tile, local_x, local_y, images);
                 }
             }
+            apply_mask_coverage(surface, x, y, coverage);
         }
     }
 }
 
-fn apply_linear_mask(surface: &mut Surface, mask: &LinearGradient, offset: PhysicalPoint) {
-    let width = surface.width();
-    let height = surface.height();
+fn tile_axis(value: f32, origin: f32, size: f32, repeat: bool) -> Option<f32> {
+    let local = value - origin;
+    if repeat {
+        Some(local.rem_euclid(size))
+    } else if local < 0.0 || local >= size {
+        None
+    } else {
+        Some(local)
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the sampled image coordinates are clamped to the tile"
+)]
+fn mask_coverage(
+    image: &MaskImage,
+    tile: PhysicalRect,
+    local_x: f32,
+    local_y: f32,
+    images: Option<&ImageResources>,
+) -> f32 {
+    match image {
+        MaskImage::Linear(gradient) => {
+            linear_mask_coverage(gradient, tile.origin.x + local_x, tile.origin.y + local_y)
+        }
+        MaskImage::Radial(gradient) => {
+            radial_mask_coverage(gradient, tile.origin.x + local_x, tile.origin.y + local_y)
+        }
+        MaskImage::Raster { resource, .. } => {
+            let Some(decoded) = images.and_then(|images| images.get(*resource)) else {
+                return 0.0;
+            };
+            let (image_width, image_height) = decoded.intrinsic_size();
+            if image_width == 0 || image_height == 0 {
+                return 0.0;
+            }
+            let u = local_x / tile.size.width;
+            let v = local_y / tile.size.height;
+            let source_x = (u * u32_to_f32(image_width)).floor();
+            let source_y = (v * u32_to_f32(image_height)).floor();
+            decoded
+                .pixel(source_x as u32, source_y as u32)
+                .map_or(0.0, |pixel| f32::from(pixel.alpha) / 255.0)
+        }
+    }
+}
+
+fn linear_mask_coverage(mask: &LinearGradient, x: f32, y: f32) -> f32 {
     let dx = mask.end.x - mask.start.x;
     let dy = mask.end.y - mask.start.y;
     let denominator = dx.mul_add(dx, dy * dy);
     if denominator <= f32::EPSILON {
-        return;
+        return 0.0;
     }
-    for y in 0..height {
-        for x in 0..width {
-            let pixel_x = u32_to_f32(x) + 0.5 - offset.x;
-            let pixel_y = u32_to_f32(y) + 0.5 - offset.y;
-            let progress = ((pixel_x - mask.start.x).mul_add(dx, (pixel_y - mask.start.y) * dy)
-                / denominator)
-                .clamp(0.0, 1.0);
-            apply_mask_coverage(surface, x, y, gradient_color(&mask.stops, progress));
-        }
-    }
+    let progress =
+        ((x - mask.start.x).mul_add(dx, (y - mask.start.y) * dy) / denominator).clamp(0.0, 1.0);
+    f32::from(gradient_color(&mask.stops, progress).alpha) / 255.0
 }
 
-fn apply_radial_mask(surface: &mut Surface, mask: &RadialGradient, offset: PhysicalPoint) {
+fn radial_mask_coverage(mask: &RadialGradient, x: f32, y: f32) -> f32 {
     if mask.radius_x <= 0.0 || mask.radius_y <= 0.0 {
-        return;
+        return 0.0;
     }
-    let width = surface.width();
-    let height = surface.height();
-    for y in 0..height {
-        for x in 0..width {
-            let pixel_x = u32_to_f32(x) + 0.5 - offset.x;
-            let pixel_y = u32_to_f32(y) + 0.5 - offset.y;
-            let dx = (pixel_x - mask.center.x) / mask.radius_x;
-            let dy = (pixel_y - mask.center.y) / mask.radius_y;
-            let progress = dx.mul_add(dx, dy * dy).sqrt().clamp(0.0, 1.0);
-            apply_mask_coverage(surface, x, y, gradient_color(&mask.stops, progress));
-        }
-    }
+    let dx = (x - mask.center.x) / mask.radius_x;
+    let dy = (y - mask.center.y) / mask.radius_y;
+    let progress = dx.mul_add(dx, dy * dy).sqrt().clamp(0.0, 1.0);
+    f32::from(gradient_color(&mask.stops, progress).alpha) / 255.0
 }
 
-fn apply_mask_coverage(surface: &mut Surface, x: u32, y: u32, color: Color) {
-    let coverage = f32::from(color.alpha) / 255.0;
+fn apply_mask_coverage(surface: &mut Surface, x: u32, y: u32, coverage: f32) {
     if let Some(index) = surface.index(x, y) {
         surface.pixels[index] = surface.pixels[index].with_opacity(coverage);
     }

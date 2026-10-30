@@ -981,6 +981,9 @@ pub(crate) enum NativeFunction {
     RegExpStatic(RegExpStaticProperty),
     /// `navigator.javaEnabled()`, which reports no Java plugin.
     NavigatorJavaEnabled,
+    /// The `Storage` interface object. `WebIDL` interface objects are not
+    /// constructible, so calling or constructing it throws.
+    StorageConstructor,
     RegExpStaticSetter(RegExpStaticProperty),
     /// `RegExp.prototype[@@match]`, `[@@matchAll]`, `[@@replace]`, `[@@search]`
     /// and `[@@split]` (ECMA-262 22.2.6.8-12).
@@ -7004,7 +7007,7 @@ impl Realm {
     /// `key(n)` insertion order and `Object.keys` enumeration for free.
     fn install_storage(
         objects: &mut Vec<JsObject>,
-        _global: ObjectId,
+        global: ObjectId,
         object_prototype: ObjectId,
         function_prototype: ObjectId,
     ) -> ObjectId {
@@ -7038,6 +7041,37 @@ impl Realm {
                 tag,
                 PropertyDescriptor::builtin(JsValue::String(("Storage".to_owned()).into())),
             ),
+        );
+        // The interface object itself. Pages feature-detect with
+        // `typeof Storage`, patch `Storage.prototype`, or use
+        // `instanceof Storage`; only the prototype link is observable.
+        let constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::StorageConstructor),
+            ..JsObject::default()
+        });
+        objects[constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        objects[global.0].properties.insert(
+            "Storage".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(constructor),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
         );
         prototype
     }
@@ -7185,6 +7219,37 @@ impl Realm {
             objects[navigator.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor::builtin(JsValue::Boolean(value)),
+            );
+        }
+        // `navigator.mimeTypes` and `navigator.plugins` are always present in
+        // browsers, even when empty. Baidu's UA detection reads
+        // `navigator.mimeTypes.length` unconditionally, so leaving it
+        // undefined aborts its bootstrap script.
+        for property in ["mimeTypes", "plugins"] {
+            let collection = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(object_prototype),
+                ..JsObject::default()
+            });
+            objects[collection.0].properties.insert(
+                "length".to_owned(),
+                PropertyDescriptor::builtin(JsValue::Number(0.0)),
+            );
+            for method in ["item", "namedItem"] {
+                let function = ObjectId(objects.len());
+                objects.push(JsObject {
+                    prototype: Some(function_prototype),
+                    host: ObjectHost::NativeFunction(NativeFunction::GlobalNoop),
+                    ..JsObject::default()
+                });
+                objects[collection.0].properties.insert(
+                    method.to_owned(),
+                    PropertyDescriptor::builtin(JsValue::Object(function)),
+                );
+            }
+            objects[navigator.0].properties.insert(
+                property.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(collection)),
             );
         }
         // `navigator.serviceWorker` exists in every secure-context browsing

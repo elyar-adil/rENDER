@@ -519,10 +519,12 @@
     this._meta = meta;
     this._upgrading = false;
     this._closed = false;
+    this._listeners = Object.create(null);
     this.objectStoreNames = nameList(meta);
     if (!meta.connections) meta.connections = [];
     meta.connections.push(this);
   }
+  eventTarget(IDBDatabase.prototype);
 
   IDBDatabase.prototype.createObjectStore = function (name, options) {
     name = String(name);

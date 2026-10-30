@@ -3587,7 +3587,7 @@ mod tests {
             r#"<!doctype html><style>
                html, body { margin: 0; background: white }
                #box { width: 20px; height: 20px; background: red;
-                      mask-image: url(mask.png) }
+                      mask-image: url(mask.png); mask-size: 100% 100% }
                </style><div id="box"></div>"#,
         );
         let initial = document.render_reference(DocumentRenderOptions::default());
@@ -3625,6 +3625,55 @@ mod tests {
             Some(Color::rgb(255, 0, 0))
         );
         assert_eq!(output.raster.surface.pixel(15, 10), Some(Color::WHITE));
+    }
+
+    /// `mask-size`, `mask-position` and `mask-repeat: no-repeat` place one
+    /// tile; everything outside the tile is fully masked.
+    #[test]
+    fn css_mask_size_position_and_no_repeat_place_one_tile() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0; background: white }
+               #box { width: 40px; height: 20px; background: red;
+                      mask-image: linear-gradient(black, black);
+                      mask-size: 10px 10px; mask-position: 10px 0;
+                      mask-repeat: no-repeat }
+               </style><div id="box"></div>"#,
+        );
+        let output = document.render_reference(DocumentRenderOptions::default());
+        assert_eq!(output.raster.surface.pixel(5, 5), Some(Color::WHITE));
+        assert_eq!(output.raster.surface.pixel(9, 5), Some(Color::WHITE));
+        assert_eq!(
+            output.raster.surface.pixel(10, 5),
+            Some(Color::rgb(255, 0, 0))
+        );
+        assert_eq!(
+            output.raster.surface.pixel(15, 5),
+            Some(Color::rgb(255, 0, 0))
+        );
+        assert_eq!(output.raster.surface.pixel(15, 15), Some(Color::WHITE));
+        assert_eq!(output.raster.surface.pixel(25, 5), Some(Color::WHITE));
+    }
+
+    /// The default/repeat case tiles the mask over the whole border box.
+    #[test]
+    fn css_mask_size_and_repeat_tile_the_mask() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0; background: white }
+               #box { width: 40px; height: 20px; background: red;
+                      mask-image: linear-gradient(black, black);
+                      mask-size: 10px 10px; mask-repeat: repeat }
+               </style><div id="box"></div>"#,
+        );
+        let output = document.render_reference(DocumentRenderOptions::default());
+        for (x, y) in [(5, 5), (15, 5), (35, 5), (15, 15), (35, 15)] {
+            assert_eq!(
+                output.raster.surface.pixel(x, y),
+                Some(Color::rgb(255, 0, 0)),
+                "({x},{y})"
+            );
+        }
     }
 
     /// CSS `mask-image: linear-gradient()` multiplies the layer's alpha.

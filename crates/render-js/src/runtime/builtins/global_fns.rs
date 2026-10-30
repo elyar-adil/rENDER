@@ -471,6 +471,7 @@ impl JsRuntime {
                 self.dynamic_import(dom, arguments, ImportPhase::Source)
             }
             NativeFunction::GlobalNoop => Ok(JsValue::Undefined),
+            NativeFunction::StorageConstructor => Err(JsError::type_error("Illegal constructor")),
             NativeFunction::HistoryPushState => self.history_state_change(dom, arguments, false),
             NativeFunction::HistoryReplaceState => self.history_state_change(dom, arguments, true),
             NativeFunction::HistoryBack => {

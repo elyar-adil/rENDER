@@ -173,7 +173,7 @@ pub struct StackingContext {
     pub reason: CompositingReason,
     pub filter: Option<FilterEffect>,
     /// CSS `mask-image`: a gradient or fetched raster used as an alpha mask.
-    pub mask: Option<MaskImage>,
+    pub mask: Option<MaskLayer>,
 }
 
 /// A resolved `mask-image` layer.
@@ -185,6 +185,20 @@ pub enum MaskImage {
         resource: ImageResourceId,
         destination: PhysicalRect,
     },
+}
+
+/// One `mask-image` layer with its tile geometry.
+///
+/// `tile` is the document-space rectangle of one mask image tile, `clip` is
+/// the element's border box, and the repeat flags describe how the tile is
+/// repeated inside the clip.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaskLayer {
+    pub image: MaskImage,
+    pub tile: PhysicalRect,
+    pub clip: PhysicalRect,
+    pub repeat_x: bool,
+    pub repeat_y: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2252,30 +2266,229 @@ fn css_mask_image(
     viewport: PhysicalSize,
     images: Option<&ImageResources>,
     node: Option<NodeId>,
-) -> Option<MaskImage> {
-    let text = style?.get("mask-image")?.css_text();
+) -> Option<MaskLayer> {
+    let style = style?;
+    let text = style.get("mask-image")?.css_text();
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
         return None;
     }
     let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("linear-gradient(") {
-        return parse_linear_gradient(trimmed, rect, palette, current_color).map(MaskImage::Linear);
-    }
-    if lower.starts_with("radial-gradient(") {
-        return parse_radial_gradient(trimmed, rect, palette, current_color, font_size, viewport)
-            .map(MaskImage::Radial);
-    }
-    if lower.starts_with("url(") {
+    let (intrinsic_width, intrinsic_height, make_image) = if lower.starts_with("linear-gradient(") {
+        (
+            rect.size.width,
+            rect.size.height,
+            MaskImageFactory::Linear(trimmed.to_owned()),
+        )
+    } else if lower.starts_with("radial-gradient(") {
+        (
+            rect.size.width,
+            rect.size.height,
+            MaskImageFactory::Radial(trimmed.to_owned()),
+        )
+    } else if lower.starts_with("url(") {
         let loaded = images
             .zip(node)
             .and_then(|(images, node)| images.get_css_mask(node, trimmed))?;
-        return Some(MaskImage::Raster {
-            resource: loaded.id,
-            destination: rect,
-        });
+        let (width, height) = loaded.image.intrinsic_size();
+        if width == 0 || height == 0 {
+            return None;
+        }
+        (
+            u32_to_f32_mask(width),
+            u32_to_f32_mask(height),
+            MaskImageFactory::Raster(loaded.id),
+        )
+    } else {
+        return None;
+    };
+
+    let preserve_ratio = matches!(make_image, MaskImageFactory::Raster(_));
+    let (tile_width, tile_height) = mask_tile_size(
+        style,
+        rect,
+        intrinsic_width,
+        intrinsic_height,
+        preserve_ratio,
+        font_size,
+        viewport,
+    );
+    if tile_width <= 0.0 || tile_height <= 0.0 {
+        return None;
     }
-    None
+    let (position_x, position_y) =
+        mask_position(style, rect, tile_width, tile_height, font_size, viewport);
+    let tile = PhysicalRect::new(
+        rect.origin.x + position_x,
+        rect.origin.y + position_y,
+        tile_width,
+        tile_height,
+    );
+    let (repeat_x, repeat_y) = mask_repeat(style);
+    let image = match make_image {
+        MaskImageFactory::Linear(value) => {
+            MaskImage::Linear(parse_linear_gradient(&value, tile, palette, current_color)?)
+        }
+        MaskImageFactory::Radial(value) => MaskImage::Radial(parse_radial_gradient(
+            &value,
+            tile,
+            palette,
+            current_color,
+            font_size,
+            viewport,
+        )?),
+        MaskImageFactory::Raster(resource) => MaskImage::Raster {
+            resource,
+            destination: tile,
+        },
+    };
+    Some(MaskLayer {
+        image,
+        tile,
+        clip: rect,
+        repeat_x,
+        repeat_y,
+    })
+}
+
+enum MaskImageFactory {
+    Linear(String),
+    Radial(String),
+    Raster(ImageResourceId),
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "decoded mask dimensions are bounded by image limits"
+)]
+fn u32_to_f32_mask(value: u32) -> f32 {
+    value as f32
+}
+
+fn mask_tile_size(
+    style: &ComputedStyle,
+    rect: PhysicalRect,
+    intrinsic_width: f32,
+    intrinsic_height: f32,
+    preserve_ratio: bool,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> (f32, f32) {
+    let size = style
+        .get("mask-size")
+        .map_or_else(|| "auto".to_owned(), |value| value.css_text().to_owned());
+    let size = size.trim();
+    if size.eq_ignore_ascii_case("cover") || size.eq_ignore_ascii_case("contain") {
+        let scale_x = rect.size.width / intrinsic_width;
+        let scale_y = rect.size.height / intrinsic_height;
+        let scale = if size.eq_ignore_ascii_case("cover") {
+            scale_x.max(scale_y)
+        } else {
+            scale_x.min(scale_y)
+        };
+        return (intrinsic_width * scale, intrinsic_height * scale);
+    }
+    let tokens = clip_components(size);
+    let resolve = |index: usize, basis: f32, fallback: f32| -> f32 {
+        let Some(value) = tokens.get(index) else {
+            return fallback;
+        };
+        if value.eq_ignore_ascii_case("auto") {
+            fallback
+        } else {
+            resolve_clip_length(value, basis, font_size, viewport).unwrap_or(fallback)
+        }
+    };
+    let width = resolve(0, rect.size.width, intrinsic_width);
+    let height = if tokens.len() > 1 {
+        resolve(1, rect.size.height, intrinsic_height)
+    } else if preserve_ratio && intrinsic_width > 0.0 {
+        // One explicit size on a raster preserves the image's own ratio; a
+        // gradient has no intrinsic ratio, so its height stays the area height.
+        width * intrinsic_height / intrinsic_width
+    } else {
+        intrinsic_height
+    };
+    (width, height)
+}
+
+fn mask_position(
+    style: &ComputedStyle,
+    rect: PhysicalRect,
+    tile_width: f32,
+    tile_height: f32,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> (f32, f32) {
+    let text = style
+        .get("mask-position")
+        .map_or_else(|| "0% 0%".to_owned(), |value| value.css_text().to_owned());
+    let tokens = clip_components(text.trim());
+    let available_x = rect.size.width - tile_width;
+    let available_y = rect.size.height - tile_height;
+    let resolve = |token: &str, basis: f32, available: f32| -> f32 {
+        match token.to_ascii_lowercase().as_str() {
+            "left" | "top" => 0.0,
+            "right" | "bottom" => available,
+            "center" => available / 2.0,
+            _ => {
+                if let Some(percent) = token.trim().strip_suffix('%') {
+                    percent
+                        .trim()
+                        .parse::<f32>()
+                        .map_or(0.0, |value| value / 100.0 * available)
+                } else {
+                    resolve_clip_length(token, basis, font_size, viewport).unwrap_or(0.0)
+                }
+            }
+        }
+    };
+    match tokens.as_slice() {
+        [] => (0.0, 0.0),
+        [single] => {
+            if matches!(single.to_ascii_lowercase().as_str(), "top" | "bottom") {
+                (
+                    available_x / 2.0,
+                    resolve(single, rect.size.height, available_y),
+                )
+            } else {
+                (
+                    resolve(single, rect.size.width, available_x),
+                    available_y / 2.0,
+                )
+            }
+        }
+        [first, second, ..] => {
+            if matches!(first.to_ascii_lowercase().as_str(), "top" | "bottom") {
+                (
+                    resolve(second, rect.size.width, available_x),
+                    resolve(first, rect.size.height, available_y),
+                )
+            } else {
+                (
+                    resolve(first, rect.size.width, available_x),
+                    resolve(second, rect.size.height, available_y),
+                )
+            }
+        }
+    }
+}
+
+fn mask_repeat(style: &ComputedStyle) -> (bool, bool) {
+    let repeat = style
+        .get("mask-repeat")
+        .map_or_else(|| "repeat".to_owned(), |value| value.css_text().to_owned());
+    let first = repeat
+        .split_whitespace()
+        .next()
+        .unwrap_or("repeat")
+        .to_ascii_lowercase();
+    match first.as_str() {
+        "no-repeat" => (false, false),
+        "repeat-x" => (true, false),
+        "repeat-y" => (false, true),
+        _ => (true, true),
+    }
 }
 
 fn clip_path_shape(
@@ -3350,7 +3563,7 @@ fn fragment_stacking_context(
     transform: Option<Transform2D>,
     clips: bool,
     filter: Option<FilterEffect>,
-    mask: Option<MaskImage>,
+    mask: Option<MaskLayer>,
 ) -> Option<StackingContext> {
     let reason = if transform.is_some() {
         CompositingReason::Transform
