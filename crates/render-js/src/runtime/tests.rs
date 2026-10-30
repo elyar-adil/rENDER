@@ -495,6 +495,28 @@ fn for_in_enumerates_prototypes_and_delete_honors_descriptors() {
 }
 
 #[test]
+fn a_template_element_exposes_its_detached_contents_fragment() {
+    let mut parsed = parse_document("<!doctype html><body></body>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var template = document.createElement("template");
+                var contents = template.content;
+                contents.appendChild(document.createElement("span"));
+                [contents.nodeType, template.childNodes.length, contents.childNodes.length].join(":");
+            "#,
+        )
+        .expect("template.content should execute");
+    assert_eq!(
+        outcome.value.to_js_string().to_lossy(),
+        "11:0:1",
+        "template.content is a DocumentFragment detached from the template element"
+    );
+}
+
+#[test]
 fn function_call_bind_and_typeof_share_callable_semantics() {
     let mut parsed = parse_document("<!doctype html><p></p>");
     let mut runtime = JsRuntime::new(&parsed.dom);

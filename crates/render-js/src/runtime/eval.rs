@@ -5234,6 +5234,21 @@ impl JsRuntime {
                         .text_content(dom, node)
                         .map(|text| JsValue::String(JsString::from(text)));
                 }
+                // HTML §4.12.3: `HTMLTemplateElement.content` is the detached
+                // DocumentFragment the parser fills instead of the element.
+                "content"
+                    if matches!(
+                        dom.node(node).map(render_dom::Node::kind),
+                        Some(render_dom::NodeKind::Element(element))
+                            if element.namespace == render_dom::Namespace::Html
+                                && element.local_name == "template"
+                    ) =>
+                {
+                    return match dom.template_contents(node) {
+                        Some(contents) => self.wrap_node(dom, contents),
+                        None => Ok(JsValue::Null),
+                    };
+                }
                 "clientWidth" | "offsetWidth" | "scrollWidth" => {
                     let width = self
                         .element_geometry
