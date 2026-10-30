@@ -1,3 +1,70 @@
+# 交接文档 (2026-10-31, 续四十一) — WAAPI effect stack 与逐关键帧 easing
+
+接续 WAAPI 速率/合成会话。这一轮把多个动画从“轮流改写 inline style”改为有
+明确创建顺序的 effect stack,并让 keyframe 自带的 easing 生效。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **effect stack** | 所有活动动画按创建顺序按属性合成;replace 覆盖、add/accumulate 叠加上一结果 |
+| **base style** | 每个元素/属性首次被动画时保存原始 inline 值;最后一个效果移除后恢复 |
+| **逐帧输出** | `_apply` 只计算 `_values`;每帧结束 `renderAll` 统一写回,避免动画间互相污染 |
+| **结束/取消** | fill forwards 保留最终值;fill none/cancel 清除效果并恢复底层样式 |
+| **per-keyframe easing** | keyframe 的 `easing` 存在点之间;`sampleTrack` 用前一个关键帧的 easing,缺省回退 effect easing |
+| **测试** | steps(1,end) 中点仍为 0、两个 replace 动画后者胜出、add 合成仍为 75px |
+
+## 证据
+
+单元测试:
+
+```
+web_animation_effect_stack_uses_creation_order ... ok
+web_animation_per_keyframe_easing_overrides_the_default ... ok
+web_animation_add_composition_uses_the_previous_value ... ok
+web_animation_playback_rate_and_reverse_adjust_the_timeline ... ok
+```
+
+effect stack 页面:100px replace + 50px add,duration 1s,500ms 时:
+
+```
+STACKPROBE width=69.6399px first=running second=running
+```
+
+即约 70px,而不是只保留第一个/第二个动画的 50px 或 100px。
+
+真实站点:
+
+```
+Bing:  ready=Complete  dom_elements=477 boxes=167
+       scripts_failed=0 scripts_threw=0 css_warnings=13 images_failed=0
+Baidu: ready=Complete  dom_elements=450 boxes=156
+       scripts_failed=0 scripts_threw=0 css_warnings=5 images_failed=0
+JD:    ready=Loading   dom_elements=999 boxes=117
+       scripts_failed=7 scripts_threw=2 css_warnings=36 images_failed=1
+```
+
+## 验证
+
+```
+cargo test --workspace                       2815 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+## 明确未做 / 下一步
+
+- `GroupEffect`/`KeyframeEffect` 对象、effect group 嵌套、animation-composition
+  的完整 ownership 仍未实现;当前是 linear effect stack。
+- 逐关键帧 easing 在区间内近似实现,复杂 spring/linear() easing 与完整 timing
+  模型仍有差距。
+- `transitionrun`/`transitionstart` 未发出;WAAPI 仍通过 inline style 写回。
+- JD 主商品区仍受 403;GitHub/HN 本机链路阻断;高级渐变、SVG filter 其余原语、
+  IndexedDB 值类型覆盖仍未完成。
+
+---
+
 # 交接文档 (2026-10-31, 续四十) — 节点移除 transitioncancel 与精确反向
 
 接续 WAAPI 统一时间线会话。这一轮补节点移除/文档切换的 transitioncancel、

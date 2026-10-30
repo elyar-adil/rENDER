@@ -1144,6 +1144,84 @@ fn web_animation_add_composition_uses_the_previous_value() {
 }
 
 #[test]
+fn web_animation_per_keyframe_easing_overrides_the_default() {
+    let mut parsed = parse_document("<!doctype html><div id='box'></div>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.fakeNow = 0;
+                performance.now = function () { return window.fakeNow; };
+                var box = document.getElementById('box');
+                var animation = box.animate(
+                    [{ opacity: 0, easing: 'steps(1, end)' }, { opacity: 1 }],
+                    { duration: 1000, fill: 'both', easing: 'linear' }
+                );
+                window.animation = animation;
+            ",
+        )
+        .expect("eased animation starts");
+    runtime
+        .execute(&mut parsed.dom, "window.fakeNow = 500;")
+        .expect("advance time");
+    tick_web_animations(&mut runtime, &mut parsed.dom, 500.0);
+    let midpoint = runtime
+        .execute(
+            &mut parsed.dom,
+            "document.getElementById('box').style.getPropertyValue('opacity')",
+        )
+        .expect("reads eased opacity")
+        .value
+        .to_js_string();
+    assert_eq!(midpoint.to_lossy(), "0");
+    runtime
+        .execute(&mut parsed.dom, "window.fakeNow = 1000;")
+        .expect("advance time");
+    tick_web_animations(&mut runtime, &mut parsed.dom, 1000.0);
+    let end = runtime
+        .execute(
+            &mut parsed.dom,
+            "document.getElementById('box').style.getPropertyValue('opacity')",
+        )
+        .expect("reads eased endpoint")
+        .value
+        .to_js_string();
+    assert_eq!(end.to_lossy(), "1");
+}
+
+#[test]
+fn web_animation_effect_stack_uses_creation_order() {
+    let mut parsed = parse_document("<!doctype html><div id='box' style='opacity: 0.2'></div>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.fakeNow = 0;
+                performance.now = function () { return window.fakeNow; };
+                var box = document.getElementById('box');
+                box.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 1000, fill: 'both' });
+                box.animate([{ opacity: 0.5 }, { opacity: 1 }], { duration: 1000, fill: 'both' });
+            ",
+        )
+        .expect("effect stack starts");
+    runtime
+        .execute(&mut parsed.dom, "window.fakeNow = 500;")
+        .expect("advance time");
+    tick_web_animations(&mut runtime, &mut parsed.dom, 500.0);
+    let opacity = runtime
+        .execute(
+            &mut parsed.dom,
+            "document.getElementById('box').style.getPropertyValue('opacity')",
+        )
+        .expect("reads stacked opacity")
+        .value
+        .to_js_string();
+    assert_eq!(opacity.to_lossy(), "0.75");
+}
+
+#[test]
 fn inner_html_round_trips_and_setter_replaces_children() {
     let mut parsed = parse_document("<!doctype html><div id='host'><p>old</p></div>");
     let mut runtime = JsRuntime::new(&parsed.dom);

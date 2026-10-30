@@ -13,6 +13,7 @@
 
   var defineProperty = Object.defineProperty;
   var animations = [];
+  var animatedTargets = [];
   var timelineStart = null;
 
   function now() {
@@ -61,13 +62,14 @@
   function buildTracks(keyframes, defaultComposite) {
     var tracks = Object.create(null);
     var meta = { offset: true, easing: true, composite: true };
-    function add(name, offset, value, composite) {
+    function add(name, offset, value, composite, easingValue) {
       if (meta[name] || value === undefined || value === null) return;
       name = camelToKebab(name);
       (tracks[name] || (tracks[name] = [])).push({
         offset: offset,
         value: value,
-        composite: composite || defaultComposite || 'replace'
+        composite: composite || defaultComposite || 'replace',
+        easing: easingValue || null
       });
     }
     if (Array.isArray(keyframes)) {
@@ -80,7 +82,7 @@
         var offset = keyframeOffset(frame.offset, index, count);
         var names = Object.keys(frame);
         for (var n = 0; n < names.length; n++) {
-          add(names[n], offset, frame[names[n]], frame.composite);
+          add(names[n], offset, frame[names[n]], frame.composite, frame.easing);
         }
       }
     } else if (keyframes && typeof keyframes === 'object') {
@@ -89,7 +91,13 @@
         var values = keyframes[names[n]];
         if (!Array.isArray(values)) values = [values];
         for (var index = 0; index < values.length; index++) {
-          add(names[n], keyframeOffset(null, index, values.length), values[index], defaultComposite);
+          add(
+            names[n],
+            keyframeOffset(null, index, values.length),
+            values[index],
+            defaultComposite,
+            null
+          );
         }
       }
     }
@@ -246,15 +254,19 @@
     return progress;
   }
 
-  function sampleTrack(points, progress) {
+  function sampleTrack(points, progress, defaultEasing) {
     if (points.length === 0) return undefined;
     if (progress <= points[0].offset) return points[0].value;
-    if (progress >= points[points.length - 1].offset) return points[points.length - 1].value;
+    if (progress >= points[points.length - 1].offset) {
+      return points[points.length - 1].value;
+    }
     for (var i = 1; i < points.length; i++) {
       if (progress <= points[i].offset) {
         var before = points[i - 1];
         var after = points[i];
-        var local = (progress - before.offset) / (after.offset - before.offset);
+        var span = after.offset - before.offset;
+        var local = span <= 0 ? 0 : (progress - before.offset) / span;
+        local = easing(before.easing || defaultEasing, local);
         return interpolateValue(before.value, after.value, local);
       }
     }
@@ -320,6 +332,76 @@
     }
   }
 
+  function animationBase(target) {
+    for (var i = 0; i < animatedTargets.length; i++) {
+      if (animatedTargets[i].target === target) return animatedTargets[i];
+    }
+    var entry = { target: target, properties: Object.create(null) };
+    animatedTargets.push(entry);
+    return entry;
+  }
+
+  function renderTarget(target) {
+    var index = -1;
+    for (var i = 0; i < animatedTargets.length; i++) {
+      if (animatedTargets[i].target === target) {
+        index = i;
+        break;
+      }
+    }
+    if (index < 0) return;
+    var entry = animatedTargets[index];
+    var stack = [];
+    for (var i = 0; i < animations.length; i++) {
+      var animation = animations[i];
+      if (animation._target === target && animation._values) {
+        stack.push(animation);
+      }
+    }
+    if (stack.length === 0) {
+      Object.keys(entry.properties).forEach(function (name) {
+        var previous = entry.properties[name];
+        if (previous === '') target.style.removeProperty(name);
+        else target.style.setProperty(name, previous);
+      });
+      animatedTargets.splice(index, 1);
+      return;
+    }
+    var composed = Object.create(null);
+    var touched = Object.create(null);
+    stack.forEach(function (animation) {
+      Object.keys(animation._values).forEach(function (name) {
+        if (!(name in composed)) {
+          composed[name] = name in entry.properties ? entry.properties[name] : '';
+        }
+        var value = animation._values[name];
+        var composite = animation._valueComposite[name] || 'replace';
+        if (composite === 'add' || composite === 'accumulate') {
+          composed[name] = addValues(composed[name], value);
+        } else {
+          composed[name] = value;
+        }
+        touched[name] = true;
+      });
+    });
+    Object.keys(entry.properties).forEach(function (name) {
+      if (touched[name]) return;
+      var previous = entry.properties[name];
+      if (previous === '') target.style.removeProperty(name);
+      else target.style.setProperty(name, previous);
+      delete entry.properties[name];
+    });
+    Object.keys(composed).forEach(function (name) {
+      if (composed[name] === '') target.style.removeProperty(name);
+      else target.style.setProperty(name, composed[name]);
+    });
+  }
+
+  function renderAll() {
+    var targets = animatedTargets.map(function (entry) { return entry.target; });
+    targets.forEach(renderTarget);
+  }
+
   // The embedding drives this function once per document animation frame. It
   // uses the same document timestamp as the CSS animation sampler, so CSS and
   // WAAPI share one timeline instead of running on separate timers.
@@ -334,6 +416,7 @@
         if (animation._playState === 'running') running = true;
       }
     }
+    renderAll();
     return running;
   };
 
@@ -350,11 +433,15 @@
     this._currentTime = 0;
     this._finished = false;
     this._listeners = Object.create(null);
-    this._saved = Object.create(null);
+    this._values = null;
+    this._valueComposite = null;
+    var base = animationBase(target);
     this._tracks.forEach(function (track) {
-      try { this._saved[track.property] = target.style.getPropertyValue(track.property); }
-      catch (error) { this._saved[track.property] = ''; }
-    }, this);
+      if (!(track.property in base.properties)) {
+        try { base.properties[track.property] = target.style.getPropertyValue(track.property); }
+        catch (error) { base.properties[track.property] = ''; }
+      }
+    });
     var self = this;
     this.finished = new Promise(function (resolve, reject) {
       self._resolveFinished = resolve;
@@ -383,31 +470,23 @@
     animations.push(this);
   }
 
-  Animation.prototype._restore = function () {
-    var self = this;
-    Object.keys(this._saved).forEach(function (name) {
-      var previous = self._saved[name];
-      if (previous === '' || previous === null) self._target.style.removeProperty(name);
-      else self._target.style.setProperty(name, previous);
-    });
-  };
-
   Animation.prototype._apply = function (progress) {
     if (progress === null) {
-      this._restore();
+      this._values = null;
+      this._valueComposite = null;
       return;
     }
     var self = this;
+    var values = Object.create(null);
+    var composites = Object.create(null);
     this._tracks.forEach(function (track) {
-      var value = sampleTrack(track.points, easing(self._timing.easing, progress));
+      var value = sampleTrack(track.points, progress, self._timing.easing);
       if (value === undefined || value === null) return;
-      var composite = track.composite || self._composite;
-      if (composite === 'add' || composite === 'accumulate') {
-        var base = self._target.style.getPropertyValue(track.property);
-        value = addValues(base, String(value));
-      }
-      self._target.style.setProperty(track.property, String(value));
+      values[track.property] = String(value);
+      composites[track.property] = track.composite || self._composite;
     });
+    this._values = values;
+    this._valueComposite = composites;
   };
 
   Animation.prototype._endTime = function () {
@@ -419,7 +498,11 @@
     if (this._playState === 'finished') return;
     this._playState = 'finished';
     this._currentTime = this._playbackRate < 0 ? 0 : this._endTime();
-    if (this._timing.fill.indexOf('forwards') < 0 && this._timing.fill.indexOf('both') < 0) this._restore();
+    if (this._timing.fill.indexOf('forwards') < 0 && this._timing.fill.indexOf('both') < 0) {
+      this._values = null;
+      this._valueComposite = null;
+    }
+    renderTarget(this._target);
     this._finished = true;
     if (this._resolveFinished) this._resolveFinished(this);
     fire(this, 'finish');
@@ -448,6 +531,7 @@
     this._finished = false;
     this._playState = 'running';
     this._sample(now());
+    renderTarget(this._target);
   };
 
   Animation.prototype.pause = function () {
@@ -455,6 +539,7 @@
     this._holdTime = this._currentTime;
     this._playState = 'paused';
     this._sample(now());
+    renderTarget(this._target);
   };
 
   Animation.prototype.finish = function () {
@@ -464,13 +549,16 @@
     this._currentTime = end;
     this._sample(now());
     if (this._playState !== 'finished') this._finish();
+    renderTarget(this._target);
   };
 
   Animation.prototype.cancel = function () {
     if (this._playState === 'idle') return;
     this._playState = 'idle';
     this._currentTime = 0;
-    this._restore();
+    this._values = null;
+    this._valueComposite = null;
+    renderTarget(this._target);
     if (this._rejectFinished && !this._finished) {
       var error;
       try { error = new DOMException('The animation was canceled', 'AbortError'); }
@@ -511,6 +599,7 @@
       }
       var result = activeProgress(this._timing, next, this._playbackRate);
       this._apply(result.progress);
+      renderTarget(this._target);
     },
     configurable: true
   });
@@ -548,6 +637,7 @@
     value: function animate(keyframes, options) {
       var animation = new Animation(this, keyframes, options);
       animation.play();
+      renderTarget(this);
       return animation;
     },
     writable: true,
