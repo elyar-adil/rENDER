@@ -34,8 +34,9 @@
 //! # What is deliberately not done
 //!
 //! * `text`, `<image>` and filter primitives other than `feGaussianBlur`,
-//!   `feColorMatrix`, `feOffset`, `feBlend` and `feComposite`: outside the
-//!   rasteriser's documented subset, so they contribute nothing there either.
+//!   `feColorMatrix`, `feOffset`, `feBlend`, `feComposite`, `feFlood`,
+//!   `feMerge`, `feDropShadow` and `feMorphology`: outside the rasteriser's
+//!   documented subset, so they contribute nothing there either.
 //!   Gradients, attribute `clip-path`, `mask` and those filter primitives are
 //!   supported, but `xlink:href` inheritance between gradient definitions and
 //!   spread modes other than `pad` are not.

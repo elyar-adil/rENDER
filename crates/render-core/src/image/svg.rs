@@ -21,13 +21,13 @@
 //! - `mask` references on shapes and groups, with offscreen alpha or
 //!   luminance compositing, `maskUnits` and `maskContentUnits`;
 //! - `filter` references with `feGaussianBlur`, `feColorMatrix`, `feOffset`,
-//!   `feBlend`, `feComposite`, `feFlood` and `feMerge`, composited through
-//!   offscreen buffers;
+//!   `feBlend`, `feComposite`, `feFlood`, `feMerge`, `feDropShadow` and
+//!   `feMorphology`, composited through offscreen buffers;
 //! - root sizing by `width`/`height` (percentages resolve against the
 //!   `viewBox`), falling back to `viewBox`, then the spec default 300×150.
 //!
-//! Everything outside the subset (text, filter primitives other than the
-//! five above, embedded images, scripting, external-document `<use>`
+//! Everything outside the subset (text, filter primitives other than those
+//! listed above, embedded images, scripting, external-document `<use>`
 //! references, gradient `xlink:href` inheritance and spread modes other than
 //! `pad`) contributes nothing, matching how an `<img>`-loaded SVG must
 //! render: static and script-free.
@@ -1372,10 +1372,12 @@ fn paint_masked_element(
 ///
 /// Like masks, the element is painted into an offscreen buffer with its
 /// `filter` attribute removed. The filter primitives then transform that
-/// buffer, and the result is composited through the filter region. The first
+/// buffer, and the result is composited through the filter region.
+///
 /// Supported primitives are `feGaussianBlur`, `feColorMatrix`, `feOffset`,
-/// `feBlend`, `feComposite`, `feFlood` and `feMerge`; a chain is processed in
-/// document order, with `result` names and `in`/`in2` references.
+/// `feBlend`, `feComposite`, `feFlood`, `feMerge`, `feDropShadow` and
+/// `feMorphology`; a chain is processed in document order, with `result`
+/// names and `in`/`in2` references.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -1460,7 +1462,7 @@ fn paint_filtered_element(
         let output = match primitive.name.as_str() {
             "feGaussianBlur" => {
                 let (mut sigma_x, mut sigma_y) =
-                    parse_std_deviation(attribute(primitive, "stdDeviation").unwrap_or("0"));
+                    parse_number_pair(attribute(primitive, "stdDeviation").unwrap_or("0"));
                 if object_primitives {
                     sigma_x *= bounds.width;
                     sigma_y *= bounds.height;
@@ -1512,6 +1514,38 @@ fn paint_filtered_element(
                 &input,
                 attribute(primitive, "operator").unwrap_or("over"),
             ),
+            "feDropShadow" => {
+                let mut dx = attribute(primitive, "dx")
+                    .and_then(parse_length)
+                    .unwrap_or(2.0);
+                let mut dy = attribute(primitive, "dy")
+                    .and_then(parse_length)
+                    .unwrap_or(2.0);
+                let (mut sigma_x, mut sigma_y) =
+                    parse_number_pair(attribute(primitive, "stdDeviation").unwrap_or("2"));
+                if object_primitives {
+                    dx *= bounds.width;
+                    dy *= bounds.height;
+                    sigma_x *= bounds.width;
+                    sigma_y *= bounds.height;
+                }
+                let color = attribute(primitive, "flood-color")
+                    .and_then(parse_color)
+                    .unwrap_or(Color::BLACK);
+                let opacity = attribute(primitive, "flood-opacity")
+                    .and_then(parse_opacity)
+                    .unwrap_or(1.0);
+                drop_shadow_pixels(
+                    &input,
+                    (raster.width, raster.height),
+                    (
+                        element_transform.a * dx + element_transform.c * dy,
+                        element_transform.b * dx + element_transform.d * dy,
+                    ),
+                    (sigma_x * transform_scale, sigma_y * transform_scale),
+                    color.with_opacity(opacity),
+                )
+            }
             "feFlood" => {
                 let color = attribute(primitive, "flood-color")
                     .and_then(parse_color)
@@ -1531,6 +1565,24 @@ fn paint_filtered_element(
                     merged = composite_pixels(&merged, &layer, "over");
                 }
                 merged
+            }
+            "feMorphology" => {
+                let (mut radius_x, mut radius_y) =
+                    parse_number_pair(attribute(primitive, "radius").unwrap_or("0"));
+                if object_primitives {
+                    radius_x *= bounds.width;
+                    radius_y *= bounds.height;
+                }
+                let dilate = attribute(primitive, "operator")
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("dilate"));
+                morphology_pixels(
+                    &input,
+                    raster.width,
+                    raster.height,
+                    radius_x * transform_scale,
+                    radius_y * transform_scale,
+                    dilate,
+                )
             }
             _ => input,
         };
@@ -1657,6 +1709,31 @@ fn offset_pixels(source: &[Color], width: u32, height: u32, dx: f32, dy: f32) ->
     output
 }
 
+/// Build a drop shadow from the input's alpha and paint it behind the input.
+///
+/// This is the spec's `feFlood` + `feComposite operator="in"` construction
+/// over the input's alpha, offset and blurred with the caller-resolved pixel
+/// distances, then merged under the input graphic. `size` is the raster's
+/// `(width, height)`; `offset` and `sigma` are already in device pixels.
+fn drop_shadow_pixels(
+    source: &[Color],
+    size: (u32, u32),
+    offset: (f32, f32),
+    sigma: (f32, f32),
+    color: Color,
+) -> Vec<Color> {
+    let (width, height) = size;
+    let alpha: Vec<Color> = source
+        .iter()
+        .map(|pixel| Color::rgba(0, 0, 0, pixel.alpha))
+        .collect();
+    let blurred = blur_pixels(&alpha, width, height, sigma.0, sigma.1);
+    let shifted = offset_pixels(&blurred, width, height, offset.0, offset.1);
+    let flood = vec![color; shifted.len()];
+    let shadow = composite_pixels(&shifted, &flood, "in");
+    blend_pixels(&shadow, source, "normal")
+}
+
 fn blend_pixels(backdrop: &[Color], source: &[Color], mode: &str) -> Vec<Color> {
     let mode = mode.trim().to_ascii_lowercase();
     backdrop
@@ -1752,7 +1829,9 @@ fn source_over(source: Color, backdrop: Color) -> Color {
     )
 }
 
-fn parse_std_deviation(raw: &str) -> (f32, f32) {
+/// Parse a `<number-optional-number>` value: the first number applies to both
+/// axes when the second is absent.
+fn parse_number_pair(raw: &str) -> (f32, f32) {
     let values: Vec<f32> = raw
         .split(|character: char| character == ',' || character.is_whitespace())
         .filter(|part| !part.is_empty())
@@ -1868,6 +1947,95 @@ fn blur_axis(
                 }
             }
             output[y as usize * width as usize + x as usize] = sum;
+        }
+    }
+    output
+}
+
+/// Apply a rectangular erode or dilate to the input's alpha channel.
+///
+/// The kernel spans `2 * radius + 1` pixels on each axis, and a radius of
+/// zero (or a negative one, which the spec treats as an error) disables the
+/// primitive. The kernel is separable, so the two axes run one after the
+/// other; that keeps the work proportional to `radius_x + radius_y` per pixel
+/// instead of their product. Radii are capped so a hostile document cannot
+/// turn the passes into unbounded work.
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "image dimensions are bounded by ImageLimits"
+)]
+fn morphology_pixels(
+    source: &[Color],
+    width: u32,
+    height: u32,
+    radius_x: f32,
+    radius_y: f32,
+    dilate: bool,
+) -> Vec<Color> {
+    if source.is_empty() || width == 0 || height == 0 {
+        return source.to_vec();
+    }
+    let radius_x = radius_x.clamp(0.0, 64.0).round() as i32;
+    let radius_y = radius_y.clamp(0.0, 64.0).round() as i32;
+    if radius_x == 0 && radius_y == 0 {
+        return source.to_vec();
+    }
+    let horizontal = morphology_axis(source, width, height, radius_x, true, dilate);
+    morphology_axis(&horizontal, width, height, radius_y, false, dilate)
+}
+
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "image dimensions are bounded by ImageLimits"
+)]
+fn morphology_axis(
+    source: &[Color],
+    width: u32,
+    height: u32,
+    radius: i32,
+    horizontal: bool,
+    dilate: bool,
+) -> Vec<Color> {
+    if radius == 0 {
+        return source.to_vec();
+    }
+    let width = width as i32;
+    let height = height as i32;
+    let mut output = vec![Color::TRANSPARENT; source.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let mut best: Option<Color> = None;
+            for offset in -radius..=radius {
+                let (sample_x, sample_y) = if horizontal {
+                    (x + offset, y)
+                } else {
+                    (x, y + offset)
+                };
+                // Outside the buffer counts as transparent black, so an
+                // erosion also thins shapes that touch the image edge.
+                let sample =
+                    if sample_x < 0 || sample_y < 0 || sample_x >= width || sample_y >= height {
+                        Color::TRANSPARENT
+                    } else {
+                        source[sample_y as usize * width as usize + sample_x as usize]
+                    };
+                let replace = best.is_none_or(|current| {
+                    if dilate {
+                        sample.alpha > current.alpha
+                    } else {
+                        sample.alpha < current.alpha
+                    }
+                });
+                if replace {
+                    best = Some(sample);
+                }
+            }
+            // The colour travels with the extremal-alpha sample: the
+            // primitive changes coverage, and taking only the alpha would
+            // paint the new pixels black.
+            if let Some(pixel) = best {
+                output[y as usize * width as usize + x as usize] = pixel;
+            }
         }
     }
     output
@@ -4042,5 +4210,80 @@ mod tests {
         let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
         assert_eq!(image.pixel(3, 3), Some(Color::rgb(255, 0, 0)));
         assert_eq!(image.pixel(8, 5), Some(Color::rgb(255, 0, 0)));
+    }
+
+    #[test]
+    fn fe_drop_shadow_paints_an_offset_coloured_shadow_behind_the_source() {
+        let svg = br##"<svg width="20" height="20"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="20" height="20">
+              <feDropShadow dx="2" dy="2" stdDeviation="0"
+                flood-color="#0000ff" flood-opacity="0.5"/>
+            </filter></defs>
+            <rect x="5" y="5" width="6" height="6" fill="red" filter="url(#f)"/></svg>"##;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(10, 10), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(12, 12), Some(Color::rgba(0, 0, 255, 128)));
+        assert_eq!(image.pixel(2, 2), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn fe_drop_shadow_shadows_a_named_result() {
+        let svg = br##"<svg width="20" height="20"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="20" height="20">
+              <feOffset in="SourceGraphic" dx="4" result="moved"/>
+              <feDropShadow in="moved" dx="1" dy="1" stdDeviation="0"
+                flood-color="#00ff00"/>
+            </filter></defs>
+            <rect x="2" y="2" width="4" height="4" fill="red" filter="url(#f)"/></svg>"##;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(2, 2), Some(Color::TRANSPARENT));
+        assert_eq!(image.pixel(7, 4), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(10, 6), Some(Color::rgb(0, 255, 0)));
+        assert_eq!(image.pixel(10, 2), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn fe_morphology_dilate_uses_the_x_and_y_radii_independently() {
+        let svg = br#"<svg width="12" height="12"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="12" height="12">
+              <feMorphology operator="dilate" radius="2 1"/>
+            </filter></defs>
+            <rect x="4" y="4" width="4" height="4" fill="red" filter="url(#f)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(2, 5), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(1, 5), Some(Color::TRANSPARENT));
+        assert_eq!(image.pixel(5, 3), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(5, 2), Some(Color::TRANSPARENT));
+        assert_eq!(image.pixel(2, 2), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn fe_morphology_erode_thins_the_source_by_the_pixel_radius() {
+        let svg = br#"<svg width="12" height="12"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="12" height="12">
+              <feMorphology operator="erode" radius="1"/>
+            </filter></defs>
+            <rect x="4" y="4" width="4" height="4" fill="red" filter="url(#f)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(4, 4), Some(Color::TRANSPARENT));
+        assert_eq!(image.pixel(4, 5), Some(Color::TRANSPARENT));
+        assert_eq!(image.pixel(5, 5), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(6, 6), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(7, 7), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn fe_morphology_result_can_be_referenced_by_name() {
+        let svg = br#"<svg width="12" height="12"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="12" height="12">
+              <feMorphology in="SourceGraphic" operator="dilate" radius="1" result="grown"/>
+              <feOffset in="grown" dx="2"/>
+            </filter></defs>
+            <rect x="3" y="3" width="4" height="4" fill="red" filter="url(#f)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(3, 5), Some(Color::TRANSPARENT));
+        assert_eq!(image.pixel(4, 5), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(9, 5), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(10, 5), Some(Color::TRANSPARENT));
     }
 }
