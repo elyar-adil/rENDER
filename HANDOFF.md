@@ -1,3 +1,76 @@
+# 交接文档 (2026-10-31, 续四十四) — 并行子任务与代理验证
+
+这一轮用 4 个独立 worktree/subagent 并行推进,随后逐个审查、cherry-pick 回主树。
+
+## 合并结果
+
+| 能力 | 提交 |
+|---|---|
+| **SVG feDropShadow/feMorphology** | `2ecb5c0`;drop shadow 复用 blur/offset/flood/merge;morphology 支持 erode/dilate、x/y radius、result 引用 |
+| **conic/repeating 渐变** | `e8a119b`;conic 方向/位置/角度停靠点、repeating linear/radial、multi-position stops、径向渐变实际光栅化 |
+| **IndexedDB 值类型** | `b608aab`;Date/RegExp/Map/Set/ArrayBuffer/11 种 TypedArray、NaN/Infinity/-0/undefined/BigInt/稀疏数组,带引用图与循环 |
+| **嵌套 GroupEffect local timing** | `5019b17`;子 group 自身 delay/duration/iterations/direction/easing/fill、`updateTiming`、`Animation.effect` 替换、auto duration |
+| **动态 CSS link 重键** | `c41f281`;link 元素被替换但 URL 不变时按 URL 复用已下载样式表 |
+
+## 代理验证（不写入代码）
+
+用户提供 `proxy.nioint.com:8080`,仅通过环境变量测试:
+
+```
+HTTPS_PROXY=http://proxy.nioint.com:8080
+HTTP_PROXY=http://proxy.nioint.com:8080
+ALL_PROXY=http://proxy.nioint.com:8080
+```
+
+Curl:
+
+```
+GitHub 200, HN 200
+```
+
+隐藏截图:
+
+```
+HN:     ready=Complete dom_elements=811 boxes=333
+        scripts_failed=0 scripts_threw=0 css_warnings=0 images_failed=0
+GitHub: ready=Loading  dom_elements=2123 boxes=845
+        scripts_failed=0 scripts_threw=0 css_warnings=0 images_failed=0
+```
+
+HN 渲染正常。GitHub 网络已通且 28 个 CSS 全部 200,但最终 `stylesheets=0`,
+截图仍是无样式 HTML;这是新的样式批处理/提交问题,不是代理问题。代理字符串
+已确认不在 tracked code 中。
+
+## 当前验证
+
+```
+cargo test --workspace                       2842 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+内容站点复跑:
+
+```
+Bing:  ready=Complete  dom_elements=474 boxes=166
+       scripts_failed=0 scripts_threw=0 css_warnings=13 images_failed=0
+Baidu: ready=Complete  dom_elements=450 boxes=156
+       scripts_failed=0 scripts_threw=0 css_warnings=5 images_failed=0
+JD:    ready=Interactive dom_elements=1159 boxes=117
+       scripts_failed=11 scripts_threw=2 css_warnings=36 images_failed=1
+```
+
+## 明确未做 / 下一步
+
+- GitHub 的 CSS 已下载但未进入最终样式表;需继续定位 batch commit/rematch。
+- conic 渐变仍仅支持百分比 stop、sRGB、无角度抗锯齿;颜色提示/绝对长度未做。
+- IndexedDB 的 Blob/DataView 未持久化;Map/Set 自循环仍受现有 structuredClone 限制。
+- GroupEffect 仍只取第一个 child target,子结构变更后不自动刷新 base ownership。
+- JD 主商品区仍受 403;GitHub 渲染未完成;高级 SVG 原语、IndexedDB Blob 等仍未完成。
+
+---
+
 # 交接文档 (2026-10-31, 续四十二) — KeyframeEffect/GroupEffect 与 transitionrun/start
 
 接续 WAAPI effect stack 会话。这一轮补 `KeyframeEffect`/`GroupEffect` 对象、
