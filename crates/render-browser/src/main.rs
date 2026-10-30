@@ -19,6 +19,7 @@ use crate::page_source::load_initial_page;
 use crate::render_worker::start_render_worker;
 use render_browser::font_backend::SystemFontBackend;
 use render_net::FetchConfig;
+use render_net::HttpProxyConfig;
 use render_net::HttpTransport;
 use render_net::NetworkWorker;
 use softbuffer::Surface as WindowSurface;
@@ -100,11 +101,31 @@ fn browser_main() -> Result<(), String> {
         builder.build().map_err(|error| error.to_string())?
     };
     event_loop.set_control_flow(ControlFlow::Wait);
-    let network = NetworkWorker::start(HttpTransport::new(FetchConfig::default()))
-        .map_err(|error| error.to_string())?;
+    let proxy = crate::profile::ProfileProxy::open(crate::profile::profile_directory());
+    let transport = match proxy.setting() {
+        None => HttpTransport::new(FetchConfig::default()),
+        Some(crate::profile::ProxySetting::Direct) => {
+            HttpTransport::with_http_proxy(FetchConfig::default(), None)
+        }
+        Some(crate::profile::ProxySetting::Address(address)) => {
+            match HttpProxyConfig::parse(address) {
+                Ok(config) => {
+                    eprintln!("render-browser proxy: saved HTTP proxy applied");
+                    HttpTransport::with_http_proxy(FetchConfig::default(), Some(config))
+                }
+                Err(error) => {
+                    eprintln!(
+                        "render-browser saved proxy is invalid ({error}); using a direct connection"
+                    );
+                    HttpTransport::with_http_proxy(FetchConfig::default(), None)
+                }
+            }
+        }
+    };
+    let network = NetworkWorker::start(transport).map_err(|error| error.to_string())?;
     let render_worker = start_render_worker(Arc::clone(&fonts), event_loop.create_proxy())
         .map_err(|error| error.to_string())?;
-    let mut app = BrowserApp::new(initial, fonts, network, render_worker);
+    let mut app = BrowserApp::new(initial, fonts, network, render_worker, proxy);
     if let Some((path, delay)) = launch.screenshot {
         app.schedule_screenshot(path, delay);
     }

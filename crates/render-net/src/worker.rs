@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use crate::diagnostics::FetchPhase;
 use crate::{
-    BatchOptions, CancelToken, FetchError, FetchRequest, FetchResult, HttpTransport, Origin,
+    BatchOptions, CancelToken, FetchError, FetchRequest, FetchResult, HttpProxyConfig,
+    HttpTransport, Origin,
 };
 
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -238,6 +239,9 @@ impl Default for NetworkWorkerConfig {
 #[derive(Clone, Debug)]
 pub struct NetworkWorker {
     events: SyncSender<Event>,
+    /// The same transport handle the worker threads use. Keeping it here lets
+    /// the UI replace the proxy without restarting the pool.
+    transport: Arc<HttpTransport>,
 }
 
 impl NetworkWorker {
@@ -317,7 +321,16 @@ impl NetworkWorker {
             }
         }
 
-        Ok(Self { events })
+        Ok(Self { events, transport })
+    }
+
+    /// Replaces the proxy used by subsequent requests.
+    ///
+    /// In-flight transfers keep the connection they started with; the worker
+    /// pool and its queue are untouched, so applying a setting does not abort a
+    /// page load.
+    pub fn set_http_proxy(&self, proxy: Option<HttpProxyConfig>) {
+        self.transport.set_http_proxy(proxy);
     }
 
     /// Queues one GET and immediately returns its typed result handle.

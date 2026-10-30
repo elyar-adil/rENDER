@@ -40,7 +40,9 @@ use crate::page_state::PendingImages;
 use crate::page_state::PendingScripts;
 use crate::page_state::PendingStyleSheets;
 use crate::profile::ProfileCookies;
+use crate::profile::ProfileProxy;
 use crate::profile::ProfileStorage;
+use crate::profile::ProxySetting;
 use crate::profile::profile_directory;
 use crate::render_worker::FullPageRenderPayload;
 use crate::render_worker::PageRenderFrame;
@@ -95,7 +97,11 @@ use render_browser::scripts::ScriptFetchPlan;
 use render_browser::scripts::plan_unstarted_classic_scripts;
 use render_browser::scripts::prepare_script_batch;
 use render_browser::settings::CacheClearUiState;
+use render_browser::settings::HTTP_PROXY_INPUT_ID;
+use render_browser::settings::ProxyFeedbackKind;
+use render_browser::settings::ProxyUiState;
 use render_browser::settings::is_trusted_clear_http_cache_action;
+use render_browser::settings::is_trusted_save_http_proxy_action;
 use render_browser::worker::CompletedRender;
 use render_browser::worker::RenderIdentity;
 use render_browser::worker::RenderJob;
@@ -122,7 +128,10 @@ use render_net::FetchRequest;
 use render_net::FetchResponse;
 use render_net::FetchResult;
 use render_net::HttpMethod;
+use render_net::HttpProxyConfig;
 use render_net::NetworkWorker;
+use render_net::ProxyConfigError;
+use render_net::ProxyConfigErrorKind;
 use render_net::Url;
 use softbuffer::Context;
 use std::collections::HashMap;
@@ -177,6 +186,13 @@ pub(super) struct PendingPageFetch {
     stage: PageFetchStage,
 }
 
+/// A privileged action on the built-in settings page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SettingsAction {
+    ClearHttpCache,
+    SaveHttpProxy,
+}
+
 /// What a page transfer does when the request it is waiting on completes.
 pub(super) enum PageFetchStage {
     /// The response answers the page. For a cross-origin request, `origin` is
@@ -218,6 +234,9 @@ pub(super) struct BrowserApp {
     pub(super) disk_cache: Option<DiskCacheWorker>,
     pub(super) pending_disk_clear: Option<DiskCacheOperationId>,
     pub(super) cache_clear_state: CacheClearUiState,
+    /// The persisted proxy choice and the settings page's presentation state.
+    pub(super) proxy: ProfileProxy,
+    pub(super) proxy_ui: ProxyUiState,
     pub(super) editor: AddressEditor,
     pub(super) content_editor: Option<ContentTextEditor>,
     pub(super) clipboard: NativeClipboard,
@@ -259,16 +278,38 @@ pub(super) struct BrowserApp {
     pub(super) started_at: Instant,
 }
 
+/// Maps the transport's proxy parse error to text for the settings page.
+fn proxy_error_message(error: &ProxyConfigError) -> String {
+    match error.kind() {
+        ProxyConfigErrorKind::Empty => {
+            "请输入代理地址，例如 http://127.0.0.1:8080；留空保存会关闭代理。".to_owned()
+        }
+        ProxyConfigErrorKind::InvalidUrl => {
+            "代理地址格式无效，请输入 host:port 或 http://host:port。".to_owned()
+        }
+        ProxyConfigErrorKind::UnsupportedScheme => "仅支持 HTTP 代理（http://）。".to_owned(),
+        ProxyConfigErrorKind::MissingHost => "代理地址缺少主机名。".to_owned(),
+        ProxyConfigErrorKind::UnexpectedPath => "代理地址不能包含路径、查询或片段。".to_owned(),
+        ProxyConfigErrorKind::InvalidProxy => format!("代理地址无效：{}", error.message()),
+    }
+}
+
 impl BrowserApp {
     pub(super) fn new(
         initial: PageSource,
         fonts: Arc<SystemFontBackend>,
         network: NetworkWorker,
         render_worker: PageRenderWorker,
+        proxy: ProfileProxy,
     ) -> Self {
         let tabs = TabModel::new(initial.title.clone(), initial.target.display_address());
         let active = tabs.active_id();
         let editor = AddressEditor::new(initial.target.display_address());
+        let proxy_ui = match proxy.setting() {
+            Some(ProxySetting::Address(address)) => ProxyUiState::new(Some(address.clone())),
+            Some(ProxySetting::Direct) => ProxyUiState::direct(),
+            None => ProxyUiState::new(None),
+        };
         let disk_cache = match render_browser::cache::disk::DiskCacheConfig::from_environment() {
             Ok(config) => match DiskCacheWorker::start(config) {
                 Ok(worker) => Some(worker),
@@ -298,6 +339,8 @@ impl BrowserApp {
             disk_cache,
             pending_disk_clear: None,
             cache_clear_state: CacheClearUiState::Ready,
+            proxy,
+            proxy_ui,
             editor,
             content_editor: None,
             clipboard: NativeClipboard::default(),
@@ -1629,7 +1672,11 @@ impl BrowserApp {
         match target {
             NavigationTarget::Home => self.install_source(id, home_source(), false),
             NavigationTarget::Settings => {
-                self.install_source(id, settings_source(self.cache_clear_state), false);
+                self.install_source(
+                    id,
+                    settings_source(self.cache_clear_state, &self.proxy_ui),
+                    false,
+                );
             }
             NavigationTarget::Url(url) if matches!(url.scheme(), "http" | "https" | "data") => {
                 self.start_network_navigation(id, url);
@@ -3359,7 +3406,7 @@ impl BrowserApp {
         // `:active` is the element the primary button went down on, plus its
         // ancestors, and lasts until the release.
         self.set_content_active(hit_node);
-        if self.press_cache_clear_control(id, hit_node) {
+        if self.press_settings_control(id, hit_node) {
             return;
         }
         let editable = hit_node.and_then(|node| {
@@ -3471,15 +3518,22 @@ impl BrowserApp {
         self.perform_content_navigation(id, navigation);
     }
 
-    fn press_cache_clear_control(
+    fn press_settings_control(
         &mut self,
         id: TabId,
         hit_node: Option<render_core::dom::NodeId>,
     ) -> bool {
-        if !self.is_cache_clear_control(id, hit_node) {
+        let Some(action) = self.settings_action(id, hit_node) else {
             return false;
+        };
+        // The save action rebuilds the settings document. Close the page text
+        // editor first so it cannot keep a stale node id for the replaced
+        // proxy field.
+        self.close_content_editor();
+        match action {
+            SettingsAction::ClearHttpCache => self.clear_http_cache(),
+            SettingsAction::SaveHttpProxy => self.save_http_proxy_setting(id),
         }
-        self.clear_http_cache();
         self.set_content_focus(
             self.content_focus_target(id, hit_node),
             FocusSource::Pointer,
@@ -3488,32 +3542,82 @@ impl BrowserApp {
         true
     }
 
-    pub(super) fn is_cache_clear_control(
+    /// The privileged action under `hit_node`, if the tab shows the trusted
+    /// settings document. The walk covers an inner span inside a control as
+    /// well as the control itself.
+    pub(super) fn settings_action(
         &self,
         id: TabId,
         hit_node: Option<render_core::dom::NodeId>,
-    ) -> bool {
-        let Some(mut node) = hit_node else {
-            return false;
-        };
-        let Some(page) = self.pages.get(&id) else {
-            return false;
-        };
+    ) -> Option<SettingsAction> {
+        let mut node = hit_node?;
+        let page = self.pages.get(&id)?;
         if page.navigation.committed().target != NavigationTarget::Settings {
-            return false;
+            return None;
         }
         let dom = page.page.document().dom();
         loop {
             let element_id = dom.attribute(node, "id").ok().flatten();
             let action = dom.attribute(node, "data-render-action").ok().flatten();
             if is_trusted_clear_http_cache_action(true, element_id, action) {
-                return true;
+                return Some(SettingsAction::ClearHttpCache);
             }
-            let Some(parent) = dom.parent(node) else {
-                return false;
-            };
-            node = parent;
+            if is_trusted_save_http_proxy_action(true, element_id, action) {
+                return Some(SettingsAction::SaveHttpProxy);
+            }
+            node = dom.parent(node)?;
         }
+    }
+
+    /// Reads the proxy field from the trusted settings document.
+    fn settings_proxy_input(&self, id: TabId) -> Option<String> {
+        let page = self.pages.get(&id)?;
+        let dom = page.page.document().dom();
+        let mut stack = vec![dom.document()];
+        while let Some(node) = stack.pop() {
+            if dom.attribute(node, "id").ok().flatten() == Some(HTTP_PROXY_INPUT_ID) {
+                return self.content_text_input_value(id, node);
+            }
+            stack.extend(dom.children(node).unwrap_or_default().iter().rev().copied());
+        }
+        None
+    }
+
+    /// Applies the field's proxy address to the live transport and persists the
+    /// choice. An empty field means an explicit direct connection.
+    pub(super) fn save_http_proxy_setting(&mut self, id: TabId) {
+        let input = self.settings_proxy_input(id).unwrap_or_default();
+        let trimmed = input.trim();
+        let result = if trimmed.is_empty() {
+            Ok(None)
+        } else {
+            HttpProxyConfig::parse(trimmed).map(Some)
+        };
+        match result {
+            Ok(config) => {
+                let address = config.as_ref().map(|config| config.address().to_owned());
+                self.network.set_http_proxy(config);
+                let saved = self.proxy.save(address.as_deref());
+                self.proxy_ui = ProxyUiState::saved(address);
+                if let Err(error) = saved {
+                    eprintln!("render-browser proxy setting not saved: {error}");
+                    if let Some(feedback) = self.proxy_ui.feedback.as_mut() {
+                        feedback.kind = ProxyFeedbackKind::Error;
+                        feedback.message = format!("代理已应用，但无法保存到配置目录：{error}");
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("render-browser rejected proxy address: {error}");
+                let mut state = ProxyUiState::invalid(input, proxy_error_message(&error));
+                // The previous proxy (if any) stays in effect after a rejected
+                // save, so keep showing it as the active choice.
+                state.address.clone_from(&self.proxy_ui.address);
+                state.direct = self.proxy_ui.direct;
+                self.proxy_ui = state;
+            }
+        }
+        self.refresh_settings_pages();
     }
 
     pub(super) fn clear_http_cache(&mut self) {
@@ -3621,7 +3725,11 @@ impl BrowserApp {
             })
             .collect::<Vec<_>>();
         for id in settings_tabs {
-            self.install_source(id, settings_source(self.cache_clear_state), false);
+            self.install_source(
+                id,
+                settings_source(self.cache_clear_state, &self.proxy_ui),
+                false,
+            );
         }
     }
 

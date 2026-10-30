@@ -4,6 +4,7 @@ use render_browser::home::HOME_HTML;
 use render_browser::home::HOME_TITLE;
 use render_browser::navigation::NavigationTarget;
 use render_browser::settings::CacheClearUiState;
+use render_browser::settings::ProxyUiState;
 use render_browser::settings::SETTINGS_TITLE;
 use render_browser::settings::settings_html;
 use render_core::html::HtmlDecodeOptions;
@@ -121,9 +122,9 @@ pub(super) fn home_source() -> PageSource {
     }
 }
 
-pub(super) fn settings_source(state: CacheClearUiState) -> PageSource {
+pub(super) fn settings_source(state: CacheClearUiState, proxy: &ProxyUiState) -> PageSource {
     PageSource {
-        html: settings_html(state),
+        html: settings_html(state, proxy),
         title: SETTINGS_TITLE.to_owned(),
         target: NavigationTarget::Settings,
     }

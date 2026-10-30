@@ -1645,6 +1645,129 @@ fn dynamic_stylesheet_merge_rekeys_a_replaced_link_by_url() {
     assert!(merged.get(&current.resources[0].key).is_some());
 }
 
+#[test]
+fn saving_the_settings_proxy_validates_applies_and_persists() {
+    let directory = std::env::temp_dir().join(format!(
+        "render-browser-proxy-settings-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    let (mut app, tab) = headless_app_with("<p>placeholder</p>");
+    app.proxy = crate::profile::ProfileProxy::open(Some(directory.clone()));
+    app.proxy_ui = render_browser::settings::ProxyUiState::new(None);
+    app.navigate_target(tab, NavigationTarget::Settings, HistoryMode::Current);
+    let save_button = find_id(
+        app.pages[&tab].page.document().dom(),
+        render_browser::settings::SAVE_HTTP_PROXY_BUTTON_ID,
+    );
+    assert!(
+        app.settings_action(tab, Some(save_button)).is_some(),
+        "the trusted settings document exposes the save action"
+    );
+
+    let set_input = |app: &mut BrowserApp, value: &str| {
+        let node = find_id(
+            app.pages[&tab].page.document().dom(),
+            render_browser::settings::HTTP_PROXY_INPUT_ID,
+        );
+        app.pages
+            .get_mut(&tab)
+            .expect("settings page")
+            .page
+            .document_mut()
+            .dom_mut()
+            .set_attribute(node, "value", value)
+            .expect("proxy field accepts a value");
+    };
+
+    set_input(&mut app, "127.0.0.1:8899");
+    app.save_http_proxy_setting(tab);
+    assert_eq!(
+        app.proxy_ui.address.as_deref(),
+        Some("http://127.0.0.1:8899")
+    );
+    assert_eq!(
+        app.proxy.setting(),
+        Some(&crate::profile::ProxySetting::Address(
+            "http://127.0.0.1:8899".to_owned()
+        ))
+    );
+    assert!(
+        directory.join("proxy.txt").is_file(),
+        "the choice is persisted for the next launch"
+    );
+
+    // The saved value reaches the live transport: a request submitted after
+    // the save must go through the proxy. The counting listener drops the
+    // connection, so the fetch itself is expected to fail.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test proxy");
+    let proxy_address = listener.local_addr().expect("proxy address");
+    let proxy_hits = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&proxy_hits);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            counted.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    set_input(&mut app, &proxy_address.to_string());
+    app.save_http_proxy_setting(tab);
+    let request = FetchRequest::get(
+        Url::parse("http://example.test/proxy-check").expect("proxied request URL"),
+    );
+    let _ = app
+        .network
+        .submit(request)
+        .recv_timeout(Duration::from_secs(10));
+    assert!(
+        proxy_hits.load(Ordering::SeqCst) >= 1,
+        "a request submitted after saving the setting goes through the proxy"
+    );
+
+    // A rejected save keeps the draft, shows an error, and leaves the previous
+    // proxy in effect.
+    set_input(&mut app, "socks5://127.0.0.1:1080");
+    app.save_http_proxy_setting(tab);
+    assert_eq!(app.proxy_ui.input, "socks5://127.0.0.1:1080");
+    assert_eq!(
+        app.proxy_ui.feedback.as_ref().map(|feedback| feedback.kind),
+        Some(render_browser::settings::ProxyFeedbackKind::Error)
+    );
+    assert_eq!(
+        app.proxy_ui.address.as_deref(),
+        Some(format!("http://{proxy_address}").as_str())
+    );
+
+    // Empty input is the explicit direct mode, which must survive a restart
+    // instead of silently inheriting an environment proxy.
+    set_input(&mut app, "");
+    app.save_http_proxy_setting(tab);
+    assert_eq!(app.proxy_ui.address, None);
+    assert!(app.proxy_ui.direct);
+    assert_eq!(
+        app.proxy.setting(),
+        Some(&crate::profile::ProxySetting::Direct)
+    );
+    let reopened = crate::profile::ProfileProxy::open(Some(directory.clone()));
+    assert_eq!(
+        reopened.setting(),
+        Some(&crate::profile::ProxySetting::Direct)
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn a_remote_document_cannot_copy_a_settings_action() {
+    let (app, tab) = headless_app_with(
+        "<button id=save-http-proxy data-render-action=save-http-proxy>save</button>",
+    );
+    let button = find_id(app.pages[&tab].page.document().dom(), "save-http-proxy");
+    assert!(
+        app.settings_action(tab, Some(button)).is_none(),
+        "the action marker is inert outside the built-in settings target"
+    );
+}
+
 /// A 200 `text/javascript` response for the plan's single external script.
 fn script_response(
     plan: &render_browser::scripts::ScriptFetchPlan,
@@ -1894,6 +2017,8 @@ fn headless_app_with_render_worker(
         disk_cache: None,
         pending_disk_clear: None,
         cache_clear_state: CacheClearUiState::Ready,
+        proxy: crate::profile::ProfileProxy::open(None),
+        proxy_ui: render_browser::settings::ProxyUiState::new(None),
         editor: AddressEditor::new("file:///rENDER-test-fixtures/page.html"),
         content_editor: None,
         clipboard: render_browser::editor::NativeClipboard::default(),

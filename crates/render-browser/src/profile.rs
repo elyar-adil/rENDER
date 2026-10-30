@@ -17,6 +17,8 @@ use render_net::Url;
 use render_net::{CookieIssue, CookieJar, FetchRequest, FetchResponse};
 
 const COOKIE_FILE: &str = "cookies.txt";
+const PROXY_FILE: &str = "proxy.txt";
+const PROXY_HEADER: &str = "# rENDER proxy v1";
 const STORAGE_FILE: &str = "local-storage.txt";
 const STORAGE_HEADER: &str = "# rENDER local storage v1";
 const INDEXED_DB_FILE: &str = "indexed-db.txt";
@@ -122,6 +124,79 @@ impl Drop for ProfileCookies {
     /// Last chance to keep sign-ins made since the previous turn.
     fn drop(&mut self) {
         self.flush_if_dirty();
+    }
+}
+
+/// The browser's saved proxy choice.
+///
+/// Three states matter: no saved choice (follow the environment and system
+/// proxy at startup), an explicit HTTP proxy, or an explicit direct connection.
+/// The last one is distinct from the first, because a user who turns the proxy
+/// off must not silently inherit `HTTPS_PROXY` on the next launch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum ProxySetting {
+    Direct,
+    Address(String),
+}
+
+pub(super) struct ProfileProxy {
+    path: Option<PathBuf>,
+    setting: Option<ProxySetting>,
+}
+
+impl ProfileProxy {
+    /// Open the proxy store in `directory`. A missing file means no choice has
+    /// been saved yet; a damaged file is ignored with a diagnostic.
+    pub(super) fn open(directory: Option<PathBuf>) -> Self {
+        let path = directory.map(|directory| directory.join(PROXY_FILE));
+        let mut setting = None;
+        if let Some(path) = &path {
+            match fs::read_to_string(path) {
+                Ok(text) => setting = parse_proxy_text(&text),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => eprintln!("render-browser proxy setting not loaded: {error}"),
+            }
+        }
+        Self { path, setting }
+    }
+
+    pub(super) fn setting(&self) -> Option<&ProxySetting> {
+        self.setting.as_ref()
+    }
+
+    /// The saved proxy address, or `None` for direct/unset.
+    #[cfg(test)]
+    fn address(&self) -> Option<&str> {
+        match self.setting.as_ref() {
+            Some(ProxySetting::Address(address)) => Some(address),
+            Some(ProxySetting::Direct) | None => None,
+        }
+    }
+
+    /// Store the choice and write it to disk. The in-memory choice changes even
+    /// when writing fails, so the setting still applies to this session.
+    pub(super) fn save(&mut self, address: Option<&str>) -> io::Result<()> {
+        self.setting = Some(address.map_or(ProxySetting::Direct, |address| {
+            ProxySetting::Address(address.to_owned())
+        }));
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let value = address.unwrap_or("direct");
+        let text = format!("{PROXY_HEADER}\n{value}\n");
+        write_store(path, &text)
+    }
+}
+
+fn parse_proxy_text(text: &str) -> Option<ProxySetting> {
+    let mut lines = text.lines();
+    if lines.next() != Some(PROXY_HEADER) {
+        return None;
+    }
+    match lines.next().map(str::trim) {
+        Some("direct") => Some(ProxySetting::Direct),
+        Some(address) if !address.is_empty() => Some(ProxySetting::Address(address.to_owned())),
+        _ => None,
     }
 }
 
@@ -474,7 +549,8 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        COOKIE_FILE, MAX_ORIGIN_STORAGE_BYTES, ProfileCookies, ProfileStorage, STORAGE_FILE,
+        COOKIE_FILE, MAX_ORIGIN_STORAGE_BYTES, PROXY_FILE, ProfileCookies, ProfileProxy,
+        ProfileStorage, ProxySetting, STORAGE_FILE,
     };
     use render_net::{
         CancelToken, FetchConfig, FetchRequest, FetchResponse, Header, HttpTransport, Url,
@@ -510,6 +586,44 @@ mod tests {
         cookies
             .decorate_request(FetchRequest::get(Url::parse(url).expect("request URL")))
             .cookie
+    }
+
+    #[test]
+    fn a_saved_proxy_survives_reopening_and_can_be_disabled_explicitly() {
+        let directory = scratch_directory("proxy");
+        let mut first = ProfileProxy::open(Some(directory.clone()));
+        assert_eq!(first.setting(), None);
+
+        first
+            .save(Some("http://127.0.0.1:8080"))
+            .expect("proxy saved");
+        drop(first);
+        assert!(directory.join(PROXY_FILE).is_file());
+
+        let reopened = ProfileProxy::open(Some(directory.clone()));
+        assert_eq!(
+            reopened.setting(),
+            Some(&ProxySetting::Address("http://127.0.0.1:8080".to_owned()))
+        );
+
+        let mut reopened = reopened;
+        reopened.save(None).expect("proxy disabled");
+        drop(reopened);
+        let direct = ProfileProxy::open(Some(directory.clone()));
+        assert_eq!(direct.setting(), Some(&ProxySetting::Direct));
+        assert_eq!(direct.address(), None);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_damaged_proxy_file_is_ignored() {
+        let directory = scratch_directory("proxy-damaged");
+        std::fs::create_dir_all(&directory).expect("scratch directory");
+        std::fs::write(directory.join(PROXY_FILE), "not a proxy store\n").expect("damaged file");
+
+        let store = ProfileProxy::open(Some(directory.clone()));
+        assert_eq!(store.setting(), None);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

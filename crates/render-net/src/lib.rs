@@ -36,7 +36,8 @@ pub use cookie::{Cookie, CookieIssue, CookieJar, CookieLimits, CookieRejection, 
 pub use diagnostics::{FetchEvent, FetchObserver, FetchPhase, NullObserver, StderrObserver};
 pub use transport::{
     ByteRange, CacheValidators, CancelToken, ContentType, FetchConfig, FetchError, FetchRequest,
-    FetchResponse, FetchResult, Header, HttpMethod, HttpStatus, HttpTransport, RedirectResponse,
+    FetchResponse, FetchResult, Header, HttpMethod, HttpProxyConfig, HttpStatus, HttpTransport,
+    ProxyConfigError, ProxyConfigErrorKind, RedirectResponse,
 };
 pub use worker::{NetworkWorker, NetworkWorkerConfig, RequestHandle, queue_full_message};
 

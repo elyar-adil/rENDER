@@ -1,3 +1,91 @@
+# 交接文档 (2026-10-31, 续四十五) — 设置页 HTTP 代理 + GitHub 样式性能
+
+## 设置页 HTTP 代理
+
+`render://settings` / `about:settings` 现在包含“HTTP 代理”区:
+
+- 输入框 `http-proxy-address`,支持 `host:port` 与 `http://host:port`。
+- 保存按钮 `save-http-proxy`,只在受信设置文档上生效;远程页面复制
+  `data-render-action` 不会获得权限。
+- 保存后立即替换 `NetworkWorker` 底层 `HttpTransport` 的 agent;正在进行的
+  请求保持旧连接,不中断加载。
+- 留空保存是显式“直接连接”,重启后也不会重新继承 `HTTPS_PROXY`。
+- 选择持久化到 profile 的 `proxy.txt`(原子写,Unix 0600);损坏文件会被忽略。
+- 设置页对代理值、状态和错误信息做 HTML 转义;错误保存保留用户草稿。
+
+代理地址仍没有写进任何 tracked code。启动时只读取 profile 里的用户输入:
+
+```
+proxy.txt:
+# rENDER proxy v1
+http://127.0.0.1:8080
+# 或 direct
+```
+
+## GitHub 性能
+
+真实 GitHub 代理抓取使用 28 个 CSS、38,396 条规则。优化前后同页样式帧:
+
+| 阶段 | 优化前 | 优化后 |
+|---|---:|---:|
+| cascade | 54.48s | 3.58s |
+| layout | 15.41s | 0.027s |
+| raster | 1.98s | 2.1s |
+| 样式帧总耗时 | ~72s | ~5.7s |
+
+关键改动:
+
+- 选择器右端 compound 的 id/class/type/attribute key 建立规则桶;`universal`
+  桶从 1,851 条降到 823 条(含伪元素上下文拆分)。
+- 按 `::before`/`::after` 上下文分桶,普通元素不再遍历纯伪元素规则。
+- `ComputedStyle` 的 properties/typed/custom 表改为 `Arc` 共享;flex
+  intrinsic sizing 的样式拷贝从深拷贝变成引用计数。
+- 初始值改为共享 `InitialValues`;未声明且未继承的属性不再复制到每个元素。
+- 未声明自定义属性时直接共享父级已解析的 custom-property map;`var()` 通过
+  父级 map 回退解析,不再逐元素复制并重新解析全部变量。
+- 继承属性未变化时直接复制父级的值和 typed 值,避免重复 tokenize/parse。
+- flex intrinsic size 增加每次 layout 内的 memoize(GitHub: 425 hits / 7,870 misses)。
+- CSS animation 无 `animation-name` 时提前返回,避免主线程每帧解析全部动画属性。
+
+环境变量 `RENDER_DEBUG_CSS_INDEX=1` 可输出规则索引/候选/匹配/子阶段耗时;
+`RENDER_DEBUG_FLEX_CACHE=1` 可输出 flex 缓存命中;生产路径不执行计时。
+
+## 验收
+
+```
+cargo test --workspace                       2852 passed, 0 failed
+real_site_tasks                              66 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+```
+
+隐藏窗口截图:
+
+```
+GitHub (proxy): ready=Complete dom_elements=2124 boxes=1580
+                css_warnings=149 scripts_threw=4 images_failed=0
+HN (proxy):     ready=Complete dom_elements=811 boxes=333
+Bing:           ready=Complete dom_elements=474 boxes=166 css_warnings=13
+Baidu:          ready=Complete dom_elements=450 boxes=156 css_warnings=5
+JD:             ready=Interactive dom_elements=1015 boxes=117
+                scripts_failed=12 css_warnings=36
+```
+
+设置页截图确认代理输入、保存按钮、状态行和缓存区正常排版。
+
+## 仍未完成
+
+- GitHub 样式帧已能在 ~3.6s 内完成,但视觉上仍缺主内容区。主要缺口是
+  `@container`(60+20+2 条规则)、`@position-try`、`@property` 和部分
+  cascade layer 语法未求值;不是性能问题。
+- JD 主商品区仍受站点 403/风控,需要受信任登录态或住宅网络。
+- 代理 UI 目前只支持 HTTP CONNECT 代理,不支持 SOCKS/HTTPS 代理、PAC、
+  按站点例外列表或代理认证的独立管理界面(带 userinfo 的 HTTP 代理可用)。
+- `ComputedStyle` 的 Arc 化移除了 `properties()` 借用整个 map 的公开访问,
+  改为 `get`/`property_names`/`property_count`;仓库内调用点已更新。
+
+---
+
 # 交接文档 (2026-10-31, 续四十四) — 并行子任务与代理验证
 
 这一轮用 4 个独立 worktree/subagent 并行推进,随后逐个审查、cherry-pick 回主树。
@@ -14,12 +102,12 @@
 
 ## 代理验证（不写入代码）
 
-用户提供 `proxy.nioint.com:8080`,仅通过环境变量测试:
+用户提供 `<test-proxy>:8080`,仅通过环境变量测试:
 
 ```
-HTTPS_PROXY=http://proxy.nioint.com:8080
-HTTP_PROXY=http://proxy.nioint.com:8080
-ALL_PROXY=http://proxy.nioint.com:8080
+HTTPS_PROXY=http://<test-proxy>:8080
+HTTP_PROXY=http://<test-proxy>:8080
+ALL_PROXY=http://<test-proxy>:8080
 ```
 
 Curl:

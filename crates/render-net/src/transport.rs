@@ -1,7 +1,7 @@
 use std::fmt;
 use std::io::Read;
 use std::sync::{
-    Arc,
+    Arc, RwLock,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -768,11 +768,131 @@ pub struct RedirectResponse {
     pub headers: Vec<Header>,
 }
 
-/// Cloneable blocking HTTP transport. Call this on a network thread, or use
-/// [`crate::NetworkWorker`] from GUI/event-loop code.
-#[derive(Clone)]
-pub struct HttpTransport {
-    config: Arc<FetchConfig>,
+/// Why an explicit HTTP proxy address was rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProxyConfigErrorKind {
+    /// The input was empty or only whitespace.
+    Empty,
+    /// The input could not be parsed as a URL.
+    InvalidUrl,
+    /// The scheme was present but is not `http`.
+    UnsupportedScheme,
+    /// The URL has no host.
+    MissingHost,
+    /// The URL carries a path, query or fragment that a proxy address cannot use.
+    UnexpectedPath,
+    /// `ureq` rejected the address (for example an invalid port).
+    InvalidProxy,
+}
+
+/// A rejected proxy address.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProxyConfigError {
+    kind: ProxyConfigErrorKind,
+    message: String,
+}
+
+impl ProxyConfigError {
+    fn new(kind: ProxyConfigErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> ProxyConfigErrorKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for ProxyConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProxyConfigError {}
+
+/// A validated explicit HTTP proxy.
+///
+/// The browser keeps the canonical address for its settings UI and hands the
+/// transport the pre-parsed `ureq` proxy. Constructing one here means an
+/// invalid address is rejected before it can reach a request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HttpProxyConfig {
+    address: String,
+    proxy: ureq::Proxy,
+}
+
+impl HttpProxyConfig {
+    /// Parses `host:port` or `http://host:port`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProxyConfigError`] for an empty address, an unsupported
+    /// scheme, a missing host, trailing path/query/fragment components, or an
+    /// address `ureq` cannot use.
+    pub fn parse(input: &str) -> Result<Self, ProxyConfigError> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Err(ProxyConfigError::new(
+                ProxyConfigErrorKind::Empty,
+                "proxy address is empty",
+            ));
+        }
+        let normalized = if trimmed.contains("://") {
+            trimmed.to_owned()
+        } else {
+            format!("http://{trimmed}")
+        };
+        let url = Url::parse(&normalized).map_err(|error| {
+            ProxyConfigError::new(
+                ProxyConfigErrorKind::InvalidUrl,
+                format!("invalid proxy URL: {error}"),
+            )
+        })?;
+        if url.scheme() != "http" {
+            return Err(ProxyConfigError::new(
+                ProxyConfigErrorKind::UnsupportedScheme,
+                format!("unsupported proxy scheme {:?}", url.scheme()),
+            ));
+        }
+        if url.host_str().is_none() {
+            return Err(ProxyConfigError::new(
+                ProxyConfigErrorKind::MissingHost,
+                "proxy URL has no host",
+            ));
+        }
+        if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+            return Err(ProxyConfigError::new(
+                ProxyConfigErrorKind::UnexpectedPath,
+                "proxy address must not contain a path, query or fragment",
+            ));
+        }
+        let address = normalized.trim_end_matches('/').to_owned();
+        let proxy = ureq::Proxy::new(&address).map_err(|error| {
+            ProxyConfigError::new(
+                ProxyConfigErrorKind::InvalidProxy,
+                format!("invalid proxy address: {error}"),
+            )
+        })?;
+        Ok(Self { address, proxy })
+    }
+
+    /// The canonical address shown in settings and persisted to the profile.
+    #[must_use]
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+}
+
+struct TransportAgent {
     agent: ureq::Agent,
     /// Whether the proxy in use was resolved implicitly from the environment or
     /// the platform, rather than handed in by a caller. See
@@ -780,12 +900,24 @@ pub struct HttpTransport {
     implicit_proxy: bool,
 }
 
+/// Cloneable blocking HTTP transport. Call this on a network thread, or use
+/// [`crate::NetworkWorker`] from GUI/event-loop code.
+///
+/// The agent is behind a lock so an explicit proxy chosen at runtime can be
+/// applied without restarting the worker pool or cancelling requests already in
+/// flight: each fetch snapshots the agent it starts with, and only later fetches
+/// see the new proxy.
+#[derive(Clone)]
+pub struct HttpTransport {
+    config: Arc<FetchConfig>,
+    agent: Arc<RwLock<TransportAgent>>,
+}
+
 impl fmt::Debug for HttpTransport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("HttpTransport")
             .field("config", &self.config)
-            .field("implicit_proxy", &self.implicit_proxy)
             .finish_non_exhaustive()
     }
 }
@@ -795,6 +927,92 @@ impl fmt::Debug for HttpTransport {
 enum HopProxy {
     Inherit,
     Direct,
+}
+
+/// Whether this hop inherits the transport's proxy or bypasses it.
+///
+/// An implicitly resolved proxy must not capture loopback targets; an
+/// explicitly configured one always applies.
+fn hop_proxy(implicit_proxy: bool, url: &Url) -> HopProxy {
+    if implicit_proxy && is_loopback_target(url) {
+        HopProxy::Direct
+    } else {
+        HopProxy::Inherit
+    }
+}
+
+fn build_agent(config: &FetchConfig, proxy: Option<ureq::Proxy>) -> ureq::Agent {
+    let connect_timeout = config.effective_connect_timeout();
+    let response_timeout = config.effective_response_timeout();
+    let body_idle_timeout = config.effective_body_idle_timeout();
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        // Redirects are handled here so intermediate response headers are
+        // available to the browser cookie jar.
+        .max_redirects(0)
+        .max_redirects_will_error(true)
+        .max_response_header_size(config.max_header_bytes)
+        // ---- Phase budgets. Three separate bounds, three separate jobs. ----
+        //
+        // There is deliberately no end-to-end wall clock
+        // (`timeout_global`/`timeout_per_call`): a large stylesheet corpus
+        // over a slow link outlives any total budget, and a total budget
+        // fails the transfers that matter most.
+        .timeout_global(None)
+        .timeout_resolve(Some(config.timeout))
+        // Connect: the TCP connect, the per-address fallback walk, and (for
+        // `https`) the TLS handshake on the socket that connected. Own
+        // budget because one black-holed address must not cost a whole
+        // request; see `FetchConfig::connect_timeout`.
+        .timeout_connect(Some(connect_timeout))
+        // Response: the wait for the status line and headers. ureq has no
+        // dedicated knob for this, and `Timeout::RecvResponse`'s deadline is
+        // re-derived from the recorded *send* time, so the send budget is
+        // what actually bounds it. Both send budgets take the same value so
+        // a bodyless request and a body-carrying one are bounded identically
+        // before and after their write completes; `fetch_transfer` then
+        // names the phase. See `FetchConfig::response_timeout`.
+        .timeout_send_request(Some(response_timeout))
+        .timeout_send_body(Some(response_timeout))
+        // `timeout_recv_response` stays `None` on purpose, and this is the
+        // one non-obvious knob in the whole agent. It is NOT symmetric with
+        // `timeout_recv_body`: `CallTimings::next_timeout` derives
+        // `RecvBody`'s deadline from *now* on every read (so it is an
+        // idle-read bound), but derives `RecvResponse`'s from the instant
+        // the headers completed (so it is a total budget covering headers
+        // *and* the entire body). Setting it would therefore cap total body
+        // time and fail every large download, which is the exact confusion
+        // this layout exists to avoid. The header wait is bounded above
+        // instead.
+        .timeout_recv_response(None)
+        // Body: an idle-read bound, and the only body budget that is safe
+        // to push all the way down to the socket. Setting it here means a
+        // stalled body read fails inside ureq as
+        // `Error::Timeout(RecvBody)` - a real socket deadline, reported as
+        // `FetchPhase::BodyTransfer` - rather than only being noticed by
+        // `read_bounded_body` watching a channel while its pump thread
+        // stays blocked on a dead socket. `read_bounded_body` still applies
+        // the same bound independently, so the two must agree, and the
+        // pump's is the one that stays authoritative for cancellation and
+        // the minimum-progress floor.
+        .timeout_recv_body(Some(body_idle_timeout))
+        // ureq 3.3's Brotli reader can finish decoding before it drains
+        // the length-delimited wire body, so the connection never returns
+        // to its pool. Gzip keeps compression and reliably reuses the
+        // connection across the many same-origin assets on real pages.
+        .accept_encoding("gzip")
+        // The idle-connection ceilings, set here rather than left to ureq's
+        // defaults (10 total, 3 per host). A per-host default of 3 is below
+        // the per-origin concurrency this crate allows, so on a page that
+        // pulls many assets from one origin - the shape of every stylesheet
+        // corpus - every wave after the first reopens the connections the
+        // pool just discarded. See `FetchConfig::idle_connections_per_origin`.
+        .max_idle_connections(config.idle_connections_total)
+        .max_idle_connections_per_host(config.idle_connections_per_origin)
+        .user_agent(config.user_agent.clone())
+        .proxy(proxy)
+        .build()
+        .into()
 }
 
 impl HttpTransport {
@@ -823,102 +1041,80 @@ impl HttpTransport {
             );
         }
         let implicit_proxy = proxy.is_some();
-        HttpTransport {
-            implicit_proxy,
-            ..Self::with_proxy(config, proxy)
+        let agent = build_agent(&config, proxy);
+        Self {
+            config: Arc::new(config),
+            agent: Arc::new(RwLock::new(TransportAgent {
+                agent,
+                implicit_proxy,
+            })),
         }
+    }
+
+    /// Creates a transport with an explicit browser-configured HTTP proxy.
+    ///
+    /// Unlike a proxy inherited from the environment, an explicit proxy is
+    /// used for every target, including loopback addresses.
+    #[must_use]
+    pub fn with_http_proxy(config: FetchConfig, proxy: Option<HttpProxyConfig>) -> Self {
+        let agent = build_agent(&config, proxy.map(|proxy| proxy.proxy));
+        Self {
+            config: Arc::new(config),
+            agent: Arc::new(RwLock::new(TransportAgent {
+                agent,
+                implicit_proxy: false,
+            })),
+        }
+    }
+
+    /// Replaces the proxy used by subsequent requests.
+    ///
+    /// Requests already in flight keep the agent they started with, so saving a
+    /// proxy setting neither cancels a page load nor tears down its connections.
+    /// Passing `None` means direct connections; it does not re-read the
+    /// environment.
+    pub fn set_http_proxy(&self, proxy: Option<HttpProxyConfig>) {
+        let agent = build_agent(&self.config, proxy.map(|proxy| proxy.proxy));
+        let mut state = self
+            .agent
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.agent = agent;
+        state.implicit_proxy = false;
     }
 
     /// Creates a transport that routes every request through `proxy` when set.
     ///
     /// This is the injection point for callers with their own proxy policy;
     /// [`HttpTransport::new`] resolves the proxy from the environment and the
-    /// platform instead. **Both constructors funnel through this one function**,
-    /// so the proxy and non-proxy paths cannot drift apart in their phase
-    /// budgets: the only thing `new` adds is the `implicit_proxy` flag that
-    /// decides whether a loopback target bypasses the proxy.
+    /// platform instead. Both constructors use [`build_agent`], so the proxy and
+    /// non-proxy paths cannot drift apart in their phase budgets: the only
+    /// difference is the `implicit_proxy` flag that decides whether a loopback
+    /// target bypasses the proxy.
     #[must_use]
     pub fn with_proxy(config: FetchConfig, proxy: Option<ureq::Proxy>) -> Self {
-        let connect_timeout = config.effective_connect_timeout();
-        let response_timeout = config.effective_response_timeout();
-        let body_idle_timeout = config.effective_body_idle_timeout();
-        let agent_config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            // Redirects are handled here so intermediate response headers are
-            // available to the browser cookie jar.
-            .max_redirects(0)
-            .max_redirects_will_error(true)
-            .max_response_header_size(config.max_header_bytes)
-            // ---- Phase budgets. Three separate bounds, three separate jobs. ----
-            //
-            // There is deliberately no end-to-end wall clock
-            // (`timeout_global`/`timeout_per_call`): a large stylesheet corpus
-            // over a slow link outlives any total budget, and a total budget
-            // fails the transfers that matter most.
-            .timeout_global(None)
-            .timeout_resolve(Some(config.timeout))
-            // Connect: the TCP connect, the per-address fallback walk, and (for
-            // `https`) the TLS handshake on the socket that connected. Own
-            // budget because one black-holed address must not cost a whole
-            // request; see `FetchConfig::connect_timeout`.
-            .timeout_connect(Some(connect_timeout))
-            // Response: the wait for the status line and headers. ureq has no
-            // dedicated knob for this, and `Timeout::RecvResponse`'s deadline is
-            // re-derived from the recorded *send* time, so the send budget is
-            // what actually bounds it. Both send budgets take the same value so
-            // a bodyless request and a body-carrying one are bounded identically
-            // before and after their write completes; `fetch_transfer` then
-            // names the phase. See `FetchConfig::response_timeout`.
-            .timeout_send_request(Some(response_timeout))
-            .timeout_send_body(Some(response_timeout))
-            // `timeout_recv_response` stays `None` on purpose, and this is the
-            // one non-obvious knob in the whole agent. It is NOT symmetric with
-            // `timeout_recv_body`: `CallTimings::next_timeout` derives
-            // `RecvBody`'s deadline from *now* on every read (so it is an
-            // idle-read bound), but derives `RecvResponse`'s from the instant
-            // the headers completed (so it is a total budget covering headers
-            // *and* the entire body). Setting it would therefore cap total body
-            // time and fail every large download, which is the exact confusion
-            // this layout exists to avoid. The header wait is bounded above
-            // instead.
-            .timeout_recv_response(None)
-            // Body: an idle-read bound, and the only body budget that is safe
-            // to push all the way down to the socket. Setting it here means a
-            // stalled body read fails inside ureq as
-            // `Error::Timeout(RecvBody)` - a real socket deadline, reported as
-            // `FetchPhase::BodyTransfer` - rather than only being noticed by
-            // `read_bounded_body` watching a channel while its pump thread
-            // stays blocked on a dead socket. `read_bounded_body` still applies
-            // the same bound independently, so the two must agree, and the
-            // pump's is the one that stays authoritative for cancellation and
-            // the minimum-progress floor.
-            .timeout_recv_body(Some(body_idle_timeout))
-            // ureq 3.3's Brotli reader can finish decoding before it drains
-            // the length-delimited wire body, so the connection never returns
-            // to its pool. Gzip keeps compression and reliably reuses the
-            // connection across the many same-origin assets on real pages.
-            .accept_encoding("gzip")
-            // The idle-connection ceilings, set here rather than left to ureq's
-            // defaults (10 total, 3 per host). A per-host default of 3 is below
-            // the per-origin concurrency this crate allows, so on a page that
-            // pulls many assets from one origin - the shape of every stylesheet
-            // corpus - every wave after the first reopens the connections the
-            // pool just discarded. See `FetchConfig::idle_connections_per_origin`.
-            .max_idle_connections(config.idle_connections_total)
-            .max_idle_connections_per_host(config.idle_connections_per_origin)
-            .user_agent(config.user_agent.clone())
-            .proxy(proxy)
-            .build();
+        let agent = build_agent(&config, proxy);
         Self {
             config: Arc::new(config),
-            agent: agent_config.into(),
-            implicit_proxy: false,
+            agent: Arc::new(RwLock::new(TransportAgent {
+                agent,
+                implicit_proxy: false,
+            })),
         }
     }
 
     #[must_use]
     pub fn config(&self) -> &FetchConfig {
         &self.config
+    }
+
+    /// Returns the agent a fetch should use and whether its proxy is implicit.
+    fn agent_snapshot(&self) -> (ureq::Agent, bool) {
+        let state = self
+            .agent
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.agent.clone(), state.implicit_proxy)
     }
 
     /// Performs one bounded HTTP(S) request or `data:` URL decode.
@@ -975,6 +1171,10 @@ impl HttpTransport {
         if cancel.is_cancelled() {
             return Err(FetchError::Cancelled);
         }
+        // One snapshot for the whole redirect chain: changing the proxy while a
+        // chain is in flight applies to later fetches, not halfway through this
+        // one.
+        let (agent, implicit_proxy) = self.agent_snapshot();
 
         let mut current_url = request.url.clone();
         // Redirect method semantics are applied per hop below; the original
@@ -1054,22 +1254,28 @@ impl HttpTransport {
                 }
             }
             let hop_started = Instant::now();
-            let response = self
-                .send_hop(current_method, &current_url, hop_body, &hop_headers)
-                .map_err(|error| {
-                    let (error, mut phase) = classify_ureq_error(&error, &self.config);
-                    // ureq reports a `SendRequest` timeout against the send-request
-                    // budget, which this transport deliberately also uses to bound
-                    // the wait for the response headers (see the phase-budget layout
-                    // in `HttpTransport::with_proxy`), so that reason is ambiguous by
-                    // itself. A request without a body writes a few hundred bytes
-                    // and leaves the send phase immediately, so for those the budget
-                    // can only have expired while waiting for the origin to answer.
-                    if hop_body.is_none() && phase == FetchPhase::RequestSend {
-                        phase = FetchPhase::ResponseHeaders;
-                    }
-                    error.in_phase(phase, hop_started.elapsed())
-                })?;
+            let response = Self::send_hop(
+                &agent,
+                implicit_proxy,
+                current_method,
+                &current_url,
+                hop_body,
+                &hop_headers,
+            )
+            .map_err(|error| {
+                let (error, mut phase) = classify_ureq_error(&error, &self.config);
+                // ureq reports a `SendRequest` timeout against the send-request
+                // budget, which this transport deliberately also uses to bound
+                // the wait for the response headers (see the phase-budget layout
+                // in `HttpTransport::with_proxy`), so that reason is ambiguous by
+                // itself. A request without a body writes a few hundred bytes
+                // and leaves the send phase immediately, so for those the budget
+                // can only have expired while waiting for the origin to answer.
+                if hop_body.is_none() && phase == FetchPhase::RequestSend {
+                    phase = FetchPhase::ResponseHeaders;
+                }
+                error.in_phase(phase, hop_started.elapsed())
+            })?;
 
             if cancel.is_cancelled() {
                 return Err(FetchError::Cancelled);
@@ -1166,53 +1372,38 @@ impl HttpTransport {
     /// `Content-Length` on the wire); body-carrying methods send the bytes and
     /// let ureq derive `Content-Length` from the body.
     fn send_hop(
-        &self,
+        agent: &ureq::Agent,
+        implicit_proxy: bool,
         method: HttpMethod,
         url: &Url,
         body: Option<&[u8]>,
         headers: &[(String, String)],
     ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         let uri = url.as_str();
-        let proxy = self.hop_proxy(url);
+        let proxy = hop_proxy(implicit_proxy, url);
         match (method, body) {
-            (HttpMethod::Get, _) => decorate(self.agent.get(uri), headers, proxy).call(),
-            (HttpMethod::Head, _) => decorate(self.agent.head(uri), headers, proxy).call(),
-            (HttpMethod::Delete, None) => decorate(self.agent.delete(uri), headers, proxy).call(),
+            (HttpMethod::Get, _) => decorate(agent.get(uri), headers, proxy).call(),
+            (HttpMethod::Head, _) => decorate(agent.head(uri), headers, proxy).call(),
+            (HttpMethod::Delete, None) => decorate(agent.delete(uri), headers, proxy).call(),
             // DELETE with a body is legal HTTP but needs ureq's explicit
             // escape hatch.
             (HttpMethod::Delete, Some(bytes)) => {
-                decorate(self.agent.delete(uri).force_send_body(), headers, proxy).send(bytes)
+                decorate(agent.delete(uri).force_send_body(), headers, proxy).send(bytes)
             }
             (HttpMethod::Post, Some(bytes)) => {
-                decorate(self.agent.post(uri), headers, proxy).send(bytes)
+                decorate(agent.post(uri), headers, proxy).send(bytes)
             }
-            (HttpMethod::Post, None) => decorate(self.agent.post(uri), headers, proxy).send_empty(),
-            (HttpMethod::Put, Some(bytes)) => {
-                decorate(self.agent.put(uri), headers, proxy).send(bytes)
-            }
-            (HttpMethod::Put, None) => decorate(self.agent.put(uri), headers, proxy).send_empty(),
+            (HttpMethod::Post, None) => decorate(agent.post(uri), headers, proxy).send_empty(),
+            (HttpMethod::Put, Some(bytes)) => decorate(agent.put(uri), headers, proxy).send(bytes),
+            (HttpMethod::Put, None) => decorate(agent.put(uri), headers, proxy).send_empty(),
             (HttpMethod::Patch, Some(bytes)) => {
-                decorate(self.agent.patch(uri), headers, proxy).send(bytes)
+                decorate(agent.patch(uri), headers, proxy).send(bytes)
             }
-            (HttpMethod::Patch, None) => {
-                decorate(self.agent.patch(uri), headers, proxy).send_empty()
-            }
-            (HttpMethod::Options, None) => decorate(self.agent.options(uri), headers, proxy).call(),
+            (HttpMethod::Patch, None) => decorate(agent.patch(uri), headers, proxy).send_empty(),
+            (HttpMethod::Options, None) => decorate(agent.options(uri), headers, proxy).call(),
             (HttpMethod::Options, Some(bytes)) => {
-                decorate(self.agent.options(uri).force_send_body(), headers, proxy).send(bytes)
+                decorate(agent.options(uri).force_send_body(), headers, proxy).send(bytes)
             }
-        }
-    }
-
-    /// Whether this hop inherits the transport's proxy or bypasses it.
-    ///
-    /// An implicitly resolved proxy must not capture loopback targets; an
-    /// explicitly configured one always applies.
-    fn hop_proxy(&self, url: &Url) -> HopProxy {
-        if self.implicit_proxy && is_loopback_target(url) {
-            HopProxy::Direct
-        } else {
-            HopProxy::Inherit
         }
     }
 
@@ -1903,10 +2094,8 @@ mod tests {
         // The same agent with a proxy that came from the environment or the
         // platform: browsers do not route loopback through those, and neither
         // does this transport.
-        let system = HttpTransport {
-            implicit_proxy: true,
-            ..explicit
-        };
+        let system = explicit.clone();
+        system.agent.write().expect("agent lock").implicit_proxy = true;
         system
             .fetch(&FetchRequest::get(url), &CancelToken::default())
             .expect("a loopback hop must not depend on a proxy that cannot serve it");
@@ -1915,6 +2104,68 @@ mod tests {
             1,
             "an implicitly resolved proxy must not capture loopback traffic"
         );
+    }
+
+    #[test]
+    fn an_explicit_proxy_can_be_swapped_without_restarting_the_transport() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let proxy_address = spawn_counting_proxy(Arc::clone(&hits));
+        let origin = spawn_origin_once();
+        let url = Url::parse(&format!("http://{origin}/resource")).expect("origin URL");
+        let transport = HttpTransport::with_http_proxy(FetchConfig::default(), None);
+
+        transport
+            .fetch(&FetchRequest::get(url.clone()), &CancelToken::default())
+            .expect("a direct first request reaches the origin");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        let config =
+            super::HttpProxyConfig::parse(&format!("http://{proxy_address}")).expect("valid proxy");
+        transport.set_http_proxy(Some(config));
+        let _outcome = transport.fetch(&FetchRequest::get(url.clone()), &CancelToken::default());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "requests after the swap use the new proxy"
+        );
+
+        transport.set_http_proxy(None);
+        assert!(
+            !transport.agent_snapshot().1,
+            "the replacement is explicit policy, not an implicit environment proxy"
+        );
+    }
+
+    #[test]
+    fn proxy_addresses_are_validated_and_canonicalized() {
+        for (input, expected) in [
+            ("127.0.0.1:8080", "http://127.0.0.1:8080"),
+            ("http://127.0.0.1:8080", "http://127.0.0.1:8080"),
+            ("http://proxy.example:3128/", "http://proxy.example:3128"),
+        ] {
+            let config = super::HttpProxyConfig::parse(input).expect("valid proxy");
+            assert_eq!(config.address(), expected);
+        }
+        for (input, kind) in [
+            ("", super::ProxyConfigErrorKind::Empty),
+            ("   ", super::ProxyConfigErrorKind::Empty),
+            (
+                "socks5://127.0.0.1:1080",
+                super::ProxyConfigErrorKind::UnsupportedScheme,
+            ),
+            (
+                "https://127.0.0.1:8080",
+                super::ProxyConfigErrorKind::UnsupportedScheme,
+            ),
+            ("http://", super::ProxyConfigErrorKind::InvalidUrl),
+            (
+                "http://127.0.0.1:8080/path",
+                super::ProxyConfigErrorKind::UnexpectedPath,
+            ),
+        ] {
+            let error = super::HttpProxyConfig::parse(input).expect_err("invalid proxy");
+            assert_eq!(error.kind(), kind, "{input:?}");
+        }
     }
 
     #[test]
