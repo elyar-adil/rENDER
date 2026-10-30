@@ -1222,6 +1222,72 @@ fn web_animation_effect_stack_uses_creation_order() {
 }
 
 #[test]
+fn web_animation_keyframe_and_group_effects_are_constructible() {
+    let mut parsed = parse_document("<!doctype html><div id='box'></div>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.fakeNow = 0;
+                performance.now = function () { return window.fakeNow; };
+                var box = document.getElementById('box');
+                var first = new KeyframeEffect(
+                    box,
+                    [{ opacity: 0 }, { opacity: 1 }],
+                    { duration: 1000, fill: 'both' }
+                );
+                var nested = new GroupEffect([
+                    new KeyframeEffect(
+                        box,
+                        [{ width: '0px' }, { width: '100px' }],
+                        { duration: 1000, fill: 'both' }
+                    )
+                ], { duration: 1000, fill: 'both' });
+                var group = new GroupEffect([first, nested], { duration: 1000, fill: 'both' });
+                var animation = new Animation(group, document.timeline);
+                animation.play();
+                window.animation = animation;
+                window.group = group;
+                window.keyframe = first;
+            ",
+        )
+        .expect("effect group starts");
+    let structure = runtime
+        .execute(
+            &mut parsed.dom,
+            r"[
+                group.getChildren().length,
+                group.getChildren()[1].getChildren().length,
+                keyframe.getTargets()[0].id,
+                keyframe.getTiming().duration,
+                animation.effect === group
+            ].join('|')",
+        )
+        .expect("reads effect structure")
+        .value
+        .to_js_string();
+    assert_eq!(structure.to_lossy(), "2|1|box|1000|true");
+
+    runtime
+        .execute(&mut parsed.dom, "window.fakeNow = 500;")
+        .expect("advance time");
+    tick_web_animations(&mut runtime, &mut parsed.dom, 500.0);
+    let sampled = runtime
+        .execute(
+            &mut parsed.dom,
+            r"[
+                document.getElementById('box').style.getPropertyValue('opacity'),
+                document.getElementById('box').style.getPropertyValue('width')
+            ].join('|')",
+        )
+        .expect("reads grouped values")
+        .value
+        .to_js_string();
+    assert_eq!(sampled.to_lossy(), "0.5|50px");
+}
+
+#[test]
 fn inner_html_round_trips_and_setter_replaces_children() {
     let mut parsed = parse_document("<!doctype html><div id='host'><p>old</p></div>");
     let mut runtime = JsRuntime::new(&parsed.dom);

@@ -44,11 +44,15 @@ struct ActiveTransition {
     reversing_adjusted_start: String,
     /// Whether a property with no numeric interpolator may step discretely.
     allow_discrete: bool,
+    /// Whether `transitionstart` has already been emitted.
+    started: bool,
 }
 
 /// Which transition event this is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransitionEventKind {
+    Run,
+    Start,
     End,
     Cancel,
 }
@@ -170,7 +174,14 @@ pub fn sample_transitions(
                                     from.clone()
                                 },
                                 allow_discrete: plan.allow_discrete(&property),
+                                started: false,
                             };
+                            events.push(transition_run_event(
+                                *node,
+                                &property,
+                                active,
+                                TransitionEventKind::Run,
+                            ));
                             continue;
                         }
                     }
@@ -204,15 +215,33 @@ pub fn sample_transitions(
                     shortening: 1.0,
                     reversing_adjusted_start: previous.clone(),
                     allow_discrete,
+                    started: false,
                 },
             );
+            if let Some(active) = node_state.active.get(&property) {
+                events.push(transition_run_event(
+                    *node,
+                    &property,
+                    active,
+                    TransitionEventKind::Run,
+                ));
+            }
         }
         for property in cancel {
             node_state.active.remove(&property);
         }
 
         let mut ended = Vec::new();
-        for (property, active) in &node_state.active {
+        for (property, active) in &mut node_state.active {
+            if !active.started && time >= active.start + active.delay {
+                active.started = true;
+                events.push(transition_run_event(
+                    *node,
+                    property,
+                    active,
+                    TransitionEventKind::Start,
+                ));
+            }
             let end = active.start + active.delay + active.duration;
             if time >= end {
                 style.set_animated_property(property, &active.to);
@@ -299,6 +328,20 @@ fn discrete_value(property: &str, from: &str, to: &str, progress: f32) -> String
         from.to_owned()
     } else {
         to.to_owned()
+    }
+}
+
+fn transition_run_event(
+    node: NodeId,
+    property: &str,
+    active: &ActiveTransition,
+    kind: TransitionEventKind,
+) -> TransitionEvent {
+    TransitionEvent {
+        kind,
+        node,
+        property: property.to_owned(),
+        elapsed_time: (-active.delay).clamp(0.0, active.duration),
     }
 }
 
@@ -595,7 +638,11 @@ mod tests {
         let mut state = TransitionState::default();
         assert!(sample_transitions(&mut styles, &mut state, 0.0).is_empty());
         styles.insert(node, base("0"));
-        assert!(sample_transitions(&mut styles, &mut state, 0.0).is_empty());
+        let started = sample_transitions(&mut styles, &mut state, 0.0);
+        assert_eq!(
+            started.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            [TransitionEventKind::Run, TransitionEventKind::Start]
+        );
         styles.insert(node, base("0"));
         sample_transitions(&mut styles, &mut state, 0.5);
         assert_eq!(
@@ -731,8 +778,10 @@ mod tests {
         // A third value replaces the running transition and cancels it.
         styles.insert(node, base("75px"));
         let events = sample_transitions(&mut styles, &mut state, 0.5);
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 3);
         assert_eq!(events[0].kind, TransitionEventKind::Cancel);
+        assert_eq!(events[1].kind, TransitionEventKind::Run);
+        assert_eq!(events[2].kind, TransitionEventKind::Start);
         assert_eq!(events[0].property, "width");
         assert!((events[0].elapsed_time - 0.5).abs() < 1.0e-6);
         assert_eq!(
@@ -895,5 +944,36 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, TransitionEventKind::Cancel);
         assert!(!state.has_active());
+    }
+    #[test]
+    fn transitionrun_and_transitionstart_precede_the_end() {
+        let node = NodeId::from_u64(11);
+        let base = |width: &str| {
+            style_with(&[
+                ("width", width),
+                ("transition-property", "width"),
+                ("transition-duration", "1s"),
+                ("transition-delay", "250ms"),
+                ("transition-timing-function", "linear"),
+            ])
+        };
+        let mut styles = BTreeMap::new();
+        styles.insert(node, base("0px"));
+        let mut state = TransitionState::default();
+        sample_transitions(&mut styles, &mut state, 0.0);
+        styles.insert(node, base("100px"));
+        let started = sample_transitions(&mut styles, &mut state, 0.0);
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].kind, TransitionEventKind::Run);
+        assert!(started[0].elapsed_time.abs() < 1.0e-6);
+
+        styles.insert(node, base("100px"));
+        let waiting = sample_transitions(&mut styles, &mut state, 0.2);
+        assert!(waiting.is_empty());
+        styles.insert(node, base("100px"));
+        let active = sample_transitions(&mut styles, &mut state, 0.3);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].kind, TransitionEventKind::Start);
+        assert!(active[0].elapsed_time.abs() < 1.0e-6);
     }
 }

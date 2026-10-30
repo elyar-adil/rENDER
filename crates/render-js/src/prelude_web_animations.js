@@ -420,12 +420,169 @@
     return running;
   };
 
-  function Animation(target, keyframes, options) {
+  function KeyframeEffect(target, keyframes, options) {
+    this._kind = 'keyframe';
     this._target = target;
     this._timing = timingFrom(options);
-    this._playbackRate = options && options.playbackRate !== undefined ? number(options.playbackRate, 1) : 1;
     this._composite = (options && options.composite) || 'replace';
     this._tracks = buildTracks(keyframes, this._composite);
+    this._pseudoElement = (options && options.pseudoElement) || '';
+    this.target = target;
+    this.pseudoElement = this._pseudoElement;
+    this.composite = this._composite;
+  }
+
+  KeyframeEffect.prototype.getTargets = function () { return [this._target]; };
+  KeyframeEffect.prototype.getKeyframes = function () {
+    var result = [];
+    this._tracks.forEach(function (track) {
+      track.points.forEach(function (point) {
+        result.push({
+          offset: point.offset,
+          easing: point.easing || this._timing.easing,
+          composite: point.composite,
+          property: track.property,
+          value: point.value
+        });
+      }, this);
+    }, this);
+    return result;
+  };
+  KeyframeEffect.prototype.getTiming = function () {
+    return {
+      duration: this._timing.duration,
+      delay: this._timing.delay,
+      endDelay: this._timing.endDelay,
+      iterations: this._timing.iterations,
+      direction: this._timing.direction,
+      fill: this._timing.fill,
+      easing: this._timing.easing
+    };
+  };
+  KeyframeEffect.prototype.getComputedTiming = function () {
+    var timing = this.getTiming();
+    timing.activeDuration = timing.duration * timing.iterations;
+    timing.endTime = timing.delay + timing.activeDuration + timing.endDelay;
+    return timing;
+  };
+  KeyframeEffect.prototype._properties = function () {
+    return this._tracks.map(function (track) { return track.property; });
+  };
+  KeyframeEffect.prototype._sample = function (progress) {
+    if (progress === null) return null;
+    var values = Object.create(null);
+    var composites = Object.create(null);
+    this._tracks.forEach(function (track) {
+      var value = sampleTrack(track.points, progress, this._timing.easing);
+      if (value === undefined || value === null) return;
+      values[track.property] = String(value);
+      composites[track.property] = track.composite || this._composite;
+    }, this);
+    return { values: values, composites: composites };
+  };
+
+  function GroupEffect(effects, options) {
+    this._kind = 'group';
+    this._children = [];
+    this._timing = timingFrom(options);
+    (effects || []).forEach(function (effect) { this.append(effect); }, this);
+  }
+
+  GroupEffect.prototype.append = function (effect) {
+    if (!effect || (effect._kind !== 'keyframe' && effect._kind !== 'group')) {
+      throw new TypeError('GroupEffect children must be effects');
+    }
+    this._children.push(effect);
+    return effect;
+  };
+  GroupEffect.prototype.prepend = function (effect) {
+    if (!effect || (effect._kind !== 'keyframe' && effect._kind !== 'group')) {
+      throw new TypeError('GroupEffect children must be effects');
+    }
+    this._children.unshift(effect);
+    return effect;
+  };
+  GroupEffect.prototype.remove = function (effect) {
+    var index = this._children.indexOf(effect);
+    if (index >= 0) this._children.splice(index, 1);
+  };
+  GroupEffect.prototype.getChildren = function () { return this._children.slice(); };
+  GroupEffect.prototype.getTiming = function () {
+    return {
+      duration: this._timing.duration,
+      delay: this._timing.delay,
+      endDelay: this._timing.endDelay,
+      iterations: this._timing.iterations,
+      direction: this._timing.direction,
+      fill: this._timing.fill,
+      easing: this._timing.easing
+    };
+  };
+  GroupEffect.prototype.getComputedTiming = function () {
+    var timing = this.getTiming();
+    timing.activeDuration = timing.duration * timing.iterations;
+    timing.endTime = timing.delay + timing.activeDuration + timing.endDelay;
+    return timing;
+  };
+  GroupEffect.prototype._properties = function () {
+    var result = [];
+    this._children.forEach(function (child) {
+      child._properties().forEach(function (property) {
+        if (result.indexOf(property) < 0) result.push(property);
+      });
+    });
+    return result;
+  };
+  GroupEffect.prototype._target = function () {
+    for (var i = 0; i < this._children.length; i++) {
+      var child = this._children[i];
+      if (child._kind === 'group') {
+        var nested = child._target();
+        if (nested) return nested;
+      } else {
+        return child._target;
+      }
+    }
+    return null;
+  };
+  GroupEffect.prototype._sample = function (progress) {
+    if (progress === null) return null;
+    var values = Object.create(null);
+    var composites = Object.create(null);
+    this._children.forEach(function (child) {
+      var result = child._sample(progress);
+      if (!result) return;
+      Object.keys(result.values).forEach(function (property) {
+        if (!(property in values)) values[property] = '';
+        var composite = result.composites[property] || 'replace';
+        if (composite === 'add' || composite === 'accumulate') {
+          values[property] = addValues(values[property], result.values[property]);
+        } else {
+          values[property] = result.values[property];
+        }
+        composites[property] = composite;
+      });
+    });
+    return { values: values, composites: composites };
+  };
+
+  function Animation(targetOrEffect, keyframesOrTimeline, options) {
+    var effect;
+    var playbackOptions;
+    if (targetOrEffect && (targetOrEffect._kind === 'keyframe' || targetOrEffect._kind === 'group')) {
+      effect = targetOrEffect;
+      playbackOptions = options || {};
+    } else {
+      effect = new KeyframeEffect(targetOrEffect, keyframesOrTimeline, options);
+      playbackOptions = options || {};
+    }
+    this._effect = effect;
+    this.effect = effect;
+    this._target = effect._kind === 'group' ? effect._target() : effect._target;
+    this._timing = effect._timing;
+    this._tracks = effect._kind === 'keyframe' ? effect._tracks : [];
+    this._playbackRate = playbackOptions.playbackRate !== undefined ? number(playbackOptions.playbackRate, 1) : 1;
+    this._composite = effect._composite || 'replace';
     this.timeline = timeline;
     this._playState = 'idle';
     this._startTime = 0;
@@ -435,38 +592,21 @@
     this._listeners = Object.create(null);
     this._values = null;
     this._valueComposite = null;
-    var base = animationBase(target);
-    this._tracks.forEach(function (track) {
-      if (!(track.property in base.properties)) {
-        try { base.properties[track.property] = target.style.getPropertyValue(track.property); }
-        catch (error) { base.properties[track.property] = ''; }
-      }
-    });
+    if (this._target) {
+      var base = animationBase(this._target);
+      effect._properties().forEach(function (property) {
+        if (!(property in base.properties)) {
+          try { base.properties[property] = this._target.style.getPropertyValue(property); }
+          catch (error) { base.properties[property] = ''; }
+        }
+      }, this);
+    }
     var self = this;
     this.finished = new Promise(function (resolve, reject) {
       self._resolveFinished = resolve;
       self._rejectFinished = reject;
     });
     this.ready = Promise.resolve(this);
-    this.effect = {
-      target: target,
-      getTiming: function () {
-        return {
-          duration: self._timing.duration,
-          delay: self._timing.delay,
-          endDelay: self._timing.endDelay,
-          iterations: self._timing.iterations,
-          direction: self._timing.direction,
-          fill: self._timing.fill,
-          easing: self._timing.easing
-        };
-      },
-      getKeyframes: function () {
-        return self._tracks.map(function (track) {
-          return { offset: null, easing: self._timing.easing, property: track.property };
-        });
-      }
-    };
     animations.push(this);
   }
 
@@ -476,17 +616,9 @@
       this._valueComposite = null;
       return;
     }
-    var self = this;
-    var values = Object.create(null);
-    var composites = Object.create(null);
-    this._tracks.forEach(function (track) {
-      var value = sampleTrack(track.points, progress, self._timing.easing);
-      if (value === undefined || value === null) return;
-      values[track.property] = String(value);
-      composites[track.property] = track.composite || self._composite;
-    });
-    this._values = values;
-    this._valueComposite = composites;
+    var result = this._effect._sample(progress);
+    this._values = result ? result.values : null;
+    this._valueComposite = result ? result.composites : null;
   };
 
   Animation.prototype._endTime = function () {
@@ -635,7 +767,8 @@
 
   defineProperty(Element.prototype, 'animate', {
     value: function animate(keyframes, options) {
-      var animation = new Animation(this, keyframes, options);
+      var effect = new KeyframeEffect(this, keyframes, options);
+      var animation = new Animation(effect, timeline, options);
       animation.play();
       renderTarget(this);
       return animation;
@@ -667,6 +800,18 @@
 
   defineProperty(global, 'Animation', {
     value: Animation,
+    writable: true,
+    configurable: true,
+    enumerable: false
+  });
+  defineProperty(global, 'KeyframeEffect', {
+    value: KeyframeEffect,
+    writable: true,
+    configurable: true,
+    enumerable: false
+  });
+  defineProperty(global, 'GroupEffect', {
+    value: GroupEffect,
     writable: true,
     configurable: true,
     enumerable: false

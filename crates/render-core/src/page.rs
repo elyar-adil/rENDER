@@ -135,6 +135,8 @@ impl PageDomEvent {
     #[must_use]
     pub fn from_transition(event: &crate::css::transition::TransitionEvent) -> Self {
         let event_type = match event.kind {
+            crate::css::transition::TransitionEventKind::Run => "transitionrun",
+            crate::css::transition::TransitionEventKind::Start => "transitionstart",
             crate::css::transition::TransitionEventKind::End => "transitionend",
             crate::css::transition::TransitionEventKind::Cancel => "transitioncancel",
         };
@@ -2964,6 +2966,37 @@ mod tests {
             page.document_title(),
             Some("cancel:width:0.25:true".to_owned())
         );
+    }
+
+    #[test]
+    fn transition_run_and_start_map_to_their_dom_event_types() {
+        let node = NodeId::from_u64(77);
+        for (kind, expected) in [
+            (
+                crate::css::transition::TransitionEventKind::Run,
+                "transitionrun",
+            ),
+            (
+                crate::css::transition::TransitionEventKind::Start,
+                "transitionstart",
+            ),
+        ] {
+            let event = PageDomEvent::from_transition(&crate::css::transition::TransitionEvent {
+                kind,
+                node,
+                property: "width".to_owned(),
+                elapsed_time: 0.25,
+            });
+            assert_eq!(event.event_type, expected);
+            assert!(event.bubbles);
+            assert!(
+                event
+                    .properties
+                    .iter()
+                    .any(|(name, value)| name == "elapsedTime"
+                        && matches!(value, crate::js::JsValue::Number(number) if (*number - 0.25).abs() < 1.0e-6))
+            );
+        }
     }
 
     #[test]

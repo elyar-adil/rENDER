@@ -544,10 +544,10 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 Interrupted reversals use the reversing shortening factor, and \
                 `transform: none` interpolates from the identity. \
                 `transition-behavior: allow-discrete` steps discrete properties and \
-                transitionend/transitioncancel are reported for style changes, node \
-                removal and document switches. Reversing-adjusted start values follow \
-                CSS Transitions 1 §3.1. transitionrun/transitionstart are not emitted. \
-                The self-hosted Web Animations core covers element.animate, \
+                transitionrun/transitionstart/transitionend/transitioncancel are \
+                reported for style changes, node removal and document switches. \
+                Reversing-adjusted start values follow CSS Transitions 1 §3.1. The \
+                self-hosted Web Animations core covers element.animate, \
                 playbackRate/reverse and composition on the same document clock as \
                 this transition timeline.",
         dependencies: &[CSS_SYNTAX],

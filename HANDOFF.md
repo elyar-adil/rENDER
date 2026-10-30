@@ -1,3 +1,86 @@
+# 交接文档 (2026-10-31, 续四十二) — KeyframeEffect/GroupEffect 与 transitionrun/start
+
+接续 WAAPI effect stack 会话。这一轮补 `KeyframeEffect`/`GroupEffect` 对象、
+嵌套 group 采样,以及 `transitionrun`/`transitionstart` 事件。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **KeyframeEffect** | `new KeyframeEffect(target,keyframes,options)`;getTargets/getKeyframes/getTiming/getComputedTiming |
+| **GroupEffect** | `new GroupEffect(effects,options)`;append/prepend/remove/getChildren/getTiming;支持嵌套 group |
+| **Animation(effect, timeline)** | 接受 effect 对象;element.animate 改为先建 KeyframeEffect 再建 Animation |
+| **group 采样** | 子效果按 source order 合并;replace/add/accumulate 使用现有合成器;effect stack 统一写回 |
+| **transitionrun/start** | `TransitionEventKind::{Run,Start}`;Run 在 transition 创建时,Start 在 delay 结束后的首个采样帧;DOM 映射为 `transitionrun`/`transitionstart` |
+| **测试** | GroupEffect/KeyframeEffect 结构、嵌套 group 的 opacity/width 采样、Run/Start 事件顺序与 DOM 映射 |
+
+## 证据
+
+本地 group 页面:
+
+```js
+var first = new KeyframeEffect(box, [{opacity:0},{opacity:1}], {duration:1000, fill:'both'});
+var nested = new GroupEffect([new KeyframeEffect(box, [{width:'0px'},{width:'100px'}], ...)]);
+var group = new GroupEffect([first, nested], {duration:1000, fill:'both'});
+new Animation(group, document.timeline).play();
+```
+
+500ms 日志:
+
+```
+GROUPPROBE opacity=0.4438 width=44.383px children=2
+health ready=Interactive scripts_failed=0 scripts_threw=0
+```
+
+即嵌套 group 同时驱动 opacity 和 width。
+
+transitionrun/start 页面:
+
+```
+标题栏 transitionrun:width|transitionsta...
+```
+
+单元测试:
+
+```
+web_animation_keyframe_and_group_effects_are_constructible ... ok
+transitionrun_and_transitionstart_precede_the_end ... ok
+transition_run_and_start_map_to_their_dom_event_types ... ok
+```
+
+真实站点:
+
+```
+Bing:  ready=Complete  dom_elements=480 boxes=167
+       scripts_failed=0 scripts_threw=0 css_warnings=1 images_failed=0
+Baidu: ready=Complete  dom_elements=450 boxes=156
+       scripts_failed=0 scripts_threw=0 css_warnings=5 images_failed=0
+JD:    ready=Loading   dom_elements=1158 boxes=117
+       scripts_failed=8 scripts_threw=2 css_warnings=36 images_failed=1
+```
+
+## 验证
+
+```
+cargo test --workspace                       2818 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+## 明确未做 / 下一步
+
+- GroupEffect 子效果目前共享父 progress,没有独立 local timing/delay/iteration
+  账本;GroupEffect/KeyframeEffect 的完整 Web Animations 语义仍不完整。
+- effect stack 已支持顺序与 add/accumulate,但 EffectGroup 的 ownership、
+  `animation-composition` 全规则和复杂 easing 仍缺。
+- transitionrun/start 已完成,但文档切换 cancel 的真实导航端到端证据仍受本机导航
+  入口限制。
+- JD 主商品区仍受 403;GitHub/HN 本机链路阻断;高级渐变、SVG filter 其余原语、
+  IndexedDB 值类型覆盖仍未完成。
+
+---
+
 # 交接文档 (2026-10-31, 续四十一) — WAAPI effect stack 与逐关键帧 easing
 
 接续 WAAPI 速率/合成会话。这一轮把多个动画从“轮流改写 inline style”改为有

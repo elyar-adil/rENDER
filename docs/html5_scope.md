@@ -357,10 +357,10 @@ Microdata、`is=""`、`<dialog>` 完整模态语义、Drag & Drop API、可访�
 |------|------|
 | `transform: translate / translateX/Y / scale / scaleX/Y / rotate / skew / matrix` | ✅ 端到端。类型在 `crates/render-css/src/properties.rs`（`TransformFunction` / `TransformList` / `TransformOrigin`），数学在 `render-core` 的 `Transform2D`，显示列表发射在 `display_list.rs:764-800`（`fragment_transform`，`transform` 读取在 `:771`），`PushTransform`/`PopTransform` 命令在 `:318-319`，光栅化有纯平移快路径与通用仿射离屏 warp（`raster.rs`）。`calc()` 参与 translate（`properties.rs` 的 transform 测试） |
 | `transform-origin` | ✅ `display_list.rs:790-793` |
-| `transition` | ✅ `transition` 简写与 longhand 解析；`render-css/src/transition.rs` 记住上一帧目标值，采样 duration/delay/timing，支持 `allow-discrete`、反向缩短与 reversing-adjusted start value，并在样式变化/节点移除/文档切换时生成 `transitionend`/`transitioncancel`；浏览器按 16ms 时钟重绘 |
+| `transition` | ✅ `transition` 简写与 longhand 解析；`render-css/src/transition.rs` 记住上一帧目标值，采样 duration/delay/timing，支持 `allow-discrete`、反向缩短与 reversing-adjusted start value，并在样式变化/节点移除/文档切换时生成 `transitionrun`/`transitionstart`/`transitionend`/`transitioncancel`；浏览器按 16ms 时钟重绘 |
 | `animation` + `@keyframes` | ✅ `@keyframes` 保留并按时间采样；浏览器驱动 16ms 时钟；多动画列表按 source order 合成，`transform:none` 按 identity 插值；WAAPI 核心已自托管，部分 easing 仍未完成 |
 | `will-change` | ⛔ |
-| Web Animations API | 🟡 `element.animate`、play/pause/finish/cancel、playbackRate/reverse、有序 effect stack、add/accumulate 合成、逐关键帧 easing、finish/cancel 事件与 CSS/WAAPI 共用 document clock 已自托管实现；GroupEffect/KeyframeEffect 与部分 timing 模型未完成 |
+| Web Animations API | 🟡 `element.animate`、play/pause/finish/cancel、playbackRate/reverse、有序 effect stack、add/accumulate 合成、逐关键帧 easing、KeyframeEffect/GroupEffect（含嵌套）与 CSS/WAAPI 共用 document clock 已自托管实现；group 子效果的独立 local timing 与部分 timing 模型未完成 |
 
 ### 4.8 媒体查询
 
