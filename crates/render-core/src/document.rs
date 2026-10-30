@@ -21,20 +21,21 @@ use crate::css::properties::TypedPropertyValue;
 use crate::css::selector::{InteractionState, MatchContext};
 use crate::css::stylesheet::{Declaration, StyleSheet, StyleSheetDiagnostic, parse_stylesheet};
 use crate::dom::{Dom, DomRevision, ElementData, Namespace, Node, NodeId, NodeKind};
-use crate::html::{HtmlParseError, QuirksMode, parse_document_with_scripting};
+use crate::html::{HtmlParseError, QuirksMode, parse_document_with_scripting, serialize_html_node};
 use crate::image::inline_svg::{
     InlineSvgDiagnostic, InlineSvgDiscovery, discover_inline_svgs_with_colors, svg_geometry,
 };
 use crate::image::{ImageLimits, ImageResources};
 use crate::layout::{
     FormattingDiagnostic, FormattingLimits, FormattingTree, LayoutDiagnostic, LayoutOptions,
-    LayoutOutput, PhysicalPoint, SimpleTextMeasurer, TextMeasurer, build_formatting_tree,
-    layout_formatting_tree_with_images,
+    LayoutOutput, PhysicalPoint, PhysicalRect, SimpleTextMeasurer, TextMeasurer,
+    build_formatting_tree, layout_formatting_tree_with_images,
 };
 use crate::paint::{
-    Color, CpuRasterOutput, CpuRasterizer, DisplayListBuildOutput, DisplayListBuilderOptions,
-    DisplayListDiagnostic, GlyphMaskProvider, NoGlyphMasks, RasterDiagnostic, ReferenceTextShaper,
-    SystemPalette, TextShaper, build_display_list_with_images,
+    ClipFillRule, ClipPathResolver, ClipShape, Color, CpuRasterOutput, CpuRasterizer,
+    DisplayListBuildOutput, DisplayListBuilderOptions, DisplayListDiagnostic, GlyphMaskProvider,
+    NoGlyphMasks, RasterDiagnostic, ReferenceTextShaper, SystemPalette, TextShaper,
+    build_display_list_with_images_and_clip_paths,
 };
 
 /// The HTML user-agent style sheet.
@@ -1398,13 +1399,15 @@ fn render_dom(
         );
         dump_fragment_tree(dom, &styles, &layout.fragments);
     }
-    let display = build_display_list_with_images(
+    let clip_path_resolver = DomClipPathResolver::new(dom);
+    let display = build_display_list_with_images_and_clip_paths(
         &layout.fragments,
         &formatting,
         &styles,
         options.display_list,
         backends.text_shaper,
         images,
+        Some(&clip_path_resolver),
     );
     stage_elapsed("display", &mut stage_mark);
     let paint_viewport_origin = layout.fragments.clamp_scroll_offset(options.scroll_offset);
@@ -1496,6 +1499,70 @@ fn computed_text_color(styles: &BTreeMap<NodeId, ComputedStyle>, node: NodeId) -
 ///
 /// `None` when no inline `svg` rasterised, so a page without icons neither
 /// copies the caller's store nor allocates a second one.
+/// Resolves `clip-path: url(#id)` against the document's inline SVG
+/// `<clipPath>` definitions. Geometry is parsed from the serialized element so
+/// it shares the SVG rasterizer's path and transform rules.
+struct DomClipPathResolver<'a> {
+    dom: &'a Dom,
+    clip_paths: BTreeMap<String, NodeId>,
+}
+
+impl<'a> DomClipPathResolver<'a> {
+    fn new(dom: &'a Dom) -> Self {
+        let mut clip_paths = BTreeMap::new();
+        for (node, _) in dom.nodes() {
+            let Some(crate::dom::NodeKind::Element(element)) =
+                dom.node(node).map(crate::dom::Node::kind)
+            else {
+                continue;
+            };
+            if element.namespace == Namespace::Svg
+                && element.local_name == "clipPath"
+                && let Some(id) = dom.attribute(node, "id").ok().flatten()
+                && !id.is_empty()
+            {
+                clip_paths.entry(id.to_owned()).or_insert(node);
+            }
+        }
+        Self { dom, clip_paths }
+    }
+}
+
+impl ClipPathResolver for DomClipPathResolver<'_> {
+    fn resolve_clip_path(
+        &self,
+        _node: NodeId,
+        reference_box: PhysicalRect,
+        id: &str,
+    ) -> Option<ClipShape> {
+        let owner = *self.clip_paths.get(id)?;
+        let markup = serialize_html_node(self.dom, owner);
+        let geometry = crate::image::svg::css_clip_path_geometry(markup.as_bytes())?;
+        let contour = geometry.contours.first()?;
+        let points = contour.iter().map(|(x, y)| {
+            if geometry.object_bounding_box {
+                PhysicalPoint {
+                    x: reference_box.origin.x + x * reference_box.size.width,
+                    y: reference_box.origin.y + y * reference_box.size.height,
+                }
+            } else {
+                PhysicalPoint {
+                    x: reference_box.origin.x + x,
+                    y: reference_box.origin.y + y,
+                }
+            }
+        });
+        Some(ClipShape::polygon(
+            points,
+            if geometry.even_odd {
+                ClipFillRule::EvenOdd
+            } else {
+                ClipFillRule::NonZero
+            },
+        ))
+    }
+}
+
 fn with_inline_svgs(
     images: Option<&ImageResources>,
     discovery: &InlineSvgDiscovery,
@@ -3397,6 +3464,32 @@ mod tests {
         assert!(painted, "the appended svg was not painted as an image");
         assert_eq!(centre_pixel(&output, svg), Some(Color::rgb(0, 255, 0)));
         assert!(output.diagnostics.inline_svg.is_empty());
+    }
+
+    /// CSS `clip-path: url(#id)` resolves an inline SVG clipPath. This one is
+    /// in `objectBoundingBox` units, so its left half covers the left half of
+    /// the HTML box.
+    #[test]
+    fn css_clip_path_url_resolves_an_inline_svg_clip_path() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0; background: white }
+               #box { width: 20px; height: 20px; background: red;
+                      clip-path: url(#half) }
+               </style>
+               <svg width="0" height="0"><defs>
+                 <clipPath id="half" clipPathUnits="objectBoundingBox">
+                   <rect width="0.5" height="1"/>
+                 </clipPath>
+               </defs></svg>
+               <div id="box"></div>"#,
+        );
+        let output = document.render_reference(DocumentRenderOptions::default());
+        assert_eq!(
+            output.raster.surface.pixel(5, 29),
+            Some(Color::rgb(255, 0, 0))
+        );
+        assert_eq!(output.raster.surface.pixel(15, 29), Some(Color::WHITE));
     }
 
     /// CSS `clip-path: circle()` must clip the element's background and

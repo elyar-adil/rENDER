@@ -1,3 +1,70 @@
+# 交接文档 (2026-10-31, 续二十三) — CSS clip-path url()/path()/reference-box
+
+接续基本形状会话。这一轮把 CSS `clip-path` 从内联基本形状扩展到
+`url(#id)` 引用内联 SVG clipPath、`path()` 和多 reference-box。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **`url(#id)`** | `DomClipPathResolver` 按 id 找内联 `<clipPath>`,序列化后用 SVG 光栅器的几何规则解析 |
+| **单位** | `clipPathUnits=objectBoundingBox` 映射到元素 reference box;`userSpaceOnUse` 加 reference box 原点 |
+| **`path()`** | 复用 SVG path 解析;支持数字坐标、闭合/多段路径 |
+| **`reference-box`** | `margin-box`/`border-box`/`padding-box`/`content-box`;`fill-box`/`stroke-box`/`view-box` 暂回退边框盒 |
+| **`calc()`** | 基本形状与 inset 参数用能识别括号的分词器,`calc(5px + 5px)` 可解析 |
+| **`clip-rule`** | `url()` 引用继承 clipPath 的 nonzero/evenodd;CSS polygon 也支持 evenodd |
+| **API** | 新增 `ClipPathResolver` 与 `build_display_list_with_images_and_clip_paths`,旧入口保持 None resolver |
+
+## 证据
+
+`clipurl.html` 像素采样:
+
+```
+half mask 内部  (20,222) = (255,0,0)
+half mask 外部  (80,222) = (255,255,255)
+path 内部       (150,222)= (0,200,0)
+path 三角形外    (220,290)= (255,255,255)
+padding-box 内  (280,242)= (0,0,255)
+border 上       (250,202)= (255,255,255)
+```
+
+即 objectBoundingBox SVG clipPath、`path()` 三角形与 `inset(0) padding-box`
+都按预期裁剪。
+
+Bing / Baidu / JD 冒烟:
+
+```
+Bing:  ready=Complete    dom_elements=481 boxes=164 images_failed=0
+Baidu: ready=Complete    dom_elements=453 boxes=156 images_failed=0
+JD:    ready=Interactive dom_elements=1157 boxes=117 images_failed=1
+```
+
+JD 主商品区仍为空(风控 403,同机 Edge 也 403)。
+
+## 验证
+
+```
+cargo test --workspace                       2744 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+image::svg                                   38 passed
+```
+
+新增测试覆盖 `path()` 点集、`padding-box` reference box、`calc()` inset、以及
+内联 SVG `url(#id)` 的实际像素裁剪。
+
+## 明确未做 / 下一步
+
+- `path()` 仍只解析数字坐标,不支持百分比/`calc()`;`url()` 只取第一条轮廓,
+  多条轮廓形成的洞还不支持。
+- `fill-box`/`stroke-box`/`view-box` reference-box、CSS 样式表中的 `clip-rule`
+  仍未接入。
+- 组级 `opacity` 离屏合成、更多 SVG filter 原语、高级渐变仍未实现。
+- JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;AVIF 依赖系统 dav1d。
+
+---
+
 # 交接文档 (2026-10-31, 续二十二) — CSS clip-path 与 SVG clip-rule
 
 接续 IndexedDB 会话。这一轮给 HTML 元素接入 CSS `clip-path` 的常用基本形状,
@@ -58,8 +125,9 @@ image::svg                                   38 passed
 
 ## 明确未做 / 下一步
 
-- CSS `clip-path: url(#id)`、`path()`、`calc()`、`reference-box` 关键字未实现;
-  目前只处理 HTML 的 inset/circle/ellipse/polygon。
+- CSS `clip-path: url(#id)`、`path()`、`reference-box` 已在续二十三实现;
+  `path()` 的百分比/`calc()` 坐标与多轮廓洞仍未覆盖,`fill-box`/`stroke-box`/
+  `view-box` 仍回退边框盒。
 - SVG 内联 CSS 样式表中的 `clip-rule` 仍未接入(仅属性与 style 属性);`mask`/
   `filter` 的 CSS 形式也未实现。
 - 组级 `opacity` 离屏合成、更多 SVG filter 原语、高级渐变仍未实现。
@@ -148,7 +216,7 @@ JD:    ready=Loading     dom_elements=968 boxes=117 images_failed=1
 - 事务没有回滚日志;`abort()` 不会撤销已经改动的内存记录;跨标签页没有
   `storage`/`versionchange` 广播,只有同一 realm 内的 `versionchange` 事件。
 - 没有配额管理/驱逐;`indexed-db.txt` 是单文件、全量重写。
-- JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;CSS `clip-path` 已实现(续二十二)、组级
+- JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;CSS `clip-path` 已实现(续二十二/二十三)、组级
   `opacity`、其它 filter 原语等仍未实现。
 
 ---

@@ -11,6 +11,7 @@ use crate::css::properties::{
 };
 use crate::dom::{DomRevision, NodeId};
 use crate::image::ImageResources;
+use crate::image::svg::parse_css_path_contours;
 use crate::layout::{
     EdgeSizes, FontRequest, FormattingNodeId, FormattingTree, Fragment, FragmentId, FragmentKind,
     FragmentTree, PhysicalPoint, PhysicalRect, PhysicalSize, StickyConstraint, nominal_face,
@@ -184,6 +185,40 @@ pub enum ClipShape {
         count: u8,
         fill_rule: ClipFillRule,
     },
+}
+
+impl ClipShape {
+    /// Build a polygon clip from up to [`MAX_CLIP_POLYGON_POINTS`] points.
+    pub(crate) fn polygon(
+        points: impl IntoIterator<Item = PhysicalPoint>,
+        fill_rule: ClipFillRule,
+    ) -> Self {
+        let mut array = [PhysicalPoint { x: 0.0, y: 0.0 }; MAX_CLIP_POLYGON_POINTS];
+        let mut count = 0;
+        for point in points {
+            if count >= MAX_CLIP_POLYGON_POINTS {
+                break;
+            }
+            array[count] = point;
+            count += 1;
+        }
+        Self::Polygon {
+            points: array,
+            count: u8::try_from(count).unwrap_or(0),
+            fill_rule,
+        }
+    }
+}
+
+/// Resolves a CSS `clip-path: url(#id)` reference to a device-space clip
+/// shape. The element's reference box is already selected by paint.
+pub trait ClipPathResolver {
+    fn resolve_clip_path(
+        &self,
+        node: NodeId,
+        reference_box: PhysicalRect,
+        id: &str,
+    ) -> Option<ClipShape>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -640,6 +675,21 @@ pub fn build_display_list_with_images(
     shaper: &dyn TextShaper,
     images: Option<&ImageResources>,
 ) -> DisplayListBuildOutput {
+    build_display_list_with_images_and_clip_paths(
+        fragments, formatting, styles, options, shaper, images, None,
+    )
+}
+
+#[must_use]
+pub fn build_display_list_with_images_and_clip_paths(
+    fragments: &FragmentTree,
+    formatting: &FormattingTree,
+    styles: &BTreeMap<NodeId, ComputedStyle>,
+    options: DisplayListBuilderOptions,
+    shaper: &dyn TextShaper,
+    images: Option<&ImageResources>,
+    clip_path_resolver: Option<&dyn ClipPathResolver>,
+) -> DisplayListBuildOutput {
     let parents = if images.is_some() {
         let mut parents = BTreeMap::<FragmentId, FragmentId>::new();
         for fragment in fragments.iter() {
@@ -669,6 +719,7 @@ pub fn build_display_list_with_images(
         options,
         shaper,
         images,
+        clip_path_resolver,
         parents,
         formatting_parents,
         items: Vec::new(),
@@ -698,6 +749,7 @@ struct Builder<'a> {
     options: DisplayListBuilderOptions,
     shaper: &'a dyn TextShaper,
     images: Option<&'a ImageResources>,
+    clip_path_resolver: Option<&'a dyn ClipPathResolver>,
     parents: BTreeMap<FragmentId, FragmentId>,
     formatting_parents: Vec<Option<FormattingNodeId>>,
     items: Vec<DisplayItem>,
@@ -770,11 +822,21 @@ impl<'a> Builder<'a> {
         // same way opacity groups it behind an alpha. When both apply, a
         // single stacking context carries them so rasterization only pays
         // for one offscreen group.
+        let clip_reference_rect = clip_reference_rect(
+            style,
+            match &fragment.kind {
+                FragmentKind::Box(geometry) => Some(geometry),
+                FragmentKind::Text(_) => None,
+            },
+            border_rect,
+        );
         let clip_path = clip_path_shape(
             style,
-            border_rect,
+            clip_reference_rect,
             style.map_or(16.0, style_font_size),
             self.fragments.viewport,
+            self.clip_path_resolver,
+            fragment.source,
         );
         let stacking_context = fragment_stacking_context(opacity, transform, clip_path.is_some());
         if let Some(context) = stacking_context {
@@ -1996,6 +2058,8 @@ fn clip_path_shape(
     rect: PhysicalRect,
     font_size: f32,
     viewport: PhysicalSize,
+    resolver: Option<&dyn ClipPathResolver>,
+    node: Option<NodeId>,
 ) -> Option<ClipShape> {
     let text = style?.get("clip-path")?.css_text();
     let trimmed = text.trim();
@@ -2014,8 +2078,65 @@ fn clip_path_shape(
         "circle" => parse_circle_clip(inner, rect, font_size, viewport),
         "ellipse" => parse_ellipse_clip(inner, rect, font_size, viewport),
         "polygon" => Some(parse_polygon_clip(inner, rect, font_size, viewport)),
+        "path" => parse_path_clip(inner, rect),
+        "url" => {
+            let resolver = resolver?;
+            let node = node?;
+            let id = inner
+                .trim()
+                .trim_matches(|character| character == '\"' || character == '\'')
+                .trim_start_matches('#');
+            resolver.resolve_clip_path(node, rect, id)
+        }
         _ => None,
     }
+}
+
+fn clip_reference_rect(
+    style: Option<&ComputedStyle>,
+    geometry: Option<&crate::layout::BoxGeometry>,
+    fallback: PhysicalRect,
+) -> PhysicalRect {
+    let Some(text) = style.and_then(|style| style.get("clip-path")) else {
+        return fallback;
+    };
+    let keyword = text
+        .css_text()
+        .split_whitespace()
+        .last()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let Some(geometry) = geometry else {
+        return fallback;
+    };
+    match keyword.as_str() {
+        "margin-box" => geometry.margin_rect(),
+        "padding-box" => geometry.padding_rect(),
+        "content-box" => geometry.content_rect,
+        _ => fallback,
+    }
+}
+
+fn parse_path_clip(inner: &str, rect: PhysicalRect) -> Option<ClipShape> {
+    let (fill_rule, data) = if let Some(rest) = inner.strip_prefix("evenodd") {
+        (ClipFillRule::EvenOdd, rest.trim_start_matches(',').trim())
+    } else if let Some(rest) = inner.strip_prefix("nonzero") {
+        (ClipFillRule::NonZero, rest.trim_start_matches(',').trim())
+    } else {
+        (ClipFillRule::NonZero, inner)
+    };
+    let data = data
+        .trim()
+        .trim_matches(|character| character == '\"' || character == '\'');
+    let mut contours = parse_css_path_contours(data).into_iter();
+    let points = contours.next()?;
+    Some(ClipShape::polygon(
+        points.into_iter().map(|(x, y)| PhysicalPoint {
+            x: rect.origin.x + x,
+            y: rect.origin.y + y,
+        }),
+        fill_rule,
+    ))
 }
 
 #[allow(
@@ -2041,6 +2162,37 @@ fn resolve_clip_length(
         .map(|value| value as f32)
 }
 
+/// Split clip-path arguments at top-level whitespace or commas, keeping
+/// `calc(...)` and `var(...)` expressions intact.
+fn clip_components(text: &str) -> Vec<&str> {
+    let mut components = Vec::new();
+    let mut depth = 0_i32;
+    let mut start = None;
+    for (index, character) in text.char_indices() {
+        match character {
+            '(' => {
+                depth += 1;
+                start.get_or_insert(index);
+            }
+            ')' => {
+                depth = (depth - 1).max(0);
+            }
+            _ if depth == 0 && (character.is_whitespace() || character == ',') => {
+                if let Some(start) = start.take() {
+                    components.push(&text[start..index]);
+                }
+            }
+            _ => {
+                start.get_or_insert(index);
+            }
+        }
+    }
+    if let Some(start) = start {
+        components.push(&text[start..]);
+    }
+    components
+}
+
 fn split_at_clause(text: &str) -> (&str, &str) {
     let lower = text.to_ascii_lowercase();
     match lower.find(" at ") {
@@ -2055,7 +2207,7 @@ fn parse_center(
     font_size: f32,
     viewport: PhysicalSize,
 ) -> PhysicalPoint {
-    let mut parts = text.split_whitespace();
+    let mut parts = clip_components(text).into_iter();
     let x = parts
         .next()
         .and_then(|value| resolve_clip_length(value, rect.size.width, font_size, viewport))
@@ -2081,7 +2233,7 @@ fn parse_inset_clip(
         Some(index) => (&text[..index], Some(&text[index + 7..])),
         None => (text, None),
     };
-    let parts: Vec<&str> = outer.split_whitespace().collect();
+    let parts = clip_components(outer);
     if parts.is_empty() || parts.len() > 4 {
         return None;
     }
@@ -2189,7 +2341,7 @@ fn parse_ellipse_clip(
     viewport: PhysicalSize,
 ) -> Option<ClipShape> {
     let (radii_text, center_text) = split_at_clause(text);
-    let mut parts = radii_text.split_whitespace();
+    let mut parts = clip_components(radii_text).into_iter();
     let rx = parts
         .next()
         .and_then(|value| resolve_clip_length(value, rect.size.width, font_size, viewport))?;
@@ -2219,10 +2371,7 @@ fn parse_polygon_clip(
     font_size: f32,
     viewport: PhysicalSize,
 ) -> ClipShape {
-    let mut tokens: Vec<&str> = text
-        .split(|character: char| character == ',' || character.is_whitespace())
-        .filter(|token| !token.is_empty())
-        .collect();
+    let mut tokens = clip_components(text);
     let mut fill_rule = ClipFillRule::NonZero;
     if let Some(first) = tokens.first() {
         if first.eq_ignore_ascii_case("evenodd") {
@@ -3615,6 +3764,97 @@ mod tests {
                     if usize::from(*count) == 3 && *fill_rule == ClipFillRule::NonZero
             )),
             "{polygon:?}"
+        );
+    }
+
+    #[test]
+    fn css_clip_path_path_reference_box_and_calc_are_resolved() {
+        let output = parse_document(
+            "<!doctype html><body><div id=path></div><div id=padding></div><div id=calc></div></body>",
+        );
+        let sheet = parse_stylesheet(
+            r"html, body { display:block; margin:0 } div { display:block; width:80px; height:40px }
+              #path { clip-path: path('M0 0 H20 V20 H0 Z') }
+              #padding { padding:10px; border:2px solid transparent; clip-path: inset(0) padding-box }
+              #calc { clip-path: inset(calc(5px + 5px)) }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let layout = layout_formatting_tree(
+            &output.dom,
+            &formatting,
+            &styles,
+            LayoutOptions::default(),
+            &SimpleTextMeasurer,
+        );
+        let display = build_display_list(
+            &layout.fragments,
+            &formatting,
+            &styles,
+            DisplayListBuilderOptions::default(),
+            &ReferenceTextShaper,
+        );
+        let clips = |id: &str| {
+            let selector = parse_selector_list(&format!("#{id}")).unwrap();
+            let node = select_all(
+                &output.dom,
+                output.dom.document(),
+                &selector,
+                &MatchContext::default(),
+            )[0];
+            display
+                .list
+                .items()
+                .iter()
+                .filter(|item| item.source == Some(node))
+                .filter_map(|item| match &item.command {
+                    DisplayCommand::PushClip(shape) => Some(*shape),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            clips("path").iter().any(|shape| matches!(
+                shape,
+                ClipShape::Polygon { points, count, .. }
+                    if usize::from(*count) == 5
+                        && points[1] == PhysicalPoint { x: 20.0, y: 0.0 }
+                        && points[2] == PhysicalPoint { x: 20.0, y: 20.0 }
+            )),
+            "{:?}",
+            clips("path")
+        );
+        assert!(
+            clips("padding").iter().any(|shape| matches!(
+                shape,
+                ClipShape::Rect(rect)
+                    if rect.origin == PhysicalPoint { x: 2.0, y: 42.0 }
+                        && rect.size.width == 100.0
+                        && rect.size.height == 60.0
+            )),
+            "{:?}",
+            clips("padding")
+        );
+        assert!(
+            clips("calc").iter().any(|shape| matches!(
+                shape,
+                ClipShape::Rect(rect)
+                    if rect.origin == PhysicalPoint { x: 10.0, y: 114.0 }
+                        && rect.size.width == 60.0
+                        && rect.size.height == 20.0
+            )),
+            "{:?}",
+            clips("calc")
         );
     }
 

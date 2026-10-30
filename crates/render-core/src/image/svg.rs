@@ -2378,6 +2378,52 @@ fn clip_fill_rule(element: &XmlNode, inherited: ClipFillRule) -> ClipFillRule {
     inherited
 }
 
+/// A `clipPath` definition extracted from serialized markup, for a CSS
+/// `clip-path: url(#id)` reference.
+pub(crate) struct CssClipPathGeometry {
+    pub(crate) object_bounding_box: bool,
+    pub(crate) even_odd: bool,
+    pub(crate) contours: Vec<Vec<(f32, f32)>>,
+}
+
+pub(crate) fn css_clip_path_geometry(markup: &[u8]) -> Option<CssClipPathGeometry> {
+    let text = str::from_utf8(markup).ok()?;
+    let root = parse_xml(text)?;
+    if root.name != "clipPath" {
+        return None;
+    }
+    let object_bounding_box = clip_path_units(&root) == ClipPathUnits::ObjectBoundingBox;
+    let transform = attribute(&root, "transform").map_or(Affine::IDENTITY, parse_transform);
+    let fill_rule = clip_fill_rule(&root, ClipFillRule::NonZero);
+    let mut polygons = Vec::new();
+    collect_clip_geometry(
+        &root,
+        transform,
+        Affine::IDENTITY,
+        ClipPathUnits::UserSpaceOnUse,
+        None,
+        fill_rule,
+        &mut polygons,
+    );
+    let mut contours = Vec::new();
+    for polygon in &polygons {
+        contours.extend(polygon.contours.iter().cloned());
+    }
+    Some(CssClipPathGeometry {
+        object_bounding_box,
+        even_odd: fill_rule == ClipFillRule::EvenOdd,
+        contours,
+    })
+}
+
+pub(crate) fn parse_css_path_contours(data: &str) -> Vec<Vec<(f32, f32)>> {
+    parse_path(data)
+        .into_iter()
+        .map(|(points, _)| points)
+        .filter(|points| points.len() >= 3)
+        .collect()
+}
+
 fn clip_device_polygon(
     points: &[(f32, f32)],
     clip_transform: Affine,
