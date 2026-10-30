@@ -77,7 +77,7 @@ mod language_tests;
 mod module;
 #[cfg(test)]
 mod range_tests;
-pub use module::ModuleLoader;
+pub use module::{DynamicModuleUnit, ModuleLoader, PendingModuleLoad};
 mod named_access;
 mod nested;
 pub use nested::DocumentLoader;
@@ -237,6 +237,14 @@ pub struct JsRuntime {
     /// object for `fetch()`, the XHR instance for `XMLHttpRequest`).
     pending_fetch_targets: BTreeMap<u64, ObjectId>,
     next_fetch_id: u64,
+    /// Dynamic `import()` requests waiting for the embedding's asynchronous
+    /// loader, drained through [`Self::take_pending_module_loads`].
+    pending_module_loads: Vec<PendingModuleLoad>,
+    /// Import id -> promise/object/phase, kept until the load settles.
+    pending_module_imports: BTreeMap<u64, module::PendingModuleImportState>,
+    /// Import id -> promise object the GC must keep alive until settle.
+    pending_module_targets: BTreeMap<u64, ObjectId>,
+    next_module_load_id: u64,
     regexes: Vec<RegexRecord>,
     /// Compiled patterns by `(source, flags)`, so a regex literal evaluated
     /// again (in a loop, or a function called repeatedly) is not compiled again.
@@ -439,6 +447,10 @@ impl JsRuntime {
             pending_fetch_promises: BTreeMap::new(),
             pending_fetch_targets: BTreeMap::new(),
             next_fetch_id: 1,
+            pending_module_loads: Vec::new(),
+            pending_module_imports: BTreeMap::new(),
+            pending_module_targets: BTreeMap::new(),
+            next_module_load_id: 1,
             regexes: Vec::new(),
             regex_cache: std::collections::HashMap::new(),
             console_messages: Vec::new(),

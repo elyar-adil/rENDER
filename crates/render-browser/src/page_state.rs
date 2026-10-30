@@ -22,11 +22,13 @@ use render_core::document::ExternalStyleSheetKey;
 use render_core::document::ExternalStyleSheets;
 use render_core::image::ImageResourceKey;
 use render_core::image::ImageResources;
+use render_core::import_map::ImportMap;
 use render_core::interaction::FocusNavigationDirection;
 use render_core::js::DocumentReadyState;
 use render_core::js::ElementRect;
 use render_core::js::JsError;
 use render_core::js::JsValue;
+use render_core::module_graph::ModuleGraph;
 use render_core::navigation::HistoryEntry;
 use render_core::navigation::NavigationLimits;
 use render_core::navigation::SessionHistory;
@@ -101,6 +103,11 @@ pub(super) struct PageState {
     pub(super) pending_style_sheets: Option<PendingStyleSheets>,
     pub(super) scripts_resolved: bool,
     pub(super) pending_scripts: Option<PendingScripts>,
+    /// The document's import map, kept after the initial script plan so later
+    /// dynamic imports resolve the same bare specifiers.
+    pub(super) module_import_map: ImportMap,
+    /// Dynamic `import()` loads waiting for render-net rounds.
+    pub(super) pending_dynamic_imports: Vec<PendingDynamicImport>,
     /// A prepared script batch that finished while the page's first
     /// stylesheet batch was still loading. Stylesheets block script
     /// execution, not fetching, so the batch waits here in document order
@@ -181,6 +188,18 @@ pub(super) struct PendingScripts {
 pub(super) struct ModulePhase {
     pub(super) preparation: ScriptBatchPreparation,
     pub(super) requests: Vec<render_net::FetchRequest>,
+}
+
+/// One dynamic-import module graph being fetched a round at a time.
+pub(super) struct PendingDynamicImport {
+    /// Correlation id from the JavaScript runtime.
+    pub(super) request_id: u64,
+    pub(super) entry_key: String,
+    pub(super) graph: ModuleGraph,
+    pub(super) handle: Option<CachedBatchHandle>,
+    pub(super) requests: Vec<render_net::FetchRequest>,
+    pub(super) since: Instant,
+    pub(super) stall_reported: bool,
 }
 
 pub(super) struct PendingImages {
@@ -282,6 +301,8 @@ impl PageState {
             pending_style_sheets: None,
             scripts_resolved: false,
             pending_scripts: None,
+            module_import_map: ImportMap::default(),
+            pending_dynamic_imports: Vec::new(),
             held_scripts: None,
             started_scripts: HashSet::new(),
             initial_script_scan_completed: false,

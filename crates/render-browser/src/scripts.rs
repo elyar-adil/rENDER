@@ -56,6 +56,13 @@ pub struct ScriptFetchPlan {
 }
 
 impl ScriptFetchPlan {
+    /// The document's import map, installed on the module graph this plan
+    /// builds.
+    #[must_use]
+    pub const fn import_map(&self) -> &render_core::import_map::ImportMap {
+        &self.import_map
+    }
+
     #[must_use]
     pub fn requests(&self) -> Vec<FetchRequest> {
         self.resources

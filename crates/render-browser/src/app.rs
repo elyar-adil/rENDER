@@ -35,6 +35,7 @@ use crate::page_source::source_from_local_file;
 use crate::page_source::source_from_network_response;
 use crate::page_state::ModulePhase;
 use crate::page_state::PageState;
+use crate::page_state::PendingDynamicImport;
 use crate::page_state::PendingImages;
 use crate::page_state::PendingScripts;
 use crate::page_state::PendingStyleSheets;
@@ -88,6 +89,7 @@ use render_browser::navigation::NavigationTarget;
 use render_browser::navigation::intent_from_address;
 use render_browser::resources::StylesheetDiagnosticSeverity;
 use render_browser::resources::StylesheetFetchPlan;
+use render_browser::scripts::SCRIPT_ACCEPT;
 use render_browser::scripts::ScriptBatchPreparation;
 use render_browser::scripts::ScriptFetchPlan;
 use render_browser::scripts::plan_unstarted_classic_scripts;
@@ -106,9 +108,11 @@ use render_core::image::ImageSource;
 use render_core::interaction::FocusNavigationDirection;
 use render_core::navigation::HistoryEntry;
 
+use render_core::import_map::ImportMapMiss;
 use render_core::js::RuntimeLimits;
-use render_core::js::{FetchOutcome, HistoryRequest, PendingFetch};
+use render_core::js::{DynamicModuleUnit, FetchOutcome, HistoryRequest, PendingFetch};
 use render_core::layout::PhysicalPoint;
+use render_core::module_graph::{ModuleGraph, module_key};
 use render_core::page::PageDomEvent;
 use render_core::paint::DisplayCommand;
 use render_core::script::ScriptDiscoveryLimits;
@@ -2120,6 +2124,7 @@ impl BrowserApp {
             if !follow_up_scan {
                 report_script_discovery_diagnostics(&plan.discovery_diagnostics);
             }
+            page.module_import_map = plan.import_map().clone();
             Self::report_script_requests(&plan);
             page.initial_script_scan_completed = true;
             page.started_scripts.extend(plan.owners());
@@ -2318,11 +2323,22 @@ impl BrowserApp {
                     pending.plan.resources.len(),
                 );
             }
+            for pending in &mut page.pending_dynamic_imports {
+                if !pending.stall_reported && pending.since.elapsed() >= STALL_REPORT_AFTER {
+                    pending.stall_reported = true;
+                    eprintln!(
+                        "render-browser dynamic import still in flight after {:?} ({} dependencies)",
+                        pending.since.elapsed(),
+                        pending.requests.len(),
+                    );
+                }
+            }
         }
     }
 
     pub(super) fn poll_network(&mut self) {
         self.report_stalled_batches();
+        self.poll_dynamic_module_imports();
         let mut completed_documents = Vec::new();
         let mut completed_style_sheets = Vec::new();
         let mut completed_scripts = Vec::new();
@@ -2987,6 +3003,194 @@ impl BrowserApp {
         })
     }
 
+    /// Drain dynamic `import()` requests, fetch their module graphs through
+    /// the cache/network worker in rounds, and settle each promise once its
+    /// graph is declared. Runs after page turns and from the network poll.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one load walks resolution, fetch rounds, graph declaration and promise settlement"
+    )]
+    fn poll_dynamic_module_imports(&mut self) {
+        let mut new_states = Vec::new();
+        let mut completions = Vec::new();
+        let network = self.network.clone();
+        let resubmit = &mut move |request: FetchRequest, cancel: CancelToken| {
+            network.submit_with_cancellation(request, cancel)
+        };
+        for (tab, page) in &mut self.pages {
+            for load in page.page.take_pending_module_loads() {
+                if env::var_os("RENDER_DEBUG_FRAME").is_some() {
+                    eprintln!(
+                        "render-browser dynamic import request id={} specifier={:?} referrer={}",
+                        load.id, load.specifier, load.referrer
+                    );
+                }
+                let referrer = Url::parse(&load.referrer)
+                    .unwrap_or_else(|_| page.navigation.committed().target.history_url());
+                match page.module_import_map.resolve(&referrer, &load.specifier) {
+                    Ok(url) => {
+                        let mut graph = ModuleGraph::new();
+                        graph.set_import_map(page.module_import_map.clone());
+                        let request = FetchRequest::get(url.clone()).with_accept(SCRIPT_ACCEPT);
+                        new_states.push((*tab, load.id, module_key(&url), graph, vec![request]));
+                    }
+                    Err(ImportMapMiss::Blocked) => page.page.reject_dynamic_import(
+                        load.id,
+                        format!(
+                            "import specifier {:?} is blocked by the import map",
+                            load.specifier
+                        ),
+                    ),
+                    Err(ImportMapMiss::Unmapped) => page.page.reject_dynamic_import(
+                        load.id,
+                        format!(
+                            "import specifier {:?} is not a URL and has no import-map entry",
+                            load.specifier
+                        ),
+                    ),
+                }
+            }
+            for pending in &mut page.pending_dynamic_imports {
+                let Some(handle) = pending.handle.as_mut() else {
+                    continue;
+                };
+                handle.retry_deferred(resubmit);
+                match handle.try_recv() {
+                    Ok(results) => {
+                        pending.handle = None;
+                        completions.push((*tab, pending.request_id, results));
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => {
+                        unreachable!("cache batch handle maps disconnects")
+                    }
+                }
+            }
+        }
+        for (tab, request_id, entry_key, graph, requests) in new_states {
+            let handle = self.submit_cached_batch(requests.clone());
+            if let Some(page) = self.pages.get_mut(&tab) {
+                page.pending_dynamic_imports.push(PendingDynamicImport {
+                    request_id,
+                    entry_key,
+                    graph,
+                    handle: Some(handle),
+                    requests,
+                    since: Instant::now(),
+                    stall_reported: false,
+                });
+            } else {
+                handle.cancel();
+            }
+        }
+
+        let limits = Self::runtime_limits();
+        let mut next_rounds = Vec::new();
+        let mut declarations = Vec::new();
+        for (tab, request_id, results) in completions {
+            let Some(page) = self.pages.get_mut(&tab) else {
+                continue;
+            };
+            let Some(index) = page
+                .pending_dynamic_imports
+                .iter()
+                .position(|pending| pending.request_id == request_id)
+            else {
+                continue;
+            };
+            let pending = &mut page.pending_dynamic_imports[index];
+            for (request, result) in pending.requests.iter().zip(results) {
+                let outcome = match result.result {
+                    Ok(response) if !response.status.is_success() => Err(format!(
+                        "module server returned HTTP status {}",
+                        response.status.as_u16()
+                    )),
+                    Ok(response) => Ok((
+                        response.final_url,
+                        String::from_utf8_lossy(&response.body).into_owned(),
+                    )),
+                    Err(error) => Err(error.to_string()),
+                };
+                pending.graph.complete(&request.url, outcome, &limits);
+            }
+            let dependencies = pending.graph.take_pending();
+            if dependencies.is_empty() {
+                let graph_diagnostics = pending.graph.take_diagnostics();
+                if env::var_os("RENDER_DEBUG_FRAME").is_some() {
+                    eprintln!(
+                        "render-browser dynamic import graph complete id={request_id} diagnostics={graph_diagnostics:?}"
+                    );
+                }
+                let entry_key = pending.entry_key.clone();
+                let units = pending.graph.entry(&entry_key).map(|entry| {
+                    entry
+                        .units
+                        .into_iter()
+                        .map(|unit| DynamicModuleUnit {
+                            key: unit.key,
+                            compiled: unit.compiled,
+                            resolutions: unit.resolutions,
+                        })
+                        .collect::<Vec<_>>()
+                });
+                page.pending_dynamic_imports.remove(index);
+                declarations.push((tab, request_id, entry_key, units, graph_diagnostics));
+            } else {
+                let requests = dependencies
+                    .into_iter()
+                    .map(|url| FetchRequest::get(url).with_accept(SCRIPT_ACCEPT))
+                    .collect::<Vec<_>>();
+                next_rounds.push((tab, request_id, requests));
+            }
+        }
+        for (tab, request_id, requests) in next_rounds {
+            let handle = self.submit_cached_batch(requests.clone());
+            let Some(page) = self.pages.get_mut(&tab) else {
+                handle.cancel();
+                continue;
+            };
+            if let Some(pending) = page
+                .pending_dynamic_imports
+                .iter_mut()
+                .find(|pending| pending.request_id == request_id)
+            {
+                pending.handle = Some(handle);
+                pending.requests = requests;
+            } else {
+                handle.cancel();
+            }
+        }
+        for (tab, request_id, entry_key, units, diagnostics) in declarations {
+            let Some(page) = self.pages.get_mut(&tab) else {
+                continue;
+            };
+            if let Some(units) = units {
+                if let Err(error) = page
+                    .page
+                    .resolve_dynamic_import(request_id, &entry_key, &units)
+                {
+                    eprintln!("render-browser dynamic import declaration failed: {error}");
+                    page.page
+                        .reject_dynamic_import(request_id, error.to_string());
+                }
+            } else {
+                let message = diagnostics
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| "module graph could not be fetched".to_owned());
+                eprintln!("render-browser dynamic import failed: {message}");
+                page.page.reject_dynamic_import(request_id, message);
+            }
+            // Settlement queues promise reactions inside the runtime, outside
+            // a page turn. Move them into the event loop so the next pump runs
+            // the `.then`/`.catch` callbacks.
+            // Settlement happened outside a page task, so its promise
+            // reactions have no checkpoint to run at. Drain them now: the
+            // chain is `import promise -> module evaluation -> user .then`.
+            page.page.drain_pending_microtasks();
+        }
+    }
+
     pub(super) fn has_pending_network(&self) -> bool {
         !self.pending_fetches.is_empty()
             || self.pages.values().any(|page| {
@@ -2995,6 +3199,8 @@ impl BrowserApp {
                     || page.pending_scripts.is_some()
                     || page.pending_images.is_some()
                     || !page.page.pending_fetch_queue_empty()
+                    || !page.page.pending_module_load_queue_empty()
+                    || !page.pending_dynamic_imports.is_empty()
             })
     }
 

@@ -177,7 +177,7 @@
 | iframe | `<iframe>` 参与布局，作为 raw-text 元素解析（`tree_builder.rs:547`） | 子文档加载 ⛔ |
 | 交互 | `details summary`（UA 样式表给 `details > summary:first-of-type { display: list-item }`，`document.rs:210`） | `<dialog>` 模态语义 🔵：UA 样式表已给 `dialog:not([open]){display:none}` 与 `dialog{position:absolute;…}`（`document.rs:93-101`），但 `showModal()`/`close()` 与顶层渲染 🔴 |
 | 编辑 | `contenteditable` 已读入并参与交互（`crates/render-browser/src/content_interaction.rs:323`） | 完整富文本编辑 🔵 |
-| 脚本 | `<script>` `<template>` | `<script type=module>` ✅：语法解析、依赖图获取、链接与执行已由 `render-core/src/module_graph.rs` 与 `page.rs` 接入；静态模块图的 import map 已支持；动态 `import()` 的浏览器加载器仍不完整 |
+| 脚本 | `<script>` `<template>` | `<script type=module>` ✅：语法解析、依赖图获取、链接与执行已由 `render-core/src/module_graph.rs` 与 `page.rs` 接入；静态模块图的 import map 已支持；动态 `import()` 已接入浏览器异步模块加载器；跨域模块 CORS 仍不完整 |
 | 元数据 | `<meta charset>` `<meta http-equiv>` `<meta name=viewport>` `<base>` | 其他 meta ⛔ |
 | 链接 | `rel=stylesheet` 执行 ✅（`document.rs:987-991`）；`rel=icon` 的处理 ❓ 本次未核实 | `preload` / `preconnect` / `canonical` / `alternate` ⛔ |
 

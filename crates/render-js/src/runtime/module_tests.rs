@@ -1,4 +1,4 @@
-use crate::{CompiledScript, JsErrorKind, JsRuntime, RuntimeLimits};
+use crate::{CompiledScript, DynamicModuleUnit, JsErrorKind, JsRuntime, RuntimeLimits};
 use render_html::parse_document;
 use std::collections::BTreeMap;
 
@@ -386,4 +386,74 @@ fn a_repeated_import_attribute_key_is_an_early_error() {
     )
     .expect_err("duplicate attribute keys must not compile");
     assert_eq!(error.kind(), crate::JsErrorKind::Syntax);
+}
+
+#[test]
+fn an_async_dynamic_import_waits_for_the_embedding_and_then_evaluates() {
+    let mut dom = parse_document("<!doctype html><html><body></body></html>").dom;
+    let mut runtime = JsRuntime::new(&dom);
+    runtime
+        .execute(
+            &mut dom,
+            "var log = []; import('widgets').then(ns => log.push('ns', ns.value));",
+        )
+        .expect("dynamic import queues");
+    let pending = runtime.take_pending_module_loads();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].specifier, "widgets");
+    assert!(!runtime.pending_module_load_queue_empty());
+
+    let key = "https://example.test/widgets.js";
+    let compiled =
+        CompiledScript::compile_module("export const value = 42;", &RuntimeLimits::default())
+            .expect("module compiles");
+    runtime
+        .resolve_dynamic_import(
+            &mut dom,
+            pending[0].id,
+            key,
+            &[DynamicModuleUnit {
+                key: key.to_owned(),
+                compiled,
+                resolutions: BTreeMap::new(),
+            }],
+        )
+        .expect("dynamic import resolves");
+    assert!(runtime.pending_module_load_queue_empty());
+    while let Some(microtask) = runtime.take_next_microtask() {
+        runtime
+            .invoke_microtask(&mut dom, microtask)
+            .expect("microtask runs");
+    }
+    let log = runtime
+        .execute(&mut dom, "log.join(',')")
+        .expect("reads log")
+        .value
+        .to_js_string();
+    assert_eq!(log.to_lossy(), "ns,42");
+}
+
+#[test]
+fn an_async_dynamic_import_can_be_rejected_by_the_embedding() {
+    let mut dom = parse_document("<!doctype html><html><body></body></html>").dom;
+    let mut runtime = JsRuntime::new(&dom);
+    runtime
+        .execute(
+            &mut dom,
+            "var log = []; import('missing').catch(error => log.push(error.name));",
+        )
+        .expect("dynamic import queues");
+    let pending = runtime.take_pending_module_loads();
+    runtime.reject_dynamic_import(pending[0].id, "network failed");
+    while let Some(microtask) = runtime.take_next_microtask() {
+        runtime
+            .invoke_microtask(&mut dom, microtask)
+            .expect("microtask runs");
+    }
+    let log = runtime
+        .execute(&mut dom, "log.join(',')")
+        .expect("reads log")
+        .value
+        .to_js_string();
+    assert_eq!(log.to_lossy(), "TypeError");
 }

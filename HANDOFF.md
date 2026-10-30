@@ -1,3 +1,86 @@
+# 交接文档 (2026-10-31, 续三十一) — 浏览器侧异步 dynamic import
+
+接续 import map 会话。这一轮把动态 `import()` 从“没有 loader 就拒绝”推进到
+render-net 驱动的异步模块加载。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **运行时挂起** | `PendingModuleLoad`/`DynamicModuleUnit`;无同步 loader 时把 `(id, referrer, specifier, attributes)` 交给 embedding |
+| **Promise 生命周期** | id → promise/object/phase 映射;GC 根保存 promise 对象;`resolve_dynamic_import` / `reject_dynamic_import` |
+| **页面 API** | `Page::take_pending_module_loads`、`resolve_dynamic_import`、`reject_dynamic_import`、`drain_pending_microtasks` |
+| **浏览器状态** | `PageState.pending_dynamic_imports` + `module_import_map`;每个 import 一个 `ModuleGraph` |
+| **多轮 fetch** | `poll_dynamic_module_imports`:解析 specifier → fetch 入口模块 → `take_pending` 逐轮取依赖 → `finish` |
+| **声明与结算** | 图完整后声明所有 unit,调用运行时链接/求值;失败用 `TypeError` 拒绝 |
+| **微任务** | 结算发生在 page task 之外,`drain_pending_microtasks` 直接跑 promise 反应链 |
+| **测试** | runner 侧 resolve/reject、Page API 端到端、浏览器本地 HTTP 探针 |
+
+## 证据
+
+本地动态 import 页面:
+
+```html
+<script type="importmap">{"imports":{"widgets":"./widget.js"}}</script>
+<script type="module">
+  document.body.textContent = 'start';
+  import('widgets').then((m) => {
+    console.log('DYN THEN value=' + m.value);
+    document.body.textContent = m.value;
+    document.body.style.background = m.color;
+  });
+</script>
+```
+
+隐藏截图 + 控制台:
+
+```
+[console.log] DYN THEN value=dynamic-ok
+[console.log] DYN AFTER dynamic-ok bg=rgb(0, 0, 255)
+背景像素 (5,195) = (0, 0, 255)
+health ready=Complete dom_elements=8 boxes=2 scripts_failed=0 scripts_threw=0
+```
+
+说明 import map 把 `widgets` 解析为 `./widget.js`,render-net 取回、编译、声明、
+链接、求值,`.then` 在截图前执行并改变 DOM/绘制。
+
+真实站点:
+
+```
+Bing:  ready=Complete  dom_elements=466 boxes=166
+       scripts_failed=0 scripts_threw=0 css_warnings=9 images_failed=0
+Baidu: ready=Complete  dom_elements=450 boxes=156
+       scripts_failed=0 scripts_threw=0 css_warnings=5 images_failed=0
+JD:    ready=Interactive dom_elements=1000 boxes=117
+       scripts_failed=12 scripts_threw=2 css_warnings=36 images_failed=1
+```
+
+Bing 仍不会由 importShim 触发原生 `import()`(其 shim 自己处理),但浏览器侧
+动态加载路径已具备;JD 主商品区仍受 403。
+
+## 验证
+
+```
+cargo test --workspace                       2781 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+新增测试覆盖:异步 import 挂起/成功结算/失败拒绝、Page API 端到端、import map
+解析与静态模块图、浏览器本地 import map 模块执行。
+
+## 明确未做 / 下一步
+
+- 动态模块 fetch 未做跨域 CORS 检查;`import` attributes 已交给 loader 接口但当前
+  加载器不使用。模块顶层 `await` 的异步求值仍按现有运行时能力。
+- 只支持第一个 `animation-name` 等旧限制仍在;动态 import 的重定向/缓存语义复用
+  现有 cache/script 管线,未做单独的模块缓存分区。
+- JD 主商品区仍受 403;GitHub/HN 本机链路阻断;高级渐变、SVG filter 其余原语、
+  IndexedDB 值类型覆盖仍未完成。
+
+---
+
 # 交接文档 (2026-10-31, 续三十) — Import maps 与模块说明符解析
 
 接续 `@keyframes` 会话。这一轮实现 `<script type="importmap">` 的解析与静态
@@ -52,8 +135,8 @@ JD:    ready=Loading   dom_elements=1157 boxes=117
        scripts_failed=8 scripts_threw=2 css_warnings=36 images_failed=1
 ```
 
-Bing 仍加载 es-module-shims,其 `importShim` 走动态加载路径;静态模块图与
-import map 已通,但浏览器侧动态 `import()` loader 仍是下一步。
+Bing 仍加载 es-module-shims;静态模块图与 import map 已通,浏览器侧动态
+`import()` loader 已在续三十一接入。
 
 ## 验证
 
@@ -69,8 +152,8 @@ real_site_tasks                              66 passed, 0 failed
 - 只应用第一张 import map;标准的多张 map 合并与"map 必须在模块之前"的时序
   仍按文档顺序宽松处理。
 - `integrity` 元数据忽略;`src` 形式的 import map 非法,当前按空内容处理并报错。
-- 动态 `import()` 仍缺浏览器侧异步 loader;Bing 的 `importShim` 因此还不能加载
-  其 bundle。`text/rms`、import maps 后的模块脚本类型仍待补。
+- 动态 `import()` 已在续三十一接入浏览器异步 loader;跨域模块 CORS、import
+  attributes 的语义仍未完整。`text/rms` 脚本类型仍待补。
 - JD 主商品区仍受 403 风控;GitHub/HN 本机链路阻断;高级渐变、SVG filter
   其余原语、IndexedDB 值类型覆盖仍未完成。
 

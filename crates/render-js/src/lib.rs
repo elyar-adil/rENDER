@@ -29,9 +29,10 @@ use std::sync::Arc;
 
 pub use bigint::JsBigInt;
 pub use runtime::{
-    ConsoleLevel, ConsoleMessage, DocumentLoader, DocumentReadyState, ElementRect,
-    FetchCredentials, FetchOutcome, HistoryRequest, JsMicrotask, JsRuntime, ModuleLoader,
-    NavigationRequest, PendingFetch, TimerEntry, TimerHandler, TimerKind, TimerRequest,
+    ConsoleLevel, ConsoleMessage, DocumentLoader, DocumentReadyState, DynamicModuleUnit,
+    ElementRect, FetchCredentials, FetchOutcome, HistoryRequest, JsMicrotask, JsRuntime,
+    ModuleLoader, NavigationRequest, PendingFetch, PendingModuleLoad, TimerEntry, TimerHandler,
+    TimerKind, TimerRequest,
 };
 pub use value::{JsObject, JsSymbol, JsValue, ObjectId, PropertyDescriptor, Realm, RealmId};
 

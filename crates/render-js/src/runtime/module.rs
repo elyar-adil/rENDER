@@ -60,6 +60,41 @@ pub trait ModuleLoader: Debug {
     ) -> Result<(String, CompiledScript), JsError>;
 }
 
+/// One dynamic `import()` the host must resolve asynchronously.
+///
+/// The runtime queues this when no synchronous [`ModuleLoader`] is installed.
+/// The embedding drains it through [`JsRuntime::take_pending_module_loads`],
+/// fetches the specifier (using the document's import map), then calls
+/// [`JsRuntime::resolve_dynamic_import`] or
+/// [`JsRuntime::reject_dynamic_import`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingModuleLoad {
+    /// Correlation id echoed back to the resolve/reject methods.
+    pub id: u64,
+    /// Base URL of the module or script that called `import()`.
+    pub referrer: String,
+    /// Specifier exactly as the script wrote it.
+    pub specifier: String,
+    /// Import attributes as `(key, value)` pairs.
+    pub attributes: Vec<(String, String)>,
+}
+
+/// One compiled module and its specifier resolutions, handed to the runtime
+/// when an asynchronous dynamic import finishes fetching.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DynamicModuleUnit {
+    pub key: String,
+    pub compiled: CompiledScript,
+    pub resolutions: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PendingModuleImportState {
+    promise: usize,
+    object: ObjectId,
+    phase: ImportPhase,
+}
+
 /// The status of a cyclic module record (ECMA-262 16.2.1.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Status {
@@ -433,19 +468,48 @@ impl JsRuntime {
         object: ObjectId,
         phase: ImportPhase,
     ) -> Result<(), JsError> {
-        let fetched = request.and_then(|(specifier, attributes)| {
-            self.with_module_loader(|runtime, loader| {
-                let Some(boxed) = loader.as_mut() else {
-                    return Err(JsError::type_error(
-                        "import() cannot load a module: no module loader is installed",
-                    ));
-                };
-                let (key, script) = boxed.load(referrer, &specifier, &attributes)?;
-                if !runtime.modules().contains_key(&key) {
-                    runtime.load_graph(loader, &key, script)?;
-                }
-                Ok(key)
-            })
+        let (specifier, attributes) = match request {
+            Ok(request) => request,
+            Err(error) => {
+                let reason = self.error_value(&error);
+                self.reject_promise(promise, &reason);
+                return Ok(());
+            }
+        };
+        // No synchronous loader: hand the request to the embedding, which
+        // fetches through render-net (honouring the document's import map) and
+        // calls resolve_dynamic_import when the graph is declared.
+        if self.module_loader.is_none() {
+            let id = self.next_module_load_id;
+            self.next_module_load_id = self.next_module_load_id.saturating_add(1);
+            self.pending_module_loads.push(PendingModuleLoad {
+                id,
+                referrer: referrer.to_owned(),
+                specifier,
+                attributes,
+            });
+            self.pending_module_imports.insert(
+                id,
+                PendingModuleImportState {
+                    promise,
+                    object,
+                    phase,
+                },
+            );
+            self.pending_module_targets.insert(id, object);
+            return Ok(());
+        }
+        let fetched = self.with_module_loader(|runtime, loader| {
+            let Some(boxed) = loader.as_mut() else {
+                return Err(JsError::type_error(
+                    "import() cannot load a module: no module loader is installed",
+                ));
+            };
+            let (key, script) = boxed.load(referrer, &specifier, &attributes)?;
+            if !runtime.modules().contains_key(&key) {
+                runtime.load_graph(loader, &key, script)?;
+            }
+            Ok(key)
         });
         match fetched {
             // A module that cannot be fetched rejects the import right away
@@ -516,6 +580,64 @@ impl JsRuntime {
             }
         }
         Ok((specifier, attributes))
+    }
+
+    /// Drain dynamic imports waiting for the embedding's asynchronous loader.
+    #[must_use]
+    pub fn take_pending_module_loads(&mut self) -> Vec<PendingModuleLoad> {
+        std::mem::take(&mut self.pending_module_loads)
+    }
+
+    /// Whether any dynamic import is still waiting for the embedding.
+    #[must_use]
+    pub fn pending_module_load_queue_empty(&self) -> bool {
+        self.pending_module_loads.is_empty() && self.pending_module_imports.is_empty()
+    }
+
+    /// Finish one asynchronous dynamic import after its graph was fetched.
+    ///
+    /// Every unit is declared before linking, so a link failure rejects the
+    /// import's promise exactly like a synchronous loader failure.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a module declaration error; link/evaluation failures reject
+    /// the promise and return `Ok`.
+    pub fn resolve_dynamic_import(
+        &mut self,
+        dom: &mut Dom,
+        id: u64,
+        entry_key: &str,
+        units: &[DynamicModuleUnit],
+    ) -> Result<(), JsError> {
+        let Some(state) = self.pending_module_imports.remove(&id) else {
+            return Ok(());
+        };
+        self.pending_module_targets.remove(&id);
+        for unit in units {
+            if !self.modules().contains_key(&unit.key) {
+                self.declare_module(&unit.key, &unit.compiled, unit.resolutions.clone())?;
+            }
+        }
+        if let Err(error) =
+            self.continue_dynamic_import(dom, entry_key, state.promise, state.object, state.phase)
+        {
+            let reason = self.error_value(&error);
+            self.reject_promise(state.promise, &reason);
+        }
+        Ok(())
+    }
+
+    /// Reject one asynchronous dynamic import (fetch, decode or resolution
+    /// failure) with a `TypeError`.
+    pub fn reject_dynamic_import(&mut self, id: u64, message: impl Into<String>) {
+        let Some(state) = self.pending_module_imports.remove(&id) else {
+            return;
+        };
+        self.pending_module_targets.remove(&id);
+        let error = JsError::type_error(message.into());
+        let reason = self.error_value(&error);
+        self.reject_promise(state.promise, &reason);
     }
 
     /// `ContinueDynamicImport`'s `onLoadFulfilled` (ECMA-262 13.3.10.1): link the

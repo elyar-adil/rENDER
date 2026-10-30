@@ -23,8 +23,8 @@ use crate::image::{DecodedImage, ImageLimits, ImageResources};
 use crate::interaction::{FocusNavigationDirection, FocusTransition, sequential_focus_target};
 use crate::invalidation::{InvalidationCursor, InvalidationError, RenderingInvalidationPlan};
 use crate::js::{
-    CompiledScript, ElementRect, FetchOutcome, JsError, JsMicrotask, JsRuntime, JsValue,
-    PendingFetch, RuntimeLimits, ScriptOutcome, TimerRequest,
+    CompiledScript, DynamicModuleUnit, ElementRect, FetchOutcome, JsError, JsMicrotask, JsRuntime,
+    JsValue, PendingFetch, PendingModuleLoad, RuntimeLimits, ScriptOutcome, TimerRequest,
 };
 use crate::layout::{FragmentKind, SimpleTextMeasurer};
 use crate::module_graph::{ModuleEntry, ModuleGraph, module_key};
@@ -1236,6 +1236,15 @@ impl Page {
             || self.event_loop.pending_microtask_count() > 0
     }
 
+    /// Run the runtime's queued microtasks now, outside a page task.
+    ///
+    /// Dynamic-import settlement happens in the embedding's network poll, so
+    /// its promise reactions have no task to attach their checkpoint to. This
+    /// drains them in order until the chain is empty.
+    pub fn drain_pending_microtasks(&mut self) {
+        self.drain_runtime_microtasks();
+    }
+
     /// Whether a task or microtask is ready to run immediately.
     #[must_use]
     pub fn has_pending_immediate_work(&self) -> bool {
@@ -1254,6 +1263,40 @@ impl Page {
     #[must_use]
     pub fn pending_fetch_queue_empty(&self) -> bool {
         self.runtime.pending_fetch_queue_empty()
+    }
+
+    /// Drain dynamic `import()` requests that need the embedding's
+    /// asynchronous loader.
+    #[must_use]
+    pub fn take_pending_module_loads(&mut self) -> Vec<PendingModuleLoad> {
+        self.runtime.take_pending_module_loads()
+    }
+
+    /// Whether a dynamic import still waits for the embedding.
+    #[must_use]
+    pub fn pending_module_load_queue_empty(&self) -> bool {
+        self.runtime.pending_module_load_queue_empty()
+    }
+
+    /// Declare a fetched dynamic-import graph and settle its promise.
+    ///
+    /// # Errors
+    ///
+    /// Propagates module declaration errors; link/evaluation failures reject
+    /// the import promise instead.
+    pub fn resolve_dynamic_import(
+        &mut self,
+        id: u64,
+        entry_key: &str,
+        units: &[DynamicModuleUnit],
+    ) -> Result<(), JsError> {
+        self.runtime
+            .resolve_dynamic_import(self.document.dom_mut(), id, entry_key, units)
+    }
+
+    /// Reject a dynamic import whose fetch or resolution failed.
+    pub fn reject_dynamic_import(&mut self, id: u64, message: impl Into<String>) {
+        self.runtime.reject_dynamic_import(id, message);
     }
 
     /// Complete one queued network transfer previously drained from
@@ -1820,7 +1863,7 @@ mod tests {
     };
     use crate::dom::{Dom, NodeId, NodeKind};
     use crate::event_loop::{EventLoopLimits, MicrotaskCheckpoint, RenderingDecision};
-    use crate::js::RuntimeLimits;
+    use crate::js::{CompiledScript, DynamicModuleUnit, RuntimeLimits};
     use crate::script::{ScriptDiscoveryLimits, ScriptScheduling};
     use std::time::Duration;
     use url::Url;
@@ -2801,6 +2844,37 @@ mod tests {
             .expect("inline script turn succeeds")
             .expect("inline script is queued");
         assert_eq!(page.document_title(), Some("Script Title".to_owned()));
+    }
+
+    #[test]
+    fn an_async_dynamic_import_settles_through_the_page_api() {
+        let mut page = Page::new("<!doctype html><html><body></body></html>");
+        page.queue_script("import('widgets').then(function (m) { document.title = m.value; });")
+            .expect("dynamic import script queues");
+        page.pump_until_idle_reference(Duration::ZERO)
+            .expect("script runs");
+        let loads = page.take_pending_module_loads();
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].specifier, "widgets");
+
+        let key = "https://example.test/widgets.js";
+        let compiled = CompiledScript::compile_module(
+            "export const value = 'dynamic-ok';",
+            &RuntimeLimits::default(),
+        )
+        .expect("module compiles");
+        page.resolve_dynamic_import(
+            loads[0].id,
+            key,
+            &[DynamicModuleUnit {
+                key: key.to_owned(),
+                compiled,
+                resolutions: std::collections::BTreeMap::default(),
+            }],
+        )
+        .expect("dynamic import resolves");
+        page.drain_pending_microtasks();
+        assert_eq!(page.document_title(), Some("dynamic-ok".to_owned()));
     }
 
     #[test]

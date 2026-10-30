@@ -632,6 +632,17 @@ impl JsRuntime {
                 *target,
             );
         }
+        // The same lifetime rule for asynchronous dynamic imports: their
+        // promise object must survive until the embedding resolves or rejects.
+        for target in self.pending_module_targets.values() {
+            mark_object(
+                self,
+                &mut marked,
+                &mut work,
+                &mut marked_environments,
+                *target,
+            );
+        }
         for microtask in &self.pending_microtasks {
             match microtask {
                 JsMicrotask::Callback(callback) => {
