@@ -1288,6 +1288,67 @@ fn web_animation_keyframe_and_group_effects_are_constructible() {
 }
 
 #[test]
+fn web_animation_group_children_keep_independent_timing() {
+    let mut parsed = parse_document("<!doctype html><div id='box'></div>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.fakeNow = 0;
+                performance.now = function () { return window.fakeNow; };
+                var box = document.getElementById('box');
+                var opacity = new KeyframeEffect(
+                    box,
+                    [{ opacity: 0 }, { opacity: 1 }],
+                    { duration: 1000, fill: 'both' }
+                );
+                var width = new KeyframeEffect(
+                    box,
+                    [{ width: '0px' }, { width: '100px' }],
+                    { duration: 400, delay: 600, fill: 'both' }
+                );
+                var group = new GroupEffect([opacity, width], { duration: 1000, fill: 'both' });
+                new Animation(group, document.timeline).play();
+            ",
+        )
+        .expect("group with local timing starts");
+    runtime
+        .execute(&mut parsed.dom, "window.fakeNow = 300;")
+        .expect("advance time");
+    tick_web_animations(&mut runtime, &mut parsed.dom, 300.0);
+    let early = runtime
+        .execute(
+            &mut parsed.dom,
+            r"[
+                document.getElementById('box').style.getPropertyValue('opacity'),
+                document.getElementById('box').style.getPropertyValue('width')
+            ].join('|')",
+        )
+        .expect("reads early group values")
+        .value
+        .to_js_string();
+    assert_eq!(early.to_lossy(), "0.3|0px");
+
+    runtime
+        .execute(&mut parsed.dom, "window.fakeNow = 800;")
+        .expect("advance time");
+    tick_web_animations(&mut runtime, &mut parsed.dom, 800.0);
+    let middle = runtime
+        .execute(
+            &mut parsed.dom,
+            r"[
+                document.getElementById('box').style.getPropertyValue('opacity'),
+                document.getElementById('box').style.getPropertyValue('width')
+            ].join('|')",
+        )
+        .expect("reads middle group values")
+        .value
+        .to_js_string();
+    assert_eq!(middle.to_lossy(), "0.8|50px");
+}
+
+#[test]
 fn inner_html_round_trips_and_setter_replaces_children() {
     let mut parsed = parse_document("<!doctype html><div id='host'><p>old</p></div>");
     let mut runtime = JsRuntime::new(&parsed.dom);

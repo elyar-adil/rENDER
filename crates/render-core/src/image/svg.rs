@@ -21,7 +21,8 @@
 //! - `mask` references on shapes and groups, with offscreen alpha or
 //!   luminance compositing, `maskUnits` and `maskContentUnits`;
 //! - `filter` references with `feGaussianBlur`, `feColorMatrix`, `feOffset`,
-//!   `feBlend` and `feComposite`, composited through offscreen buffers;
+//!   `feBlend`, `feComposite`, `feFlood` and `feMerge`, composited through
+//!   offscreen buffers;
 //! - root sizing by `width`/`height` (percentages resolve against the
 //!   `viewBox`), falling back to `viewBox`, then the spec default 300×150.
 //!
@@ -1373,8 +1374,8 @@ fn paint_masked_element(
 /// `filter` attribute removed. The filter primitives then transform that
 /// buffer, and the result is composited through the filter region. The first
 /// Supported primitives are `feGaussianBlur`, `feColorMatrix`, `feOffset`,
-/// `feBlend` and `feComposite`; a chain is processed in document order, with
-/// `result` names and `in`/`in2` references.
+/// `feBlend`, `feComposite`, `feFlood` and `feMerge`; a chain is processed in
+/// document order, with `result` names and `in`/`in2` references.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -1511,6 +1512,26 @@ fn paint_filtered_element(
                 &input,
                 attribute(primitive, "operator").unwrap_or("over"),
             ),
+            "feFlood" => {
+                let color = attribute(primitive, "flood-color")
+                    .and_then(parse_color)
+                    .unwrap_or(Color::BLACK);
+                let opacity = attribute(primitive, "flood-opacity")
+                    .and_then(parse_opacity)
+                    .unwrap_or(1.0);
+                vec![color.with_opacity(opacity); input.len()]
+            }
+            "feMerge" => {
+                let mut merged = vec![Color::TRANSPARENT; input.len()];
+                for node in &primitive.children {
+                    if node.name != "feMergeNode" {
+                        continue;
+                    }
+                    let layer = filter_input(node, "in", &source, &source_alpha, &results, &merged);
+                    merged = composite_pixels(&merged, &layer, "over");
+                }
+                merged
+            }
             _ => input,
         };
         if let Some(result) = attribute(primitive, "result") {
@@ -3995,5 +4016,31 @@ mod tests {
         let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
         assert_eq!(image.pixel(3, 1), Some(Color::rgb(0, 0, 0)));
         assert_eq!(image.pixel(3, 3), Some(Color::rgba(0, 0, 0, 0)));
+    }
+    #[test]
+    fn fe_flood_paints_the_filter_region() {
+        let svg = br##"<svg width="20" height="20"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="20" height="20">
+              <feFlood flood-color="#0000ff" flood-opacity="0.5"/>
+            </filter></defs>
+            <rect x="2" y="2" width="5" height="5" fill="red" filter="url(#f)"/></svg>"##;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(10, 10), Some(Color::rgba(0, 0, 255, 128)));
+    }
+
+    #[test]
+    fn fe_merge_layers_named_results_in_order() {
+        let svg = br#"<svg width="20" height="20"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="20" height="20">
+              <feOffset dx="5" result="shifted"/>
+              <feMerge>
+                <feMergeNode in="SourceGraphic"/>
+                <feMergeNode in="shifted"/>
+              </feMerge>
+            </filter></defs>
+            <rect x="2" y="2" width="5" height="5" fill="red" filter="url(#f)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(3, 3), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(8, 5), Some(Color::rgb(255, 0, 0)));
     }
 }

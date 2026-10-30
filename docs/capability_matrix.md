@@ -237,8 +237,9 @@ them would break more real pages than everything else combined:
    no compositor thread. A self-hosted WAAPI core shares that document clock and
    covers element.animate, play/pause/finish/cancel, playbackRate/reverse,
    an ordered effect stack with add/accumulate composition, per-keyframe easing,
-   KeyframeEffect/GroupEffect with nested groups, and finish/cancel events;
-   group-local child timing and several timing-model edge cases remain incomplete
+   KeyframeEffect/GroupEffect with nested groups and independent per-child timing,
+   and finish/cancel events; nested group local-time transforms and several
+   timing-model edge cases remain incomplete
 3. **Shadow-scoped styling** - shadow trees exist, but a `<style>` inside a shadow root applies
    nowhere and `:host`/`::slotted` match nothing
 4. **Selection, bidi, workers and compositing** - the remaining structural absences. The

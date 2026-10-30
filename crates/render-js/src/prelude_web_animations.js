@@ -481,6 +481,12 @@
     return { values: values, composites: composites };
   };
 
+  KeyframeEffect.prototype._sampleAtTime = function (localTime) {
+    var result = activeProgress(this._timing, localTime, 1);
+    if (result.progress === null) return null;
+    return this._sample(result.progress);
+  };
+
   function GroupEffect(effects, options) {
     this._kind = 'group';
     this._children = [];
@@ -545,6 +551,26 @@
     }
     return null;
   };
+  GroupEffect.prototype._sampleAtTime = function (localTime) {
+    var values = Object.create(null);
+    var composites = Object.create(null);
+    this._children.forEach(function (child) {
+      var result = child._sampleAtTime(localTime);
+      if (!result) return;
+      Object.keys(result.values).forEach(function (property) {
+        if (!(property in values)) values[property] = '';
+        var composite = result.composites[property] || 'replace';
+        if (composite === 'add' || composite === 'accumulate') {
+          values[property] = addValues(values[property], result.values[property]);
+        } else {
+          values[property] = result.values[property];
+        }
+        composites[property] = composite;
+      });
+    });
+    return { values: values, composites: composites };
+  };
+
   GroupEffect.prototype._sample = function (progress) {
     if (progress === null) return null;
     var values = Object.create(null);
@@ -610,13 +636,13 @@
     animations.push(this);
   }
 
-  Animation.prototype._apply = function (progress) {
+  Animation.prototype._apply = function (progress, elapsed) {
     if (progress === null) {
       this._values = null;
       this._valueComposite = null;
       return;
     }
-    var result = this._effect._sample(progress);
+    var result = this._effect._sampleAtTime(elapsed);
     this._values = result ? result.values : null;
     this._valueComposite = result ? result.composites : null;
   };
@@ -645,7 +671,7 @@
     var elapsed = (time - this._startTime) * this._playbackRate;
     this._currentTime = elapsed;
     var result = activeProgress(this._timing, elapsed, this._playbackRate);
-    this._apply(result.progress);
+    this._apply(result.progress, elapsed);
     if (result.finished) this._finish();
   };
 
@@ -730,7 +756,7 @@
         this._startTime = now() - next / this._playbackRate;
       }
       var result = activeProgress(this._timing, next, this._playbackRate);
-      this._apply(result.progress);
+      this._apply(result.progress, next);
       renderTarget(this._target);
     },
     configurable: true
