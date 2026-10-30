@@ -18,13 +18,15 @@
 //! - same-document `<use>` references through `href`/`xlink:href`, including
 //!   `x`/`y`, inherited paint, and `<symbol>` viewBox scaling by the use
 //!   element's `width`/`height`;
+//! - `mask` references on shapes and groups, with offscreen alpha or
+//!   luminance compositing, `maskUnits` and `maskContentUnits`;
 //! - root sizing by `width`/`height` (percentages resolve against the
 //!   `viewBox`), falling back to `viewBox`, then the spec default 300×150.
 //!
-//! Everything outside the subset (text, masks, filters, embedded images,
-//! scripting, external-document `<use>` references, gradient `xlink:href`
-//! inheritance and spread modes other than `pad`) contributes nothing,
-//! matching how an `<img>`-loaded SVG must render: static and script-free.
+//! Everything outside the subset (text, filters, embedded images, scripting,
+//! external-document `<use>` references, gradient `xlink:href` inheritance
+//! and spread modes other than `pad`) contributes nothing, matching how an
+//! `<img>`-loaded SVG must render: static and script-free.
 //!
 //! Two things about the document are easy to get wrong and are pinned by
 //! tests: it is XML, so an attribute name is case-sensitive and `viewBox` is
@@ -391,6 +393,7 @@ fn decode_viewport(
         pixels: vec![Color::rgba(0, 0, 0, 0); width as usize * height as usize],
         clip: ClipStack::default(),
         use_depth: 0,
+        mask_depth: 0,
     };
 
     // Root viewBox-to-viewport mapping, composed ahead of every shape.
@@ -428,6 +431,7 @@ fn decode_viewport(
     // initial value in force.
     let (gradients, gradient_index) = collect_gradients(root, current_color);
     let clip_paths = collect_clip_paths(root);
+    let mask_paths = collect_masks(root);
     let ids = collect_element_ids(root);
     let fill = root_paint(
         root,
@@ -446,6 +450,7 @@ fn decode_viewport(
         &gradients,
         &gradient_index,
         &clip_paths,
+        &mask_paths,
         &ids,
         &mut raster,
     );
@@ -458,6 +463,7 @@ struct Raster {
     pixels: Vec<Color>,
     clip: ClipStack,
     use_depth: usize,
+    mask_depth: usize,
 }
 
 impl Raster {
@@ -585,6 +591,7 @@ fn walk(
     gradients: &[Gradient],
     gradient_index: &BTreeMap<String, usize>,
     clip_paths: &BTreeMap<String, &XmlNode>,
+    mask_paths: &BTreeMap<String, &XmlNode>,
     ids: &BTreeMap<String, &XmlNode>,
     raster: &mut Raster,
 ) {
@@ -604,6 +611,25 @@ fn walk(
             Some(specification) => transform.then(parse_transform(specification)),
             None => transform,
         };
+        if attribute("display").is_some_and(|value| value.eq_ignore_ascii_case("none")) {
+            continue;
+        }
+        if paint_masked_element(
+            raster,
+            child_node,
+            transform,
+            child_transform,
+            child_fill,
+            child_stroke,
+            current_color,
+            gradients,
+            gradient_index,
+            clip_paths,
+            mask_paths,
+            ids,
+        ) {
+            continue;
+        }
         match child_node.name.as_str() {
             "defs" | "text" | "image" | "style" | "title" | "desc" | "metadata" => {}
             "rect" => {
@@ -890,6 +916,7 @@ fn walk(
                     gradients,
                     gradient_index,
                     clip_paths,
+                    mask_paths,
                     ids,
                     raster,
                 );
@@ -908,6 +935,7 @@ fn walk(
                     gradients,
                     gradient_index,
                     clip_paths,
+                    mask_paths,
                     ids,
                     raster,
                 );
@@ -923,6 +951,7 @@ fn walk(
                     gradients,
                     gradient_index,
                     clip_paths,
+                    mask_paths,
                     ids,
                     raster,
                 );
@@ -932,6 +961,205 @@ fn walk(
     if clipped {
         raster.clip.pop();
     }
+}
+
+/// Render one element through an SVG mask.
+///
+/// The element is painted into an offscreen buffer with its `mask` attribute
+/// removed, then the mask definition is painted into a second buffer. The
+/// resulting coverage is applied per pixel when the offscreen content is
+/// composited into `raster`, so masks work for shapes, groups and `<use>`.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one masked element needs content, mask and region passes in one place"
+)]
+fn paint_masked_element(
+    raster: &mut Raster,
+    element: &XmlNode,
+    parent_transform: Affine,
+    element_transform: Affine,
+    fill: Paint,
+    stroke: Paint,
+    current_color: Color,
+    gradients: &[Gradient],
+    gradient_index: &BTreeMap<String, usize>,
+    clip_paths: &BTreeMap<String, &XmlNode>,
+    mask_paths: &BTreeMap<String, &XmlNode>,
+    ids: &BTreeMap<String, &XmlNode>,
+) -> bool {
+    let Some(reference) = attribute(element, "mask") else {
+        return false;
+    };
+    let Some(id) = reference_id(reference) else {
+        return false;
+    };
+    let Some(mask) = mask_paths.get(id) else {
+        return false;
+    };
+    if raster.mask_depth >= 8 {
+        return false;
+    }
+    let Some(bounds) = element_bounds(element) else {
+        return true;
+    };
+
+    let mut content = Raster {
+        width: raster.width,
+        height: raster.height,
+        pixels: vec![Color::TRANSPARENT; raster.width as usize * raster.height as usize],
+        clip: raster.clip.clone(),
+        use_depth: raster.use_depth,
+        mask_depth: raster.mask_depth,
+    };
+    let mut clone = element.clone();
+    clone.attributes.retain(|(name, _)| name != "mask");
+    let shadow = XmlNode {
+        name: "masked-content".to_owned(),
+        attributes: Vec::new(),
+        children: vec![clone],
+    };
+    walk(
+        &shadow,
+        parent_transform,
+        fill,
+        stroke,
+        current_color,
+        gradients,
+        gradient_index,
+        clip_paths,
+        mask_paths,
+        ids,
+        &mut content,
+    );
+
+    let object_content = attribute(mask, "maskContentUnits")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("objectBoundingBox"));
+    let mut mask_transform = element_transform;
+    if object_content {
+        mask_transform = mask_transform.then(Affine {
+            a: bounds.width,
+            b: 0.0,
+            c: 0.0,
+            d: bounds.height,
+            e: bounds.x,
+            f: bounds.y,
+        });
+    }
+    if let Some(specification) = attribute(mask, "transform") {
+        mask_transform = mask_transform.then(parse_transform(specification));
+    }
+    let mut mask_raster = Raster {
+        width: raster.width,
+        height: raster.height,
+        pixels: vec![Color::TRANSPARENT; raster.width as usize * raster.height as usize],
+        clip: ClipStack::default(),
+        use_depth: 0,
+        mask_depth: raster.mask_depth + 1,
+    };
+    walk(
+        mask,
+        mask_transform,
+        Paint::Color(Color::BLACK),
+        Paint::None,
+        current_color,
+        gradients,
+        gradient_index,
+        clip_paths,
+        mask_paths,
+        ids,
+        &mut mask_raster,
+    );
+
+    let object_units = !attribute(mask, "maskUnits")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("userSpaceOnUse"));
+    let (x, y, width, height) = if object_units {
+        (
+            attribute(mask, "x")
+                .and_then(parse_fraction)
+                .unwrap_or(-0.1),
+            attribute(mask, "y")
+                .and_then(parse_fraction)
+                .unwrap_or(-0.1),
+            attribute(mask, "width")
+                .and_then(parse_fraction)
+                .unwrap_or(1.2),
+            attribute(mask, "height")
+                .and_then(parse_fraction)
+                .unwrap_or(1.2),
+        )
+    } else {
+        (
+            attribute(mask, "x")
+                .and_then(parse_length)
+                .unwrap_or(bounds.x - 0.1 * bounds.width),
+            attribute(mask, "y")
+                .and_then(parse_length)
+                .unwrap_or(bounds.y - 0.1 * bounds.height),
+            attribute(mask, "width")
+                .and_then(parse_length)
+                .unwrap_or(1.2 * bounds.width),
+            attribute(mask, "height")
+                .and_then(parse_length)
+                .unwrap_or(1.2 * bounds.height),
+        )
+    };
+    if width <= 0.0 || height <= 0.0 {
+        return true;
+    }
+    let (region_x, region_y, region_width, region_height) = if object_units {
+        (
+            bounds.x + x * bounds.width,
+            bounds.y + y * bounds.height,
+            width * bounds.width,
+            height * bounds.height,
+        )
+    } else {
+        (x, y, width, height)
+    };
+    let region = [
+        (region_x, region_y),
+        (region_x + region_width, region_y),
+        (region_x + region_width, region_y + region_height),
+        (region_x, region_y + region_height),
+    ]
+    .map(|(x, y)| element_transform.apply(x, y));
+    let mask_is_alpha = attribute(mask, "mask-type")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("alpha"))
+        || attribute(mask, "style").is_some_and(|style| {
+            style
+                .to_ascii_lowercase()
+                .replace(' ', "")
+                .contains("mask-type:alpha")
+        });
+
+    for y in 0..raster.height {
+        for x in 0..raster.width {
+            if !point_in_polygon(&region, x as f32 + 0.5, y as f32 + 0.5) {
+                continue;
+            }
+            let index = y as usize * raster.width as usize + x as usize;
+            let source = content.pixels[index];
+            if source.alpha == 0 {
+                continue;
+            }
+            let mask_pixel = mask_raster.pixels[index];
+            let mask_alpha = f32::from(mask_pixel.alpha) / 255.0;
+            let coverage = if mask_is_alpha {
+                mask_alpha
+            } else {
+                let luminance = 0.2126 * f32::from(mask_pixel.red)
+                    + 0.7152 * f32::from(mask_pixel.green)
+                    + 0.0722 * f32::from(mask_pixel.blue);
+                (luminance / 255.0) * mask_alpha
+            };
+            if coverage <= 0.0 {
+                continue;
+            }
+            raster.put(i64::from(x), i64::from(y), source.with_opacity(coverage));
+        }
+    }
+    true
 }
 
 /// Fill one shape with a solid colour or a gradient.
@@ -1455,6 +1683,26 @@ fn collect_element_ids_into<'a>(element: &'a XmlNode, ids: &mut BTreeMap<String,
     }
 }
 
+/// Index every `mask` definition by id, including forward references.
+fn collect_masks(root: &XmlNode) -> BTreeMap<String, &XmlNode> {
+    let mut masks = BTreeMap::new();
+    collect_masks_into(root, &mut masks);
+    masks
+}
+
+fn collect_masks_into<'a>(element: &'a XmlNode, masks: &mut BTreeMap<String, &'a XmlNode>) {
+    for child in &element.children {
+        if child.name == "mask"
+            && let Some(id) = attribute(child, "id")
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+        {
+            masks.entry(id.to_owned()).or_insert(child);
+        }
+        collect_masks_into(child, masks);
+    }
+}
+
 fn clip_path_units(node: &XmlNode) -> ClipPathUnits {
     if attribute(node, "clipPathUnits")
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("objectBoundingBox"))
@@ -1628,60 +1876,83 @@ fn element_bounds(element: &XmlNode) -> Option<Bounds> {
 }
 
 fn collect_bounds(element: &XmlNode, transform: Affine, points: &mut Vec<(f32, f32)>) {
+    match element.name.as_str() {
+        "rect" => {
+            if let Some(local) = rect_polygon(
+                attribute(element, "x").and_then(parse_length),
+                attribute(element, "y").and_then(parse_length),
+                attribute(element, "width").and_then(parse_length),
+                attribute(element, "height").and_then(parse_length),
+            ) {
+                points.extend(local.iter().map(|(x, y)| transform.apply(*x, *y)));
+            }
+            return;
+        }
+        "circle" | "ellipse" => {
+            let cx = attribute(element, "cx")
+                .and_then(parse_length)
+                .unwrap_or(0.0);
+            let cy = attribute(element, "cy")
+                .and_then(parse_length)
+                .unwrap_or(0.0);
+            let (rx, ry) = if element.name == "circle" {
+                let r = attribute(element, "r")
+                    .and_then(parse_length)
+                    .unwrap_or(0.0);
+                (r, r)
+            } else {
+                (
+                    attribute(element, "rx")
+                        .and_then(parse_length)
+                        .unwrap_or(0.0),
+                    attribute(element, "ry")
+                        .and_then(parse_length)
+                        .unwrap_or(0.0),
+                )
+            };
+            if rx > 0.0 && ry > 0.0 {
+                for step in 0..48 {
+                    let angle = std::f32::consts::TAU * step as f32 / 48.0;
+                    points.push(transform.apply(cx + rx * angle.cos(), cy + ry * angle.sin()));
+                }
+            }
+            return;
+        }
+        "polygon" | "polyline" => {
+            if let Some(local) = attribute(element, "points").and_then(parse_points) {
+                points.extend(local.iter().map(|(x, y)| transform.apply(*x, *y)));
+            }
+            return;
+        }
+        "path" => {
+            if let Some(specification) = attribute(element, "d") {
+                for (subpath, _) in parse_path(specification) {
+                    points.extend(subpath.iter().map(|(x, y)| transform.apply(*x, *y)));
+                }
+            }
+            return;
+        }
+        "line" => {
+            let (Some(x1), Some(y1), Some(x2), Some(y2)) = (
+                attribute(element, "x1").and_then(parse_length),
+                attribute(element, "y1").and_then(parse_length),
+                attribute(element, "x2").and_then(parse_length),
+                attribute(element, "y2").and_then(parse_length),
+            ) else {
+                return;
+            };
+            points.push(transform.apply(x1, y1));
+            points.push(transform.apply(x2, y2));
+            return;
+        }
+        _ => {}
+    }
     for child in &element.children {
         let child_transform = match attribute(child, "transform") {
             Some(specification) => transform.then(parse_transform(specification)),
             None => transform,
         };
-        match child.name.as_str() {
-            "rect" => {
-                if let Some(local) = rect_polygon(
-                    attribute(child, "x").and_then(parse_length),
-                    attribute(child, "y").and_then(parse_length),
-                    attribute(child, "width").and_then(parse_length),
-                    attribute(child, "height").and_then(parse_length),
-                ) {
-                    points.extend(local.iter().map(|(x, y)| child_transform.apply(*x, *y)));
-                }
-            }
-            "circle" | "ellipse" => {
-                let cx = attribute(child, "cx").and_then(parse_length).unwrap_or(0.0);
-                let cy = attribute(child, "cy").and_then(parse_length).unwrap_or(0.0);
-                let (rx, ry) = if child.name == "circle" {
-                    let r = attribute(child, "r").and_then(parse_length).unwrap_or(0.0);
-                    (r, r)
-                } else {
-                    (
-                        attribute(child, "rx").and_then(parse_length).unwrap_or(0.0),
-                        attribute(child, "ry").and_then(parse_length).unwrap_or(0.0),
-                    )
-                };
-                if rx > 0.0 && ry > 0.0 {
-                    for step in 0..48 {
-                        let angle = std::f32::consts::TAU * step as f32 / 48.0;
-                        points.push(
-                            child_transform.apply(cx + rx * angle.cos(), cy + ry * angle.sin()),
-                        );
-                    }
-                }
-            }
-            "polygon" | "polyline" => {
-                if let Some(local) = attribute(child, "points").and_then(parse_points) {
-                    points.extend(local.iter().map(|(x, y)| child_transform.apply(*x, *y)));
-                }
-            }
-            "path" => {
-                if let Some(specification) = attribute(child, "d") {
-                    for (subpath, _) in parse_path(specification) {
-                        points.extend(subpath.iter().map(|(x, y)| child_transform.apply(*x, *y)));
-                    }
-                }
-            }
-            "g" | "svg" | "a" | "switch" => {
-                collect_bounds(child, child_transform, points);
-            }
-            _ => {}
-        }
+        collect_bounds(child, child_transform, points);
     }
 }
 
@@ -2597,6 +2868,62 @@ mod tests {
             <use href="#loop"/></svg>"##;
         let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
         assert_eq!(image.pixel(5, 5), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn an_alpha_mask_limits_the_masked_element() {
+        let svg = br#"<svg width="10" height="10"><defs>
+            <mask id="m" mask-type="alpha"><rect width="5" height="10" fill="white"/></mask>
+            </defs><rect width="10" height="10" fill="red" mask="url(#m)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(2, 2), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(7, 2), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn a_luminance_mask_uses_the_mask_content_brightness() {
+        let svg = br#"<svg width="10" height="10"><defs>
+            <mask id="m"><rect width="5" height="10" fill="white"/>
+              <rect x="5" width="5" height="10" fill="black"/></mask>
+            </defs><rect width="10" height="10" fill="red" mask="url(#m)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(2, 2), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(7, 2), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn a_group_mask_composites_the_whole_group() {
+        let svg = br#"<svg width="10" height="10"><defs>
+            <mask id="m" mask-type="alpha"><rect width="5" height="10" fill="white"/></mask>
+            </defs><g mask="url(#m)"><rect width="10" height="10" fill="red"/>
+            <rect x="0" y="5" width="10" height="5" fill="blue"/></g></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(2, 2), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(2, 7), Some(Color::rgb(0, 0, 255)));
+        assert_eq!(image.pixel(7, 2), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn mask_content_units_can_use_the_element_bounding_box() {
+        let svg = br#"<svg width="10" height="10"><defs>
+            <mask id="m" mask-type="alpha" maskContentUnits="objectBoundingBox">
+              <rect width="0.5" height="1" fill="white"/></mask>
+            </defs><rect x="2" y="2" width="6" height="6" fill="red" mask="url(#m)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(2, 2), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(4, 4), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(6, 4), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn a_luminance_mask_preserves_partial_alpha() {
+        let svg = br##"<svg width="4" height="4"><defs>
+            <mask id="m"><rect width="4" height="4" fill="#808080"/></mask>
+            </defs><rect width="4" height="4" fill="red" mask="url(#m)"/></svg>"##;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        let pixel = image.pixel(2, 2).expect("masked pixel");
+        assert!(pixel.alpha > 100 && pixel.alpha < 200, "{pixel:?}");
+        assert!(pixel.red > 200, "{pixel:?}");
     }
 
     #[test]

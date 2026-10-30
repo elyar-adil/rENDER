@@ -33,9 +33,9 @@
 //!
 //! # What is deliberately not done
 //!
-//! * `text`, `mask`, `filter` and `<image>`: outside the rasteriser's
-//!   documented subset, so they contribute nothing there either. Gradients and
-//!   attribute `clip-path` references are supported, but `xlink:href`
+//! * `text`, `filter` and `<image>`: outside the rasteriser's documented
+//!   subset, so they contribute nothing there either. Gradients, attribute
+//!   `clip-path` and `mask` references are supported, but `xlink:href`
 //!   inheritance between gradient definitions and spread modes other than
 //!   `pad` are not.
 //! * `foreignObject`: its HTML subtree is laid out by render-layout as

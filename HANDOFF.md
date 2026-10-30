@@ -1,3 +1,75 @@
+# 交接文档 (2026-10-31, 续十八) — SVG `mask`
+
+接续 `<use>` 会话。这一轮实现 SVG `mask`:形状/组/`use` 引用可以经过
+alpha 或 luminance 遮罩合成。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **收集 mask 定义** | 按 `id` 索引整棵 XML 树,支持前向引用 |
+| **离屏内容** | 被遮罩元素克隆后去掉 `mask` 属性,在独立 `Raster` 中绘制,继承已有 clip 栈 |
+| **离屏遮罩** | `mask` 内容在第二个 `Raster` 中绘制,默认黑底透明 |
+| **合成** | 每个像素按 `mask-type` 取 alpha 或 luminance(`0.2126R+0.7152G+0.0722B`),乘 mask alpha 后再 source-over |
+| **单位** | `maskUnits`(区域)与 `maskContentUnits`(内容)支持 `userSpaceOnUse` / `objectBoundingBox` |
+| **区域** | 默认 objectBoundingBox `-10%/-10%/120%/120%`;显式 `x/y/width/height` 生效 |
+| **作用范围** | 形状、组、`<use>`;嵌套 mask 深度限制 8 |
+| **测试** | alpha、luminance、组、`maskContentUnits=objectBoundingBox`、部分 alpha,共 5 个 |
+
+## 证据
+
+端到端 mask 页面(`maskprobe.html`):
+
+```
+red  pixels = 2048, bounds = (0,192)..(31,255)   # 20×20 元素的左半
+blue pixels = 4096, bounds = (0,256)..(63,319)   # 无裁剪的 luminance mask
+```
+
+即 alpha mask 只保留左半,白色 luminance mask 完整保留。
+
+Bing(隐藏截图,15 秒):
+
+```
+health page=https://cn.bing.com/ ready=Complete dom_elements=472 boxes=167
+       scripts_failed=0 scripts_threw=0 css_errors=0 css_warnings=17 images_failed=3
+layout <div> id=rh_rwm 105.5×42
+layout <svg> class=medal-newlevel-circled 32×32
+paint #266 source=.medal-newlevel-circled … image
+```
+
+勋章、汉堡菜单、九宫格仍正常。
+
+Baidu / JD 冒烟:
+
+```
+Baidu: ready=Complete  dom_elements=453 boxes=156 scripts_failed=0
+JD:    ready=Interactive dom_elements=1158 boxes=117 scripts_failed=11
+```
+
+JD 主商品区仍为空(风控 403,同机 Edge 也 403)。
+
+## 验证
+
+```
+cargo test --workspace                       2729 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+image::svg                                   33 passed
+```
+
+## 明确未做 / 下一步
+
+- `mask` 只支持属性,不支持 CSS `mask-image`/`mask-mode`;mask 内容中的
+  `<text>`/`filter` 仍不绘制。
+- `filter`(blur/color-matrix 等)、CSS `clip-path`/`clip-rule`、组级
+  `opacity` 离屏合成仍未实现。
+- 渐变高级特性(`xlink:href` 继承、`spreadMethod`、径向焦点)仍未做。
+- `content` 仍只支持字符串;IndexedDB 仍是内存子集;JD 主商品区仍受风控 403;
+  GitHub/HN 本机链路阻断;AVIF 未实现。
+
+---
+
 # 交接文档 (2026-10-31, 续十七) — SVG `<use>` / `<symbol>`
 
 接续 `clipPath` 会话。这一轮补上 SVG 图标系统最常用的间接引用:
@@ -63,8 +135,8 @@ image::svg                                   28 passed
 
 - `<use>` 仅支持同文档引用;外部文档 URL、CSS `width`/`height`(需要计算样式)
   和 `use` 上的 `clip-path` 复杂坐标仍未完全覆盖。
-- `mask`/`filter`、`<text>`、CSS `clip-path`/`clip-rule`、组级 `opacity` 离屏
-  合成仍未实现。
+- `filter`、`<text>`、CSS `clip-path`/`clip-rule`、组级 `opacity` 离屏
+  合成仍未实现;`mask` 已在续十八实现。
 - 渐变高级特性(`xlink:href` 继承、`spreadMethod`、径向焦点)仍未做。
 - `content` 仍只支持字符串;IndexedDB 仍是内存子集;JD 主商品区仍受风控 403;
   GitHub/HN 本机链路阻断;AVIF 未实现。
@@ -129,7 +201,8 @@ Baidu smoke: dom_elements=455  boxes=156
 
 - `clip-path` 仅支持 **属性**,不支持 CSS `style="clip-path:..."`;`clip-rule`
   固定 even-odd,未区分 nonzero。
-- `clipPath` 内容的 `text` 不参与裁剪;`mask`/`filter` 仍未实现;`<use>` 已在续十七实现。
+- `clipPath` 内容的 `text` 不参与裁剪;`filter` 仍未实现;`<use>` 已在续十七、
+  `mask` 已在续十八实现。
 - 渐变高级特性(`xlink:href` 继承、`spreadMethod`、径向焦点)与组级 `opacity`
   离屏合成仍未做。
 - `content` 仍只支持字符串;IndexedDB 仍是内存子集;JD 主商品区仍受风控 403;
@@ -201,7 +274,8 @@ Baidu smoke: dom_elements=453  boxes=156
   `fx`/`fy` 焦点、`userSpaceOnUse` 下的百分比坐标。
 - `<g opacity>` 仍按每个子形状独立绘制,未做组级离屏合成;T2 的 0.7 透明度
   叠加会比 Edge 略强。
-- `mask`/`filter` 仍未实现;`clipPath` 已在续十六、`<use>` 已在续十七实现。
+- `filter` 仍未实现;`clipPath` 已在续十六、`<use>` 已在续十七、`mask` 已在
+  续十八实现。
 - `content` 仍只支持字符串;IndexedDB 仍是内存子集;JD 主商品区仍受风控 403;
   GitHub/HN 本机链路阻断;AVIF 未实现。
 
@@ -266,8 +340,8 @@ real_site_tasks                              66 passed, 0 failed
 
 - **Rewards 模板差异**:Bing 对 Edge 与本机 rENDER 返回不同勋章模板(T2 vs T5),
   这是页面实验/状态差异;本轮保证两种模板都能被光栅化。
-- **SVG 特性子集**:`mask`、`filter` 仍未实现;渐变已在续十五、`clipPath`
-  已在续十六、`<use>` 已在续十七实现。
+- **SVG 特性子集**:`filter` 仍未实现;渐变已在续十五、`clipPath` 已在续十六、
+  `<use>` 已在续十七、`mask` 已在续十八实现。
 - `content` 仍只支持字符串;`attr()`/`counter()` 未实现。
 - JD 主商品区仍受风控 403(同机 Edge 也 403);IndexedDB 仍是内存子集;GitHub/HN
   的本机 TCP 链路仍被阻断;AVIF 解码未实现(images_failed=3 是能力探测)。
