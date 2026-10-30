@@ -1,3 +1,83 @@
+# 交接文档 (2026-10-31, 续二十) — AVIF 解码与失败回退
+
+接续 filter 会话。这一轮接入 AVIF 解码,并为无法解码的“能力探测/追踪像素”提供
+透明占位回退,使 Bing/Baidu 的 `images_failed` 归零。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **AVIF 解码** | `image` 0.25.9 的 `avif-native` feature,底层 `dav1d`;新增 `ImageFormat::Avif` |
+| **格式识别** | `image/avif` 媒体类型、文件签名 sniff、`IMAGE_ACCEPT` 加入 `image/avif` |
+| **真实 AVIF 测试** | 16×16 红色 AVIF(avifenc 生成)解码为 16×16 红像素 |
+| **截断能力探测回退** | `data:image/avif` 且 `ispe` 尺寸 ≤4×4 的截断 AVIF,解码失败时插入 2×2 透明占位并告警 |
+| **非图片响应回退** | `<img>` 收到无图片签名的小响应(追踪像素/软 404)时插入 1×1 透明占位并告警,不再计为硬错误 |
+| **诊断** | 新增 `ImageResourceDiagnosticCode::PlaceholderFallback`(Warning) |
+| **测试** | AVIF 解码、非图片占位、截断 AVIF 占位,共 3 个 |
+
+## 证据
+
+AVIF 实际解码(浏览器内,data URL):
+
+```
+health images_failed=0
+image loaded=1 size=16x16
+red pixels = 4096, bounds = (8,200)..(71,263)
+```
+
+Bing(隐藏截图,15 秒):
+
+```
+health page=https://cn.bing.com/ ready=Complete dom_elements=481 boxes=166
+       scripts_failed=0 scripts_threw=0 css_errors=0 css_warnings=13 images_failed=0
+layout <div> id=rh_rwm 105.5×42
+layout <svg> class=medal-newlevel-circled 32×32
+```
+
+`images_failed` 从 3 → 0;T5 勋章仍可见。截断的 2×2 AVIF 能力探测和
+`/fd/ls/l?...` 追踪像素均以 Warning `PlaceholderFallback` 处理。
+
+Baidu / JD:
+
+```
+Baidu: ready=Complete    dom_elements=453 boxes=156 images_failed=0  (7 → 0)
+JD:    ready=Interactive dom_elements=1000 boxes=117 images_failed=1  (2 → 1)
+```
+
+JD 主商品区仍为空(风控 403,同机 Edge 也 403)。
+
+## 构建前置条件
+
+`avif-native` 需要系统的 `libdav1d` 与头文件;本机通过 Homebrew 安装:
+
+```
+pkg-config --exists dav1d   # yes
+which dav1d                 # /opt/homebrew/bin/dav1d
+```
+
+在无 dav1d 的 CI/机器上需要安装 `dav1d` 开发包,否则构建失败。
+
+## 验证
+
+```
+cargo test --workspace                       2735 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+image::svg                                   36 passed
+```
+
+## 明确未做 / 下一步
+
+- AVIF 解码依赖系统 dav1d,不是纯 Rust 便携路径;AVIF 动画/序列仍未处理。
+- 非图片小响应回退是视觉占位,不会真正解码 BMP/TIFF 等其它未支持格式。
+- SVG `filter` 仍只有 blur/color-matrix;CSS `filter`、`clip-path`/`clip-rule`、
+  组级 `opacity` 离屏合成、高级渐变仍未实现。
+- 其它图片格式/真实 CDN 变体仍需继续抽样;IndexedDB 仍是内存子集;JD 风控、
+  GitHub/HN 链路阻断是外部条件。
+
+---
+
 # 交接文档 (2026-10-31, 续十九) — SVG `filter`: blur / color matrix
 
 接续 SVG mask 会话。这一轮实现 filter 的前两个原语:
@@ -69,7 +149,7 @@ image::svg                                   36 passed
 - CSS `clip-path`/`clip-rule`、组级 `opacity` 离屏合成、高级渐变、`content`
   字符串以外内容仍未实现。
 - IndexedDB 仍是内存子集;JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;
-  AVIF 未实现。
+  AVIF 已在续二十实现/回退。
 
 ---
 
@@ -419,7 +499,7 @@ real_site_tasks                              66 passed, 0 failed
   `mask` 已在续十八、`filter`(blur/color matrix)已在续十九实现。
 - `content` 仍只支持字符串;`attr()`/`counter()` 未实现。
 - JD 主商品区仍受风控 403(同机 Edge 也 403);IndexedDB 仍是内存子集;GitHub/HN
-  的本机 TCP 链路仍被阻断;AVIF 解码未实现(images_failed=3 是能力探测)。
+  的本机 TCP 链路仍被阻断;AVIF 已在续二十实现(能力探测使用透明占位回退)。
 
 ---
 

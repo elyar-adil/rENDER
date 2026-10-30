@@ -377,6 +377,7 @@ pub enum ImageFormat {
     Jpeg,
     Gif,
     WebP,
+    Avif,
     Svg,
 }
 
@@ -388,6 +389,7 @@ impl ImageFormat {
             "image/jpeg" | "image/pjpeg" => Some(Self::Jpeg),
             "image/gif" => Some(Self::Gif),
             "image/webp" => Some(Self::WebP),
+            "image/avif" => Some(Self::Avif),
             "image/svg+xml" | "image/svg" => Some(Self::Svg),
             _ => None,
         }
@@ -400,6 +402,7 @@ impl ImageFormat {
             Self::Jpeg => "image/jpeg",
             Self::Gif => "image/gif",
             Self::WebP => "image/webp",
+            Self::Avif => "image/avif",
             Self::Svg => "image/svg+xml",
         }
     }
@@ -412,6 +415,7 @@ impl ImageFormat {
             Self::Jpeg => Some(CodecImageFormat::Jpeg),
             Self::Gif => Some(CodecImageFormat::Gif),
             Self::WebP => Some(CodecImageFormat::WebP),
+            Self::Avif => Some(CodecImageFormat::Avif),
             Self::Svg => None,
         }
     }
@@ -425,6 +429,7 @@ pub fn sniff_image_format(bytes: &[u8]) -> Option<ImageFormat> {
         CodecImageFormat::Jpeg => Some(ImageFormat::Jpeg),
         CodecImageFormat::Gif => Some(ImageFormat::Gif),
         CodecImageFormat::WebP => Some(ImageFormat::WebP),
+        CodecImageFormat::Avif => Some(ImageFormat::Avif),
         _ => None,
     }
 }
@@ -1310,6 +1315,8 @@ fn pixel_len(width: u32, height: u32) -> Option<usize> {
 mod tests {
     use std::io::Cursor;
 
+    const AVIF_PROBE: &str = "AAAAIGZ0eXBhdmlmAAAAAGF2aWZtaWYxbWlhZk1BMUEAAADrbWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAcGljdAAAAAAAAAAAAAAAAAAAAAAOcGl0bQAAAAAAAQAAAB5pbG9jAAAAAEQAAAEAAQAAAAEAAAETAAAAIgAAAChpaW5mAAAAAAABAAAAGmluZmUCAAAAAAEAAGF2MDFDb2xvcgAAAABqaXBycAAAAEtpcGNvAAAAFGlzcGUAAAAAAAAAEAAAABAAAAAQcGl4aQAAAAADCAgIAAAADGF2MUOBIAAAAAAAE2NvbHJuY2x4AAEADQAGgAAAABdpcG1hAAAAAAAAAAEAAQQBAoMEAAAAKm1kYXQSAAoIOAz/2EBDQaQyFBAAAAAUuboKM00UXyTHSo5Ou3Yw";
+
     use image_codec::{DynamicImage, ImageFormat as CodecImageFormat, Rgba, RgbaImage};
     use url::Url;
 
@@ -1318,7 +1325,7 @@ mod tests {
     use super::{
         DecodedImage, ImageDecodeError, ImageFormat, ImageLimits, ImageResources,
         ImageSelectionContext, decode_image, discover_images, discover_images_with_context,
-        image_key_is_current,
+        image_key_is_current, sniff_image_format,
     };
     use crate::dom::{ShadowRootMode, SlotAssignmentMode};
     use crate::paint::Color;
@@ -1594,6 +1601,30 @@ mod tests {
             .set_attribute(image, "srcset", "new.png 1x")
             .unwrap();
         assert!(!image_key_is_current(&parsed.dom, &document_url, &key));
+    }
+
+    #[test]
+    fn sniffs_and_decodes_avif() {
+        // A 16x16 red AVIF encoded by avifenc. Decoding it is what makes
+        // `images_failed` stop counting a browser as AVIF-incapable.
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(AVIF_PROBE)
+            .expect("AVIF base64");
+        assert_eq!(sniff_image_format(&bytes), Some(ImageFormat::Avif));
+        assert_eq!(
+            ImageFormat::from_media_type("image/avif"),
+            Some(ImageFormat::Avif)
+        );
+        let decoded =
+            decode_image(&bytes, ImageFormat::Avif, ImageLimits::default()).expect("AVIF decodes");
+        assert_eq!(decoded.intrinsic_size(), (16, 16));
+        let pixel = decoded.pixel(0, 0).expect("decoded pixel");
+        assert!(
+            pixel.red >= 250 && pixel.green < 5 && pixel.blue < 5,
+            "{pixel:?}"
+        );
+        assert_eq!(pixel.alpha, 255);
     }
 
     #[test]

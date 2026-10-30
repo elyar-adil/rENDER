@@ -10,14 +10,14 @@ use render_core::css::computed::ComputedStyle;
 use render_core::document::Document;
 use render_core::dom::{DomRevision, NodeId};
 use render_core::image::{
-    ImageDiscoveryDiagnostic, ImageDiscoveryDiagnosticCode, ImageFormat, ImageLimits,
+    DecodedImage, ImageDiscoveryDiagnostic, ImageDiscoveryDiagnosticCode, ImageFormat, ImageLimits,
     ImageResourceKey, ImageResources, ImageSelectionContext, ImageSource, decode_image,
     discover_images_with_styles_and_context, image_key_is_current, sniff_image_format,
 };
 use render_core::paint::ImageResourceId;
 use render_net::{FetchRequest, FetchResponse, FetchResult, Url};
 
-pub const IMAGE_ACCEPT: &str = "image/webp,image/png,image/jpeg,image/gif,*/*;q=0.1";
+pub const IMAGE_ACCEPT: &str = "image/avif,image/webp,image/png,image/jpeg,image/gif,*/*;q=0.1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageFetch {
@@ -69,6 +69,7 @@ pub enum ImageResourceDiagnosticCode {
     ContentTypeMismatch,
     Decode,
     Store,
+    PlaceholderFallback,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -237,6 +238,10 @@ pub fn apply_image_batch(
     application
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one response walks status, format, fallback and storage in order"
+)]
 fn apply_response(
     resource: &ImageFetch,
     response: FetchResponse,
@@ -269,9 +274,34 @@ fn apply_response(
         return;
     }
     let sniffed_format = sniff_image_format(&response.body);
-    let declared_supported = response.content_type.as_ref().is_some_and(|content_type| {
-        ImageFormat::from_media_type(&content_type.media_type).is_some()
-    });
+    let declared_format = response
+        .content_type
+        .as_ref()
+        .and_then(|content_type| ImageFormat::from_media_type(&content_type.media_type));
+    let declared_supported = declared_format.is_some();
+    // Tracking beacons and soft-404 endpoints are routinely referenced from
+    // `<img>` but return HTML, an empty body, or another non-image payload.
+    // A browser renders those as a failed/empty image, not as a hard page
+    // error. Keep the pixels empty and surface a warning instead.
+    if sniffed_format.is_none()
+        && declared_format != Some(ImageFormat::Svg)
+        && !looks_like_svg(&response.body)
+        && response.body.len() <= 4096
+    {
+        store_placeholder(
+            resource,
+            response.final_url,
+            declared_format.unwrap_or(ImageFormat::Png),
+            1,
+            1,
+            images,
+            limits,
+            application,
+            ImageResourceDiagnosticCode::PlaceholderFallback,
+            "image response has no supported signature; inserted a transparent placeholder",
+        );
+        return;
+    }
     let Some(format) = resolve_image_format(
         resource,
         response.content_type.as_ref(),
@@ -304,6 +334,28 @@ fn apply_response(
     let decoded = match decode_image(&response.body, format, limits) {
         Ok(decoded) => decoded,
         Err(error) => {
+            // Bing and other sites probe AVIF support with a tiny, truncated
+            // data: AVIF whose header is valid but whose frame data is not.
+            // Decoders disagree on it; treating it as a transparent image is
+            // the same visual result as a browser that reports AVIF support.
+            if format == ImageFormat::Avif
+                && is_tiny_avif_probe(resource, &response.body)
+                && let Some((width, height)) = avif_probe_size(&response.body)
+            {
+                store_placeholder(
+                    resource,
+                    response.final_url,
+                    format,
+                    width,
+                    height,
+                    images,
+                    limits,
+                    application,
+                    ImageResourceDiagnosticCode::PlaceholderFallback,
+                    "truncated AVIF capability probe; inserted a transparent placeholder",
+                );
+                return;
+            }
             application.diagnostics.push(resource_diagnostic(
                 resource,
                 ImageDiagnosticSeverity::Error,
@@ -324,6 +376,78 @@ fn apply_response(
             resource_id,
             format,
             encoded_bytes: response.body.len(),
+            width,
+            height,
+        }),
+        Err(error) => application.diagnostics.push(resource_diagnostic(
+            resource,
+            ImageDiagnosticSeverity::Error,
+            ImageResourceDiagnosticCode::Store,
+            error.to_string(),
+        )),
+    }
+}
+
+/// `true` when `bytes` contains an SVG root in the first kilobyte.
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    bytes
+        .windows(4)
+        .take(1024)
+        .any(|window| window.eq_ignore_ascii_case(b"<svg"))
+}
+
+fn is_tiny_avif_probe(resource: &ImageFetch, bytes: &[u8]) -> bool {
+    bytes.len() <= 4096
+        && resource
+            .key
+            .requested_url
+            .as_str()
+            .starts_with("data:image/avif")
+}
+
+/// The `ispe` box's width/height, when it names a probe-sized image.
+fn avif_probe_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let marker = bytes.windows(4).position(|window| window == b"ispe")?;
+    let width = u32::from_be_bytes(bytes.get(marker + 8..marker + 12)?.try_into().ok()?);
+    let height = u32::from_be_bytes(bytes.get(marker + 12..marker + 16)?.try_into().ok()?);
+    (1..=4).contains(&width).then_some(())?;
+    (1..=4).contains(&height).then_some(())?;
+    Some((width, height))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_placeholder(
+    resource: &ImageFetch,
+    final_url: Url,
+    format: ImageFormat,
+    width: u32,
+    height: u32,
+    images: &mut ImageResources,
+    limits: ImageLimits,
+    application: &mut ImageBatchApplication,
+    code: ImageResourceDiagnosticCode,
+    message: &str,
+) {
+    application.diagnostics.push(resource_diagnostic(
+        resource,
+        ImageDiagnosticSeverity::Warning,
+        code,
+        message.to_owned(),
+    ));
+    let bytes = vec![0_u8; width as usize * height as usize * 4];
+    let Ok(decoded) = DecodedImage::from_rgba8(width, height, &bytes) else {
+        return;
+    };
+    match images.insert(resource.key.clone(), decoded, limits) {
+        Ok(resource_id) => application.loaded.push(LoadedImageMetadata {
+            source_order: resource.source_order,
+            owner: resource.key.owner,
+            source: resource.key.source,
+            requested_url: resource.key.requested_url.clone(),
+            final_url,
+            resource_id,
+            format,
+            encoded_bytes: 0,
             width,
             height,
         }),
@@ -485,6 +609,8 @@ mod tests {
     use super::{IMAGE_ACCEPT, ImageResourceDiagnosticCode, apply_image_batch, plan_images};
 
     // Valid 1 x 1 RGBA PNG generated once for the local transport fixtures.
+    const AVIF_PROBE: &str = "AAAAIGZ0eXBhdmlmAAAAAGF2aWZtaWYxbWlhZk1BMUIAAADybWV0YQAAAAAAAAAoaGRscgAAAAAAAAAAcGljdAAAAAAAAAAAAAAAAGxpYmF2aWYAAAAADnBpdG0AAAAAAAEAAAAeaWxvYwAAAABEAAABAAEAAAABAAABGgAAAB0AAAAoaWluZgAAAAAAAQAAABppbmZlAgAAAAABAABhdjAxQ29sb3IAAAAAamlwcnAAAABLaXBjbwAAABRpc3BlAAAAAAAAAAIAAAACAAAAEHBpeGkAAAAAAwgICAAAAAxhdjFDgQ0MAAAAABNjb2xybmNseAACAAIAAYAAAAAXaXBtYQAAAAAAAAABAAEEAQKDBAAAACVtZGF0EgAKCBgANogQEAwgMg8f8D///8WfhwB8+ErK";
+
     const PNG: &[u8] = &[
         137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
         0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 240,
@@ -669,6 +795,65 @@ mod tests {
         assert_eq!(application.loaded.len(), 1, "{application:?}");
         assert!(application.diagnostics.is_empty());
         assert_eq!(images.len(), 1);
+    }
+
+    #[test]
+    fn a_non_image_response_used_as_an_image_becomes_a_transparent_placeholder() {
+        let (base, server) = serve(1, Some("text/html"), b"<html>not an image</html>");
+        let document = Document::parse("<img src='beacon'>");
+        let plan = plan_images(&document, &base, ImageLimits::default());
+        let results = transport().fetch_batch(
+            plan.requests(),
+            &BatchOptions::default(),
+            &CancelToken::default(),
+        );
+        server.join().expect("server thread");
+        let mut images = ImageResources::default();
+        let application = apply_image_batch(
+            &document,
+            &plan,
+            results,
+            &mut images,
+            ImageLimits::default(),
+        );
+        assert_eq!(application.loaded.len(), 1);
+        assert_eq!(images.len(), 1);
+        assert!(application.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ImageResourceDiagnosticCode::PlaceholderFallback
+                && diagnostic.severity == super::ImageDiagnosticSeverity::Warning
+        }));
+        assert!(
+            !application
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == super::ImageDiagnosticSeverity::Error)
+        );
+    }
+
+    #[test]
+    fn a_truncated_avif_probe_falls_back_to_a_transparent_placeholder() {
+        let document = Document::parse(&format!("<img src='data:image/avif;base64,{AVIF_PROBE}'>"));
+        let base = Url::parse("https://example.test/").unwrap();
+        let plan = plan_images(&document, &base, ImageLimits::default());
+        let results = transport().fetch_batch(
+            plan.requests(),
+            &BatchOptions::default(),
+            &CancelToken::default(),
+        );
+        let mut images = ImageResources::default();
+        let application = apply_image_batch(
+            &document,
+            &plan,
+            results,
+            &mut images,
+            ImageLimits::default(),
+        );
+        assert_eq!(application.loaded.len(), 1);
+        assert_eq!(images.len(), 1);
+        assert!(application.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ImageResourceDiagnosticCode::PlaceholderFallback
+                && diagnostic.severity == super::ImageDiagnosticSeverity::Warning
+        }));
     }
 
     fn transport() -> HttpTransport {
