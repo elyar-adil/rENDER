@@ -4,8 +4,19 @@
 // and feature detection: `open` with version upgrade and `upgradeneeded`,
 // object stores, read/write transactions that auto-commit, requests firing
 // success/error, `get`/`put`/`add`/`delete`/`clear`/`count`, key ranges and
-// cursors. Data lives for the lifetime of the realm: there is no on-disk
-// persistence yet, so a reopened page starts from an empty database.
+// cursors. Data lives for the lifetime of the realm, and the host may carry it
+// between documents by seeding `__renderIndexedDbData`.
+//
+// IndexedDB stores structured clones, not JSON. The host format is JSON, so
+// the encoder below writes a tagged graph: `Date`, `RegExp`, `Map`, `Set`,
+// `ArrayBuffer` and every typed-array kind keep their identity, nested values
+// are encoded recursively, and a container that is reached twice becomes a
+// `ref` node so cycles survive `JSON.stringify`. The decoder builds containers
+// before their children, so a back-reference resolves to the object still
+// being constructed. `Blob` is the documented gap: this engine exposes a
+// Blob's bytes only through `arrayBuffer()`/`text()` promises, which the
+// synchronous commit path cannot wait for, so a Blob is not serialized
+// faithfully. `File` does not exist in this engine.
 //
 // Requests fire from microtasks. IndexedDB specifies tasks, but the runtime's
 // event loop only exposes microtasks to self-hosted built-ins; ordering
@@ -61,36 +72,273 @@
     persistedCommit();
   }
 
-  function encodePersisted(value) {
-    if (value instanceof Date) return { __renderType: 'date', value: value.getTime() };
-    if (Array.isArray(value)) {
-      return { __renderType: 'array', value: value.map(encodePersisted) };
-    }
-    if (value && typeof value === 'object') {
-      var object = {};
-      var names = Object.keys(value);
-      for (var index = 0; index < names.length; index++) {
-        object[names[index]] = encodePersisted(value[names[index]]);
+  // --------------------------------------------------------- persisted values
+  var typedArrayNames = [
+    'Int8Array', 'Uint8Array', 'Uint8ClampedArray',
+    'Int16Array', 'Uint16Array',
+    'Int32Array', 'Uint32Array',
+    'Float32Array', 'Float64Array',
+    'BigInt64Array', 'BigUint64Array'
+  ];
+
+  function typedArrayKind(value) {
+    for (var index = 0; index < typedArrayNames.length; index++) {
+      var constructor = global[typedArrayNames[index]];
+      if (typeof constructor === 'function' && value instanceof constructor) {
+        return typedArrayNames[index];
       }
-      return object;
     }
-    return value;
+    return null;
   }
 
-  function decodePersisted(value) {
-    if (value && typeof value === 'object') {
-      if (value.__renderType === 'date') return new Date(value.value);
-      if (value.__renderType === 'array') {
-        return (value.value || []).map(decodePersisted);
+  function encodeBytes(bytes) {
+    if (typeof global.btoa === 'function') {
+      // `btoa` takes a binary string; build it in chunks so a large buffer
+      // does not become one huge `apply` argument list.
+      var chunks = [];
+      var chunkSize = 0x2000;
+      for (var start = 0; start < bytes.length; start += chunkSize) {
+        var end = Math.min(start + chunkSize, bytes.length);
+        var chunk = [];
+        for (var index = start; index < end; index++) chunk.push(bytes[index]);
+        chunks.push(String.fromCharCode.apply(null, chunk));
       }
+      return global.btoa(chunks.join(''));
+    }
+    var values = [];
+    for (var index = 0; index < bytes.length; index++) values.push(bytes[index]);
+    return values;
+  }
+
+  function decodeBytes(encoded) {
+    if (typeof encoded === 'string' && typeof global.atob === 'function') {
+      var binary = global.atob(encoded);
+      var bytes = new global.Uint8Array(binary.length);
+      for (var index = 0; index < binary.length; index++) {
+        bytes[index] = binary.charCodeAt(index);
+      }
+      return bytes;
+    }
+    var values = Array.isArray(encoded) ? encoded : [];
+    var bytes = new global.Uint8Array(values.length);
+    for (var index = 0; index < values.length; index++) bytes[index] = values[index];
+    return bytes;
+  }
+
+  function bufferFromBytes(bytes) {
+    var buffer = new global.ArrayBuffer(bytes.length);
+    new global.Uint8Array(buffer).set(bytes);
+    return buffer;
+  }
+
+  // `state.ids` maps a container to the id it was written with. Only values
+  // that can contain references (objects, arrays, maps, sets) need an id; a
+  // `Date`, a `RegExp` or a binary value is a leaf and is written by value.
+  function encodePersisted(value) {
+    return encodeValue(value, { ids: new global.Map(), nextId: 1 });
+  }
+
+  function encodeValue(value, state) {
+    if (value === undefined) return { __renderType: 'undefined' };
+    if (value === null) return null;
+    var type = typeof value;
+    if (type === 'number') {
+      if (value !== value) return { __renderType: 'number', value: 'NaN' };
+      if (value === Infinity) return { __renderType: 'number', value: 'Infinity' };
+      if (value === -Infinity) return { __renderType: 'number', value: '-Infinity' };
+      if (value === 0 && 1 / value === -Infinity) {
+        return { __renderType: 'number', value: '-0' };
+      }
+      return value;
+    }
+    if (type === 'bigint') return { __renderType: 'bigint', value: String(value) };
+    if (type === 'string' || type === 'boolean') return value;
+    if (type !== 'object') {
+      // A function or a symbol is not structured-cloneable. The engine's
+      // `structuredClone` refuses it, and JSON has never represented it, so
+      // leave it to stringify to drop rather than inventing a value.
+      return value;
+    }
+    var existing = state.ids.get(value);
+    if (existing !== undefined) return { __renderType: 'ref', value: existing };
+    if (value instanceof Date) {
+      // The time is encoded, not just written, so an invalid date keeps its
+      // NaN instead of JSON turning it into a null and reviving as epoch zero.
+      return { __renderType: 'date', value: encodeValue(value.getTime(), state) };
+    }
+    if (value instanceof RegExp) {
+      return {
+        __renderType: 'regexp',
+        source: String(value.source),
+        flags: String(value.flags)
+      };
+    }
+    if (typeof global.ArrayBuffer === 'function' && value instanceof global.ArrayBuffer) {
+      return {
+        __renderType: 'arraybuffer',
+        value: encodeBytes(new global.Uint8Array(value))
+      };
+    }
+    var kind = typedArrayKind(value);
+    if (kind !== null) {
+      // A view's bytes, not its elements: a Float64Array's elements are not
+      // integers, so only the underlying byte range round-trips exactly.
+      var view = new global.Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+      return { __renderType: 'typedarray', kind: kind, value: encodeBytes(view) };
+    }
+    if (Array.isArray(value)) {
+      var arrayId = state.nextId++;
+      state.ids.set(value, arrayId);
+      var items = [];
+      for (var index = 0; index < value.length; index++) {
+        items.push(index in value
+          ? encodeValue(value[index], state)
+          : { __renderType: 'hole' });
+      }
+      return {
+        __renderType: 'array',
+        id: arrayId,
+        length: value.length,
+        value: items
+      };
+    }
+    if (typeof global.Map === 'function' && value instanceof global.Map) {
+      var mapId = state.nextId++;
+      state.ids.set(value, mapId);
+      var entries = [];
+      value.forEach(function (entryValue, entryKey) {
+        entries.push([
+          encodeValue(entryKey, state),
+          encodeValue(entryValue, state)
+        ]);
+      });
+      return { __renderType: 'map', id: mapId, value: entries };
+    }
+    if (typeof global.Set === 'function' && value instanceof global.Set) {
+      var setId = state.nextId++;
+      state.ids.set(value, setId);
+      var setItems = [];
+      value.forEach(function (item) {
+        setItems.push(encodeValue(item, state));
+      });
+      return { __renderType: 'set', id: setId, value: setItems };
+    }
+    var objectId = state.nextId++;
+    state.ids.set(value, objectId);
+    var entries = [];
+    var names = Object.keys(value);
+    for (var nameIndex = 0; nameIndex < names.length; nameIndex++) {
+      var name = names[nameIndex];
+      entries.push([name, encodeValue(value[name], state)]);
+    }
+    return { __renderType: 'object', id: objectId, value: entries };
+  }
+
+  function registerRef(state, id, value) {
+    if (typeof id === 'number') state.refs[id] = value;
+  }
+
+  // `modern` is true for state written with `format: 2`. Older state only
+  // knows the `date` and `array` markers and stores plain objects as plain
+  // JSON; restricting the marker set keeps an old object whose own property
+  // happens to be named `__renderType` a plain object, as it was before.
+  function decodePersisted(value, modern) {
+    return decodeValue(value, { modern: !!modern, refs: [] });
+  }
+
+  function decodeValue(value, state) {
+    if (value === null || typeof value !== 'object') return value;
+    if (Array.isArray(value)) {
+      var list = [];
+      for (var index = 0; index < value.length; index++) {
+        list.push(decodeValue(value[index], state));
+      }
+      return list;
+    }
+    var type = value.__renderType;
+    if (type === 'date') return new Date(decodeValue(value.value, state));
+    if (type === 'array') {
+      var length = typeof value.length === 'number'
+        ? value.length
+        : (value.value || []).length;
+      var array = new Array(length);
+      registerRef(state, value.id, array);
+      var items = value.value || [];
+      for (var index = 0; index < items.length && index < length; index++) {
+        if (items[index] && items[index].__renderType === 'hole') continue;
+        array[index] = decodeValue(items[index], state);
+      }
+      return array;
+    }
+    if (!state.modern) return decodePlain(value, state);
+    if (type === 'ref') return state.refs[value.value];
+    if (type === 'undefined') return undefined;
+    if (type === 'number') {
+      if (value.value === 'NaN') return NaN;
+      if (value.value === 'Infinity') return Infinity;
+      if (value.value === '-Infinity') return -Infinity;
+      if (value.value === '-0') return -0;
+      return Number(value.value);
+    }
+    if (type === 'bigint') return BigInt(value.value);
+    if (type === 'regexp') return new RegExp(value.source, value.flags);
+    if (type === 'arraybuffer') return bufferFromBytes(decodeBytes(value.value));
+    if (type === 'typedarray') {
+      var constructor = global[value.kind];
+      if (typeof constructor !== 'function') return null;
+      return new constructor(bufferFromBytes(decodeBytes(value.value)));
+    }
+    if (type === 'map') {
+      var map = new global.Map();
+      registerRef(state, value.id, map);
+      var entries = value.value || [];
+      for (var index = 0; index < entries.length; index++) {
+        map.set(
+          decodeValue(entries[index][0], state),
+          decodeValue(entries[index][1], state)
+        );
+      }
+      return map;
+    }
+    if (type === 'set') {
+      var set = new global.Set();
+      registerRef(state, value.id, set);
+      var setItems = value.value || [];
+      for (var index = 0; index < setItems.length; index++) {
+        set.add(decodeValue(setItems[index], state));
+      }
+      return set;
+    }
+    if (type === 'object') {
       var object = {};
-      var names = Object.keys(value);
-      for (var index = 0; index < names.length; index++) {
-        object[names[index]] = decodePersisted(value[names[index]]);
+      registerRef(state, value.id, object);
+      var pairs = value.value || [];
+      for (var index = 0; index < pairs.length; index++) {
+        defineProperty(object, String(pairs[index][0]), {
+          value: decodeValue(pairs[index][1], state),
+          writable: true,
+          enumerable: true,
+          configurable: true
+        });
       }
       return object;
     }
-    return value;
+    return decodePlain(value, state);
+  }
+
+  function decodePlain(value, state) {
+    var object = {};
+    registerRef(state, value.id, object);
+    var names = Object.keys(value);
+    for (var index = 0; index < names.length; index++) {
+      defineProperty(object, names[index], {
+        value: decodeValue(value[names[index]], state),
+        writable: true,
+        enumerable: true,
+        configurable: true
+      });
+    }
+    return object;
   }
 
   function loadDatabase(name) {
@@ -100,6 +348,7 @@
     if (!raw) return;
     try {
       var data = JSON.parse(raw);
+      var modern = Number(data.format) >= 2;
       var meta = {
         name: name,
         version: Number(data.version) || 0,
@@ -112,7 +361,7 @@
         var saved = data.stores[storeName];
         var store = {
           name: storeName,
-          keyPath: saved.keyPath === undefined ? null : decodePersisted(saved.keyPath),
+          keyPath: saved.keyPath === undefined ? null : decodePersisted(saved.keyPath, modern),
           autoIncrement: !!saved.autoIncrement,
           nextKey: Number(saved.nextKey) || 1,
           indexes: Object.create(null),
@@ -124,7 +373,7 @@
           var savedIndex = saved.indexes[indexName];
           store.indexes[indexName] = {
             name: indexName,
-            keyPath: decodePersisted(savedIndex.keyPath),
+            keyPath: decodePersisted(savedIndex.keyPath, modern),
             unique: !!savedIndex.unique,
             multiEntry: !!savedIndex.multiEntry
           };
@@ -132,8 +381,8 @@
         var records = saved.records || [];
         for (var recordIndex = 0; recordIndex < records.length; recordIndex++) {
           store.records.push({
-            key: decodePersisted(records[recordIndex].key),
-            value: decodePersisted(records[recordIndex].value)
+            key: decodePersisted(records[recordIndex].key, modern),
+            value: decodePersisted(records[recordIndex].value, modern)
           });
         }
         meta.stores[storeName] = store;
@@ -183,6 +432,7 @@
       };
     }
     storageSet(name, JSON.stringify({
+      format: 2,
       version: meta.version,
       stores: stores
     }));

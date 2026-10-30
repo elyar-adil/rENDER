@@ -1892,6 +1892,275 @@ fn indexed_db_opens_upgrades_and_round_trips_values() {
     );
 }
 
+/// The value fixture and its probe are shared by the in-session and
+/// persistence tests so both exercise exactly the same structured-clone graph.
+const IDB_STRUCTURED_VALUE_SCRIPT: &str = r"
+    function makeStoredValue() {
+        var shared = { label: 'shared' };
+        var cyclic = { name: 'cycle' };
+        cyclic.self = cyclic;
+        var list = [];
+        list.push(list);
+        var sparse = [];
+        sparse[2] = 'third';
+        return {
+            date: new Date(1700000000000),
+            invalid: new Date(NaN),
+            regexp: /a+b/gi,
+            map: new Map([['alpha', 1], [{ key: 2 }, 'two']]),
+            set: new Set([1, 'two', { three: 3 }]),
+            buffer: new Uint8Array([1, 2, 3, 4]).buffer,
+            bytes: new Uint8Array([9, 8, 7]),
+            ints: new Int32Array([-1, 0, 2147483647]),
+            floats: new Float64Array([1.5, -2.25, 0.125]),
+            bigints: new BigInt64Array([-5n, 7n]),
+            big: 12345678901234567890n,
+            nested: { list: [new Map([['deep', new Set([new Date(0), { x: 1 }])]])] },
+            left: shared,
+            right: shared,
+            cyclic: cyclic,
+            list: list,
+            sparse: sparse,
+            special: {
+                nan: NaN,
+                infinity: Infinity,
+                negative: -Infinity,
+                negativeZero: -0,
+                missing: undefined
+            }
+        };
+    }
+    function logStoredValue(copy) {
+        var mapObject = '';
+        copy.map.forEach(function (value, key) {
+            if (key !== null && typeof key === 'object') mapObject = key.key + ':' + value;
+        });
+        var setObject = '';
+        copy.set.forEach(function (value) {
+            if (value !== null && typeof value === 'object') setObject = value.three;
+        });
+        var nestedMap = copy.nested.list[0];
+        var nestedSet = nestedMap.get('deep');
+        var nestedParts = [];
+        nestedSet.forEach(function (value) {
+            nestedParts.push(value instanceof Date ? 'date:' + value.getTime() : 'object:' + value.x);
+        });
+        log.push('date:' + (copy.date instanceof Date) + ':' + copy.date.getTime());
+        log.push('invalid:' + (copy.invalid instanceof Date) + ':' +
+            (copy.invalid.getTime() !== copy.invalid.getTime()));
+        log.push('regexp:' + (copy.regexp instanceof RegExp) + ':' +
+            copy.regexp.source + ':' + copy.regexp.flags);
+        log.push('map:' + (copy.map instanceof Map) + ':' + copy.map.size + ':' +
+            copy.map.get('alpha') + ':' + mapObject);
+        log.push('set:' + (copy.set instanceof Set) + ':' + copy.set.size + ':' +
+            copy.set.has('two') + ':' + setObject);
+        log.push('buffer:' + (copy.buffer instanceof ArrayBuffer) + ':' +
+            copy.buffer.byteLength + ':' + new Uint8Array(copy.buffer)[2]);
+        log.push('bytes:' + (copy.bytes instanceof Uint8Array) + ':' +
+            copy.bytes.length + ':' + copy.bytes[1]);
+        log.push('ints:' + (copy.ints instanceof Int32Array) + ':' +
+            copy.ints[0] + ':' + copy.ints[2]);
+        log.push('floats:' + (copy.floats instanceof Float64Array) + ':' + copy.floats[1]);
+        log.push('bigints:' + (copy.bigints instanceof BigInt64Array) + ':' +
+            copy.bigints[0] + ':' + copy.bigints[1]);
+        log.push('big:' + (typeof copy.big) + ':' + String(copy.big));
+        log.push('nested:' + (nestedMap instanceof Map) + ':' + (nestedSet instanceof Set) + ':' +
+            nestedParts.join(','));
+        log.push('shared:' + (copy.left === copy.right));
+        log.push('cycle:' + (copy.cyclic.self === copy.cyclic) + ':' + (copy.list[0] === copy.list));
+        log.push('sparse:' + copy.sparse.length + ':' + (0 in copy.sparse) + ':' +
+            (2 in copy.sparse) + ':' + copy.sparse[2]);
+        log.push('special:' + (copy.special.nan !== copy.special.nan) + ':' +
+            copy.special.infinity + ':' + copy.special.negative + ':' +
+            (1 / copy.special.negativeZero === -Infinity) + ':' +
+            (copy.special.missing === undefined));
+    }
+";
+
+const IDB_STRUCTURED_VALUE_LOG: &str = "date:true:1700000000000|\
+invalid:true:true|\
+regexp:true:a+b:gi|\
+map:true:2:1:2:two|\
+set:true:3:true:3|\
+buffer:true:4:3|\
+bytes:true:3:8|\
+ints:true:-1:2147483647|\
+floats:true:-2.25|\
+bigints:true:-5:7|\
+big:bigint:12345678901234567890|\
+nested:true:true:date:0,object:1|\
+shared:true|\
+cycle:true:true|\
+sparse:3:false:true:third|\
+special:true:Infinity:-Infinity:true:true";
+
+/// Run a test body on a thread with room for the interpreter's large
+/// debug-build frames. Structured-clone graphs nest a few levels deep and the
+/// default 2 MiB test-thread stack is not enough for the `IndexedDB` put/get
+/// path when a Map holds a Set of objects.
+fn run_in_large_stack<F: FnOnce() + Send + 'static>(test: F) {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(test)
+        .expect("spawn test thread")
+        .join()
+        .expect("test thread");
+}
+
+#[test]
+fn indexed_db_round_trips_structured_clone_value_types() {
+    run_in_large_stack(|| {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        let source = [
+            IDB_STRUCTURED_VALUE_SCRIPT,
+            r"
+                window.log = [];
+                var open = indexedDB.open('structured-values', 1);
+                open.onupgradeneeded = function () {
+                    open.result.createObjectStore('items');
+                };
+                open.onsuccess = function () {
+                    var tx = open.result.transaction('items', 'readwrite');
+                    var store = tx.objectStore('items');
+                    store.put(makeStoredValue(), 'value');
+                    store.get('value').onsuccess = function (event) {
+                        logStoredValue(event.target.result);
+                    };
+                };
+            ",
+        ]
+        .concat();
+        runtime
+            .execute(&mut parsed.dom, &source)
+            .expect("IndexedDB structured value script executes");
+        drain_microtasks(&mut runtime, &mut parsed.dom);
+        let value = runtime
+            .execute(&mut parsed.dom, "log.join('|')")
+            .expect("log reads")
+            .value;
+        assert_eq!(value, JsValue::String(IDB_STRUCTURED_VALUE_LOG.into()));
+    });
+}
+
+#[test]
+fn indexed_db_persists_structured_clone_value_types() {
+    run_in_large_stack(|| {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        let source = [
+            IDB_STRUCTURED_VALUE_SCRIPT,
+            r"
+                window.log = [];
+                var open = indexedDB.open('structured-persist', 1);
+                open.onupgradeneeded = function () {
+                    open.result.createObjectStore('items');
+                };
+                open.onsuccess = function () {
+                    var tx = open.result.transaction('items', 'readwrite');
+                    tx.objectStore('items').put(makeStoredValue(), 'value');
+                };
+            ",
+        ]
+        .concat();
+        runtime
+            .execute(&mut parsed.dom, &source)
+            .expect("IndexedDB structured write executes");
+        drain_microtasks(&mut runtime, &mut parsed.dom);
+        let state = runtime.indexed_db_data();
+        assert!(state.contains("\"format\":2"));
+        assert!(state.contains("\"__renderType\":\"map\""));
+        assert!(state.contains("\"__renderType\":\"typedarray\""));
+        assert!(state.contains("\"__renderType\":\"ref\""));
+
+        let mut restored = parse_document("<!doctype html><p></p>");
+        let mut second = JsRuntime::new(&restored.dom);
+        second.seed_indexed_db(&state);
+        let source = [
+            IDB_STRUCTURED_VALUE_SCRIPT,
+            r"
+                window.log = [];
+                var open = indexedDB.open('structured-persist');
+                open.onsuccess = function () {
+                    var tx = open.result.transaction('items');
+                    tx.objectStore('items').get('value').onsuccess = function (event) {
+                        logStoredValue(event.target.result);
+                    };
+                };
+            ",
+        ]
+        .concat();
+        second
+            .execute(&mut restored.dom, &source)
+            .expect("IndexedDB structured reopen executes");
+        drain_microtasks(&mut second, &mut restored.dom);
+        let value = second
+            .execute(&mut restored.dom, "log.join('|')")
+            .expect("log reads")
+            .value;
+        assert_eq!(value, JsValue::String(IDB_STRUCTURED_VALUE_LOG.into()));
+    });
+}
+
+#[test]
+fn indexed_db_reads_values_persisted_before_the_graph_format() {
+    // The first persisted format only tagged dates and arrays; plain objects
+    // were ordinary JSON. A state file written then must still load.
+    let legacy = r#"{
+        "legacy-db": {
+            "version": 1,
+            "stores": {
+                "items": {
+                    "keyPath": null,
+                    "autoIncrement": false,
+                    "nextKey": 2,
+                    "indexes": {},
+                    "records": [{
+                        "key": "value",
+                        "value": {
+                            "__renderType": "array",
+                            "value": [
+                                {"__renderType": "date", "value": 1700000000000},
+                                {"name": "plain", "nested": {"__renderType": "not-a-marker"}}
+                            ]
+                        }
+                    }]
+                }
+            }
+        }
+    }"#;
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime.seed_indexed_db(legacy);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.log = [];
+                var open = indexedDB.open('legacy-db');
+                open.onsuccess = function () {
+                    var tx = open.result.transaction('items');
+                    tx.objectStore('items').get('value').onsuccess = function (event) {
+                        var copy = event.target.result;
+                        log.push('date:' + (copy[0] instanceof Date) + ':' + copy[0].getTime());
+                        log.push('plain:' + copy[1].name + ':' +
+                            (copy[1].nested.__renderType === 'not-a-marker'));
+                    };
+                };
+            ",
+        )
+        .expect("IndexedDB legacy reopen executes");
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    let value = runtime
+        .execute(&mut parsed.dom, "log.join('|')")
+        .expect("log reads")
+        .value;
+    assert_eq!(
+        value,
+        JsValue::String("date:true:1700000000000|plain:plain:true".into())
+    );
+}
+
 #[test]
 fn indexed_db_upgrade_notifies_an_open_connection_of_versionchange() {
     let mut parsed = parse_document("<!doctype html><p></p>");
