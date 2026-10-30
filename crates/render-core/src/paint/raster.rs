@@ -11,9 +11,10 @@ use crate::layout::{PhysicalPoint, PhysicalRect, StickyConstraint};
 use super::color::{Color, clamped_rounded_u8};
 use super::display_list::{
     BorderPaint, BoxShadowPaint, ClipFillRule, ClipShape, CornerRadii, DisplayCommand, DisplayItem,
-    DisplayItemId, DisplayList, FilterEffect, FontInstanceId, GlyphId, GlyphRun, LinearGradient,
-    ListMarkerPaint, ListMarkerShape, PaintCoordinateSpace, StackingContext, TextDecoration,
-    TextDecorationStyle, TextShadowPaint, Transform2D,
+    DisplayItemId, DisplayList, FilterEffect, FilterOperation, FontInstanceId, GlyphId, GlyphRun,
+    LinearGradient, ListMarkerPaint, ListMarkerShape, MaskImage, PaintCoordinateSpace,
+    RadialGradient, StackingContext, TextDecoration, TextDecorationStyle, TextShadowPaint,
+    Transform2D,
 };
 use super::scene::{PaintDamage, PaintScene, RetainedFrame};
 use super::sticky::sticky_displacement;
@@ -367,6 +368,7 @@ impl CpuRasterizer {
             surface,
             request.viewport_origin,
             damage_bounds,
+            request.images,
             Some(control),
         );
         for item in request.scene.display_list().items() {
@@ -390,7 +392,7 @@ impl CpuRasterizer {
     ) -> CpuRasterOutput {
         let width = ceil_to_u32(list.viewport.width);
         let height = ceil_to_u32(list.viewport.height);
-        let mut state = RasterState::new(width, height, background, viewport_origin);
+        let mut state = RasterState::new(width, height, background, viewport_origin, images);
         for item in list.items() {
             state.process_item(item, glyphs, images);
         }
@@ -412,6 +414,7 @@ impl CpuRasterizer {
             height,
             background,
             viewport_origin,
+            images,
             Some(control),
         );
         for item in list.items() {
@@ -438,9 +441,10 @@ enum StackingFrame {
     Layer {
         transform: Transform2D,
         offset: PhysicalPoint,
+        coordinate_space: PaintCoordinateSpace,
         opacity: f32,
         filter: Option<FilterEffect>,
-        mask: Option<LinearGradient>,
+        mask: Option<MaskImage>,
     },
 }
 
@@ -487,13 +491,20 @@ struct RasterState<'a> {
     pending_shadows: Vec<TextShadowPaint>,
     diagnostics: Vec<RasterDiagnostic>,
     viewport_origin: PhysicalPoint,
+    images: Option<&'a ImageResources>,
     control: Option<&'a dyn RasterControl>,
     cancelled: bool,
 }
 
 impl<'a> RasterState<'a> {
-    fn new(width: u32, height: u32, background: Color, viewport_origin: PhysicalPoint) -> Self {
-        Self::new_with_control(width, height, background, viewport_origin, None)
+    fn new(
+        width: u32,
+        height: u32,
+        background: Color,
+        viewport_origin: PhysicalPoint,
+        images: Option<&'a ImageResources>,
+    ) -> Self {
+        Self::new_with_control(width, height, background, viewport_origin, images, None)
     }
 
     fn new_with_control(
@@ -501,6 +512,7 @@ impl<'a> RasterState<'a> {
         height: u32,
         background: Color,
         viewport_origin: PhysicalPoint,
+        images: Option<&'a ImageResources>,
         control: Option<&'a dyn RasterControl>,
     ) -> Self {
         Self {
@@ -523,6 +535,7 @@ impl<'a> RasterState<'a> {
                 x: finite_non_negative(viewport_origin.x),
                 y: finite_non_negative(viewport_origin.y),
             },
+            images,
             control,
             cancelled: false,
         }
@@ -532,6 +545,7 @@ impl<'a> RasterState<'a> {
         surface: Surface,
         viewport_origin: PhysicalPoint,
         clip: PhysicalRect,
+        images: Option<&'a ImageResources>,
         control: Option<&'a dyn RasterControl>,
     ) -> Self {
         let width = surface.width();
@@ -551,6 +565,7 @@ impl<'a> RasterState<'a> {
                 x: finite_non_negative(viewport_origin.x),
                 y: finite_non_negative(viewport_origin.y),
             },
+            images,
             control,
             cancelled: false,
         }
@@ -585,7 +600,7 @@ impl<'a> RasterState<'a> {
             DisplayCommand::PushClip(shape) => self.push_clip(*shape, offset),
             DisplayCommand::PopClip => self.pop_clip(item.id),
             DisplayCommand::PushStackingContext(context) => {
-                self.push_stacking_context(context.clone());
+                self.push_stacking_context(context.clone(), item.coordinate_space);
             }
             DisplayCommand::PopStackingContext => self.pop_stacking_context(item.id),
             DisplayCommand::PushSticky(constraint) => self.push_sticky(constraint),
@@ -1099,7 +1114,11 @@ impl<'a> RasterState<'a> {
     }
 
     #[allow(clippy::float_cmp)] // opacity arrives as an exact literal constant
-    fn push_stacking_context(&mut self, context: StackingContext) {
+    fn push_stacking_context(
+        &mut self,
+        context: StackingContext,
+        coordinate_space: PaintCoordinateSpace,
+    ) {
         // A pure translation at full opacity only shifts where items paint:
         // accumulate it into the offset instead of paying for an offscreen
         // surface. Clips pushed inside inherit the shift because push_clip
@@ -1127,6 +1146,7 @@ impl<'a> RasterState<'a> {
         self.frames.push(StackingFrame::Layer {
             transform: context.transform,
             offset: self.item_offset(PaintCoordinateSpace::Document),
+            coordinate_space,
             opacity: context.opacity,
             filter: context.filter,
             mask: context.mask,
@@ -1144,10 +1164,18 @@ impl<'a> RasterState<'a> {
             Some(StackingFrame::Layer {
                 transform,
                 offset,
+                coordinate_space,
                 opacity,
                 filter,
                 mask,
-            }) => self.warp_top_layer(transform, offset, opacity, filter, mask),
+            }) => self.warp_top_layer(
+                transform,
+                offset,
+                coordinate_space,
+                opacity,
+                filter.as_ref(),
+                mask.as_ref(),
+            ),
             None => {
                 self.diagnostics.push(RasterDiagnostic {
                     item,
@@ -1168,16 +1196,21 @@ impl<'a> RasterState<'a> {
         &mut self,
         transform: Transform2D,
         offset: PhysicalPoint,
+        coordinate_space: PaintCoordinateSpace,
         opacity: f32,
-        filter: Option<FilterEffect>,
-        mask: Option<LinearGradient>,
+        filter: Option<&FilterEffect>,
+        mask: Option<&MaskImage>,
     ) {
         let mut layer = self.layers.pop().expect("layer frame has a surface");
         if let Some(filter) = filter {
             apply_filter_effect(&mut layer, filter);
         }
         if let Some(mask) = mask {
-            apply_linear_mask(&mut layer, &mask);
+            let mask_offset = match coordinate_space {
+                PaintCoordinateSpace::Document => offset,
+                PaintCoordinateSpace::Viewport => PhysicalPoint::default(),
+            };
+            apply_mask_image(&mut layer, mask, mask_offset, self.images);
         }
         let into_layer = Transform2D {
             translate_x: -offset.x,
@@ -1219,6 +1252,7 @@ impl<'a> RasterState<'a> {
             let StackingFrame::Layer {
                 transform,
                 offset,
+                coordinate_space,
                 opacity,
                 filter,
                 mask,
@@ -1226,7 +1260,14 @@ impl<'a> RasterState<'a> {
             else {
                 continue;
             };
-            self.warp_top_layer(transform, offset, opacity, filter, mask);
+            self.warp_top_layer(
+                transform,
+                offset,
+                coordinate_space,
+                opacity,
+                filter.as_ref(),
+                mask.as_ref(),
+            );
         }
         self.output()
     }
@@ -1236,6 +1277,7 @@ impl<'a> RasterState<'a> {
             let StackingFrame::Layer {
                 transform,
                 offset,
+                coordinate_space,
                 opacity,
                 filter,
                 mask,
@@ -1246,7 +1288,14 @@ impl<'a> RasterState<'a> {
             if self.is_cancelled() {
                 return Err(RasterCancelled);
             }
-            self.warp_top_layer(transform, offset, opacity, filter, mask);
+            self.warp_top_layer(
+                transform,
+                offset,
+                coordinate_space,
+                opacity,
+                filter.as_ref(),
+                mask.as_ref(),
+            );
             if self.was_cancelled() {
                 return Err(RasterCancelled);
             }
@@ -2333,25 +2382,201 @@ fn paint_image(
 /// rectangle is honored here, on par with the former 1:1 composite: rounded
 /// clip shapes stay a paint-time concern because the source surface already
 /// carries their coverage. A singular transform paints nothing.
-fn apply_filter_effect(surface: &mut Surface, effect: FilterEffect) {
-    if (effect.brightness - 1.0).abs() > f32::EPSILON {
-        for pixel in surface.pixels_mut() {
-            let scale =
-                |channel: u8| -> u8 { clamped_rounded_u8(f32::from(channel) * effect.brightness) };
-            *pixel = Color::rgba(
-                scale(pixel.red),
-                scale(pixel.green),
-                scale(pixel.blue),
-                pixel.alpha,
-            );
+fn apply_filter_effect(surface: &mut Surface, effect: &FilterEffect) {
+    for operation in &effect.operations {
+        match operation {
+            FilterOperation::Blur(sigma) => blur_surface(surface, *sigma),
+            FilterOperation::Brightness(amount) => {
+                for pixel in surface.pixels_mut() {
+                    let scale =
+                        |channel: u8| -> u8 { clamped_rounded_u8(f32::from(channel) * amount) };
+                    *pixel = Color::rgba(
+                        scale(pixel.red),
+                        scale(pixel.green),
+                        scale(pixel.blue),
+                        pixel.alpha,
+                    );
+                }
+            }
+            FilterOperation::Grayscale(amount) => {
+                let amount = amount.clamp(0.0, 1.0);
+                for pixel in surface.pixels_mut() {
+                    let red = f32::from(pixel.red);
+                    let green = f32::from(pixel.green);
+                    let blue = f32::from(pixel.blue);
+                    let luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+                    *pixel = Color::rgba(
+                        clamped_rounded_u8(red + (luminance - red) * amount),
+                        clamped_rounded_u8(green + (luminance - green) * amount),
+                        clamped_rounded_u8(blue + (luminance - blue) * amount),
+                        pixel.alpha,
+                    );
+                }
+            }
+            FilterOperation::Saturate(amount) => {
+                let saturation = amount.max(0.0);
+                for pixel in surface.pixels_mut() {
+                    let red = f32::from(pixel.red);
+                    let green = f32::from(pixel.green);
+                    let blue = f32::from(pixel.blue);
+                    *pixel = Color::rgba(
+                        clamped_rounded_u8(
+                            (0.213 + 0.787 * saturation) * red
+                                + (0.715 - 0.715 * saturation) * green
+                                + (0.072 - 0.072 * saturation) * blue,
+                        ),
+                        clamped_rounded_u8(
+                            (0.213 - 0.213 * saturation) * red
+                                + (0.715 + 0.285 * saturation) * green
+                                + (0.072 - 0.072 * saturation) * blue,
+                        ),
+                        clamped_rounded_u8(
+                            (0.213 - 0.213 * saturation) * red
+                                + (0.715 - 0.715 * saturation) * green
+                                + (0.072 + 0.928 * saturation) * blue,
+                        ),
+                        pixel.alpha,
+                    );
+                }
+            }
+            FilterOperation::DropShadow {
+                offset_x,
+                offset_y,
+                blur,
+                color,
+            } => apply_drop_shadow(surface, *offset_x, *offset_y, *blur, *color),
         }
-    }
-    if effect.blur > 0.0 {
-        blur_surface(surface, effect.blur);
     }
 }
 
-fn apply_linear_mask(surface: &mut Surface, mask: &LinearGradient) {
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_lossless,
+    clippy::cast_sign_loss,
+    reason = "the shadow offset is rounded to whole pixels and bounded by the surface"
+)]
+fn apply_drop_shadow(surface: &mut Surface, offset_x: f32, offset_y: f32, blur: f32, color: Color) {
+    let width = surface.width();
+    let height = surface.height();
+    let mut shadow = vec![Color::TRANSPARENT; surface.pixels().len()];
+    for (index, pixel) in surface.pixels().iter().enumerate() {
+        shadow[index] = color.with_opacity(f32::from(pixel.alpha) / 255.0);
+    }
+    let shift_x = offset_x.round() as i64;
+    let shift_y = offset_y.round() as i64;
+    let mut shifted = vec![Color::TRANSPARENT; shadow.len()];
+    if shift_x != 0 || shift_y != 0 {
+        for y in 0..height as i64 {
+            for x in 0..width as i64 {
+                let source_x = x - shift_x;
+                let source_y = y - shift_y;
+                if source_x < 0
+                    || source_y < 0
+                    || source_x >= width as i64
+                    || source_y >= height as i64
+                {
+                    continue;
+                }
+                shifted[y as usize * width as usize + x as usize] =
+                    shadow[source_y as usize * width as usize + source_x as usize];
+            }
+        }
+    } else {
+        shifted = shadow;
+    }
+    if blur > 0.0 {
+        let mut shadow_surface = Surface {
+            width,
+            height,
+            pixels: shifted,
+        };
+        blur_surface(&mut shadow_surface, blur);
+        shifted = shadow_surface.pixels;
+    }
+    for (pixel, shadow) in surface.pixels_mut().iter_mut().zip(shifted) {
+        *pixel = source_over(*pixel, shadow);
+    }
+}
+
+fn source_over(source: Color, backdrop: Color) -> Color {
+    let source_alpha = f32::from(source.alpha) / 255.0;
+    let backdrop_alpha = f32::from(backdrop.alpha) / 255.0;
+    let output_alpha = source_alpha + backdrop_alpha * (1.0 - source_alpha);
+    if output_alpha <= 0.0001 {
+        return Color::TRANSPARENT;
+    }
+    let channel = |source: u8, backdrop: u8| -> u8 {
+        let value = (f32::from(source) * source_alpha
+            + f32::from(backdrop) * backdrop_alpha * (1.0 - source_alpha))
+            / (output_alpha * 255.0);
+        clamped_rounded_u8(value * 255.0)
+    };
+    Color::rgba(
+        channel(source.red, backdrop.red),
+        channel(source.green, backdrop.green),
+        channel(source.blue, backdrop.blue),
+        clamped_rounded_u8(output_alpha * 255.0),
+    )
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the sampled image coordinates are clamped to the destination region"
+)]
+fn apply_mask_image(
+    surface: &mut Surface,
+    mask: &MaskImage,
+    offset: PhysicalPoint,
+    images: Option<&ImageResources>,
+) {
+    match mask {
+        MaskImage::Linear(gradient) => apply_linear_mask(surface, gradient, offset),
+        MaskImage::Radial(gradient) => apply_radial_mask(surface, gradient, offset),
+        MaskImage::Raster {
+            resource,
+            destination,
+        } => {
+            let Some(decoded) = images.and_then(|images| images.get(*resource)) else {
+                return;
+            };
+            let (image_width, image_height) = decoded.intrinsic_size();
+            if image_width == 0
+                || image_height == 0
+                || destination.size.width <= 0.0
+                || destination.size.height <= 0.0
+            {
+                return;
+            }
+            for y in 0..surface.height() {
+                for x in 0..surface.width() {
+                    let document_x = u32_to_f32(x) + 0.5 - offset.x;
+                    let document_y = u32_to_f32(y) + 0.5 - offset.y;
+                    if document_x < destination.origin.x
+                        || document_y < destination.origin.y
+                        || document_x >= destination.origin.x + destination.size.width
+                        || document_y >= destination.origin.y + destination.size.height
+                    {
+                        continue;
+                    }
+                    let u = (document_x - destination.origin.x) / destination.size.width;
+                    let v = (document_y - destination.origin.y) / destination.size.height;
+                    let source_x = (u * u32_to_f32(image_width)).floor();
+                    let source_y = (v * u32_to_f32(image_height)).floor();
+                    let coverage = decoded
+                        .pixel(source_x as u32, source_y as u32)
+                        .map_or(0.0, |pixel| f32::from(pixel.alpha) / 255.0);
+                    if let Some(index) = surface.index(x, y) {
+                        surface.pixels[index] = surface.pixels[index].with_opacity(coverage);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn apply_linear_mask(surface: &mut Surface, mask: &LinearGradient, offset: PhysicalPoint) {
     let width = surface.width();
     let height = surface.height();
     let dx = mask.end.x - mask.start.x;
@@ -2362,17 +2587,38 @@ fn apply_linear_mask(surface: &mut Surface, mask: &LinearGradient) {
     }
     for y in 0..height {
         for x in 0..width {
-            let pixel_x = u32_to_f32(x) + 0.5;
-            let pixel_y = u32_to_f32(y) + 0.5;
+            let pixel_x = u32_to_f32(x) + 0.5 - offset.x;
+            let pixel_y = u32_to_f32(y) + 0.5 - offset.y;
             let progress = ((pixel_x - mask.start.x).mul_add(dx, (pixel_y - mask.start.y) * dy)
                 / denominator)
                 .clamp(0.0, 1.0);
-            let coverage = f32::from(gradient_color(&mask.stops, progress).alpha) / 255.0;
-            if let Some(index) = surface.index(x, y) {
-                let pixel = surface.pixels[index];
-                surface.pixels[index] = pixel.with_opacity(coverage);
-            }
+            apply_mask_coverage(surface, x, y, gradient_color(&mask.stops, progress));
         }
+    }
+}
+
+fn apply_radial_mask(surface: &mut Surface, mask: &RadialGradient, offset: PhysicalPoint) {
+    if mask.radius_x <= 0.0 || mask.radius_y <= 0.0 {
+        return;
+    }
+    let width = surface.width();
+    let height = surface.height();
+    for y in 0..height {
+        for x in 0..width {
+            let pixel_x = u32_to_f32(x) + 0.5 - offset.x;
+            let pixel_y = u32_to_f32(y) + 0.5 - offset.y;
+            let dx = (pixel_x - mask.center.x) / mask.radius_x;
+            let dy = (pixel_y - mask.center.y) / mask.radius_y;
+            let progress = dx.mul_add(dx, dy * dy).sqrt().clamp(0.0, 1.0);
+            apply_mask_coverage(surface, x, y, gradient_color(&mask.stops, progress));
+        }
+    }
+}
+
+fn apply_mask_coverage(surface: &mut Surface, x: u32, y: u32, color: Color) {
+    let coverage = f32::from(color.alpha) / 255.0;
+    if let Some(index) = surface.index(x, y) {
+        surface.pixels[index] = surface.pixels[index].with_opacity(coverage);
     }
 }
 

@@ -1,3 +1,69 @@
+# 交接文档 (2026-10-31, 续二十七) — grayscale / saturate / drop-shadow 与 mask URL
+
+接续 CSS filter/mask 会话。这一轮补齐常用 filter 函数,并让 `mask-image` 支持
+径向渐变与 URL 图片源。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **filter 函数顺序** | `filter` 解析为按源码顺序执行的 `FilterOperation` 列表,不再压平为固定字段 |
+| **grayscale** | 按 CSS Filter Effects 亮度权重混合到灰度 |
+| **saturate** | CSS 饱和度矩阵 |
+| **drop-shadow** | offset/blur/color;alpha 轮廓偏移 + 高斯模糊,再 source-over 到原图下方 |
+| **mask radial-gradient** | 解析 `circle/ellipse`、`closest/farthest-side/corner`、显式半径与 `at` 位置 |
+| **mask URL** | 新增 `ImageSource::CssMask`,图片发现/加载/get_css_mask;mask 采样图片 alpha |
+| **坐标** | 遮罩按 document 坐标在离屏层内反算,支持滚动 |
+| **测试** | grayscale、saturate、drop-shadow、radial mask、URL mask(加载真实解码图),共 5 个 |
+
+## 证据
+
+`cssfilterprobe2.html` 像素采样(白底,页面原点 y=192):
+
+```
+grayscale(1) 红             (30,232)  = (54,54,54)
+saturate(0) rgb(0,200,0)    (110,232) = (143,143,143)
+drop-shadow(10px 0 0 black) 原图       (185,212) = (255,0,0)
+                            阴影       (196,212) = (0,0,0)
+radial mask 中心             (280,232) = (255,4,4)
+radial mask 角               (305,257) = (255,217,217)
+url mask 左/右               (340,232) = (255,0,0)
+                             (380,232) = (255,255,255)
+```
+
+即灰度/去饱和正确、阴影落在元素后方、径向 mask 从中心到边缘渐隐、URL mask
+左半保留右半透明。
+
+Bing / Baidu / JD 冒烟:
+
+```
+Bing:  ready=Complete    dom_elements=475 boxes=167 images_failed=0
+Baidu: ready=Complete    dom_elements=453 boxes=156 images_failed=0
+JD:    ready=Loading     dom_elements=1157 boxes=117 images_failed=1
+```
+
+JD 主商品区仍为空(风控 403,同机 Edge 也 403)。
+
+## 验证
+
+```
+cargo test --workspace                       2760 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+## 明确未做 / 下一步
+
+- CSS filter 仍未实现 `contrast`/`hue-rotate`/`invert`/`sepia`/`url(#filter)` 等;
+  `drop-shadow` 目前是单层、无多阴影列表。
+- `mask-image` 仍缺 `mask-size`/`mask-position`/`mask-repeat`/`mask-mode` 与多层
+  mask;URL mask 目前拉伸到元素边框盒。
+- 高级渐变(`xlink:href`/`spreadMethod`/径向焦点)、IndexedDB 值类型覆盖仍未完成。
+- JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;AVIF 依赖系统 dav1d。
+
+---
+
 # 交接文档 (2026-10-31, 续二十六) — CSS filter / mask-image
 
 接续 SVG filter 原语会话。这一轮给 HTML 元素的 stacking context 接入
@@ -50,8 +116,8 @@ real_site_tasks                              66 passed, 0 failed
 
 ## 明确未做 / 下一步
 
-- CSS filter 仅 blur/brightness;grayscale/saturate/drop-shadow 等未实现。
-- mask-image 仅 linear-gradient;radial-gradient、URL/图片源、mask-size/position/
+- CSS filter 的 `grayscale`/`saturate`/`drop-shadow` 与 mask 的
+  `radial-gradient`/URL 源已在续二十七实现;其余 filter 函数、mask-size/position/
   mask-mode 未实现。
 - 高级渐变(`xlink:href`/`spreadMethod`/径向焦点)、IndexedDB 值类型覆盖仍未完成。
 - JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;AVIF 依赖系统 dav1d。

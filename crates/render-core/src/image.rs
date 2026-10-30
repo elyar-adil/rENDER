@@ -92,6 +92,8 @@ pub enum ImageSource {
     /// not by URL-keyed image loads.
     VideoFrame,
     CssBackground,
+    /// A `mask-image: url(...)` layer on an HTML element.
+    CssMask,
     /// The bitmap of a `<canvas>` element, published by the canvas engine
     /// (installed through [`ImageResources::set_canvas_bitmap`]), not by a
     /// URL-keyed load.
@@ -276,7 +278,7 @@ pub fn discover_images_with_styles_and_context(
 ) -> ImageDiscovery {
     let mut discovery = discover_images_with_context(dom, document_url, limits, context);
     let (elements, _) = collect_elements(dom, limits.max_discovery_nodes);
-    for node in elements {
+    for &node in &elements {
         if discovery.resources.len() >= limits.max_resources {
             break;
         }
@@ -319,6 +321,46 @@ pub fn discover_images_with_styles_and_context(
             },
         });
     }
+    for &node in &elements {
+        if discovery.resources.len() >= limits.max_resources {
+            break;
+        }
+        let Some(value) = styles
+            .get(&node)
+            .and_then(|style| style.get("mask-image"))
+            .map(|value| value.css_text().to_owned())
+        else {
+            continue;
+        };
+        let Some(reference) = background_url(&value) else {
+            continue;
+        };
+        let Ok(requested_url) = discovery.effective_base_url.join(reference) else {
+            continue;
+        };
+        if !matches!(requested_url.scheme(), "http" | "https" | "data")
+            || requested_url.as_str().len() > limits.max_url_bytes
+        {
+            continue;
+        }
+        if discovery.resources.iter().any(|resource| {
+            resource.key.owner == node
+                && resource.key.requested_url == requested_url
+                && resource.key.source == ImageSource::CssMask
+        }) {
+            continue;
+        }
+        discovery.resources.push(DiscoveredImage {
+            source_order: discovery.resources.len(),
+            key: ImageResourceKey {
+                owner: node,
+                requested_url,
+                source_snapshot: value.clone(),
+                source: ImageSource::CssMask,
+                selection_context: context,
+            },
+        });
+    }
     discovery
 }
 
@@ -333,7 +375,10 @@ pub fn background_url(value: &str) -> Option<&str> {
 /// source and current document-base resolution.
 #[must_use]
 pub fn image_key_is_current(dom: &Dom, document_url: &Url, key: &ImageResourceKey) -> bool {
-    if key.source == ImageSource::CssBackground {
+    if matches!(
+        key.source,
+        ImageSource::CssBackground | ImageSource::CssMask
+    ) {
         return true;
     }
     // Presented video frames are owned by the video pipeline's lifecycle,
@@ -738,6 +783,16 @@ impl ImageResources {
         self.by_node_url.values().find(|loaded| {
             loaded.key.owner == node
                 && loaded.key.source == ImageSource::CssBackground
+                && loaded.key.source_snapshot == snapshot
+        })
+    }
+
+    /// The loaded `mask-image: url(...)` layer attached to `node`.
+    #[must_use]
+    pub fn get_css_mask(&self, node: NodeId, snapshot: &str) -> Option<&LoadedImage> {
+        self.by_node_url.values().find(|loaded| {
+            loaded.key.owner == node
+                && loaded.key.source == ImageSource::CssMask
                 && loaded.key.source_snapshot == snapshot
         })
     }

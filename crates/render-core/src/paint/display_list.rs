@@ -144,25 +144,24 @@ pub enum CompositingReason {
     Clip,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// One function in a CSS `filter` list, in source order.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FilterOperation {
+    Blur(f32),
+    Brightness(f32),
+    Grayscale(f32),
+    Saturate(f32),
+    DropShadow {
+        offset_x: f32,
+        offset_y: f32,
+        blur: f32,
+        color: Color,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct FilterEffect {
-    pub blur: f32,
-    pub brightness: f32,
-}
-
-impl Default for FilterEffect {
-    fn default() -> Self {
-        Self {
-            blur: 0.0,
-            brightness: 1.0,
-        }
-    }
-}
-
-impl FilterEffect {
-    const fn is_none(self) -> bool {
-        self.blur <= 0.0 && (self.brightness - 1.0).abs() < f32::EPSILON
-    }
+    pub operations: Vec<FilterOperation>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -173,8 +172,19 @@ pub struct StackingContext {
     pub isolated: bool,
     pub reason: CompositingReason,
     pub filter: Option<FilterEffect>,
-    /// CSS `mask-image` as a linear-gradient alpha mask over the element box.
-    pub mask: Option<LinearGradient>,
+    /// CSS `mask-image`: a gradient or fetched raster used as an alpha mask.
+    pub mask: Option<MaskImage>,
+}
+
+/// A resolved `mask-image` layer.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MaskImage {
+    Linear(LinearGradient),
+    Radial(RadialGradient),
+    Raster {
+        resource: ImageResourceId,
+        destination: PhysicalRect,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -863,8 +873,17 @@ impl<'a> Builder<'a> {
             self.clip_path_resolver,
             fragment.source,
         );
-        let filter = css_filter(style, font_size, self.fragments.viewport);
-        let mask = css_mask_image(style, border_rect, self.options.palette, current_color);
+        let filter = css_filter(style, font_size, self.fragments.viewport, current_color);
+        let mask = css_mask_image(
+            style,
+            border_rect,
+            self.options.palette,
+            current_color,
+            font_size,
+            self.fragments.viewport,
+            self.images,
+            fragment.source,
+        );
         let stacking_context =
             fragment_stacking_context(opacity, transform, clip_path.is_some(), filter, mask);
         if let Some(context) = stacking_context.clone() {
@@ -2085,46 +2104,178 @@ fn css_filter(
     style: Option<&ComputedStyle>,
     font_size: f32,
     viewport: PhysicalSize,
+    current_color: Color,
 ) -> Option<FilterEffect> {
     let text = style?.get("filter")?.css_text();
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
         return None;
     }
-    let mut effect = FilterEffect::default();
-    let lower = trimmed.to_ascii_lowercase();
-    if let Some(start) = lower.find("blur(")
-        && let Some(end) = trimmed[start + 5..].find(')')
-    {
-        let argument = trimmed[start + 5..start + 5 + end].trim();
-        effect.blur = resolve_clip_length(argument, 0.0, font_size, viewport)?;
+    let mut operations = Vec::new();
+    for (name, argument) in filter_functions(trimmed) {
+        match name.as_str() {
+            "blur" => {
+                let radius = resolve_clip_length(argument, 0.0, font_size, viewport)?;
+                operations.push(FilterOperation::Blur(radius.max(0.0)));
+            }
+            "brightness" => operations.push(FilterOperation::Brightness(
+                parse_filter_amount(argument, 1.0)?.max(0.0),
+            )),
+            "grayscale" => operations.push(FilterOperation::Grayscale(
+                parse_filter_amount(argument, 1.0)?.clamp(0.0, 1.0),
+            )),
+            "saturate" => operations.push(FilterOperation::Saturate(
+                parse_filter_amount(argument, 1.0)?.max(0.0),
+            )),
+            "drop-shadow" => {
+                operations.push(parse_drop_shadow(
+                    argument,
+                    font_size,
+                    viewport,
+                    current_color,
+                )?);
+            }
+            _ => {}
+        }
     }
-    if let Some(start) = lower.find("brightness(")
-        && let Some(end) = trimmed[start + 11..].find(')')
-    {
-        let argument = trimmed[start + 11..start + 11 + end].trim();
-        let value = if let Some(percent) = argument.strip_suffix('%') {
-            percent.parse::<f32>().ok()? / 100.0
-        } else {
-            argument.parse::<f32>().ok()?
-        };
-        effect.brightness = value.max(0.0);
-    }
-    (!effect.is_none()).then_some(effect)
+    (!operations.is_empty()).then_some(FilterEffect { operations })
 }
 
+/// Split a filter list into `(name, argument)` pairs, respecting nested
+/// parentheses and quoted strings so colour functions stay in one argument.
+fn filter_functions(value: &str) -> Vec<(String, &str)> {
+    let mut functions = Vec::new();
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        while index < bytes.len() && !bytes[index].is_ascii_alphabetic() {
+            index += 1;
+        }
+        let name_start = index;
+        while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'-')
+        {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        let name = value[name_start..index].to_ascii_lowercase();
+        while index < bytes.len() && bytes[index] != b'(' {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        index += 1;
+        let argument_start = index;
+        let mut depth = 1_u32;
+        let mut quote = None;
+        while index < bytes.len() {
+            let character = bytes[index] as char;
+            match (quote, character) {
+                (Some(expected), character) if character == expected => quote = None,
+                (None, '\'' | '"') => quote = Some(character),
+                (None, '(') => depth += 1,
+                (None, ')') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        if depth != 0 {
+            break;
+        }
+        functions.push((name, value[argument_start..index].trim()));
+        index += 1;
+    }
+    functions
+}
+
+fn parse_filter_amount(value: &str, default: f32) -> Option<f32> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Some(default);
+    }
+    if let Some(percent) = value.strip_suffix('%') {
+        return percent
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|value| value / 100.0);
+    }
+    value.parse::<f32>().ok().filter(|value| value.is_finite())
+}
+
+fn parse_drop_shadow(
+    value: &str,
+    font_size: f32,
+    viewport: PhysicalSize,
+    current_color: Color,
+) -> Option<FilterOperation> {
+    let mut lengths = Vec::new();
+    let mut color = current_color;
+    for token in clip_components(value) {
+        if let Some(Ok(TypedPropertyValue::Color(parsed))) = parse_typed_property("color", token) {
+            color = SystemPalette::default().resolve(parsed, current_color);
+        } else if let Some(length) = resolve_clip_length(token, 0.0, font_size, viewport) {
+            lengths.push(length);
+        } else {
+            return None;
+        }
+    }
+    let (Some(offset_x), Some(offset_y)) = (lengths.first().copied(), lengths.get(1).copied())
+    else {
+        return None;
+    };
+    Some(FilterOperation::DropShadow {
+        offset_x,
+        offset_y,
+        blur: lengths.get(2).copied().unwrap_or(0.0).max(0.0),
+        color,
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one CSS mask source needs style, geometry, palette, viewport and image lookup"
+)]
 fn css_mask_image(
     style: Option<&ComputedStyle>,
     rect: PhysicalRect,
     palette: SystemPalette,
     current_color: Color,
-) -> Option<LinearGradient> {
+    font_size: f32,
+    viewport: PhysicalSize,
+    images: Option<&ImageResources>,
+    node: Option<NodeId>,
+) -> Option<MaskImage> {
     let text = style?.get("mask-image")?.css_text();
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
         return None;
     }
-    parse_linear_gradient(trimmed, rect, palette, current_color)
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("linear-gradient(") {
+        return parse_linear_gradient(trimmed, rect, palette, current_color).map(MaskImage::Linear);
+    }
+    if lower.starts_with("radial-gradient(") {
+        return parse_radial_gradient(trimmed, rect, palette, current_color, font_size, viewport)
+            .map(MaskImage::Radial);
+    }
+    if lower.starts_with("url(") {
+        let loaded = images
+            .zip(node)
+            .and_then(|(images, node)| images.get_css_mask(node, trimmed))?;
+        return Some(MaskImage::Raster {
+            resource: loaded.id,
+            destination: rect,
+        });
+    }
+    None
 }
 
 fn clip_path_shape(
@@ -2839,6 +2990,233 @@ fn parse_linear_gradient(
     })
 }
 
+/// Parse the `radial-gradient()` subset used for CSS masks.
+///
+/// Supported: optional `circle`/`ellipse`, `closest-side`, `closest-corner`,
+/// `farthest-side`, `farthest-corner`, one or two explicit radii, an optional
+/// `at <position>`, and the standard colour-stop list.
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_precision_loss,
+    reason = "the radial-gradient grammar is parsed in one readable sequence"
+)]
+fn parse_radial_gradient(
+    value: &str,
+    rect: PhysicalRect,
+    palette: SystemPalette,
+    current_color: Color,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> Option<RadialGradient> {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    if !lower.starts_with("radial-gradient(") || !value.ends_with(')') {
+        return None;
+    }
+    let open = value.find('(')?;
+    let arguments = split_gradient_arguments(&value[open + 1..value.len() - 1]);
+    if arguments.len() < 2 {
+        return None;
+    }
+
+    let first = arguments[0];
+    let first_lower = first.to_ascii_lowercase();
+    let (shape_tokens, position_text, first_stop) = if first_lower.starts_with("at ") {
+        (Vec::new(), Some(first[3..].trim()), 1)
+    } else if parse_gradient_stop(first, palette, current_color).is_some() {
+        (Vec::new(), None, 0)
+    } else {
+        let (before, after) = first
+            .to_ascii_lowercase()
+            .find(" at ")
+            .map_or((first, None), |index| {
+                (first[..index].trim(), Some(first[index + 4..].trim()))
+            });
+        (clip_components(before), after, 1)
+    };
+
+    let stops = arguments[first_stop..]
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| {
+            let (color, offset) = parse_gradient_stop(argument, palette, current_color)?;
+            let default_offset = if arguments.len().saturating_sub(first_stop) <= 1 {
+                0.0
+            } else {
+                index as f32 / (arguments.len() - first_stop - 1) as f32
+            };
+            Some(GradientStop {
+                offset: offset.unwrap_or(default_offset).clamp(0.0, 1.0),
+                color,
+            })
+        })
+        .collect::<Vec<_>>();
+    if stops.len() < 2 {
+        return None;
+    }
+
+    let center = position_text.map_or_else(
+        || PhysicalPoint {
+            x: rect.origin.x + rect.size.width / 2.0,
+            y: rect.origin.y + rect.size.height / 2.0,
+        },
+        |text| {
+            parse_mask_position(text, rect, font_size, viewport).unwrap_or(PhysicalPoint {
+                x: rect.origin.x + rect.size.width / 2.0,
+                y: rect.origin.y + rect.size.height / 2.0,
+            })
+        },
+    );
+
+    let mut shape = None;
+    let mut keyword = None;
+    let mut lengths = Vec::new();
+    for token in shape_tokens {
+        let lower = token.to_ascii_lowercase();
+        match lower.as_str() {
+            "circle" => shape = Some(true),
+            "ellipse" => shape = Some(false),
+            "closest-side" | "closest-corner" | "farthest-side" | "farthest-corner" => {
+                keyword = Some(lower);
+            }
+            _ => {
+                let basis = if lengths.is_empty() {
+                    rect.size.width
+                } else {
+                    rect.size.height
+                };
+                lengths.push(resolve_clip_length(token, basis, font_size, viewport)?);
+            }
+        }
+    }
+    if shape.is_none() && !lengths.is_empty() {
+        shape = Some(lengths.len() == 1);
+    }
+    let shape = shape.unwrap_or(false);
+
+    let left = center.x - rect.origin.x;
+    let right = rect.origin.x + rect.size.width - center.x;
+    let top = center.y - rect.origin.y;
+    let bottom = rect.origin.y + rect.size.height - center.y;
+    let (radius_x, radius_y) = if lengths.is_empty() {
+        match keyword.as_deref().unwrap_or("farthest-corner") {
+            "closest-side" => {
+                if shape {
+                    let radius = left.min(right).min(top).min(bottom);
+                    (radius, radius)
+                } else {
+                    (left.min(right), top.min(bottom))
+                }
+            }
+            "farthest-side" => {
+                if shape {
+                    let radius = left.max(right).max(top).max(bottom);
+                    (radius, radius)
+                } else {
+                    (left.max(right), top.max(bottom))
+                }
+            }
+            "closest-corner" => {
+                if shape {
+                    let radius = left
+                        .hypot(top)
+                        .min(left.hypot(bottom))
+                        .min(right.hypot(top))
+                        .min(right.hypot(bottom));
+                    (radius, radius)
+                } else {
+                    (left.min(right), top.min(bottom))
+                }
+            }
+            _ => {
+                if shape {
+                    let radius = left
+                        .hypot(top)
+                        .max(left.hypot(bottom))
+                        .max(right.hypot(top))
+                        .max(right.hypot(bottom));
+                    (radius, radius)
+                } else {
+                    (left.max(right), top.max(bottom))
+                }
+            }
+        }
+    } else if shape || lengths.len() == 1 {
+        (lengths[0], lengths[0])
+    } else {
+        (lengths[0], lengths.get(1).copied().unwrap_or(lengths[0]))
+    };
+    if radius_x <= 0.0 || radius_y <= 0.0 {
+        return None;
+    }
+    Some(RadialGradient {
+        rect,
+        center,
+        radius_x,
+        radius_y,
+        stops,
+    })
+}
+
+fn parse_mask_position(
+    text: &str,
+    rect: PhysicalRect,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> Option<PhysicalPoint> {
+    let tokens = clip_components(text);
+    let (x, y) = match tokens.as_slice() {
+        [] => (rect.size.width / 2.0, rect.size.height / 2.0),
+        [single] => {
+            let lower = single.to_ascii_lowercase();
+            if matches!(lower.as_str(), "top" | "bottom") {
+                (
+                    rect.size.width / 2.0,
+                    mask_position_value(single, rect.size.height, font_size, viewport)?,
+                )
+            } else {
+                (
+                    mask_position_value(single, rect.size.width, font_size, viewport)?,
+                    rect.size.height / 2.0,
+                )
+            }
+        }
+        [first, second, ..] => {
+            let first_lower = first.to_ascii_lowercase();
+            let horizontal_first = !matches!(first_lower.as_str(), "top" | "bottom");
+            if horizontal_first {
+                (
+                    mask_position_value(first, rect.size.width, font_size, viewport)?,
+                    mask_position_value(second, rect.size.height, font_size, viewport)?,
+                )
+            } else {
+                (
+                    mask_position_value(second, rect.size.width, font_size, viewport)?,
+                    mask_position_value(first, rect.size.height, font_size, viewport)?,
+                )
+            }
+        }
+    };
+    Some(PhysicalPoint {
+        x: rect.origin.x + x,
+        y: rect.origin.y + y,
+    })
+}
+
+fn mask_position_value(
+    token: &str,
+    basis: f32,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> Option<f32> {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "left" | "top" => Some(0.0),
+        "center" => Some(basis / 2.0),
+        "right" | "bottom" => Some(basis),
+        _ => resolve_clip_length(token, basis, font_size, viewport),
+    }
+}
+
 fn split_gradient_arguments(value: &str) -> Vec<&str> {
     let mut arguments = Vec::new();
     let mut start = 0;
@@ -2972,7 +3350,7 @@ fn fragment_stacking_context(
     transform: Option<Transform2D>,
     clips: bool,
     filter: Option<FilterEffect>,
-    mask: Option<LinearGradient>,
+    mask: Option<MaskImage>,
 ) -> Option<StackingContext> {
     let reason = if transform.is_some() {
         CompositingReason::Transform

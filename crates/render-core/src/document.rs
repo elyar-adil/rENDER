@@ -28,14 +28,13 @@ use crate::image::inline_svg::{
 use crate::image::{ImageLimits, ImageResources};
 use crate::layout::{
     FormattingDiagnostic, FormattingLimits, FormattingTree, LayoutDiagnostic, LayoutOptions,
-    LayoutOutput, PhysicalPoint, PhysicalRect, SimpleTextMeasurer, TextMeasurer,
-    build_formatting_tree, layout_formatting_tree_with_images,
+    LayoutOutput, PhysicalPoint, PhysicalRect, TextMeasurer, build_formatting_tree,
+    layout_formatting_tree_with_images,
 };
 use crate::paint::{
     ClipFillRule, ClipPathResolver, ClipShape, Color, CpuRasterOutput, CpuRasterizer,
     DisplayListBuildOutput, DisplayListBuilderOptions, DisplayListDiagnostic, GlyphMaskProvider,
-    NoGlyphMasks, RasterDiagnostic, ReferenceTextShaper, SystemPalette, TextShaper,
-    build_display_list_with_images_and_clip_paths,
+    RasterDiagnostic, SystemPalette, TextShaper, build_display_list_with_images_and_clip_paths,
 };
 
 /// The HTML user-agent style sheet.
@@ -1188,9 +1187,9 @@ impl Document {
         self.render(
             options,
             DocumentBackends {
-                text_measurer: &SimpleTextMeasurer,
-                text_shaper: &ReferenceTextShaper,
-                glyph_masks: &NoGlyphMasks,
+                text_measurer: &crate::layout::SimpleTextMeasurer,
+                text_shaper: &crate::paint::ReferenceTextShaper,
+                glyph_masks: &crate::paint::NoGlyphMasks,
             },
         )
     }
@@ -1206,9 +1205,9 @@ impl Document {
         self.render_with_external_style_sheets(
             options,
             DocumentBackends {
-                text_measurer: &SimpleTextMeasurer,
-                text_shaper: &ReferenceTextShaper,
-                glyph_masks: &NoGlyphMasks,
+                text_measurer: &crate::layout::SimpleTextMeasurer,
+                text_shaper: &crate::paint::ReferenceTextShaper,
+                glyph_masks: &crate::paint::NoGlyphMasks,
             },
             base_url,
             external,
@@ -3497,6 +3496,135 @@ mod tests {
         let outside = output.raster.surface.pixel(12, 5).expect("blurred edge");
         assert_eq!(centre.red, 255);
         assert!(outside.red > 200 && outside.green > 0, "{outside:?}");
+    }
+
+    /// CSS `filter: grayscale(1)` replaces colour by its luminance.
+    #[test]
+    fn css_filter_grayscale_removes_colour() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0; background: white }
+               #box { width: 20px; height: 20px; background: red; filter: grayscale(1) }
+               </style><div id="box"></div>"#,
+        );
+        let output = document.render_reference(DocumentRenderOptions::default());
+        let pixel = output.raster.surface.pixel(10, 10).expect("filtered pixel");
+        assert!(
+            (i16::from(pixel.red) - i16::from(pixel.green)).abs() <= 1,
+            "{pixel:?}"
+        );
+        assert!(
+            (i16::from(pixel.green) - i16::from(pixel.blue)).abs() <= 1,
+            "{pixel:?}"
+        );
+        assert!(pixel.red < 70, "{pixel:?}");
+    }
+
+    /// CSS `filter: saturate(0)` also removes colour, through the saturation
+    /// matrix rather than the grayscale blend.
+    #[test]
+    fn css_filter_saturate_zero_removes_colour() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0; background: white }
+               #box { width: 20px; height: 20px; background: rgb(0, 200, 0);
+                      filter: saturate(0) }
+               </style><div id="box"></div>"#,
+        );
+        let output = document.render_reference(DocumentRenderOptions::default());
+        let pixel = output.raster.surface.pixel(10, 10).expect("filtered pixel");
+        assert!(
+            (i16::from(pixel.red) - i16::from(pixel.green)).abs() <= 1,
+            "{pixel:?}"
+        );
+        assert!(
+            (i16::from(pixel.green) - i16::from(pixel.blue)).abs() <= 1,
+            "{pixel:?}"
+        );
+    }
+
+    /// CSS `drop-shadow()` paints the alpha silhouette offset behind the
+    /// element and keeps the original on top.
+    #[test]
+    fn css_filter_drop_shadow_paints_behind_the_element() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0; background: white }
+               #box { width: 20px; height: 20px; background: red;
+                      filter: drop-shadow(10px 0 0 black) }
+               </style><div id="box"></div>"#,
+        );
+        let output = document.render_reference(DocumentRenderOptions::default());
+        assert_eq!(
+            output.raster.surface.pixel(5, 10),
+            Some(Color::rgb(255, 0, 0))
+        );
+        assert_eq!(output.raster.surface.pixel(25, 10), Some(Color::BLACK));
+    }
+
+    /// CSS `mask-image: radial-gradient()` fades the element towards its
+    /// edges: the centre keeps the background, the far corner does not.
+    #[test]
+    fn css_mask_image_radial_gradient_fades_the_element() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0; background: white }
+               #box { width: 20px; height: 20px; background: red;
+                      mask-image: radial-gradient(circle at center, black, transparent) }
+               </style><div id="box"></div>"#,
+        );
+        let output = document.render_reference(DocumentRenderOptions::default());
+        let centre = output.raster.surface.pixel(10, 10).expect("centre pixel");
+        assert!(centre.red == 255 && centre.green < 30, "{centre:?}");
+        let corner = output.raster.surface.pixel(19, 19).expect("corner pixel");
+        assert!(corner.green > 200 && corner.red == 255, "{corner:?}");
+    }
+
+    /// CSS `mask-image: url(...)` uses a fetched raster's alpha channel.
+    #[test]
+    fn css_mask_image_url_uses_the_loaded_image_alpha() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0; background: white }
+               #box { width: 20px; height: 20px; background: red;
+                      mask-image: url(mask.png) }
+               </style><div id="box"></div>"#,
+        );
+        let initial = document.render_reference(DocumentRenderOptions::default());
+        let url = Url::parse("https://example.test/").unwrap();
+        let discovery = crate::image::discover_images_with_styles(
+            document.dom(),
+            &initial.styles,
+            &url,
+            ImageLimits::default(),
+        );
+        let key = discovery
+            .resources
+            .iter()
+            .find(|resource| resource.key.source == crate::image::ImageSource::CssMask)
+            .map(|resource| resource.key.clone())
+            .expect("mask image is discovered");
+        let mask =
+            DecodedImage::from_pixels(2, 1, vec![Color::rgba(0, 0, 0, 255), Color::TRANSPARENT])
+                .expect("mask image");
+        let mut images = ImageResources::default();
+        images
+            .insert(key, mask, ImageLimits::default())
+            .expect("mask image stores");
+        let output = document.render_with_images(
+            DocumentRenderOptions::default(),
+            DocumentBackends {
+                text_measurer: &crate::layout::SimpleTextMeasurer,
+                text_shaper: &crate::paint::ReferenceTextShaper,
+                glyph_masks: &crate::paint::NoGlyphMasks,
+            },
+            &images,
+        );
+        assert_eq!(
+            output.raster.surface.pixel(5, 10),
+            Some(Color::rgb(255, 0, 0))
+        );
+        assert_eq!(output.raster.surface.pixel(15, 10), Some(Color::WHITE));
     }
 
     /// CSS `mask-image: linear-gradient()` multiplies the layer's alpha.
