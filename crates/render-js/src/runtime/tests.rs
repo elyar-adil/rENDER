@@ -1390,6 +1390,100 @@ fn indexed_db_cursor_sees_earlier_writes_and_continues() {
 }
 
 #[test]
+fn indexed_db_indexes_and_persisted_state_survive_a_new_runtime() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.log = [];
+                var open = indexedDB.open('persist-db', 1);
+                open.onupgradeneeded = function () {
+                    var store = open.result.createObjectStore('items', { keyPath: 'id' });
+                    store.createIndex('by_name', 'name', { unique: true });
+                };
+                open.onsuccess = function () {
+                    var tx = open.result.transaction('items', 'readwrite');
+                    var store = tx.objectStore('items');
+                    store.put({ id: 1, name: 'alpha' });
+                    store.index('by_name').get('alpha').onsuccess = function (event) {
+                        log.push('index:' + event.target.result.id);
+                    };
+                };
+            ",
+        )
+        .expect("IndexedDB write script executes");
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    let state = runtime.indexed_db_data();
+    assert!(state.contains("persist-db"));
+    assert!(state.contains("alpha"));
+
+    // A new runtime with the same seeded state is the browser-restart model:
+    // the prelude is evaluated before the seed and reads it lazily on open.
+    let mut restored = parse_document("<!doctype html><p></p>");
+    let mut second = JsRuntime::new(&restored.dom);
+    second.seed_indexed_db(&state);
+    second
+        .execute(
+            &mut restored.dom,
+            r"
+                window.log = [];
+                var open = indexedDB.open('persist-db');
+                open.onsuccess = function () {
+                    var tx = open.result.transaction('items');
+                    var store = tx.objectStore('items');
+                    store.get(1).onsuccess = function (event) {
+                        log.push('get:' + event.target.result.name);
+                    };
+                    store.index('by_name').get('alpha').onsuccess = function (event) {
+                        log.push('index:' + event.target.result.name);
+                    };
+                };
+            ",
+        )
+        .expect("IndexedDB reopen script executes");
+    drain_microtasks(&mut second, &mut restored.dom);
+    let value = second
+        .execute(&mut restored.dom, "log.join('|')")
+        .expect("log reads")
+        .value;
+    assert_eq!(value, JsValue::String("get:alpha|index:alpha".into()));
+}
+
+#[test]
+fn indexed_db_unique_index_rejects_a_duplicate_key() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.log = [];
+                var open = indexedDB.open('unique-db', 1);
+                open.onupgradeneeded = function () {
+                    var store = open.result.createObjectStore('items', { keyPath: 'id' });
+                    store.createIndex('by_name', 'name', { unique: true });
+                };
+                open.onsuccess = function () {
+                    var tx = open.result.transaction('items', 'readwrite');
+                    var store = tx.objectStore('items');
+                    store.put({ id: 1, name: 'same' });
+                    var duplicate = store.put({ id: 2, name: 'same' });
+                    duplicate.onerror = function () { log.push(duplicate.error.name); };
+                };
+            ",
+        )
+        .expect("IndexedDB unique script executes");
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    let value = runtime
+        .execute(&mut parsed.dom, "log.join('|')")
+        .expect("log reads")
+        .value;
+    assert_eq!(value, JsValue::String("ConstraintError".into()));
+}
+
+#[test]
 fn indexed_db_missing_store_is_a_not_found_error_like_the_platform() {
     // Bing opens `ImageCacheDB` version 2 with no upgrade handler: the database
     // is created but the `IOTD` store does not exist, and the page's own

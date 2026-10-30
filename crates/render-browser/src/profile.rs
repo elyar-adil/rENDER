@@ -19,11 +19,14 @@ use render_net::{CookieIssue, CookieJar, FetchRequest, FetchResponse};
 const COOKIE_FILE: &str = "cookies.txt";
 const STORAGE_FILE: &str = "local-storage.txt";
 const STORAGE_HEADER: &str = "# rENDER local storage v1";
+const INDEXED_DB_FILE: &str = "indexed-db.txt";
+const INDEXED_DB_HEADER: &str = "# rENDER indexed db v1";
 
 /// The largest `localStorage` area the browser persists for one origin. The
 /// engine does not enforce a quota yet, so the browser refuses a change that
 /// would grow an area past this, rather than writing unbounded data to disk.
 const MAX_ORIGIN_STORAGE_BYTES: usize = 5 * 1024 * 1024;
+const MAX_ORIGIN_INDEXED_DB_BYTES: usize = 64 * 1024 * 1024;
 
 /// The browser-wide cookie jar and its on-disk copy.
 pub(super) struct ProfileCookies {
@@ -130,15 +133,21 @@ impl Drop for ProfileCookies {
 /// rather than overwriting each other with stale copies.
 pub(super) struct ProfileStorage {
     origins: BTreeMap<String, BTreeMap<String, String>>,
+    indexed_db: BTreeMap<String, String>,
     path: Option<PathBuf>,
+    indexed_db_path: Option<PathBuf>,
     dirty: bool,
+    indexed_db_dirty: bool,
 }
 
 impl ProfileStorage {
     /// Open the store in `directory`, loading every persisted area. A missing
     /// file is a first run. A damaged file starts empty and says so.
     pub(super) fn open(directory: Option<PathBuf>) -> Self {
-        let path = directory.map(|directory| directory.join(STORAGE_FILE));
+        let path = directory
+            .as_ref()
+            .map(|directory| directory.join(STORAGE_FILE));
+        let indexed_db_path = directory.map(|directory| directory.join(INDEXED_DB_FILE));
         let mut origins: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
         if let Some(path) = &path {
             match fs::read_to_string(path) {
@@ -151,10 +160,23 @@ impl ProfileStorage {
                 Err(error) => eprintln!("render-browser local storage not loaded: {error}"),
             }
         }
+        let mut indexed_db = BTreeMap::new();
+        if let Some(path) = &indexed_db_path {
+            match fs::read_to_string(path) {
+                Ok(text) => {
+                    indexed_db = parse_indexed_db_text(&text);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => eprintln!("render-browser indexed DB not loaded: {error}"),
+            }
+        }
         Self {
             origins,
+            indexed_db,
             path,
+            indexed_db_path,
             dirty: false,
+            indexed_db_dirty: false,
         }
     }
 
@@ -218,8 +240,39 @@ impl ProfileStorage {
         self.dirty = true;
     }
 
+    /// The serialized `IndexedDB` state of `origin`, if it has any.
+    pub(super) fn indexed_db_area(&self, origin: &str) -> Option<String> {
+        self.indexed_db.get(origin).cloned()
+    }
+
+    /// Replace the serialized `IndexedDB` state of `origin`.
+    pub(super) fn apply_indexed_db(&mut self, origin: &str, data: &str) {
+        if data.is_empty() {
+            if self.indexed_db.remove(origin).is_some() {
+                self.indexed_db_dirty = true;
+            }
+            return;
+        }
+        if data.len() > MAX_ORIGIN_INDEXED_DB_BYTES {
+            eprintln!(
+                "render-browser indexed DB for {origin} is over {MAX_ORIGIN_INDEXED_DB_BYTES} bytes; this change is not persisted"
+            );
+            return;
+        }
+        if self
+            .indexed_db
+            .get(origin)
+            .is_some_and(|existing| existing == data)
+        {
+            return;
+        }
+        self.indexed_db.insert(origin.to_owned(), data.to_owned());
+        self.indexed_db_dirty = true;
+    }
+
     /// Write the store if anything changed since the last write.
     pub(super) fn flush_if_dirty(&mut self) {
+        self.flush_indexed_db_if_dirty();
         if !self.dirty {
             return;
         }
@@ -230,6 +283,20 @@ impl ProfileStorage {
         let text = self.serialize();
         if let Err(error) = write_store(path, &text) {
             eprintln!("render-browser local storage not saved: {error}");
+        }
+    }
+
+    fn flush_indexed_db_if_dirty(&mut self) {
+        if !self.indexed_db_dirty {
+            return;
+        }
+        self.indexed_db_dirty = false;
+        let Some(path) = &self.indexed_db_path else {
+            return;
+        };
+        let text = serialize_indexed_db(&self.indexed_db);
+        if let Err(error) = write_store(path, &text) {
+            eprintln!("render-browser indexed DB not saved: {error}");
         }
     }
 
@@ -254,6 +321,34 @@ impl Drop for ProfileStorage {
     fn drop(&mut self) {
         self.flush_if_dirty();
     }
+}
+
+fn serialize_indexed_db(indexed_db: &BTreeMap<String, String>) -> String {
+    let mut text = String::from(INDEXED_DB_HEADER);
+    text.push('\n');
+    for (origin, data) in indexed_db {
+        text.push_str(&escape_field(origin));
+        text.push('\t');
+        text.push_str(&escape_field(data));
+        text.push('\n');
+    }
+    text
+}
+
+fn parse_indexed_db_text(text: &str) -> BTreeMap<String, String> {
+    let mut lines = text.lines();
+    if lines.next() != Some(INDEXED_DB_HEADER) {
+        return BTreeMap::new();
+    }
+    lines
+        .filter_map(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            match fields.as_slice() {
+                [origin, data] => Some((unescape_field(origin)?, unescape_field(data)?)),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Parse a store written by [`ProfileStorage::serialize`]. A malformed line is
@@ -547,6 +642,20 @@ mod tests {
 
         let reopened = ProfileStorage::open(Some(directory.clone()));
         assert_eq!(reopened.area(ORIGIN), entries(&[("draft", awkward)]));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn indexed_db_state_survives_reopening() {
+        let directory = scratch_directory("indexed-db");
+        let mut first = ProfileStorage::open(Some(directory.clone()));
+        let state = r#"{"persist-db":{"version":1,"stores":{"items":{"records":[{"key":1,"value":{"name":"alpha"}}]}}}}"#;
+        first.apply_indexed_db(ORIGIN, state);
+        first.flush_if_dirty();
+        drop(first);
+
+        let reopened = ProfileStorage::open(Some(directory.clone()));
+        assert_eq!(reopened.indexed_db_area(ORIGIN).as_deref(), Some(state));
         let _ = std::fs::remove_dir_all(&directory);
     }
 

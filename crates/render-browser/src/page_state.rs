@@ -70,6 +70,8 @@ pub(super) struct PageState {
     /// Changes are reported as a difference from it, so other documents of the
     /// same origin are not overwritten by a stale copy.
     pub(super) storage_baseline: Vec<(String, String)>,
+    /// This document's serialized `IndexedDB` state as of the last profile sync.
+    pub(super) indexed_db_baseline: String,
     pub(super) style_sheets: ExternalStyleSheets,
     /// Keys already submitted for this document. A failed stylesheet is not
     /// resubmitted on every paint; changing its URL creates a new key.
@@ -263,6 +265,7 @@ impl PageState {
             navigation: PageNavigation::new(source),
             page,
             storage_baseline: Vec::new(),
+            indexed_db_baseline: String::new(),
             style_sheets: ExternalStyleSheets::default(),
             started_style_sheets: HashSet::new(),
             style_batch: None,
@@ -334,6 +337,30 @@ impl PageState {
         }
         storage.apply_changes(&origin, &self.storage_baseline, &current);
         self.storage_baseline = current;
+    }
+
+    /// Seed this document's `IndexedDB` state from the profile. Call it after
+    /// the document is created and before it runs any script.
+    pub(super) fn restore_indexed_db(&mut self, storage: &ProfileStorage) {
+        let Some(origin) = self.local_storage_origin() else {
+            return;
+        };
+        let data = storage.indexed_db_area(&origin).unwrap_or_default();
+        self.page.runtime_mut().seed_indexed_db(&data);
+        self.indexed_db_baseline = data;
+    }
+
+    /// Write this document's `IndexedDB` state to the profile if it changed.
+    pub(super) fn sync_indexed_db(&mut self, storage: &mut ProfileStorage) {
+        let Some(origin) = self.local_storage_origin() else {
+            return;
+        };
+        let current = self.page.runtime().indexed_db_data();
+        if current == self.indexed_db_baseline {
+            return;
+        }
+        storage.apply_indexed_db(&origin, &current);
+        self.indexed_db_baseline = current;
     }
 
     pub(super) fn set_source(&mut self, source: PageSource) {

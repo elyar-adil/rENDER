@@ -57,6 +57,25 @@ impl JsRuntime {
         }
     }
 
+    /// The origin's serialized `IndexedDB` state, for a host that keeps it
+    /// between documents and browser runs.
+    #[must_use]
+    pub fn indexed_db_data(&self) -> String {
+        match self.realm.global("__renderIndexedDbData") {
+            Some(JsValue::String(value)) => value.to_lossy(),
+            _ => String::new(),
+        }
+    }
+
+    /// Seed the origin's serialized `IndexedDB` state before document scripts
+    /// run. The self-hosted `indexedDB` prelude reads this lazily on `open`.
+    pub fn seed_indexed_db(&mut self, data: &str) {
+        self.realm.set_global(
+            "__renderIndexedDbData".to_owned(),
+            JsValue::String((data.to_owned()).into()),
+        );
+    }
+
     fn local_storage_object(&self) -> Option<ObjectId> {
         match self.realm.global("localStorage")? {
             JsValue::Object(storage) => Some(storage),

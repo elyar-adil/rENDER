@@ -1,3 +1,89 @@
+# 交接文档 (2026-10-31, 续二十一) — IndexedDB 磁盘持久化、索引与升级
+
+接续 AVIF 会话。这一轮把内存版 IndexedDB 接到 profile 磁盘存储,并补齐
+`createIndex`/索引查询与 `versionchange` 升级事件。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **持久化数据** | prelude 维护 `__renderIndexedDbData` JSON;宿主在文档脚本前注入,事务提交/升级/删除时更新 |
+| **profile 文件** | `indexed-db.txt`,按 origin 保存序列化状态;复用 `escape_field`/`write_store`,上限 64 MB |
+| **文档同步** | `PageState::restore_indexed_db` / `sync_indexed_db`,接入新建、导航、pump、关闭与标签关闭 |
+| **索引 API** | `createIndex`/`deleteIndex`/`store.index()`,唯一约束、`multiEntry`,`get`/`getKey`/`getAll`/`getAllKeys`/`count`/`openCursor` |
+| **版本升级** | `upgradeneeded` 期间可建/删 store 与 index;连接收到 `versionchange`;`deleteDatabase` 清理持久化 |
+| **序列化** | Date、数组、普通对象;保留 keyPath、autoIncrement、nextKey、索引元数据与记录 |
+| **测试** | runtime 持久化/索引、唯一索引冲突、profile 重开;另做了真实浏览器重启与升级 |
+
+## 证据
+
+真实浏览器写入(临时 profile,`indexed-db.txt` 已落盘):
+
+```
+IDB_WRITE complete
+# rENDER indexed db v1
+http://127.0.0.1:8765  {"restart-db":{"version":1,"stores":{"items":{
+  "keyPath":"id","autoIncrement":false,"nextKey":1,
+  "indexes":{"by_name":{"keyPath":"name","unique":true,"multiEntry":false}},
+  "records":[{"key":1,"value":{"id":1,"name":"alpha","n":10}},
+             {"key":2,"value":{"id":2,"name":"beta","n":20}}]}}}}
+```
+
+浏览器完全退出后重新启动,同一 profile 打开读页面:
+
+```
+IDB_READ get=alpha
+IDB_READ index=2
+IDB_READ count=2
+```
+
+升级到 v2(第三次启动):
+
+```
+IDB_UPGRADE old=1 new=2
+IDB_UPGRADE complete
+```
+
+文件版本变为 2,原 `items` 数据与索引保留,新增 `logs` store;升级后再次启动
+读页面仍返回 `get=alpha / index=2 / count=2`。
+
+相关测试:
+
+```
+cargo test -p render-js --lib indexed_db_indexes_and_persisted_state  ok
+cargo test -p render-js --lib indexed_db_unique_index                ok
+cargo test -p render-browser --bin render-browser indexed_db_state   ok
+```
+
+## 验证
+
+```
+cargo test --workspace                       2738 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+Bing/Baidu/JD 冒烟(持久化改动后):
+
+```
+Bing:  ready=Complete    dom_elements=465 boxes=166 images_failed=0
+Baidu: ready=Complete    dom_elements=453 boxes=156 images_failed=0
+JD:    ready=Loading     dom_elements=968 boxes=117 images_failed=1
+```
+
+## 明确未做 / 下一步
+
+- 持久化只覆盖 Date/数组/普通对象;`Map`/`Set`/TypedArray/Blob/File 无标记编码,
+  重启后会丢类型或值。
+- 事务没有回滚日志;`abort()` 不会撤销已经改动的内存记录;跨标签页没有
+  `storage`/`versionchange` 广播,只有同一 realm 内的 `versionchange` 事件。
+- 没有配额管理/驱逐;`indexed-db.txt` 是单文件、全量重写。
+- JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;CSS `clip-path`、组级
+  `opacity`、其它 filter 原语等仍未实现。
+
+---
+
 # 交接文档 (2026-10-31, 续二十) — AVIF 解码与失败回退
 
 接续 filter 会话。这一轮接入 AVIF 解码,并为无法解码的“能力探测/追踪像素”提供
@@ -73,7 +159,7 @@ image::svg                                   36 passed
 - 非图片小响应回退是视觉占位,不会真正解码 BMP/TIFF 等其它未支持格式。
 - SVG `filter` 仍只有 blur/color-matrix;CSS `filter`、`clip-path`/`clip-rule`、
   组级 `opacity` 离屏合成、高级渐变仍未实现。
-- 其它图片格式/真实 CDN 变体仍需继续抽样;IndexedDB 仍是内存子集;JD 风控、
+- 其它图片格式/真实 CDN 变体仍需继续抽样;IndexedDB 已持久化(续二十一);JD 风控、
   GitHub/HN 链路阻断是外部条件。
 
 ---
@@ -148,7 +234,7 @@ image::svg                                   36 passed
 - `filter` 只支持属性,不支持 CSS `filter`;filter 内容中的 `<text>` 不绘制。
 - CSS `clip-path`/`clip-rule`、组级 `opacity` 离屏合成、高级渐变、`content`
   字符串以外内容仍未实现。
-- IndexedDB 仍是内存子集;JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;
+- IndexedDB 已持久化(续二十一);JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;
   AVIF 已在续二十实现/回退。
 
 ---
@@ -220,7 +306,7 @@ image::svg                                   33 passed
 - 除 `feGaussianBlur`/`feColorMatrix` 外的 filter 原语、CSS `clip-path`/
   `clip-rule`、组级 `opacity` 离屏合成仍未实现。
 - 渐变高级特性(`xlink:href` 继承、`spreadMethod`、径向焦点)仍未做。
-- `content` 仍只支持字符串;IndexedDB 仍是内存子集;JD 主商品区仍受风控 403;
+- `content` 仍只支持字符串;IndexedDB 已持久化(续二十一);JD 主商品区仍受风控 403;
   GitHub/HN 本机链路阻断;AVIF 未实现。
 
 ---
@@ -293,7 +379,7 @@ image::svg                                   28 passed
 - `<text>`、CSS `clip-path`/`clip-rule`、组级 `opacity` 离屏合成仍未实现;
   `mask` 已在续十八、`filter` 已在续十九实现。
 - 渐变高级特性(`xlink:href` 继承、`spreadMethod`、径向焦点)仍未做。
-- `content` 仍只支持字符串;IndexedDB 仍是内存子集;JD 主商品区仍受风控 403;
+- `content` 仍只支持字符串;IndexedDB 已持久化(续二十一);JD 主商品区仍受风控 403;
   GitHub/HN 本机链路阻断;AVIF 未实现。
 
 ---
@@ -360,7 +446,7 @@ Baidu smoke: dom_elements=455  boxes=156
   续十八、`filter` 已在续十九实现。
 - 渐变高级特性(`xlink:href` 继承、`spreadMethod`、径向焦点)与组级 `opacity`
   离屏合成仍未做。
-- `content` 仍只支持字符串;IndexedDB 仍是内存子集;JD 主商品区仍受风控 403;
+- `content` 仍只支持字符串;IndexedDB 已持久化(续二十一);JD 主商品区仍受风控 403;
   GitHub/HN 本机链路阻断;AVIF 未实现。
 
 ---

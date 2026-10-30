@@ -326,6 +326,7 @@ impl BrowserApp {
         };
         if let Some(page) = app.pages.get_mut(&active) {
             page.restore_local_storage(&app.storage);
+            page.restore_indexed_db(&app.storage);
         }
         app
     }
@@ -1389,6 +1390,7 @@ impl BrowserApp {
                 self.render_worker.cancel_tab(id.as_u64());
                 if let Some(mut page) = self.pages.remove(&id) {
                     page.sync_local_storage(&mut self.storage);
+                    page.sync_indexed_db(&mut self.storage);
                     page.cancel_pending();
                 }
                 if let Some(created) = self.tabs.apply(intent) {
@@ -1933,8 +1935,10 @@ impl BrowserApp {
         let mut address = source.target.display_address();
         if let Some(page) = self.pages.get_mut(&id) {
             page.sync_local_storage(&mut self.storage);
+            page.sync_indexed_db(&mut self.storage);
             page.set_source(source);
             page.restore_local_storage(&self.storage);
+            page.restore_indexed_db(&self.storage);
             page.sync_committed_title();
             title.clone_from(&page.navigation.committed().title);
             address = page.navigation.committed().target.display_address();
@@ -4582,6 +4586,7 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
             WindowEvent::CloseRequested => {
                 for page in self.pages.values_mut() {
                     page.sync_local_storage(&mut self.storage);
+                    page.sync_indexed_db(&mut self.storage);
                 }
                 event_loop.exit();
             }
@@ -4708,6 +4713,7 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
             }
             page.drain_console();
             page.sync_local_storage(&mut self.storage);
+            page.sync_indexed_db(&mut self.storage);
             if !page
                 .page
                 .runtime_mut()
