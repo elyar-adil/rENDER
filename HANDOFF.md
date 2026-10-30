@@ -1,3 +1,65 @@
+# 交接文档 (2026-10-31, 续三十三) — Bing RMS 依赖加载顺序
+
+接续 `text/rms` 会话。上一轮直接按 Defer 执行这些块,导致依赖 RMS 懒加载 bundle
+的块(Feedback)在 bundle 到达前抛 `ReferenceError`。这一轮让它们等 RMS 加载完
+注册资源后再执行。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **标记 RMS 块** | `ClassicScript.rms`/`PlannedScript.rms`;`text/rms` 在发现阶段保留该标记 |
+| **执行包装** | `rms_bootstrap_source`:注册 `window.rms.onload(run)`,调用 `window.rms.start()`,由 run 追加一个 `text/javascript` 脚本元素执行原始源码 |
+| **全局作用域** | 原始源码作为新脚本元素执行,不进入包装函数的局部作用域,`var mcp_banner` 等仍是页面全局 |
+| **回退** | 页面没有 `window.rms`/`start`/`onload` 时立即执行,保持原有行为 |
+| **转义** | JS 字符串字面量处理反斜杠、引号、换行、U+2028/U+2029;回归测试验证包装源码可编译 |
+| **测试** | `text/rms` 的 rms 标记/Defer 调度、包装源码编译;Bing 实页延迟探针 |
+
+## 证据
+
+Bing 隐藏截图 + 延迟 3 秒探针:
+
+```
+[console.log] RMSPROBE0 count=9 mcp=function feedback=undefined
+[console.log] RMSPROBE3 mcp=function bm=object feedback=object zoom=object share=object
+health ready=Complete dom_elements=480 boxes=167
+       scripts_failed=0 scripts_threw=0 css_errors=0 css_warnings=13 images_failed=0
+```
+
+即 9 个 text/rms 块仍存在;加载时 `feedback` 尚未就绪,3 秒后
+`mcp_banner`、`BMTrigger`、`Feedback`、`AccessibilityZoomDesktop`、
+`ShareDialogConfig` 全部定义,且不再有未捕获异常。Bing 截图中壁纸、页头、
+Rewards/登录、热搜均正常。
+
+Baidu / JD:
+
+```
+Baidu: ready=Complete   dom_elements=450 boxes=156
+       scripts_failed=0 scripts_threw=0 css_warnings=5 images_failed=0
+JD:    ready=Loading    dom_elements=1159 boxes=117
+       scripts_failed=8 scripts_threw=3 css_warnings=36 images_failed=1
+```
+
+## 验证
+
+```
+cargo test --workspace                       2783 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+## 明确未做 / 下一步
+
+- RMS 包装依赖 Bing 的 `window.rms` 形状(`onload`/`start`);不是通用标准 API。
+  每个 text/rms 块都会注册回调并调用 start,bundle 加载由 RMS 自身去重。
+- `Feedback`/`AccessibilityZoom` 等 bundle 是否加载仍由 Bing 的 RMS 队列决定;
+  其它站点自定义脚本类型仍需单独建模。
+- JD 主商品区仍受 403;GitHub/HN 本机链路阻断;连续动画时钟、高级渐变、
+  SVG filter 其余原语、IndexedDB 值类型覆盖仍未完成。
+
+---
+
 # 交接文档 (2026-10-31, 续三十二) — Bing `text/rms` 延迟脚本
 
 接续动态 import 会话。这一轮让 Bing 的 `<script type="text/rms">` 真正执行。
@@ -220,7 +282,8 @@ real_site_tasks                              66 passed, 0 failed
   仍按文档顺序宽松处理。
 - `integrity` 元数据忽略;`src` 形式的 import map 非法,当前按空内容处理并报错。
 - 动态 `import()` 已在续三十一接入浏览器异步 loader;跨域模块 CORS、import
-  attributes 的语义仍未完整。`text/rms` 已在续三十二按延迟经典脚本执行。
+  attributes 的语义仍未完整。`text/rms` 已在续三十二执行,并在续三十三接入
+  RMS 依赖加载顺序。
 - JD 主商品区仍受 403 风控;GitHub/HN 本机链路阻断;高级渐变、SVG filter
   其余原语、IndexedDB 值类型覆盖仍未完成。
 
@@ -353,8 +416,8 @@ real_site_tasks                              66 passed, 0 failed
 ## 明确未做 / 下一步
 
 - JD 主商品区仍受 403 风控;GitHub/HN 本机链路阻断。
-- Bing 的 import map 已在续三十接入静态模块图;`text/rms` 已在续三十二按延迟
-  经典脚本执行。
+- Bing 的 import map 已在续三十接入静态模块图;`text/rms` 已在续三十二执行,
+  并在续三十三接入 RMS 依赖加载顺序。
   `@keyframes` 已在续二十九由时间参数化样式采样执行,但没有持续运行的合成器时钟。
 - CSS `mask-mode`、多层 mask、`mask-composite`、`space`/`round` 精确平铺未做;
   filter 仍缺 `contrast`/`hue-rotate`/`invert`/`sepia`/`url(#filter)`。

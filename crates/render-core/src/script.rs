@@ -51,6 +51,9 @@ pub struct ClassicScript {
     pub source: ScriptSource,
     /// `type="module"`: parsed as a module and linked through a module graph.
     pub module: bool,
+    /// `type="text/rms"`: a Bing RMS deferred block. The browser wraps it so
+    /// the RMS bundle loader runs before the block executes.
+    pub rms: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,14 +203,16 @@ impl DiscoveryState {
         else {
             return;
         };
-        let module = attribute(element, "type")
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("module"));
+        let script_type = attribute(element, "type").map_or("", str::trim);
+        let module = script_type.eq_ignore_ascii_case("module");
+        let rms = script_type.eq_ignore_ascii_case("text/rms");
         self.scripts.push(ClassicScript {
             owner,
             source_order,
             scheduling,
             source,
             module,
+            rms,
         });
     }
 
@@ -549,6 +554,7 @@ mod tests {
                 .iter()
                 .all(|script| script.scheduling == ScriptScheduling::Defer)
         );
+        assert!(discovery.scripts.iter().all(|script| script.rms));
         assert!(matches!(
             &discovery.scripts[0].source,
             ScriptSource::Inline { source } if source == "var widget = 1;"

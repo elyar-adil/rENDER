@@ -42,6 +42,7 @@ struct PlannedScript {
     scheduling: ScriptScheduling,
     source: PlannedSource,
     module: bool,
+    rms: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -252,6 +253,7 @@ pub fn plan_unstarted_classic_scripts<S: BuildHasher>(
                 scheduling,
                 source,
                 module: script.module,
+                rms: script.rms,
             }
         })
         .collect();
@@ -497,6 +499,45 @@ fn apply_response(
     );
 }
 
+/// Wrap one `type="text/rms"` block so Bing's RMS loader has loaded its
+/// registered lazy bundles before the block runs.
+///
+/// The wrapper itself defines no page globals: it appends a fresh classic
+/// script element whose text is the original source, which the engine's
+/// dynamic-script scan then executes in global scope. If RMS is absent the
+/// block still runs immediately, matching the old behavior.
+fn rms_bootstrap_source(source: &str) -> String {
+    let literal = js_string_literal(source);
+    format!(
+        "(function(){{var ran=false;function run(){{if(ran)return;ran=true;\
+         var script=document.createElement('script');script.type='text/javascript';\
+         script.text={literal};(document.head||document.documentElement).appendChild(script);}}\
+         if(window.rms&&typeof window.rms.start==='function'&&\
+         typeof window.rms.onload==='function'){{\
+         window.rms.onload(run);try{{window.rms.start();}}catch(error){{run();}}\
+         }}else{{run();}}}})();"
+    )
+}
+
+fn js_string_literal(source: &str) -> String {
+    let mut literal = String::with_capacity(source.len() + 2);
+    literal.push('"');
+    for character in source.chars() {
+        match character {
+            '\\' => literal.push_str("\\\\"),
+            '"' => literal.push_str("\\\""),
+            '\n' => literal.push_str("\\n"),
+            '\r' => literal.push_str("\\r"),
+            '\t' => literal.push_str("\\t"),
+            '\u{2028}' => literal.push_str("\\u2028"),
+            '\u{2029}' => literal.push_str("\\u2029"),
+            other => literal.push(other),
+        }
+    }
+    literal.push('"');
+    literal
+}
+
 fn compile_source(
     script: &PlannedScript,
     plan_base: &Url,
@@ -526,7 +567,12 @@ fn compile_source(
             final_url.as_ref().map_or("inline", |url| url.as_str())
         );
     }
-    match CompiledScript::compile(source, limits) {
+    let source = if script.rms {
+        std::borrow::Cow::Owned(rms_bootstrap_source(source))
+    } else {
+        std::borrow::Cow::Borrowed(source)
+    };
+    match CompiledScript::compile(&source, limits) {
         Ok(mut compiled) => {
             if let Some(url) = &final_url {
                 compiled.set_source_name(url.as_str());
@@ -848,6 +894,16 @@ mod tests {
             .value
             .to_js_string();
         assert!(out.to_lossy().starts_with("ab"), "{out}");
+    }
+
+    #[test]
+    fn the_rms_wrapper_compiles_and_escapes_the_original_source() {
+        let source = "var quote = \"x\"; var slash = '\\\\'; if (a < b) { quote += '\n'; }";
+        let wrapped = super::rms_bootstrap_source(source);
+        assert!(wrapped.contains("window.rms.onload"));
+        assert!(wrapped.contains("document.createElement('script')"));
+        render_core::js::CompiledScript::compile(&wrapped, &RuntimeLimits::default())
+            .expect("the RMS wrapper is valid JavaScript");
     }
 
     #[test]
