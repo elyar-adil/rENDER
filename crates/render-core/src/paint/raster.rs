@@ -10,11 +10,11 @@ use crate::layout::{PhysicalPoint, PhysicalRect, StickyConstraint};
 
 use super::color::{Color, clamped_rounded_u8};
 use super::display_list::{
-    BorderPaint, BoxShadowPaint, ClipFillRule, ClipShape, CornerRadii, DisplayCommand, DisplayItem,
-    DisplayItemId, DisplayList, FilterEffect, FilterOperation, FontInstanceId, GlyphId, GlyphRun,
-    LinearGradient, ListMarkerPaint, ListMarkerShape, MaskImage, MaskLayer, PaintCoordinateSpace,
-    RadialGradient, StackingContext, TextDecoration, TextDecorationStyle, TextShadowPaint,
-    Transform2D,
+    BorderPaint, BoxShadowPaint, ClipFillRule, ClipShape, ConicGradient, CornerRadii,
+    DisplayCommand, DisplayItem, DisplayItemId, DisplayList, FilterEffect, FilterOperation,
+    FontInstanceId, GlyphId, GlyphRun, LinearGradient, ListMarkerPaint, ListMarkerShape, MaskImage,
+    MaskLayer, PaintCoordinateSpace, RadialGradient, StackingContext, TextDecoration,
+    TextDecorationStyle, TextShadowPaint, Transform2D,
 };
 use super::scene::{PaintDamage, PaintScene, RetainedFrame};
 use super::sticky::sticky_displacement;
@@ -641,19 +641,9 @@ impl<'a> RasterState<'a> {
                     });
                 }
             }
-            DisplayCommand::LinearGradient(gradient) => {
-                let clip = self.current_clip();
-                let control = self.control;
-                if !paint_linear_gradient(
-                    self.current_surface(),
-                    gradient,
-                    offset,
-                    clip.as_ref(),
-                    control,
-                ) {
-                    self.cancelled = true;
-                }
-            }
+            DisplayCommand::LinearGradient(_)
+            | DisplayCommand::RadialGradient(_)
+            | DisplayCommand::ConicGradient(_) => self.paint_gradient(item, offset),
             DisplayCommand::BoxShadow(shadow) => {
                 let clip = self.current_clip();
                 let control = self.control;
@@ -667,13 +657,34 @@ impl<'a> RasterState<'a> {
                     self.cancelled = true;
                 }
             }
-            DisplayCommand::PushTransform(_)
-            | DisplayCommand::PopTransform
-            | DisplayCommand::RadialGradient(_) => self.diagnostics.push(RasterDiagnostic {
-                item: item.id,
-                code: RasterDiagnosticCode::UnsupportedCommand,
-                message: "display command is represented but not rasterized yet".to_owned(),
-            }),
+            DisplayCommand::PushTransform(_) | DisplayCommand::PopTransform => {
+                self.diagnostics.push(RasterDiagnostic {
+                    item: item.id,
+                    code: RasterDiagnosticCode::UnsupportedCommand,
+                    message: "display command is represented but not rasterized yet".to_owned(),
+                });
+            }
+        }
+    }
+
+    fn paint_gradient(&mut self, item: &DisplayItem, offset: PhysicalPoint) {
+        let clip = self.current_clip();
+        let control = self.control;
+        let surface = self.current_surface();
+        let painted = match &item.command {
+            DisplayCommand::LinearGradient(gradient) => {
+                paint_linear_gradient(surface, gradient, offset, clip.as_ref(), control)
+            }
+            DisplayCommand::RadialGradient(gradient) => {
+                paint_radial_gradient(surface, gradient, offset, clip.as_ref(), control)
+            }
+            DisplayCommand::ConicGradient(gradient) => {
+                paint_conic_gradient(surface, gradient, offset, clip.as_ref(), control)
+            }
+            _ => true,
+        };
+        if !painted {
+            self.cancelled = true;
         }
     }
 
@@ -2097,15 +2108,124 @@ fn paint_linear_gradient(
             }
             let point_x = u32_to_f32(x) + 0.5 - start.x;
             let point_y = u32_to_f32(y) + 0.5 - start.y;
-            let progress =
-                ((point_x * direction_x + point_y * direction_y) / length_squared).clamp(0.0, 1.0);
-            let color = gradient_color(&gradient.stops, progress);
+            let progress = (point_x * direction_x + point_y * direction_y) / length_squared;
+            let color = gradient_color_at(&gradient.stops, progress, gradient.repeating);
             if let Some(index) = surface.index(x, y) {
                 surface.pixels[index] = blend(surface.pixels[index], color, coverage);
             }
         }
     }
     true
+}
+
+fn paint_radial_gradient(
+    surface: &mut Surface,
+    gradient: &RadialGradient,
+    offset: PhysicalPoint,
+    clip: Option<&ClipRegion>,
+    control: Option<&dyn RasterControl>,
+) -> bool {
+    let rect = translate_rect(gradient.rect, offset);
+    let Some(visible) = intersection(Some(rect), clip.map_or(rect, |c| c.rect)) else {
+        return true;
+    };
+    if gradient.radius_x <= 0.0 || gradient.radius_y <= 0.0 {
+        return fill_rect(surface, visible, gradient.stops[0].color, clip, control);
+    }
+    let center = translate_point(gradient.center, offset);
+    let left = floor_to_u32(visible.origin.x);
+    let top = floor_to_u32(visible.origin.y);
+    let right = ceil_to_u32(visible.right().min(u32_to_f32(surface.width)));
+    let bottom = ceil_to_u32(visible.bottom().min(u32_to_f32(surface.height)));
+    for y in top..bottom {
+        if control.is_some_and(RasterControl::is_cancelled) {
+            return false;
+        }
+        for x in left..right {
+            let coverage = clip_coverage(clip, u32_to_f32(x) + 0.5, u32_to_f32(y) + 0.5);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let point_x = (u32_to_f32(x) + 0.5 - center.x) / gradient.radius_x;
+            let point_y = (u32_to_f32(y) + 0.5 - center.y) / gradient.radius_y;
+            let progress = point_x.mul_add(point_x, point_y * point_y).sqrt();
+            let color = gradient_color_at(&gradient.stops, progress, gradient.repeating);
+            if let Some(index) = surface.index(x, y) {
+                surface.pixels[index] = blend(surface.pixels[index], color, coverage);
+            }
+        }
+    }
+    true
+}
+
+fn paint_conic_gradient(
+    surface: &mut Surface,
+    gradient: &ConicGradient,
+    offset: PhysicalPoint,
+    clip: Option<&ClipRegion>,
+    control: Option<&dyn RasterControl>,
+) -> bool {
+    let rect = translate_rect(gradient.rect, offset);
+    let Some(visible) = intersection(Some(rect), clip.map_or(rect, |c| c.rect)) else {
+        return true;
+    };
+    let center = translate_point(gradient.center, offset);
+    let left = floor_to_u32(visible.origin.x);
+    let top = floor_to_u32(visible.origin.y);
+    let right = ceil_to_u32(visible.right().min(u32_to_f32(surface.width)));
+    let bottom = ceil_to_u32(visible.bottom().min(u32_to_f32(surface.height)));
+    for y in top..bottom {
+        if control.is_some_and(RasterControl::is_cancelled) {
+            return false;
+        }
+        for x in left..right {
+            let coverage = clip_coverage(clip, u32_to_f32(x) + 0.5, u32_to_f32(y) + 0.5);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let progress = conic_progress(
+                center,
+                gradient.from_angle,
+                u32_to_f32(x) + 0.5,
+                u32_to_f32(y) + 0.5,
+            );
+            let color = gradient_color_at(&gradient.stops, progress, gradient.repeating);
+            if let Some(index) = surface.index(x, y) {
+                surface.pixels[index] = blend(surface.pixels[index], color, coverage);
+            }
+        }
+    }
+    true
+}
+
+/// Fraction of a full turn between the gradient's `from` angle and the ray
+/// through `(x, y)`, clockwise with 0 at up.
+fn conic_progress(center: PhysicalPoint, from_angle: f32, x: f32, y: f32) -> f32 {
+    let angle = (x - center.x).atan2(center.y - y);
+    ((angle - from_angle) / std::f32::consts::TAU).rem_euclid(1.0)
+}
+
+fn gradient_color_at(
+    stops: &[super::display_list::GradientStop],
+    progress: f32,
+    repeating: bool,
+) -> Color {
+    if !repeating {
+        return gradient_color(stops, progress.clamp(0.0, 1.0));
+    }
+    let (Some(first), Some(last)) = (stops.first(), stops.last()) else {
+        return Color::TRANSPARENT;
+    };
+    // CSS Images 3 §3.5.1: the repeating period is the distance between the
+    // first and last stop, not necessarily the whole gradient line.
+    let period = last.offset - first.offset;
+    if period <= f32::EPSILON {
+        return last.color;
+    }
+    gradient_color(
+        stops,
+        first.offset + (progress - first.offset).rem_euclid(period),
+    )
 }
 
 fn gradient_color(stops: &[super::display_list::GradientStop], progress: f32) -> Color {
@@ -2586,6 +2706,9 @@ fn mask_coverage(
         MaskImage::Radial(gradient) => {
             radial_mask_coverage(gradient, tile.origin.x + local_x, tile.origin.y + local_y)
         }
+        MaskImage::Conic(gradient) => {
+            conic_mask_coverage(gradient, tile.origin.x + local_x, tile.origin.y + local_y)
+        }
         MaskImage::Raster { resource, .. } => {
             let Some(decoded) = images.and_then(|images| images.get(*resource)) else {
                 return 0.0;
@@ -2612,9 +2735,8 @@ fn linear_mask_coverage(mask: &LinearGradient, x: f32, y: f32) -> f32 {
     if denominator <= f32::EPSILON {
         return 0.0;
     }
-    let progress =
-        ((x - mask.start.x).mul_add(dx, (y - mask.start.y) * dy) / denominator).clamp(0.0, 1.0);
-    f32::from(gradient_color(&mask.stops, progress).alpha) / 255.0
+    let progress = (x - mask.start.x).mul_add(dx, (y - mask.start.y) * dy) / denominator;
+    f32::from(gradient_color_at(&mask.stops, progress, mask.repeating).alpha) / 255.0
 }
 
 fn radial_mask_coverage(mask: &RadialGradient, x: f32, y: f32) -> f32 {
@@ -2623,8 +2745,13 @@ fn radial_mask_coverage(mask: &RadialGradient, x: f32, y: f32) -> f32 {
     }
     let dx = (x - mask.center.x) / mask.radius_x;
     let dy = (y - mask.center.y) / mask.radius_y;
-    let progress = dx.mul_add(dx, dy * dy).sqrt().clamp(0.0, 1.0);
-    f32::from(gradient_color(&mask.stops, progress).alpha) / 255.0
+    let progress = dx.mul_add(dx, dy * dy).sqrt();
+    f32::from(gradient_color_at(&mask.stops, progress, mask.repeating).alpha) / 255.0
+}
+
+fn conic_mask_coverage(mask: &ConicGradient, x: f32, y: f32) -> f32 {
+    let progress = conic_progress(mask.center, mask.from_angle, x, y);
+    f32::from(gradient_color_at(&mask.stops, progress, mask.repeating).alpha) / 255.0
 }
 
 fn apply_mask_coverage(surface: &mut Surface, x: u32, y: u32, coverage: f32) {
@@ -2984,11 +3111,11 @@ mod tests {
     use crate::dom::Dom;
     use crate::layout::{EdgeSizes, FragmentId, PhysicalPoint, PhysicalRect, PhysicalSize};
     use crate::paint::display_list::{
-        BlendMode, BorderPaint, BoxShadowPaint, ClipShape, CompositingReason, CornerRadii,
-        DisplayCommand, DisplayItem, DisplayItemId, DisplayList, FontInstanceId, GlyphId,
-        GlyphInstance, GlyphRun, GradientStop, LinearGradient, ListMarkerPaint, ListMarkerShape,
-        PaintCoordinateSpace, PaintPhase, StackingContext, TextDecoration, TextDecorationLine,
-        TextDecorationStyle, TextShadowPaint, Transform2D,
+        BlendMode, BorderPaint, BoxShadowPaint, ClipShape, CompositingReason, ConicGradient,
+        CornerRadii, DisplayCommand, DisplayItem, DisplayItemId, DisplayList, FontInstanceId,
+        GlyphId, GlyphInstance, GlyphRun, GradientStop, LinearGradient, ListMarkerPaint,
+        ListMarkerShape, PaintCoordinateSpace, PaintPhase, RadialGradient, StackingContext,
+        TextDecoration, TextDecorationLine, TextDecorationStyle, TextShadowPaint, Transform2D,
     };
     use crate::paint::{
         GlyphMask, GlyphMaskProvider, PaintScene, RasterControl, RasterRequest, RetainedFrame,
@@ -3464,6 +3591,7 @@ mod tests {
                     color: Color::rgb(0, 0, 255),
                 },
             ],
+            repeating: false,
         };
         let list = DisplayList {
             dom_revision: dom.revision(),
@@ -3491,6 +3619,169 @@ mod tests {
         let right = output.surface.pixel(3, 0).expect("right gradient pixel");
         assert!(left.red > left.blue);
         assert!(right.blue > right.red);
+        assert!(output.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn cpu_reference_rasterizer_paints_conic_gradients() {
+        let dom = Dom::new();
+        let rect = PhysicalRect::new(0.0, 0.0, 4.0, 4.0);
+        let gradient = ConicGradient {
+            rect,
+            center: PhysicalPoint { x: 2.0, y: 2.0 },
+            from_angle: 0.0,
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: Color::rgb(255, 0, 0),
+                },
+                GradientStop {
+                    offset: 0.5,
+                    color: Color::rgb(0, 0, 255),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: Color::rgb(255, 0, 0),
+                },
+            ],
+            repeating: false,
+        };
+        let list = DisplayList {
+            dom_revision: dom.revision(),
+            viewport: PhysicalSize {
+                width: 4.0,
+                height: 4.0,
+            },
+            items: vec![DisplayItem {
+                id: DisplayItemId {
+                    source: None,
+                    fragment_hint: 0,
+                    phase: PaintPhase::Background,
+                    ordinal: 0,
+                },
+                fragment: FragmentId::from_index(0),
+                source: None,
+                bounds: rect,
+                coordinate_space: PaintCoordinateSpace::Document,
+                command: DisplayCommand::ConicGradient(gradient),
+            }],
+        };
+
+        let output = CpuRasterizer.rasterize(&list, Color::WHITE, &NoGlyphMasks);
+        let top_right = output.surface.pixel(3, 0).expect("top-right cone");
+        let bottom_right = output.surface.pixel(3, 3).expect("bottom-right cone");
+        let top_left = output.surface.pixel(0, 0).expect("top-left cone");
+        // 0deg points up and angles grow clockwise: the top-right ray is
+        // nearest red, the bottom-right ray is nearest blue, and the seam at
+        // 360deg returns to red.
+        assert!(top_right.red > top_right.blue);
+        assert!(bottom_right.blue > bottom_right.red);
+        assert!(top_left.red > top_left.blue);
+        assert!(output.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn cpu_reference_rasterizer_repeats_linear_gradient_stops() {
+        let dom = Dom::new();
+        let rect = PhysicalRect::new(0.0, 0.0, 8.0, 1.0);
+        let gradient = LinearGradient {
+            rect,
+            start: PhysicalPoint { x: 0.0, y: 0.0 },
+            end: PhysicalPoint { x: 8.0, y: 0.0 },
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: Color::rgb(255, 0, 0),
+                },
+                GradientStop {
+                    offset: 0.25,
+                    color: Color::rgb(0, 0, 255),
+                },
+            ],
+            repeating: true,
+        };
+        let list = DisplayList {
+            dom_revision: dom.revision(),
+            viewport: PhysicalSize {
+                width: 8.0,
+                height: 1.0,
+            },
+            items: vec![DisplayItem {
+                id: DisplayItemId {
+                    source: None,
+                    fragment_hint: 0,
+                    phase: PaintPhase::Background,
+                    ordinal: 0,
+                },
+                fragment: FragmentId::from_index(0),
+                source: None,
+                bounds: rect,
+                coordinate_space: PaintCoordinateSpace::Document,
+                command: DisplayCommand::LinearGradient(gradient),
+            }],
+        };
+
+        let output = CpuRasterizer.rasterize(&list, Color::WHITE, &NoGlyphMasks);
+        let first = output.surface.pixel(0, 0).expect("first period");
+        let second = output.surface.pixel(2, 0).expect("second period");
+        let third = output.surface.pixel(3, 0).expect("third period");
+        assert_eq!(first, Color::rgb(191, 0, 64));
+        assert_eq!(second, first);
+        assert_eq!(third, Color::rgb(64, 0, 191));
+        assert!(output.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn cpu_reference_rasterizer_repeats_radial_gradient_stops() {
+        let dom = Dom::new();
+        let rect = PhysicalRect::new(0.0, 0.0, 12.0, 1.0);
+        let gradient = RadialGradient {
+            rect,
+            center: PhysicalPoint { x: 0.0, y: 0.5 },
+            radius_x: 4.0,
+            radius_y: 4.0,
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: Color::rgb(255, 0, 0),
+                },
+                GradientStop {
+                    offset: 0.5,
+                    color: Color::rgb(0, 0, 255),
+                },
+            ],
+            repeating: true,
+        };
+        let list = DisplayList {
+            dom_revision: dom.revision(),
+            viewport: PhysicalSize {
+                width: 12.0,
+                height: 1.0,
+            },
+            items: vec![DisplayItem {
+                id: DisplayItemId {
+                    source: None,
+                    fragment_hint: 0,
+                    phase: PaintPhase::Background,
+                    ordinal: 0,
+                },
+                fragment: FragmentId::from_index(0),
+                source: None,
+                bounds: rect,
+                coordinate_space: PaintCoordinateSpace::Document,
+                command: DisplayCommand::RadialGradient(gradient),
+            }],
+        };
+
+        let output = CpuRasterizer.rasterize(&list, Color::WHITE, &NoGlyphMasks);
+        let first = output.surface.pixel(0, 0).expect("first ring");
+        let second = output.surface.pixel(4, 0).expect("second ring");
+        let third = output.surface.pixel(8, 0).expect("third ring");
+        let opposite = output.surface.pixel(1, 0).expect("opposite phase");
+        assert_eq!(first, Color::rgb(191, 0, 64));
+        assert_eq!(second, first);
+        assert_eq!(third, first);
+        assert_eq!(opposite, Color::rgb(64, 0, 191));
         assert!(output.diagnostics.is_empty());
     }
 

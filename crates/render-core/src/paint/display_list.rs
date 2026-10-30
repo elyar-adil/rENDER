@@ -181,6 +181,7 @@ pub struct StackingContext {
 pub enum MaskImage {
     Linear(LinearGradient),
     Radial(RadialGradient),
+    Conic(ConicGradient),
     Raster {
         resource: ImageResourceId,
         destination: PhysicalRect,
@@ -390,6 +391,9 @@ pub struct LinearGradient {
     pub start: PhysicalPoint,
     pub end: PhysicalPoint,
     pub stops: Vec<GradientStop>,
+    /// `true` for `repeating-linear-gradient()`, whose stop list repeats
+    /// infinitely in both directions along the gradient line.
+    pub repeating: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -399,6 +403,21 @@ pub struct RadialGradient {
     pub radius_x: f32,
     pub radius_y: f32,
     pub stops: Vec<GradientStop>,
+    /// `true` for `repeating-radial-gradient()`, whose stop list repeats
+    /// infinitely away from the center.
+    pub repeating: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConicGradient {
+    pub rect: PhysicalRect,
+    pub center: PhysicalPoint,
+    /// Rotation of the 0% stop, clockwise from up, in radians.
+    pub from_angle: f32,
+    pub stops: Vec<GradientStop>,
+    /// `true` for `repeating-conic-gradient()`, whose stop list repeats
+    /// around the center.
+    pub repeating: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -431,6 +450,7 @@ pub enum DisplayCommand {
     Image(ImagePaint),
     LinearGradient(LinearGradient),
     RadialGradient(RadialGradient),
+    ConicGradient(ConicGradient),
     PushStackingContext(StackingContext),
     PopStackingContext,
     /// Opens a CSS Positioned Layout §4.1 sticky scope. Everything up to the
@@ -1241,8 +1261,15 @@ impl<'a> Builder<'a> {
                 } else {
                     painting_area
                 };
-                parse_linear_gradient(layer, area, self.options.palette, current_color)
-                    .map(|gradient| (index, gradient))
+                parse_background_gradient(
+                    layer,
+                    area,
+                    self.options.palette,
+                    current_color,
+                    style_font_size(style),
+                    self.fragments.viewport,
+                )
+                .map(|gradient| (index, gradient))
             })
             .collect::<Vec<_>>();
         if !gradient_layers.is_empty() {
@@ -1266,6 +1293,7 @@ impl<'a> Builder<'a> {
                 } else {
                     border_clip
                 };
+                let bounds = gradient.rect();
                 self.push(
                     fragment,
                     PaintPhase::Background,
@@ -1276,9 +1304,9 @@ impl<'a> Builder<'a> {
                 self.push(
                     fragment,
                     PaintPhase::Background,
-                    gradient.rect,
+                    bounds,
                     coordinate_space,
-                    DisplayCommand::LinearGradient(gradient),
+                    gradient.into_command(),
                 );
                 self.push(
                     fragment,
@@ -2274,17 +2302,28 @@ fn css_mask_image(
         return None;
     }
     let lower = trimmed.to_ascii_lowercase();
-    let (intrinsic_width, intrinsic_height, make_image) = if lower.starts_with("linear-gradient(") {
+    let (intrinsic_width, intrinsic_height, make_image) = if lower.starts_with("linear-gradient(")
+        || lower.starts_with("repeating-linear-gradient(")
+    {
         (
             rect.size.width,
             rect.size.height,
             MaskImageFactory::Linear(trimmed.to_owned()),
         )
-    } else if lower.starts_with("radial-gradient(") {
+    } else if lower.starts_with("radial-gradient(")
+        || lower.starts_with("repeating-radial-gradient(")
+    {
         (
             rect.size.width,
             rect.size.height,
             MaskImageFactory::Radial(trimmed.to_owned()),
+        )
+    } else if lower.starts_with("conic-gradient(") || lower.starts_with("repeating-conic-gradient(")
+    {
+        (
+            rect.size.width,
+            rect.size.height,
+            MaskImageFactory::Conic(trimmed.to_owned()),
         )
     } else if lower.starts_with("url(") {
         let loaded = images
@@ -2337,6 +2376,14 @@ fn css_mask_image(
             font_size,
             viewport,
         )?),
+        MaskImageFactory::Conic(value) => MaskImage::Conic(parse_conic_gradient(
+            &value,
+            tile,
+            palette,
+            current_color,
+            font_size,
+            viewport,
+        )?),
         MaskImageFactory::Raster(resource) => MaskImage::Raster {
             resource,
             destination: tile,
@@ -2354,6 +2401,7 @@ fn css_mask_image(
 enum MaskImageFactory {
     Linear(String),
     Radial(String),
+    Conic(String),
     Raster(ImageResourceId),
 }
 
@@ -3136,10 +3184,56 @@ fn shadow_bounds(shadow: &BoxShadowPaint) -> PhysicalRect {
     )
 }
 
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "gradient stop counts are bounded by display-list limits"
-)]
+/// A gradient layer resolved for `background-image`.
+enum BackgroundGradient {
+    Linear(LinearGradient),
+    Radial(RadialGradient),
+    Conic(ConicGradient),
+}
+
+impl BackgroundGradient {
+    const fn rect(&self) -> PhysicalRect {
+        match self {
+            Self::Linear(gradient) => gradient.rect,
+            Self::Radial(gradient) => gradient.rect,
+            Self::Conic(gradient) => gradient.rect,
+        }
+    }
+
+    fn into_command(self) -> DisplayCommand {
+        match self {
+            Self::Linear(gradient) => DisplayCommand::LinearGradient(gradient),
+            Self::Radial(gradient) => DisplayCommand::RadialGradient(gradient),
+            Self::Conic(gradient) => DisplayCommand::ConicGradient(gradient),
+        }
+    }
+}
+
+fn parse_background_gradient(
+    value: &str,
+    rect: PhysicalRect,
+    palette: SystemPalette,
+    current_color: Color,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> Option<BackgroundGradient> {
+    let lower = value.trim().to_ascii_lowercase();
+    if lower.starts_with("linear-gradient(") || lower.starts_with("repeating-linear-gradient(") {
+        parse_linear_gradient(value, rect, palette, current_color).map(BackgroundGradient::Linear)
+    } else if lower.starts_with("radial-gradient(")
+        || lower.starts_with("repeating-radial-gradient(")
+    {
+        parse_radial_gradient(value, rect, palette, current_color, font_size, viewport)
+            .map(BackgroundGradient::Radial)
+    } else if lower.starts_with("conic-gradient(") || lower.starts_with("repeating-conic-gradient(")
+    {
+        parse_conic_gradient(value, rect, palette, current_color, font_size, viewport)
+            .map(BackgroundGradient::Conic)
+    } else {
+        None
+    }
+}
+
 fn parse_linear_gradient(
     value: &str,
     rect: PhysicalRect,
@@ -3148,7 +3242,14 @@ fn parse_linear_gradient(
 ) -> Option<LinearGradient> {
     let value = value.trim();
     let lower = value.to_ascii_lowercase();
-    if !lower.starts_with("linear-gradient(") || !value.ends_with(')') {
+    let repeating = if lower.starts_with("repeating-linear-gradient(") {
+        true
+    } else if lower.starts_with("linear-gradient(") {
+        false
+    } else {
+        return None;
+    };
+    if !value.ends_with(')') {
         return None;
     }
     let open = value.find('(')?;
@@ -3159,25 +3260,7 @@ fn parse_linear_gradient(
 
     let (angle, first_stop) =
         parse_gradient_direction(arguments[0]).map_or((180.0, 0), |angle| (angle, 1));
-    let stops = arguments[first_stop..]
-        .iter()
-        .enumerate()
-        .filter_map(|(index, argument)| {
-            let (color, offset) = parse_gradient_stop(argument, palette, current_color)?;
-            let default_offset = if arguments.len().saturating_sub(first_stop) <= 1 {
-                0.0
-            } else {
-                index as f32 / (arguments.len() - first_stop - 1) as f32
-            };
-            Some(GradientStop {
-                offset: offset.unwrap_or(default_offset).clamp(0.0, 1.0),
-                color,
-            })
-        })
-        .collect::<Vec<_>>();
-    if stops.len() < 2 {
-        return None;
-    }
+    let stops = parse_gradient_stops(&arguments[first_stop..], palette, current_color, false)?;
 
     let radians = angle.to_radians();
     let direction = (radians.sin(), -radians.cos());
@@ -3200,17 +3283,18 @@ fn parse_linear_gradient(
             y: center.y + direction.1 * half_length,
         },
         stops,
+        repeating,
     })
 }
 
-/// Parse the `radial-gradient()` subset used for CSS masks.
+/// Parse the `radial-gradient()` and `repeating-radial-gradient()` subsets
+/// used for CSS backgrounds and masks.
 ///
 /// Supported: optional `circle`/`ellipse`, `closest-side`, `closest-corner`,
 /// `farthest-side`, `farthest-corner`, one or two explicit radii, an optional
 /// `at <position>`, and the standard colour-stop list.
 #[allow(
     clippy::too_many_lines,
-    clippy::cast_precision_loss,
     reason = "the radial-gradient grammar is parsed in one readable sequence"
 )]
 fn parse_radial_gradient(
@@ -3223,7 +3307,14 @@ fn parse_radial_gradient(
 ) -> Option<RadialGradient> {
     let value = value.trim();
     let lower = value.to_ascii_lowercase();
-    if !lower.starts_with("radial-gradient(") || !value.ends_with(')') {
+    let repeating = if lower.starts_with("repeating-radial-gradient(") {
+        true
+    } else if lower.starts_with("radial-gradient(") {
+        false
+    } else {
+        return None;
+    };
+    if !value.ends_with(')') {
         return None;
     }
     let open = value.find('(')?;
@@ -3236,7 +3327,7 @@ fn parse_radial_gradient(
     let first_lower = first.to_ascii_lowercase();
     let (shape_tokens, position_text, first_stop) = if first_lower.starts_with("at ") {
         (Vec::new(), Some(first[3..].trim()), 1)
-    } else if parse_gradient_stop(first, palette, current_color).is_some() {
+    } else if parse_gradient_stop_spec(first, palette, current_color).is_some() {
         (Vec::new(), None, 0)
     } else {
         let (before, after) = first
@@ -3248,25 +3339,7 @@ fn parse_radial_gradient(
         (clip_components(before), after, 1)
     };
 
-    let stops = arguments[first_stop..]
-        .iter()
-        .enumerate()
-        .filter_map(|(index, argument)| {
-            let (color, offset) = parse_gradient_stop(argument, palette, current_color)?;
-            let default_offset = if arguments.len().saturating_sub(first_stop) <= 1 {
-                0.0
-            } else {
-                index as f32 / (arguments.len() - first_stop - 1) as f32
-            };
-            Some(GradientStop {
-                offset: offset.unwrap_or(default_offset).clamp(0.0, 1.0),
-                color,
-            })
-        })
-        .collect::<Vec<_>>();
-    if stops.len() < 2 {
-        return None;
-    }
+    let stops = parse_gradient_stops(&arguments[first_stop..], palette, current_color, false)?;
 
     let center = position_text.map_or_else(
         || PhysicalPoint {
@@ -3368,7 +3441,101 @@ fn parse_radial_gradient(
         radius_x,
         radius_y,
         stops,
+        repeating,
     })
+}
+
+/// Parse the basic `conic-gradient()` and `repeating-conic-gradient()` forms.
+///
+/// Supported: an optional `from <angle>` and `at <position>` preamble, in that
+/// order, followed by the standard colour-stop list. Conic stop positions may
+/// be percentages or angles. Colour interpolation methods (`in oklab`, …) are
+/// ignored, so the renderer always interpolates in sRGB.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the conic-gradient grammar is parsed in one readable sequence"
+)]
+fn parse_conic_gradient(
+    value: &str,
+    rect: PhysicalRect,
+    palette: SystemPalette,
+    current_color: Color,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> Option<ConicGradient> {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    let repeating = if lower.starts_with("repeating-conic-gradient(") {
+        true
+    } else if lower.starts_with("conic-gradient(") {
+        false
+    } else {
+        return None;
+    };
+    if !value.ends_with(')') {
+        return None;
+    }
+    let open = value.find('(')?;
+    let arguments = split_gradient_arguments(&value[open + 1..value.len() - 1]);
+    if arguments.len() < 2 {
+        return None;
+    }
+
+    let (from_angle, center, first_stop) =
+        if parse_gradient_stop_spec(arguments[0], palette, current_color).is_some() {
+            (0.0, gradient_center(rect), 0)
+        } else {
+            let (from_angle, center) =
+                parse_conic_preamble(arguments[0], rect, font_size, viewport)?;
+            (from_angle, center, 1)
+        };
+    let stops = parse_gradient_stops(&arguments[first_stop..], palette, current_color, true)?;
+
+    Some(ConicGradient {
+        rect,
+        center,
+        from_angle: from_angle.to_radians(),
+        stops,
+        repeating,
+    })
+}
+
+/// Resolve the optional `from <angle> ... at <position>` preamble of a conic
+/// gradient. Unknown interpolation-method keywords are ignored.
+fn parse_conic_preamble(
+    text: &str,
+    rect: PhysicalRect,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> Option<(f32, PhysicalPoint)> {
+    let text = text.trim();
+    let lower = text.to_ascii_lowercase();
+    if lower.starts_with("at ") {
+        let center = parse_mask_position(&text[3..], rect, font_size, viewport)?;
+        return Some((0.0, center));
+    }
+    let (before, after) = split_at_clause(text);
+    let mut from_angle = 0.0;
+    let before = before.trim();
+    if !before.is_empty() {
+        let lower = before.to_ascii_lowercase();
+        if lower.starts_with("from ") {
+            from_angle = parse_gradient_angle(&before[5..])?;
+        }
+    }
+    let center = if after.trim().is_empty() {
+        gradient_center(rect)
+    } else {
+        parse_mask_position(after.trim(), rect, font_size, viewport)?
+    };
+    Some((from_angle, center))
+}
+
+fn gradient_center(rect: PhysicalRect) -> PhysicalPoint {
+    PhysicalPoint {
+        x: rect.origin.x + rect.size.width / 2.0,
+        y: rect.origin.y + rect.size.height / 2.0,
+    }
 }
 
 fn parse_mask_position(
@@ -3454,49 +3621,219 @@ fn split_gradient_arguments(value: &str) -> Vec<&str> {
 
 fn parse_gradient_direction(value: &str) -> Option<f32> {
     let value = value.trim().to_ascii_lowercase();
-    if let Some(degrees) = value.strip_suffix("deg") {
-        return degrees.trim().parse::<f32>().ok();
+    if let Some(angle) = parse_gradient_angle(&value) {
+        return Some(angle);
     }
     let value = value.strip_prefix("to ")?;
     let horizontal = if value.contains("right") {
-        Some(90.0)
+        1.0
     } else if value.contains("left") {
-        Some(270.0)
+        -1.0
     } else {
-        None
+        0.0
     };
     let vertical = if value.contains("bottom") {
-        Some(180.0)
+        1.0
     } else if value.contains("top") {
-        Some(0.0)
+        -1.0
     } else {
-        None
+        0.0
     };
-    match (horizontal, vertical) {
-        (Some(horizontal), Some(vertical)) => Some(f32::midpoint(horizontal, vertical)),
-        (Some(horizontal), None) | (None, Some(horizontal)) => Some(horizontal),
-        (None, None) => None,
+    (horizontal != 0.0 || vertical != 0.0).then(|| {
+        f32::atan2(horizontal, -vertical)
+            .to_degrees()
+            .rem_euclid(360.0)
+    })
+}
+
+/// Parse a CSS angle into degrees. Unitless zero is accepted; every other
+/// unitless number is invalid, matching the CSS angle grammar.
+fn parse_gradient_angle(value: &str) -> Option<f32> {
+    const UNITS: [(&str, f32); 4] = [
+        ("deg", 1.0),
+        ("grad", 0.9),
+        ("rad", 180.0 / std::f32::consts::PI),
+        ("turn", 360.0),
+    ];
+    let value = value.trim().to_ascii_lowercase();
+    for (suffix, factor) in UNITS {
+        if let Some(number) = value.strip_suffix(suffix) {
+            let number = number.trim().parse::<f32>().ok()?;
+            return number.is_finite().then_some(number * factor);
+        }
+    }
+    let number = value.parse::<f32>().ok()?;
+    (number.abs() <= f32::EPSILON).then_some(0.0)
+}
+
+#[derive(Clone, Copy)]
+enum StopPosition {
+    Percent(f32),
+    Angle(f32),
+}
+
+impl StopPosition {
+    /// Convert to a fraction of the gradient's parameter space. Angles are
+    /// only meaningful for conic gradients, where a full turn is 1.0.
+    fn offset(self, angular: bool) -> Option<f32> {
+        match self {
+            Self::Percent(percent) => Some(percent / 100.0),
+            Self::Angle(degrees) if angular => Some(degrees / 360.0),
+            Self::Angle(_) => None,
+        }
     }
 }
 
-fn parse_gradient_stop(
+fn parse_stop_position(value: &str) -> Option<StopPosition> {
+    let value = value.trim().to_ascii_lowercase();
+    if let Some(percent) = value.strip_suffix('%') {
+        let percent = percent.trim().parse::<f32>().ok()?;
+        return percent
+            .is_finite()
+            .then_some(StopPosition::Percent(percent));
+    }
+    if value == "0" {
+        return Some(StopPosition::Percent(0.0));
+    }
+    parse_gradient_angle(&value).map(StopPosition::Angle)
+}
+
+#[derive(Clone, Copy)]
+struct GradientStopSpec {
+    color: Color,
+    positions: [Option<StopPosition>; 2],
+}
+
+/// Parse one color-stop. A stop may carry up to two positions
+/// (`red 10% 20%`), which expands into two stops with the same color.
+fn parse_gradient_stop_spec(
     value: &str,
     palette: SystemPalette,
     current_color: Color,
-) -> Option<(Color, Option<f32>)> {
-    let value = value.trim();
-    let (color_value, offset) = value
-        .rsplit_once(char::is_whitespace)
-        .and_then(|(color, offset)| {
-            let offset = offset.trim().strip_suffix('%')?.parse::<f32>().ok()?;
-            Some((color.trim(), Some(offset / 100.0)))
-        })
-        .unwrap_or((value, None));
-    let typed = parse_typed_property("color", color_value)?.ok()?;
-    let TypedPropertyValue::Color(color) = typed else {
+) -> Option<GradientStopSpec> {
+    let mut color = None;
+    let mut positions = [None; 2];
+    let mut position_count = 0;
+    for component in clip_components(value.trim()) {
+        if color.is_none()
+            && let Some(parsed) = parse_gradient_color(component, palette, current_color)
+        {
+            color = Some(parsed);
+            continue;
+        }
+        if position_count < positions.len()
+            && let Some(position) = parse_stop_position(component)
+        {
+            positions[position_count] = Some(position);
+            position_count += 1;
+        }
+    }
+    Some(GradientStopSpec {
+        color: color?,
+        positions,
+    })
+}
+
+fn parse_gradient_color(
+    value: &str,
+    palette: SystemPalette,
+    current_color: Color,
+) -> Option<Color> {
+    let TypedPropertyValue::Color(color) = parse_typed_property("color", value)?.ok()? else {
         return None;
     };
-    Some((palette.resolve(color, current_color), offset))
+    Some(palette.resolve(color, current_color))
+}
+
+/// Build the normalized stop list for one gradient, applying the CSS Images 3
+/// default-position and monotonicity rules after expanding multi-position
+/// stops.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "gradient stop counts are bounded by display-list limits"
+)]
+fn parse_gradient_stops(
+    arguments: &[&str],
+    palette: SystemPalette,
+    current_color: Color,
+    angular: bool,
+) -> Option<Vec<GradientStop>> {
+    let specs = arguments
+        .iter()
+        .filter_map(|argument| parse_gradient_stop_spec(argument, palette, current_color))
+        .collect::<Vec<_>>();
+    if specs.len() < 2 {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(specs.len().saturating_mul(2));
+    for spec in specs {
+        let mut positioned = false;
+        for position in spec.positions.iter().flatten() {
+            if let Some(offset) = position.offset(angular) {
+                entries.push((spec.color, Some(offset)));
+                positioned = true;
+            }
+        }
+        if !positioned {
+            entries.push((spec.color, None));
+        }
+    }
+    if entries.len() < 2 {
+        return None;
+    }
+    resolve_gradient_offsets(&mut entries);
+    Some(
+        entries
+            .into_iter()
+            .map(|(color, offset)| GradientStop {
+                offset: offset.unwrap_or(0.0).clamp(0.0, 1.0),
+                color,
+            })
+            .collect(),
+    )
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "gradient stop counts are bounded by display-list limits"
+)]
+fn resolve_gradient_offsets(entries: &mut [(Color, Option<f32>)]) {
+    let last = entries.len() - 1;
+    if entries[0].1.is_none() {
+        entries[0].1 = Some(0.0);
+    }
+    if entries[last].1.is_none() {
+        entries[last].1 = Some(1.0);
+    }
+    // A position below an earlier specified position collapses onto it.
+    let mut maximum = f32::NEG_INFINITY;
+    for (_, offset) in entries.iter_mut() {
+        if let Some(value) = offset {
+            let clamped = (*value).max(maximum);
+            *value = clamped;
+            maximum = clamped;
+        }
+    }
+    // Runs of unspecified stops are evenly spaced between their neighbours.
+    let mut index = 0;
+    while index < entries.len() {
+        if entries[index].1.is_some() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < entries.len() && entries[index].1.is_none() {
+            index += 1;
+        }
+        let end = index;
+        let before = entries[start - 1].1.unwrap_or(0.0);
+        let after = entries[end].1.unwrap_or(1.0);
+        let count = end - start;
+        for (step, entry) in entries[start..end].iter_mut().enumerate() {
+            let fraction = (step + 1) as f32 / (count + 1) as f32;
+            entry.1 = Some(before + (after - before) * fraction);
+        }
+    }
 }
 
 #[allow(
@@ -4179,7 +4516,7 @@ mod tests {
     use crate::dom::NodeId;
     use crate::html::{ParseOutput, parse_document};
     use crate::layout::{
-        FormattingLimits, FragmentKind, LayoutOptions, PhysicalPoint, PhysicalRect,
+        FormattingLimits, FragmentKind, LayoutOptions, PhysicalPoint, PhysicalRect, PhysicalSize,
         SimpleTextMeasurer, build_formatting_tree, layout_formatting_tree,
     };
     use crate::paint::Color;
@@ -4187,9 +4524,10 @@ mod tests {
     use super::{
         Builder, ClipFillRule, ClipShape, CompositingReason, DisplayCommand,
         DisplayListBuildOutput, DisplayListBuilderOptions, GlyphRun, ImagePaint, ListMarkerPaint,
-        ListMarkerShape, ReferenceTextShaper, StackingContext, TextDecoration, TextDecorationLine,
-        TextDecorationStyle, TextShadowPaint, TextShaper, Transform2D, build_display_list,
-        build_display_list_with_images,
+        ListMarkerShape, ReferenceTextShaper, StackingContext, SystemPalette, TextDecoration,
+        TextDecorationLine, TextDecorationStyle, TextShadowPaint, TextShaper, Transform2D,
+        build_display_list, build_display_list_with_images, parse_conic_gradient,
+        parse_linear_gradient, parse_radial_gradient,
     };
 
     /// The one thing that must never be true of the reference path: the width
@@ -4683,6 +5021,141 @@ mod tests {
                     if gradient.stops.len() == 2
                         && gradient.rect.size.width > 0.0
                         && gradient.rect.size.height > 0.0
+            )
+        }));
+    }
+
+    #[test]
+    fn gradient_stops_expand_multi_position_and_default_placement() {
+        let palette = SystemPalette::default();
+        let rect = PhysicalRect::new(0.0, 0.0, 100.0, 50.0);
+        let linear = parse_linear_gradient(
+            "repeating-linear-gradient(90deg, red 10% 20%, blue)",
+            rect,
+            palette,
+            Color::BLACK,
+        )
+        .expect("repeating linear gradient");
+        assert!(linear.repeating);
+        let offsets = linear
+            .stops
+            .iter()
+            .map(|stop| stop.offset)
+            .collect::<Vec<_>>();
+        assert_eq!(offsets, vec![0.1, 0.2, 1.0]);
+        assert_eq!(linear.stops[0].color, linear.stops[1].color);
+
+        let radial = parse_radial_gradient(
+            "repeating-radial-gradient(circle at center, red 0% 25%, blue 25% 50%)",
+            rect,
+            palette,
+            Color::BLACK,
+            16.0,
+            PhysicalSize {
+                width: 100.0,
+                height: 50.0,
+            },
+        )
+        .expect("repeating radial gradient");
+        assert!(radial.repeating);
+        let offsets = radial
+            .stops
+            .iter()
+            .map(|stop| stop.offset)
+            .collect::<Vec<_>>();
+        assert_eq!(offsets, vec![0.0, 0.25, 0.25, 0.5]);
+
+        let positional = parse_linear_gradient(
+            "linear-gradient(red, yellow, blue 20%)",
+            rect,
+            palette,
+            Color::BLACK,
+        )
+        .expect("positional linear gradient");
+        let offsets = positional
+            .stops
+            .iter()
+            .map(|stop| stop.offset)
+            .collect::<Vec<_>>();
+        assert_eq!(offsets, vec![0.0, 0.1, 0.2]);
+
+        let conic = parse_conic_gradient(
+            "conic-gradient(from 0.25turn at 25% 75%, red 10% 20%, blue)",
+            rect,
+            palette,
+            Color::BLACK,
+            16.0,
+            PhysicalSize {
+                width: 100.0,
+                height: 50.0,
+            },
+        )
+        .expect("conic gradient");
+        assert!((conic.from_angle - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+        assert_eq!(conic.center, PhysicalPoint { x: 25.0, y: 37.5 });
+        let offsets = conic
+            .stops
+            .iter()
+            .map(|stop| stop.offset)
+            .collect::<Vec<_>>();
+        assert_eq!(offsets, vec![0.1, 0.2, 1.0]);
+        assert_eq!(conic.stops[0].color, conic.stops[1].color);
+
+        let at_only = parse_conic_gradient(
+            "conic-gradient(at 10% 20%, red, blue)",
+            rect,
+            palette,
+            Color::BLACK,
+            16.0,
+            PhysicalSize {
+                width: 100.0,
+                height: 50.0,
+            },
+        )
+        .expect("at-only conic gradient");
+        assert_eq!(at_only.center, PhysicalPoint { x: 10.0, y: 10.0 });
+        assert!((at_only.from_angle - 0.0).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn conic_gradient_background_becomes_a_paint_command() {
+        let output = parse_document("<!doctype html><body><div id=cone></div></body>");
+        let sheet = parse_stylesheet(
+            "html, body { display:block; margin:0 } #cone { display:block; width:80px; height:40px; background:conic-gradient(from 45deg at 25% 25%, red, blue); }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let layout = layout_formatting_tree(
+            &output.dom,
+            &formatting,
+            &styles,
+            LayoutOptions::default(),
+            &SimpleTextMeasurer,
+        );
+        let display = build_display_list(
+            &layout.fragments,
+            &formatting,
+            &styles,
+            DisplayListBuilderOptions::default(),
+            &ReferenceTextShaper,
+        );
+        assert!(display.list.items().iter().any(|item| {
+            matches!(
+                &item.command,
+                DisplayCommand::ConicGradient(gradient)
+                    if gradient.stops.len() == 2
+                        && (gradient.from_angle - std::f32::consts::FRAC_PI_4).abs() < 1e-6
+                        && gradient.center.x > gradient.rect.origin.x
+                        && gradient.center.y > gradient.rect.origin.y
             )
         }));
     }

@@ -3957,6 +3957,60 @@ mod tests {
         assert!(corner.green > 200 && corner.red == 255, "{corner:?}");
     }
 
+    /// CSS `conic-gradient()` rotates its stops clockwise from the `from`
+    /// angle: the top-right quadrant is red and the bottom-right is blue.
+    #[test]
+    fn css_conic_gradient_background_paints_clockwise_angles() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0; background: white }
+               #box { width: 20px; height: 20px;
+                      background: conic-gradient(from 0deg at 50% 50%,
+                                                red 0deg 90deg, blue 90deg 360deg) }
+               </style><div id="box"></div>"#,
+        );
+        let output = document.render_reference(DocumentRenderOptions::default());
+        let top_right = output.raster.surface.pixel(15, 5).expect("top-right pixel");
+        let bottom_right = output
+            .raster
+            .surface
+            .pixel(15, 15)
+            .expect("bottom-right pixel");
+        assert_eq!(top_right, Color::rgb(255, 0, 0));
+        assert_eq!(bottom_right, Color::rgb(0, 0, 255));
+    }
+
+    /// `repeating-linear-gradient()` restarts its stop list at the last stop's
+    /// position instead of clamping to the box's far edge.
+    #[test]
+    fn css_repeating_linear_gradient_background_repeats_stops() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0; background: white }
+               #box { width: 20px; height: 20px;
+                      background: repeating-linear-gradient(90deg,
+                        red 0% 10%, blue 10% 20%) }
+               </style><div id="box"></div>"#,
+        );
+        let output = document.render_reference(DocumentRenderOptions::default());
+        assert_eq!(
+            output.raster.surface.pixel(1, 10),
+            Some(Color::rgb(255, 0, 0))
+        );
+        assert_eq!(
+            output.raster.surface.pixel(3, 10),
+            Some(Color::rgb(0, 0, 255))
+        );
+        assert_eq!(
+            output.raster.surface.pixel(5, 10),
+            Some(Color::rgb(255, 0, 0))
+        );
+        assert_eq!(
+            output.raster.surface.pixel(7, 10),
+            Some(Color::rgb(0, 0, 255))
+        );
+    }
+
     /// CSS `mask-image: url(...)` uses a fetched raster's alpha channel.
     #[test]
     fn css_mask_image_url_uses_the_loaded_image_alpha() {

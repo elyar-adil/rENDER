@@ -1026,9 +1026,7 @@ fn extract_css_gradients(value: &str) -> Option<String> {
     let lower = value.to_ascii_lowercase();
     let mut gradients = Vec::new();
     let mut search_from = 0;
-    while let Some(relative_start) = lower[search_from..].find("linear-gradient(") {
-        let start = search_from + relative_start;
-        let open = start + "linear-gradient".len();
+    while let Some((start, open)) = gradient_function_start(&lower, search_from) {
         let mut depth = 0_u32;
         let mut end = None;
         for (offset, character) in value[open..].char_indices() {
@@ -1049,6 +1047,27 @@ fn extract_css_gradients(value: &str) -> Option<String> {
         search_from = end;
     }
     (!gradients.is_empty()).then(|| gradients.join(","))
+}
+
+/// Find the earliest gradient function at or after `from`, returning the
+/// function's start and the byte index of its opening parenthesis.
+fn gradient_function_start(value: &str, from: usize) -> Option<(usize, usize)> {
+    const FUNCTIONS: [&str; 6] = [
+        "repeating-linear-gradient(",
+        "repeating-radial-gradient(",
+        "repeating-conic-gradient(",
+        "linear-gradient(",
+        "radial-gradient(",
+        "conic-gradient(",
+    ];
+    FUNCTIONS
+        .iter()
+        .filter_map(|function| {
+            value[from..]
+                .find(function)
+                .map(|offset| (from + offset, from + offset + function.len() - 1))
+        })
+        .min_by_key(|(start, _)| *start)
 }
 
 fn expand_box_shorthand(name: &str, value: &str) -> Vec<(String, String)> {
@@ -2076,6 +2095,48 @@ mod tests {
                 .get("background-position")
                 .map(|value| value.value.as_str()),
             Some("50% 50%")
+        );
+    }
+
+    #[test]
+    fn background_shorthand_keeps_conic_and_repeating_gradients() {
+        let (dom, target) = document_and_target();
+        let sheet = parse_stylesheet(
+            "#target { background: conic-gradient(from 45deg at 25% 25%, red, blue) }",
+        );
+        let style = cascade_element(
+            &dom,
+            target,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+        assert_eq!(
+            style
+                .get("background-image")
+                .map(|value| value.value.as_str()),
+            Some("conic-gradient(from 45deg at 25% 25%, red, blue)")
+        );
+
+        let sheet = parse_stylesheet(
+            "#target { background: repeating-linear-gradient(90deg, red 10% 20%, blue) }",
+        );
+        let style = cascade_element(
+            &dom,
+            target,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+        assert_eq!(
+            style
+                .get("background-image")
+                .map(|value| value.value.as_str()),
+            Some("repeating-linear-gradient(90deg, red 10% 20%, blue)")
         );
     }
 

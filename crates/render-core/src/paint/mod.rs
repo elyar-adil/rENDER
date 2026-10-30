@@ -10,7 +10,7 @@ pub(crate) mod sticky;
 pub use color::{Color, SystemPalette};
 pub use display_list::{
     BlendMode, BorderPaint, BoxShadowPaint, ClipFillRule, ClipPathResolver, ClipShape,
-    CompositingReason, DisplayCommand, DisplayItem, DisplayItemId, DisplayList,
+    CompositingReason, ConicGradient, DisplayCommand, DisplayItem, DisplayItemId, DisplayList,
     DisplayListBuildOutput, DisplayListBuilderLimits, DisplayListBuilderOptions,
     DisplayListDiagnostic, DisplayListDiagnosticCode, DisplayListDiff, FontInstanceId, GlyphId,
     GlyphInstance, GlyphRun, GradientStop, ImagePaint, ImageResourceId, LinearGradient,
