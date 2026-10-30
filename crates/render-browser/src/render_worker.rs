@@ -390,7 +390,12 @@ pub(super) fn merge_current_style_sheets(
     let mut merged = ExternalStyleSheets::default();
     for resource in &current.resources {
         let key = &resource.key;
-        if let Some(sheet) = incoming.get(key).or_else(|| existing.get(key)) {
+        let sheet = incoming
+            .get(key)
+            .or_else(|| existing.get(key))
+            .or_else(|| incoming.find_by_url(&key.requested_url))
+            .or_else(|| existing.find_by_url(&key.requested_url));
+        if let Some(sheet) = sheet {
             merged.insert(key.clone(), sheet.clone());
         }
     }

@@ -946,6 +946,17 @@ impl ExternalStyleSheets {
         self.entries.get(key)
     }
 
+    /// A sheet fetched for `url`, regardless of which `<link>` node owned the
+    /// request. Dynamic pages routinely replace a link element with a new one
+    /// carrying the same URL; the bytes are still valid for the new owner.
+    #[must_use]
+    pub fn find_by_url(&self, url: &Url) -> Option<&StyleSheet> {
+        self.entries
+            .iter()
+            .find(|(key, _)| &key.requested_url == url)
+            .map(|(_, sheet)| sheet)
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()

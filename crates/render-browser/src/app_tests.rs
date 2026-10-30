@@ -1601,6 +1601,50 @@ fn dynamic_stylesheet_merge_keeps_previous_css_and_drops_retargeted_links() {
     assert!(merged.get(&current.resources[1].key).is_some());
 }
 
+#[test]
+fn dynamic_stylesheet_merge_rekeys_a_replaced_link_by_url() {
+    let base = Url::parse("https://example.test/page.html").expect("base URL");
+    let mut document = Document::parse("<link rel=stylesheet href=a.css>");
+    let original = plan_external_style_sheets(
+        &document,
+        &base,
+        render_core::document::DocumentLimits::default(),
+    );
+    let mut existing = ExternalStyleSheets::default();
+    existing.insert_css(original.resources[0].key.clone(), "h1 { color: red }");
+
+    let old = original.resources[0].key.owner;
+    let parent = document.dom().parent(old).expect("link has a parent");
+    document
+        .dom_mut()
+        .remove_child(parent, old)
+        .expect("old link detaches");
+    let replacement = document.dom_mut().create_element("link");
+    document
+        .dom_mut()
+        .set_attribute(replacement, "rel", "stylesheet")
+        .expect("rel attribute");
+    document
+        .dom_mut()
+        .set_attribute(replacement, "href", "a.css")
+        .expect("href attribute");
+    document
+        .dom_mut()
+        .append_child(parent, replacement)
+        .expect("replacement link attaches");
+
+    let current = plan_external_style_sheets(
+        &document,
+        &base,
+        render_core::document::DocumentLimits::default(),
+    );
+    assert_ne!(current.resources[0].key.owner, old);
+    let merged =
+        merge_current_style_sheets(&document, &base, &existing, &ExternalStyleSheets::default());
+    assert_eq!(merged.len(), 1);
+    assert!(merged.get(&current.resources[0].key).is_some());
+}
+
 /// A 200 `text/javascript` response for the plan's single external script.
 fn script_response(
     plan: &render_browser::scripts::ScriptFetchPlan,
