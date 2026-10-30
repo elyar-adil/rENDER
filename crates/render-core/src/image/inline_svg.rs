@@ -38,10 +38,11 @@
 //!   own styles and its own geometry. This rasteriser has no shadow tree, so
 //!   a `<use>` contributes nothing. An honest absence is better than a global
 //!   that silently returns an empty image.
-//! * `text`, `clipPath`, `mask`, `filter` and `<image>`: outside the
-//!   rasteriser's documented subset, so they contribute nothing there either.
-//!   Gradients are supported, but `xlink:href` inheritance between gradient
-//!   definitions and spread modes other than `pad` are not.
+//! * `text`, `mask`, `filter` and `<image>`: outside the rasteriser's
+//!   documented subset, so they contribute nothing there either. Gradients and
+//!   attribute `clip-path` references are supported, but `xlink:href`
+//!   inheritance between gradient definitions and spread modes other than
+//!   `pad` are not.
 //! * `foreignObject`: its HTML subtree is laid out by render-layout as
 //!   ordinary in-flow HTML rather than in the SVG viewport coordinate system,
 //!   so it is positioned correctly only for `x=0 y=0` with no viewBox

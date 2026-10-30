@@ -1,3 +1,69 @@
+# 交接文档 (2026-10-31, 续十六) — SVG `clipPath`
+
+接续 SVG 渐变会话。T5 勋章的整棵图形位于
+`<g clip-path="url(#clip0_5048_100697)">` 中;之前 clipPath 被忽略,虽然本轮之前
+的渐变/命名空间修复让图像有内容,但真正的裁剪语义尚未实现。本轮补齐。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **收集 clipPath** | 按 `id` 索引整棵 XML 树,支持引用出现在 `<defs>` 之后 |
+| **裁剪几何** | `rect`/`circle`/`ellipse`/`polygon`/`polyline`/`path`,以及 `g`/`svg`/`a`/`switch` 的递归与子 `transform` |
+| **`clipPathUnits`** | `userSpaceOnUse`(默认)和 `objectBoundingBox`;组按后代几何求 bbox |
+| **`transform`** | `clipPath` 自身的 `transform` 与其内容的 `transform` 组合后映射到设备空间 |
+| **作用范围** | 形状级与组级 `clip-path`;嵌套 clip 取交集;fill 与 stroke 都受裁剪 |
+| **裁剪测试** | 设备像素中心做 even-odd point-in-polygon;空 clipPath 裁剪掉全部内容 |
+| **回归测试** | 形状/组裁剪、`objectBoundingBox`、`transform`、嵌套交集、T5 勋章模板,共 6 个测试 |
+
+## 证据
+
+Bing(隐藏截图,15 秒):
+
+```
+health page=https://cn.bing.com/ ready=Complete dom_elements=475 boxes=169
+       scripts_failed=0 scripts_threw=0 css_errors=0 css_warnings=20 images_failed=3
+layout <div> id=rh_rwm 105.5×42
+layout <svg> class=medal-newlevel-circled 32×32
+paint #279 source=.medal-newlevel-circled … image
+```
+
+裁剪图 `bing146-rewards.png` 中 T5 白色勋章完整可见(未被 clipPath 擦除),
+旁边汉堡菜单/九宫格正常。与 Edge 参考 `edge-rewards-15s.json` 对比:
+
+| 元素 | Edge | rENDER |
+|---|---|---|
+| `#rh_rwm` | 104.656×42, y=13.5 | 105.525×42, y=13.5 |
+| 勋章 `svg` | 32×32, y=18.5 | 32×32, y=18.5 |
+| 勋章内部 `g` | 30.5×30.5 | 裁剪后 32×32 视口内可见 |
+
+T5 模板单元测试:23 个 `image::svg` 测试全过,其中
+`the_t5_rewards_medal_clip_path_keeps_the_icon_visible` 断言裁剪后仍有
+>150 个可见像素、>50 个白色像素。
+
+## 验证
+
+```
+cargo test --workspace                       2719 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+JD smoke:    dom_elements=1011 boxes=251
+Baidu smoke: dom_elements=455  boxes=156
+```
+
+## 明确未做 / 下一步
+
+- `clip-path` 仅支持 **属性**,不支持 CSS `style="clip-path:..."`;`clip-rule`
+  固定 even-odd,未区分 nonzero。
+- `clipPath` 内容的 `text`/`use` 不参与裁剪;`mask`/`filter`/`<use>` 仍未实现。
+- 渐变高级特性(`xlink:href` 继承、`spreadMethod`、径向焦点)与组级 `opacity`
+  离屏合成仍未做。
+- `content` 仍只支持字符串;IndexedDB 仍是内存子集;JD 主商品区仍受风控 403;
+  GitHub/HN 本机链路阻断;AVIF 未实现。
+
+---
+
 # 交接文档 (2026-10-31, 续十五) — SVG 渐变与 T2 勋章
 
 接续动态 SVG 命名空间会话。上一轮修好了 `innerHTML` 插入的 SVG 的命名空间和
@@ -62,7 +128,7 @@ Baidu smoke: dom_elements=453  boxes=156
   `fx`/`fy` 焦点、`userSpaceOnUse` 下的百分比坐标。
 - `<g opacity>` 仍按每个子形状独立绘制,未做组级离屏合成;T2 的 0.7 透明度
   叠加会比 Edge 略强。
-- `clipPath`/`mask`/`filter`/`<use>` 仍未实现。
+- `mask`/`filter`/`<use>` 仍未实现;`clipPath` 已在续十六实现。
 - `content` 仍只支持字符串;IndexedDB 仍是内存子集;JD 主商品区仍受风控 403;
   GitHub/HN 本机链路阻断;AVIF 未实现。
 
@@ -127,8 +193,8 @@ real_site_tasks                              66 passed, 0 failed
 
 - **Rewards 模板差异**:Bing 对 Edge 与本机 rENDER 返回不同勋章模板(T2 vs T5),
   这是页面实验/状态差异;本轮保证两种模板都能被光栅化。
-- **SVG 特性子集**:`clipPath`、`mask`、`filter` 和 `<use>` 仍未实现;渐变已在
-  续十五实现。
+- **SVG 特性子集**:`mask`、`filter` 和 `<use>` 仍未实现;渐变已在续十五、
+  `clipPath` 已在续十六实现。
 - `content` 仍只支持字符串;`attr()`/`counter()` 未实现。
 - JD 主商品区仍受风控 403(同机 Edge 也 403);IndexedDB 仍是内存子集;GitHub/HN
   的本机 TCP 链路仍被阻断;AVIF 解码未实现(images_failed=3 是能力探测)。

@@ -13,10 +13,12 @@
 //! - linear and radial gradients, including `gradientUnits`,
 //!   `gradientTransform`, `stop-color` and `stop-opacity`, for fills and
 //!   strokes;
+//! - `clipPath` references on shapes and groups, with `clipPathUnits` and
+//!   transforms;
 //! - root sizing by `width`/`height` (percentages resolve against the
 //!   `viewBox`), falling back to `viewBox`, then the spec default 300×150.
 //!
-//! Everything outside the subset (text, clips, masks, embedded images,
+//! Everything outside the subset (text, masks, filters, embedded images,
 //! scripting, gradient `xlink:href` inheritance and spread modes other than
 //! `pad`) contributes nothing, matching how an `<img>`-loaded SVG must
 //! render: static and script-free.
@@ -135,6 +137,12 @@ enum GradientUnits {
     UserSpaceOnUse,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipPathUnits {
+    ObjectBoundingBox,
+    UserSpaceOnUse,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum GradientKind {
     Linear { x1: f32, y1: f32, x2: f32, y2: f32 },
@@ -233,6 +241,62 @@ fn lerp_color(from: Color, to: Color, progress: f32) -> Color {
     )
 }
 
+/// A stack of clip layers, each layer the union of its polygons.
+///
+/// Nested clips intersect: a pixel must be inside every layer. The clips are
+/// kept in device space because each shape paints immediately; a group clip
+/// applies to every descendant drawn while it is on the stack.
+#[derive(Clone, Debug, Default)]
+struct ClipStack {
+    layers: Vec<ClipLayer>,
+}
+
+#[derive(Clone, Debug)]
+struct ClipLayer {
+    /// Polygons in device space. An empty layer clips everything, which is
+    /// what an empty `<clipPath>` means.
+    polygons: Vec<Vec<(f32, f32)>>,
+}
+
+impl ClipStack {
+    fn push(&mut self, layer: ClipLayer) {
+        self.layers.push(layer);
+    }
+
+    fn pop(&mut self) {
+        self.layers.pop();
+    }
+
+    fn contains(&self, x: f32, y: f32) -> bool {
+        self.layers.iter().all(|layer| {
+            layer
+                .polygons
+                .iter()
+                .any(|polygon| point_in_polygon(polygon, x, y))
+        })
+    }
+}
+
+/// Even-odd point-in-polygon. Clip paths use this test; the paint scanline
+/// fill uses the same rule, so clipped edges agree with the shape edges.
+fn point_in_polygon(points: &[(f32, f32)], x: f32, y: f32) -> bool {
+    if points.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    for index in 0..points.len() {
+        let (x1, y1) = points[index];
+        let (x2, y2) = points[(index + 1) % points.len()];
+        if (y1 > y) != (y2 > y) {
+            let crossing = (x2 - x1).mul_add((y - y1) / (y2 - y1), x1);
+            if x < crossing {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
 /// Decode an SVG document into an RGBA image.
 ///
 /// # Errors
@@ -326,6 +390,7 @@ fn decode_viewport(
         width,
         height,
         pixels: vec![Color::rgba(0, 0, 0, 0); width as usize * height as usize],
+        clip: ClipStack::default(),
     };
 
     // Root viewBox-to-viewport mapping, composed ahead of every shape.
@@ -362,6 +427,7 @@ fn decode_viewport(
     // fill and no stroke. An unparseable value is ignored, which leaves the
     // initial value in force.
     let (gradients, gradient_index) = collect_gradients(root, current_color);
+    let clip_paths = collect_clip_paths(root);
     let fill = root_paint(
         root,
         "fill",
@@ -378,6 +444,7 @@ fn decode_viewport(
         current_color,
         &gradients,
         &gradient_index,
+        &clip_paths,
         &mut raster,
     );
     DecodedImage::from_pixels(width, height, raster.pixels)
@@ -387,6 +454,7 @@ struct Raster {
     width: u32,
     height: u32,
     pixels: Vec<Color>,
+    clip: ClipStack,
 }
 
 impl Raster {
@@ -442,7 +510,13 @@ impl Raster {
     }
 
     fn put(&mut self, x: i64, y: i64, color: Color) {
-        if color.alpha == 0 || x < 0 || y < 0 || x >= self.width.into() || y >= self.height.into() {
+        if color.alpha == 0
+            || x < 0
+            || y < 0
+            || x >= self.width.into()
+            || y >= self.height.into()
+            || !self.clip.contains(x as f32 + 0.5, y as f32 + 0.5)
+        {
             return;
         }
         let index =
@@ -507,8 +581,10 @@ fn walk(
     current_color: Color,
     gradients: &[Gradient],
     gradient_index: &BTreeMap<String, usize>,
+    clip_paths: &BTreeMap<String, &XmlNode>,
     raster: &mut Raster,
 ) {
+    let clipped = push_element_clip(raster, element, transform, None, clip_paths);
     for child_node in &element.children {
         let attribute = |name: &str| {
             attribute(child_node, name)
@@ -536,6 +612,13 @@ fn walk(
                     continue;
                 };
                 let device = transform_points(&points, child_transform);
+                let clipped = push_element_clip(
+                    raster,
+                    child_node,
+                    child_transform,
+                    points_bounds(&points),
+                    clip_paths,
+                );
                 paint_shape(
                     raster,
                     &points,
@@ -552,6 +635,9 @@ fn walk(
                     child_stroke.resolve(None),
                     gradients,
                 );
+                if clipped {
+                    raster.clip.pop();
+                }
             }
             "circle" | "ellipse" => {
                 let cx = attribute("cx").and_then(parse_length).unwrap_or(0.0);
@@ -574,6 +660,13 @@ fn walk(
                     points.push((cx + rx * angle.cos(), cy + ry * angle.sin()));
                 }
                 let device = transform_points(&points, child_transform);
+                let clipped = push_element_clip(
+                    raster,
+                    child_node,
+                    child_transform,
+                    points_bounds(&points),
+                    clip_paths,
+                );
                 paint_shape(
                     raster,
                     &points,
@@ -590,6 +683,9 @@ fn walk(
                     child_stroke.resolve(None),
                     gradients,
                 );
+                if clipped {
+                    raster.clip.pop();
+                }
             }
             "polygon" | "polyline" => {
                 let Some(points) = attribute("points").and_then(parse_points) else {
@@ -599,6 +695,13 @@ fn walk(
                     continue;
                 }
                 let device = transform_points(&points, child_transform);
+                let clipped = push_element_clip(
+                    raster,
+                    child_node,
+                    child_transform,
+                    points_bounds(&points),
+                    clip_paths,
+                );
                 paint_shape(
                     raster,
                     &points,
@@ -616,6 +719,9 @@ fn walk(
                     child_stroke.resolve(None),
                     gradients,
                 );
+                if clipped {
+                    raster.clip.pop();
+                }
             }
             "line" => {
                 let (Some(x1), Some(y1), Some(x2), Some(y2)) = (
@@ -628,20 +734,43 @@ fn walk(
                 };
                 let from = child_transform.apply(x1, y1);
                 let to = child_transform.apply(x2, y2);
+                let local = [(x1, y1), (x2, y2)];
+                let clipped = push_element_clip(
+                    raster,
+                    child_node,
+                    child_transform,
+                    points_bounds(&local),
+                    clip_paths,
+                );
                 stroke_outline_segments(
                     raster,
-                    &[(x1, y1), (x2, y2)],
+                    &local,
                     &[(from, to)],
                     child_transform,
                     child_stroke.resolve(None),
                     gradients,
                 );
+                if clipped {
+                    raster.clip.pop();
+                }
             }
             "path" => {
                 let Some(specification) = attribute("d") else {
                     continue;
                 };
-                for (subpath, closed) in &parse_path(specification) {
+                let subpaths = parse_path(specification);
+                let all_points: Vec<(f32, f32)> = subpaths
+                    .iter()
+                    .flat_map(|(subpath, _)| subpath.iter().copied())
+                    .collect();
+                let clipped = push_element_clip(
+                    raster,
+                    child_node,
+                    child_transform,
+                    points_bounds(&all_points),
+                    clip_paths,
+                );
+                for (subpath, closed) in &subpaths {
                     if subpath.len() < 2 {
                         continue;
                     }
@@ -664,6 +793,9 @@ fn walk(
                         gradients,
                     );
                 }
+                if clipped {
+                    raster.clip.pop();
+                }
             }
             "svg" | "g" | "a" | "switch" => {
                 if attribute("display").is_some_and(|value| value.eq_ignore_ascii_case("none")) {
@@ -677,6 +809,7 @@ fn walk(
                     current_color,
                     gradients,
                     gradient_index,
+                    clip_paths,
                     raster,
                 );
             }
@@ -690,10 +823,14 @@ fn walk(
                     current_color,
                     gradients,
                     gradient_index,
+                    clip_paths,
                     raster,
                 );
             }
         }
+    }
+    if clipped {
+        raster.clip.pop();
     }
 }
 
@@ -1103,19 +1240,28 @@ fn rect_polygon(
     ])
 }
 
-fn parse_paint(raw: &str, current_color: Color, gradient_index: &BTreeMap<String, usize>) -> Paint {
+/// The id in a `url(#id)` paint or `clip-path` reference.
+fn reference_id(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
     let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("url(") && trimmed.ends_with(')') {
-        let inner = trimmed[4..trimmed.len() - 1].trim();
-        let id = inner
-            .trim_matches(|character| character == '"' || character == '\'')
-            .trim_start_matches('#');
-        if let Some(index) = gradient_index.get(id) {
-            return Paint::Gradient(*index);
-        }
+    if !lower.starts_with("url(") || !trimmed.ends_with(')') {
+        return None;
     }
-    match lower.as_str() {
+    let inner = trimmed[4..trimmed.len() - 1].trim();
+    let id = inner
+        .trim_matches(|character| character == '\"' || character == '\'')
+        .trim_start_matches('#');
+    (!id.is_empty()).then_some(id)
+}
+
+fn parse_paint(raw: &str, current_color: Color, gradient_index: &BTreeMap<String, usize>) -> Paint {
+    let trimmed = raw.trim();
+    if let Some(id) = reference_id(trimmed)
+        && let Some(index) = gradient_index.get(id)
+    {
+        return Paint::Gradient(*index);
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
         "none" | "transparent" => Paint::None,
         "currentcolor" => Paint::Color(current_color),
         _ => parse_color(trimmed).map_or(Paint::Inherit, Paint::Color),
@@ -1157,6 +1303,256 @@ fn collect_gradients_into(
             }
         }
         collect_gradients_into(child, current_color, gradients, index);
+    }
+}
+
+/// Index every `clipPath` definition by id, including forward references.
+fn collect_clip_paths(root: &XmlNode) -> BTreeMap<String, &XmlNode> {
+    let mut paths = BTreeMap::new();
+    collect_clip_paths_into(root, &mut paths);
+    paths
+}
+
+fn collect_clip_paths_into<'a>(element: &'a XmlNode, paths: &mut BTreeMap<String, &'a XmlNode>) {
+    for child in &element.children {
+        if child.name == "clipPath"
+            && let Some(id) = attribute(child, "id")
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+        {
+            paths.entry(id.to_owned()).or_insert(child);
+        }
+        collect_clip_paths_into(child, paths);
+    }
+}
+
+fn clip_path_units(node: &XmlNode) -> ClipPathUnits {
+    if attribute(node, "clipPathUnits")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("objectBoundingBox"))
+    {
+        ClipPathUnits::ObjectBoundingBox
+    } else {
+        ClipPathUnits::UserSpaceOnUse
+    }
+}
+
+/// Push a clip for `element`, if it has a resolvable `clip-path`.
+///
+/// `local_bounds` is the geometry bounds for a shape; containers pass `None`
+/// and their descendant geometry is measured when `objectBoundingBox` units
+/// need it. Returns whether a layer was pushed so the caller can pop it.
+fn push_element_clip(
+    raster: &mut Raster,
+    element: &XmlNode,
+    transform: Affine,
+    local_bounds: Option<Bounds>,
+    clip_paths: &BTreeMap<String, &XmlNode>,
+) -> bool {
+    let Some(reference) = attribute(element, "clip-path") else {
+        return false;
+    };
+    let Some(id) = reference_id(reference) else {
+        return false;
+    };
+    let Some(clip) = clip_paths.get(id) else {
+        return false;
+    };
+    let units = clip_path_units(clip);
+    let bounds = match units {
+        ClipPathUnits::UserSpaceOnUse => None,
+        ClipPathUnits::ObjectBoundingBox => {
+            let Some(bounds) = local_bounds.or_else(|| element_bounds(element)) else {
+                return false;
+            };
+            Some(bounds)
+        }
+    };
+    let clip_transform = attribute(clip, "transform").map_or(Affine::IDENTITY, parse_transform);
+    let mut polygons = Vec::new();
+    collect_clip_geometry(
+        clip,
+        clip_transform,
+        transform,
+        units,
+        bounds,
+        &mut polygons,
+    );
+    raster.clip.push(ClipLayer { polygons });
+    true
+}
+
+fn collect_clip_geometry(
+    container: &XmlNode,
+    clip_transform: Affine,
+    element_transform: Affine,
+    units: ClipPathUnits,
+    bounds: Option<Bounds>,
+    polygons: &mut Vec<Vec<(f32, f32)>>,
+) {
+    for child in &container.children {
+        let child_transform = match attribute(child, "transform") {
+            Some(specification) => clip_transform.then(parse_transform(specification)),
+            None => clip_transform,
+        };
+        let mut push = |points: &[(f32, f32)]| {
+            if let Some(polygon) =
+                clip_device_polygon(points, child_transform, element_transform, units, bounds)
+            {
+                polygons.push(polygon);
+            }
+        };
+        match child.name.as_str() {
+            "rect" => {
+                if let Some(points) = rect_polygon(
+                    attribute(child, "x").and_then(parse_length),
+                    attribute(child, "y").and_then(parse_length),
+                    attribute(child, "width").and_then(parse_length),
+                    attribute(child, "height").and_then(parse_length),
+                ) {
+                    push(&points);
+                }
+            }
+            "circle" | "ellipse" => {
+                let cx = attribute(child, "cx").and_then(parse_length).unwrap_or(0.0);
+                let cy = attribute(child, "cy").and_then(parse_length).unwrap_or(0.0);
+                let (rx, ry) = if child.name == "circle" {
+                    let r = attribute(child, "r").and_then(parse_length).unwrap_or(0.0);
+                    (r, r)
+                } else {
+                    (
+                        attribute(child, "rx").and_then(parse_length).unwrap_or(0.0),
+                        attribute(child, "ry").and_then(parse_length).unwrap_or(0.0),
+                    )
+                };
+                if rx > 0.0 && ry > 0.0 {
+                    let points: Vec<_> = (0..48)
+                        .map(|step| {
+                            let angle = std::f32::consts::TAU * step as f32 / 48.0;
+                            (cx + rx * angle.cos(), cy + ry * angle.sin())
+                        })
+                        .collect();
+                    push(&points);
+                }
+            }
+            "polygon" | "polyline" => {
+                if let Some(points) = attribute(child, "points").and_then(parse_points)
+                    && points.len() >= 3
+                {
+                    push(&points);
+                }
+            }
+            "path" => {
+                if let Some(specification) = attribute(child, "d") {
+                    for (subpath, _) in parse_path(specification) {
+                        if subpath.len() >= 3 {
+                            push(&subpath);
+                        }
+                    }
+                }
+            }
+            "g" | "svg" | "a" | "switch" => {
+                collect_clip_geometry(
+                    child,
+                    child_transform,
+                    element_transform,
+                    units,
+                    bounds,
+                    polygons,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn clip_device_polygon(
+    points: &[(f32, f32)],
+    clip_transform: Affine,
+    element_transform: Affine,
+    units: ClipPathUnits,
+    bounds: Option<Bounds>,
+) -> Option<Vec<(f32, f32)>> {
+    if points.len() < 3 {
+        return None;
+    }
+    let mut polygon = Vec::with_capacity(points.len());
+    for (x, y) in points {
+        let (x, y) = clip_transform.apply(*x, *y);
+        let (x, y) = match units {
+            ClipPathUnits::UserSpaceOnUse => (x, y),
+            ClipPathUnits::ObjectBoundingBox => {
+                let bounds = bounds?;
+                (bounds.x + x * bounds.width, bounds.y + y * bounds.height)
+            }
+        };
+        polygon.push(element_transform.apply(x, y));
+    }
+    Some(polygon)
+}
+
+/// Bounds of all shape geometry below `element`, in the element's own user
+/// coordinate system. Used for `clipPathUnits="objectBoundingBox"` on a group.
+fn element_bounds(element: &XmlNode) -> Option<Bounds> {
+    let mut points = Vec::new();
+    collect_bounds(element, Affine::IDENTITY, &mut points);
+    points_bounds(&points)
+}
+
+fn collect_bounds(element: &XmlNode, transform: Affine, points: &mut Vec<(f32, f32)>) {
+    for child in &element.children {
+        let child_transform = match attribute(child, "transform") {
+            Some(specification) => transform.then(parse_transform(specification)),
+            None => transform,
+        };
+        match child.name.as_str() {
+            "rect" => {
+                if let Some(local) = rect_polygon(
+                    attribute(child, "x").and_then(parse_length),
+                    attribute(child, "y").and_then(parse_length),
+                    attribute(child, "width").and_then(parse_length),
+                    attribute(child, "height").and_then(parse_length),
+                ) {
+                    points.extend(local.iter().map(|(x, y)| child_transform.apply(*x, *y)));
+                }
+            }
+            "circle" | "ellipse" => {
+                let cx = attribute(child, "cx").and_then(parse_length).unwrap_or(0.0);
+                let cy = attribute(child, "cy").and_then(parse_length).unwrap_or(0.0);
+                let (rx, ry) = if child.name == "circle" {
+                    let r = attribute(child, "r").and_then(parse_length).unwrap_or(0.0);
+                    (r, r)
+                } else {
+                    (
+                        attribute(child, "rx").and_then(parse_length).unwrap_or(0.0),
+                        attribute(child, "ry").and_then(parse_length).unwrap_or(0.0),
+                    )
+                };
+                if rx > 0.0 && ry > 0.0 {
+                    for step in 0..48 {
+                        let angle = std::f32::consts::TAU * step as f32 / 48.0;
+                        points.push(
+                            child_transform.apply(cx + rx * angle.cos(), cy + ry * angle.sin()),
+                        );
+                    }
+                }
+            }
+            "polygon" | "polyline" => {
+                if let Some(local) = attribute(child, "points").and_then(parse_points) {
+                    points.extend(local.iter().map(|(x, y)| child_transform.apply(*x, *y)));
+                }
+            }
+            "path" => {
+                if let Some(specification) = attribute(child, "d") {
+                    for (subpath, _) in parse_path(specification) {
+                        points.extend(subpath.iter().map(|(x, y)| child_transform.apply(*x, *y)));
+                    }
+                }
+            }
+            "g" | "svg" | "a" | "switch" => {
+                collect_bounds(child, child_transform, points);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1733,6 +2129,20 @@ fn flush_number(number: &mut String, tokens: &mut Vec<PathToken>) {
 mod tests {
     use super::{Color, ImageLimits, decode_svg, decode_svg_viewport, parse_path};
 
+    const T5_MEDAL: &str = r#"<svg class="medal-newlevel-circled" xmlns="http://www.w3.org/2000/svg" data-priority="2" width="32" height="32" viewBox="0 0 32 32" fill="none">
+  <g clip-path="url(#clip0_5048_100697)">
+    <path d="M16 0.75C24.4223 0.75 31.25 7.57766 31.25 16C31.25 24.4223 24.4223 31.25 16 31.25C7.57766 31.25 0.75 24.4223 0.75 16C0.75 7.57766 7.57766 0.75 16 0.75Z" stroke="white" stroke-width="1.5" stroke-miterlimit="10" />
+    <path d="M15.9268 13.5645C19.0638 13.5646 21.6064 16.1081 21.6064 19.2451C21.6063 22.382 19.0637 24.9246 15.9268 24.9248C12.7897 24.9248 10.2463 22.3821 10.2461 19.2451C10.2461 16.108 12.7896 13.5645 15.9268 13.5645ZM15.7949 16.3682C15.0948 16.3734 14.394 16.6404 13.8594 17.168C12.7794 18.2338 12.7794 19.9615 13.8594 21.0273C14.0754 21.2405 14.4255 21.2405 14.6416 21.0273C14.8577 20.8142 14.8577 20.469 14.6416 20.2559C13.9936 19.6163 13.9936 18.579 14.6416 17.9395C14.9625 17.6228 15.3815 17.4632 15.8027 17.46C16.1082 17.4577 16.3547 17.2115 16.3525 16.9102C16.3502 16.6088 16.1003 16.3661 15.7949 16.3682Z" fill="white" />
+    <path d="M15.9268 13.5889C17.2017 13.5889 18.3792 14.0058 19.3311 14.71L16.6689 16.0283C16.2017 16.2596 15.6518 16.2596 15.1846 16.0283L12.5215 14.71C13.4735 14.0054 14.6515 13.5889 15.9268 13.5889ZM22.0127 8.17969C22.9294 8.17972 23.6729 8.91569 23.6729 9.82324V11.5459C23.6729 12.1683 23.3171 12.7372 22.7549 13.0156L20.2305 14.2646C19.0714 13.2768 17.569 12.6797 15.9268 12.6797C14.2845 12.6797 12.7821 13.2768 11.623 14.2646L9.09863 13.0156C8.53631 12.7373 8.18066 12.1683 8.18066 11.5459V9.82324C8.18066 8.91567 8.92412 8.17969 9.84082 8.17969H22.0127Z" fill="white" />
+  </g>
+  <defs>
+    <clipPath id="clip0_5048_100697">
+      <rect width="32" height="32" fill="white" />
+    </clipPath>
+  </defs>
+</svg>
+"#;
+
     #[test]
     fn rect_fill_covers_exact_area() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect x="2" y="3" width="4" height="5" fill="#ff0000"/></svg>"##;
@@ -1918,6 +2328,99 @@ mod tests {
         let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
         assert_eq!(image.pixel(4, 4), Some(Color::rgb(255, 0, 0)));
         assert_eq!(image.pixel(0, 0), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn a_clip_path_limits_fill_and_stroke() {
+        let svg = br#"<svg width="10" height="10"><defs>
+            <clipPath id="c"><rect width="5" height="10"/></clipPath></defs>
+            <g clip-path="url(#c)"><rect width="10" height="10" fill="red"/>
+            <line x1="0" y1="5" x2="10" y2="5" stroke="blue"/></g></svg>""#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(2, 2), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(7, 2), Some(Color::TRANSPARENT));
+        assert_eq!(image.pixel(2, 5), Some(Color::rgb(0, 0, 255)));
+        assert_eq!(image.pixel(7, 5), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn object_bounding_box_clip_path_maps_to_the_element_bounds() {
+        let svg = br#"<svg width="10" height="10"><defs>
+            <clipPath id="c" clipPathUnits="objectBoundingBox">
+              <rect width="0.5" height="1"/></clipPath></defs>
+            <rect x="2" y="2" width="6" height="6" fill="red" clip-path="url(#c)"/></svg>""#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(2, 2), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(4, 4), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(6, 4), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn object_bounding_box_units_on_a_group_use_descendant_bounds() {
+        let svg = br#"<svg width="10" height="10"><defs>
+            <clipPath id="c" clipPathUnits="objectBoundingBox">
+              <rect width="0.5" height="1"/></clipPath></defs>
+            <g clip-path="url(#c)"><rect x="2" y="2" width="6" height="6" fill="red"/></g>
+            </svg>""#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(2, 2), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(4, 4), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(6, 4), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn a_transform_on_the_clip_path_moves_the_clip_region() {
+        let svg = br#"<svg width="10" height="10"><defs>
+            <clipPath id="c" transform="translate(5 0)">
+              <rect width="5" height="10"/></clipPath></defs>
+            <rect width="10" height="10" fill="red" clip-path="url(#c)"/></svg>""#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(2, 2), Some(Color::TRANSPARENT));
+        assert_eq!(image.pixel(7, 2), Some(Color::rgb(255, 0, 0)));
+    }
+
+    #[test]
+    fn nested_clip_paths_intersect() {
+        let svg = br#"<svg width="10" height="10"><defs>
+            <clipPath id="left"><rect width="8" height="10"/></clipPath>
+            <clipPath id="right"><rect x="3" width="7" height="10"/></clipPath></defs>
+            <g clip-path="url(#left)"><g clip-path="url(#right)">
+              <rect width="10" height="10" fill="red"/></g></g></svg>""#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(2, 2), Some(Color::TRANSPARENT));
+        assert_eq!(image.pixel(4, 2), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(8, 2), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn the_t5_rewards_medal_clip_path_keeps_the_icon_visible() {
+        // The template Bing's Rewards widget inserts for the T5 experiment.
+        // Its whole drawing is inside `<g clip-path="url(#clip0_...)">`; a
+        // clip that is parsed but empties the group would erase the medal.
+        let image = decode_svg_viewport(
+            T5_MEDAL.as_bytes(),
+            32,
+            32,
+            Color::WHITE,
+            ImageLimits::default(),
+        )
+        .expect("T5 medal decodes");
+        let mut visible = 0;
+        let mut white = 0;
+        for y in 0..32 {
+            for x in 0..32 {
+                if let Some(pixel) = image.pixel(x, y)
+                    && pixel.alpha > 0
+                {
+                    visible += 1;
+                    if pixel.red > 200 && pixel.green > 200 && pixel.blue > 200 {
+                        white += 1;
+                    }
+                }
+            }
+        }
+        assert!(visible > 150, "only {visible} visible pixels");
+        assert!(white > 50, "only {white} white pixels");
     }
 
     #[test]
