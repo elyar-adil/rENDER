@@ -114,6 +114,8 @@ impl PropertyRegistry {
         for (name, initial) in [
             ("content", "normal"),
             ("clip-path", "none"),
+            ("filter", "none"),
+            ("mask-image", "none"),
             ("background-color", "transparent"),
             ("background-image", "none"),
             ("background-repeat", "repeat"),

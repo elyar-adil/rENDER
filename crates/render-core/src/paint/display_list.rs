@@ -145,12 +145,36 @@ pub enum CompositingReason {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FilterEffect {
+    pub blur: f32,
+    pub brightness: f32,
+}
+
+impl Default for FilterEffect {
+    fn default() -> Self {
+        Self {
+            blur: 0.0,
+            brightness: 1.0,
+        }
+    }
+}
+
+impl FilterEffect {
+    const fn is_none(self) -> bool {
+        self.blur <= 0.0 && (self.brightness - 1.0).abs() < f32::EPSILON
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct StackingContext {
     pub opacity: f32,
     pub transform: Transform2D,
     pub blend_mode: BlendMode,
     pub isolated: bool,
     pub reason: CompositingReason,
+    pub filter: Option<FilterEffect>,
+    /// CSS `mask-image` as a linear-gradient alpha mask over the element box.
+    pub mask: Option<LinearGradient>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -830,16 +854,20 @@ impl<'a> Builder<'a> {
             },
             border_rect,
         );
+        let font_size = style.map_or(16.0, style_font_size);
         let clip_path = clip_path_shape(
             style,
             clip_reference_rect,
-            style.map_or(16.0, style_font_size),
+            font_size,
             self.fragments.viewport,
             self.clip_path_resolver,
             fragment.source,
         );
-        let stacking_context = fragment_stacking_context(opacity, transform, clip_path.is_some());
-        if let Some(context) = stacking_context {
+        let filter = css_filter(style, font_size, self.fragments.viewport);
+        let mask = css_mask_image(style, border_rect, self.options.palette, current_color);
+        let stacking_context =
+            fragment_stacking_context(opacity, transform, clip_path.is_some(), filter, mask);
+        if let Some(context) = stacking_context.clone() {
             self.push_scope(
                 fragment,
                 coordinate_space,
@@ -2053,6 +2081,52 @@ fn overflow_clip_shape(
 /// Percentages resolve against the element's border box. `url()` references
 /// and `path()` are left for the SVG clipPath resolver; the common `inset()`,
 /// `circle()`, `ellipse()` and `polygon()` forms are handled here.
+fn css_filter(
+    style: Option<&ComputedStyle>,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> Option<FilterEffect> {
+    let text = style?.get("filter")?.css_text();
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let mut effect = FilterEffect::default();
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(start) = lower.find("blur(")
+        && let Some(end) = trimmed[start + 5..].find(')')
+    {
+        let argument = trimmed[start + 5..start + 5 + end].trim();
+        effect.blur = resolve_clip_length(argument, 0.0, font_size, viewport)?;
+    }
+    if let Some(start) = lower.find("brightness(")
+        && let Some(end) = trimmed[start + 11..].find(')')
+    {
+        let argument = trimmed[start + 11..start + 11 + end].trim();
+        let value = if let Some(percent) = argument.strip_suffix('%') {
+            percent.parse::<f32>().ok()? / 100.0
+        } else {
+            argument.parse::<f32>().ok()?
+        };
+        effect.brightness = value.max(0.0);
+    }
+    (!effect.is_none()).then_some(effect)
+}
+
+fn css_mask_image(
+    style: Option<&ComputedStyle>,
+    rect: PhysicalRect,
+    palette: SystemPalette,
+    current_color: Color,
+) -> Option<LinearGradient> {
+    let text = style?.get("mask-image")?.css_text();
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    parse_linear_gradient(trimmed, rect, palette, current_color)
+}
+
 fn clip_path_shape(
     style: Option<&ComputedStyle>,
     rect: PhysicalRect,
@@ -2897,31 +2971,29 @@ fn fragment_stacking_context(
     opacity: f32,
     transform: Option<Transform2D>,
     clips: bool,
+    filter: Option<FilterEffect>,
+    mask: Option<LinearGradient>,
 ) -> Option<StackingContext> {
-    match transform {
-        Some(transform) => Some(StackingContext {
-            opacity,
-            transform,
-            blend_mode: BlendMode::Normal,
-            isolated: true,
-            reason: CompositingReason::Transform,
-        }),
-        None if opacity < 1.0 => Some(StackingContext {
-            opacity,
-            transform: Transform2D::default(),
-            blend_mode: BlendMode::Normal,
-            isolated: true,
-            reason: CompositingReason::Opacity,
-        }),
-        None if clips => Some(StackingContext {
-            opacity: 1.0,
-            transform: Transform2D::default(),
-            blend_mode: BlendMode::Normal,
-            isolated: true,
-            reason: CompositingReason::Clip,
-        }),
-        None => None,
-    }
+    let reason = if transform.is_some() {
+        CompositingReason::Transform
+    } else if opacity < 1.0 {
+        CompositingReason::Opacity
+    } else if filter.is_some() {
+        CompositingReason::Filter
+    } else if mask.is_some() || clips {
+        CompositingReason::Clip
+    } else {
+        return None;
+    };
+    Some(StackingContext {
+        opacity,
+        transform: transform.unwrap_or_default(),
+        blend_mode: BlendMode::Normal,
+        isolated: true,
+        reason,
+        filter,
+        mask,
+    })
 }
 
 /// Converts one transform list function into its 2D affine matrix.

@@ -3466,6 +3466,56 @@ mod tests {
         assert!(output.diagnostics.inline_svg.is_empty());
     }
 
+    /// CSS `filter: brightness()` applies to the element's offscreen layer.
+    #[test]
+    fn css_filter_brightness_darkens_the_element() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0; background: white }
+               #box { width: 20px; height: 20px; background: red; filter: brightness(0.5) }
+               </style><div id="box"></div>"#,
+        );
+        let output = document.render_reference(DocumentRenderOptions::default());
+        assert_eq!(
+            output.raster.surface.pixel(10, 10),
+            Some(Color::rgb(128, 0, 0))
+        );
+        assert_eq!(output.raster.surface.pixel(30, 10), Some(Color::WHITE));
+    }
+
+    /// CSS `filter: blur()` spreads pixels beyond the element box.
+    #[test]
+    fn css_filter_blur_spreads_the_element_edge() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0; background: white }
+               #box { width: 10px; height: 10px; background: red; filter: blur(2px) }
+               </style><div id="box"></div>"#,
+        );
+        let output = document.render_reference(DocumentRenderOptions::default());
+        let centre = output.raster.surface.pixel(5, 5).expect("centre");
+        let outside = output.raster.surface.pixel(12, 5).expect("blurred edge");
+        assert_eq!(centre.red, 255);
+        assert!(outside.red > 200 && outside.green > 0, "{outside:?}");
+    }
+
+    /// CSS `mask-image: linear-gradient()` multiplies the layer's alpha.
+    #[test]
+    fn css_mask_image_linear_gradient_limits_the_element() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0; background: white }
+               #box { width: 20px; height: 20px; background: red;
+                      mask-image: linear-gradient(90deg, transparent, black) }
+               </style><div id="box"></div>"#,
+        );
+        let output = document.render_reference(DocumentRenderOptions::default());
+        let left = output.raster.surface.pixel(2, 10).expect("masked left");
+        let right = output.raster.surface.pixel(18, 10).expect("masked right");
+        assert!(left.green > 200 && left.red == 255, "{left:?}");
+        assert!(right.red == 255 && right.green < 50, "{right:?}");
+    }
+
     /// CSS `clip-path: url(#id)` resolves an inline SVG clipPath. This one is
     /// in `objectBoundingBox` units, so its left half covers the left half of
     /// the HTML box.

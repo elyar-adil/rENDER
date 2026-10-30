@@ -1,3 +1,63 @@
+# 交接文档 (2026-10-31, 续二十六) — CSS filter / mask-image
+
+接续 SVG filter 原语会话。这一轮给 HTML 元素的 stacking context 接入
+`filter: blur()/brightness()` 与 `mask-image: linear-gradient(...)`。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **CSS `filter`** | 计算样式注册;解析 `blur(<length>)` 与 `brightness(<number|%>)` |
+| **离屏层** | 有 filter/mask 的元素强制 stacking context;raster 在合成前处理层像素 |
+| **blur** | 可分离高斯卷积,premultiplied RGBA,边界透明 |
+| **brightness** | RGB 通道乘法,alpha 不变 |
+| **CSS `mask-image`** | 支持 `linear-gradient(...)` alpha 遮罩,按元素边框盒投影 |
+| **顺序** | 层内先 brightness 再 blur,再应用 mask,最后 warp/opacity 合成 |
+| **测试** | brightness、blur 扩散、linear-gradient mask,共 3 个 |
+
+## 证据
+
+`cssfilterprobe.html` 像素采样(白底):
+
+```
+brightness(0.5)  (30,222)  = (128,0,0)
+blur 中心/边缘    (100,222) = (255,142,142)
+                 (115,222) = (255,245,245)
+mask 左/右        (160,222) = (255,210,210)
+                 (200,222) = (255,40,40)
+```
+
+即亮度减半、blur 向盒外扩散、linear-gradient 从透明到不透明。
+
+Bing / Baidu / JD 冒烟:
+
+```
+Bing:  ready=Complete    dom_elements=488 boxes=165 images_failed=0
+Baidu: ready=Complete    dom_elements=453 boxes=156 images_failed=0
+JD:    ready=Loading     dom_elements=843 boxes=117 images_failed=1
+```
+
+JD 主商品区仍为空(风控 403,同机 Edge 也 403)。
+
+## 验证
+
+```
+cargo test --workspace                       2755 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+```
+
+## 明确未做 / 下一步
+
+- CSS filter 仅 blur/brightness;grayscale/saturate/drop-shadow 等未实现。
+- mask-image 仅 linear-gradient;radial-gradient、URL/图片源、mask-size/position/
+  mask-mode 未实现。
+- 高级渐变(`xlink:href`/`spreadMethod`/径向焦点)、IndexedDB 值类型覆盖仍未完成。
+- JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;AVIF 依赖系统 dav1d。
+
+---
+
 # 交接文档 (2026-10-31, 续二十五) — feOffset / feBlend / feComposite
 
 接续组级 opacity 会话。这一轮把 SVG filter 从 blur/color-matrix 扩展到常用的
@@ -54,7 +114,8 @@ image::svg                                   46 passed
 - `feFlood`/`feImage`/`feMorphology`/`feTurbulence`/`feDisplacementMap` 等原语
   未实现;`feComposite arithmetic` 的 k1..k4 仍按 source-over 近似。
 - `color-interpolation-filters` 固定 sRGB;filter 的完整 DAG/分支语义未覆盖。
-- CSS `filter`、CSS mask、高级渐变、IndexedDB 值类型覆盖仍未完成。
+- CSS `filter`(blur/brightness)与 `mask-image`(linear-gradient)已在续二十六实现;
+  高级渐变、IndexedDB 值类型覆盖仍未完成。
 - JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;AVIF 依赖系统 dav1d。
 
 ---
@@ -110,7 +171,7 @@ image::svg                                   43 passed
 ## 明确未做 / 下一步
 
 - opacity 只处理 SVG 栅格器内的元素;HTML/CSS `opacity` 已有 stacking context
-  实现,但 CSS mask/filter 形式仍未接入。
+  实现;CSS filter blur/brightness 与 mask-image linear-gradient 已在续二十六接入。
 - 更多 SVG filter 原语(`feOffset`/`feBlend`/`feComposite` 等)、高级渐变
   (`xlink:href`/`spreadMethod`/径向焦点)仍未实现。
 - `content` 仍只支持字符串;IndexedDB 值类型覆盖有限;JD 风控、GitHub/HN
@@ -417,7 +478,7 @@ image::svg                                   36 passed
 - AVIF 解码依赖系统 dav1d,不是纯 Rust 便携路径;AVIF 动画/序列仍未处理。
 - 非图片小响应回退是视觉占位,不会真正解码 BMP/TIFF 等其它未支持格式。
 - SVG `filter` 已支持 blur/color-matrix/offset/blend/composite;CSS `filter`
-  未实现;CSS `clip-path`
+  blur/brightness 已在续二十六实现;CSS `clip-path`
   已在续二十二实现;组级 `opacity` 已在续二十四实现,高级渐变仍未实现。
 - 其它图片格式/真实 CDN 变体仍需继续抽样;IndexedDB 已持久化(续二十一);JD 风控、
   GitHub/HN 链路阻断是外部条件。
@@ -491,7 +552,8 @@ image::svg                                   36 passed
   `feFlood`/`feImage`/`feMorphology`/`feTurbulence` 等仍未实现。
 - `color-interpolation-filters` 固定 sRGB,未做 linearRGB;`feColorMatrix`
   只做单链,不解析命名 `result`。
-- `filter` 只支持属性,不支持 CSS `filter`;filter 内容中的 `<text>` 不绘制。
+- CSS `filter` 已支持 blur/brightness(续二十六);更多 filter 函数与 filter
+  内容中的 `<text>` 未实现。
 - CSS `clip-path` 已在续二十二实现;高级渐变、
   `content` 字符串以外内容仍未实现。
 - IndexedDB 已持久化(续二十一);JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;
@@ -561,7 +623,8 @@ image::svg                                   33 passed
 
 ## 明确未做 / 下一步
 
-- `mask` 只支持属性,不支持 CSS `mask-image`/`mask-mode`;mask 内容中的
+- CSS `mask-image` 已支持 linear-gradient(续二十六);`mask-mode`/URL 源与
+  mask 内容中的
   `<text>` 仍不绘制;`filter` 已在续十九实现。
 - 除 blur/color-matrix/offset/blend/composite 外的 filter 原语仍未实现;
   组级 `opacity` 已在续二十四实现,CSS `clip-path` 已在续二十二实现。

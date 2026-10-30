@@ -11,9 +11,9 @@ use crate::layout::{PhysicalPoint, PhysicalRect, StickyConstraint};
 use super::color::{Color, clamped_rounded_u8};
 use super::display_list::{
     BorderPaint, BoxShadowPaint, ClipFillRule, ClipShape, CornerRadii, DisplayCommand, DisplayItem,
-    DisplayItemId, DisplayList, FontInstanceId, GlyphId, GlyphRun, LinearGradient, ListMarkerPaint,
-    ListMarkerShape, PaintCoordinateSpace, StackingContext, TextDecoration, TextDecorationStyle,
-    TextShadowPaint, Transform2D,
+    DisplayItemId, DisplayList, FilterEffect, FontInstanceId, GlyphId, GlyphRun, LinearGradient,
+    ListMarkerPaint, ListMarkerShape, PaintCoordinateSpace, StackingContext, TextDecoration,
+    TextDecorationStyle, TextShadowPaint, Transform2D,
 };
 use super::scene::{PaintDamage, PaintScene, RetainedFrame};
 use super::sticky::sticky_displacement;
@@ -61,6 +61,10 @@ impl Surface {
     #[must_use]
     pub fn pixels(&self) -> &[Color] {
         &self.pixels
+    }
+
+    pub(crate) fn pixels_mut(&mut self) -> &mut [Color] {
+        &mut self.pixels
     }
 
     #[must_use]
@@ -435,6 +439,8 @@ enum StackingFrame {
         transform: Transform2D,
         offset: PhysicalPoint,
         opacity: f32,
+        filter: Option<FilterEffect>,
+        mask: Option<LinearGradient>,
     },
 }
 
@@ -578,7 +584,9 @@ impl<'a> RasterState<'a> {
             DisplayCommand::Border(border) => self.paint_border(item.id, border, offset),
             DisplayCommand::PushClip(shape) => self.push_clip(*shape, offset),
             DisplayCommand::PopClip => self.pop_clip(item.id),
-            DisplayCommand::PushStackingContext(context) => self.push_stacking_context(*context),
+            DisplayCommand::PushStackingContext(context) => {
+                self.push_stacking_context(context.clone());
+            }
             DisplayCommand::PopStackingContext => self.pop_stacking_context(item.id),
             DisplayCommand::PushSticky(constraint) => self.push_sticky(constraint),
             DisplayCommand::PopSticky => self.pop_sticky(item.id),
@@ -1096,7 +1104,11 @@ impl<'a> RasterState<'a> {
         // accumulate it into the offset instead of paying for an offscreen
         // surface. Clips pushed inside inherit the shift because push_clip
         // translates shapes by the current item offset.
-        if context.transform.is_translation() && context.opacity == 1.0 {
+        if context.transform.is_translation()
+            && context.opacity == 1.0
+            && context.filter.is_none()
+            && context.mask.is_none()
+        {
             let (translate_x, translate_y) = context.transform.translation();
             self.translation.x += translate_x;
             self.translation.y += translate_y;
@@ -1116,6 +1128,8 @@ impl<'a> RasterState<'a> {
             transform: context.transform,
             offset: self.item_offset(PaintCoordinateSpace::Document),
             opacity: context.opacity,
+            filter: context.filter,
+            mask: context.mask,
         });
         self.layers
             .push(Surface::new(self.width, self.height, Color::TRANSPARENT));
@@ -1131,7 +1145,9 @@ impl<'a> RasterState<'a> {
                 transform,
                 offset,
                 opacity,
-            }) => self.warp_top_layer(transform, offset, opacity),
+                filter,
+                mask,
+            }) => self.warp_top_layer(transform, offset, opacity, filter, mask),
             None => {
                 self.diagnostics.push(RasterDiagnostic {
                     item,
@@ -1148,8 +1164,21 @@ impl<'a> RasterState<'a> {
     /// Layer pixels hold `document point + push-time offset`, so the mapping
     /// from layer pixels to parent pixels is
     /// `T(offset) �?transform �?T(−offset)`.
-    fn warp_top_layer(&mut self, transform: Transform2D, offset: PhysicalPoint, opacity: f32) {
-        let layer = self.layers.pop().expect("layer frame has a surface");
+    fn warp_top_layer(
+        &mut self,
+        transform: Transform2D,
+        offset: PhysicalPoint,
+        opacity: f32,
+        filter: Option<FilterEffect>,
+        mask: Option<LinearGradient>,
+    ) {
+        let mut layer = self.layers.pop().expect("layer frame has a surface");
+        if let Some(filter) = filter {
+            apply_filter_effect(&mut layer, filter);
+        }
+        if let Some(mask) = mask {
+            apply_linear_mask(&mut layer, &mask);
+        }
         let into_layer = Transform2D {
             translate_x: -offset.x,
             translate_y: -offset.y,
@@ -1191,11 +1220,13 @@ impl<'a> RasterState<'a> {
                 transform,
                 offset,
                 opacity,
+                filter,
+                mask,
             } = frame
             else {
                 continue;
             };
-            self.warp_top_layer(transform, offset, opacity);
+            self.warp_top_layer(transform, offset, opacity, filter, mask);
         }
         self.output()
     }
@@ -1206,6 +1237,8 @@ impl<'a> RasterState<'a> {
                 transform,
                 offset,
                 opacity,
+                filter,
+                mask,
             } = frame
             else {
                 continue;
@@ -1213,7 +1246,7 @@ impl<'a> RasterState<'a> {
             if self.is_cancelled() {
                 return Err(RasterCancelled);
             }
-            self.warp_top_layer(transform, offset, opacity);
+            self.warp_top_layer(transform, offset, opacity, filter, mask);
             if self.was_cancelled() {
                 return Err(RasterCancelled);
             }
@@ -2300,6 +2333,143 @@ fn paint_image(
 /// rectangle is honored here, on par with the former 1:1 composite: rounded
 /// clip shapes stay a paint-time concern because the source surface already
 /// carries their coverage. A singular transform paints nothing.
+fn apply_filter_effect(surface: &mut Surface, effect: FilterEffect) {
+    if (effect.brightness - 1.0).abs() > f32::EPSILON {
+        for pixel in surface.pixels_mut() {
+            let scale =
+                |channel: u8| -> u8 { clamped_rounded_u8(f32::from(channel) * effect.brightness) };
+            *pixel = Color::rgba(
+                scale(pixel.red),
+                scale(pixel.green),
+                scale(pixel.blue),
+                pixel.alpha,
+            );
+        }
+    }
+    if effect.blur > 0.0 {
+        blur_surface(surface, effect.blur);
+    }
+}
+
+fn apply_linear_mask(surface: &mut Surface, mask: &LinearGradient) {
+    let width = surface.width();
+    let height = surface.height();
+    let dx = mask.end.x - mask.start.x;
+    let dy = mask.end.y - mask.start.y;
+    let denominator = dx.mul_add(dx, dy * dy);
+    if denominator <= f32::EPSILON {
+        return;
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let pixel_x = u32_to_f32(x) + 0.5;
+            let pixel_y = u32_to_f32(y) + 0.5;
+            let progress = ((pixel_x - mask.start.x).mul_add(dx, (pixel_y - mask.start.y) * dy)
+                / denominator)
+                .clamp(0.0, 1.0);
+            let coverage = f32::from(gradient_color(&mask.stops, progress).alpha) / 255.0;
+            if let Some(index) = surface.index(x, y) {
+                let pixel = surface.pixels[index];
+                surface.pixels[index] = pixel.with_opacity(coverage);
+            }
+        }
+    }
+}
+
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "image dimensions are bounded by ImageLimits"
+)]
+fn blur_surface(surface: &mut Surface, sigma: f32) {
+    let sigma = sigma.clamp(0.0, 64.0);
+    if sigma < 0.05 {
+        return;
+    }
+    let width = surface.width();
+    let height = surface.height();
+    let mut premultiplied: Vec<[f32; 4]> = surface
+        .pixels()
+        .iter()
+        .map(|pixel| {
+            let alpha = f32::from(pixel.alpha) / 255.0;
+            [
+                f32::from(pixel.red) / 255.0 * alpha,
+                f32::from(pixel.green) / 255.0 * alpha,
+                f32::from(pixel.blue) / 255.0 * alpha,
+                alpha,
+            ]
+        })
+        .collect();
+    premultiplied = blur_axis(&premultiplied, width, height, sigma, true);
+    premultiplied = blur_axis(&premultiplied, width, height, sigma, false);
+    for (pixel, source) in surface.pixels_mut().iter_mut().zip(premultiplied) {
+        let alpha = source[3].clamp(0.0, 1.0);
+        if alpha <= 0.0001 {
+            *pixel = Color::TRANSPARENT;
+        } else {
+            *pixel = Color::rgba(
+                clamped_rounded_u8(source[0] / alpha * 255.0),
+                clamped_rounded_u8(source[1] / alpha * 255.0),
+                clamped_rounded_u8(source[2] / alpha * 255.0),
+                clamped_rounded_u8(alpha * 255.0),
+            );
+        }
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "the kernel radius and image dimensions are bounded"
+)]
+fn blur_axis(
+    source: &[[f32; 4]],
+    width: u32,
+    height: u32,
+    sigma: f32,
+    horizontal: bool,
+) -> Vec<[f32; 4]> {
+    let radius = (sigma * 3.0).ceil().clamp(1.0, 64.0) as i32;
+    let mut weights = Vec::with_capacity((radius * 2 + 1) as usize);
+    let mut total = 0.0_f32;
+    for offset in -radius..=radius {
+        let weight = (-(offset as f32).powi(2) / (2.0 * sigma * sigma)).exp();
+        weights.push(weight);
+        total += weight;
+    }
+    for weight in &mut weights {
+        *weight /= total;
+    }
+    let mut output = vec![[0.0_f32; 4]; source.len()];
+    for y in 0..height as i32 {
+        for x in 0..width as i32 {
+            let mut sum = [0.0_f32; 4];
+            for (index, offset) in (-radius..=radius).enumerate() {
+                let (sample_x, sample_y) = if horizontal {
+                    (x + offset, y)
+                } else {
+                    (x, y + offset)
+                };
+                if sample_x < 0
+                    || sample_y < 0
+                    || sample_x >= width as i32
+                    || sample_y >= height as i32
+                {
+                    continue;
+                }
+                let pixel = source[sample_y as usize * width as usize + sample_x as usize];
+                for channel in 0..4 {
+                    sum[channel] += pixel[channel] * weights[index];
+                }
+            }
+            output[y as usize * width as usize + x as usize] = sum;
+        }
+    }
+    output
+}
+
 fn warp_surface(
     destination: &mut Surface,
     source: &Surface,
@@ -3339,6 +3509,8 @@ mod tests {
             blend_mode: BlendMode::Normal,
             isolated: true,
             reason: CompositingReason::Transform,
+            filter: None,
+            mask: None,
         }
     }
 
