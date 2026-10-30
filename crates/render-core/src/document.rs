@@ -3399,6 +3399,27 @@ mod tests {
         assert!(output.diagnostics.inline_svg.is_empty());
     }
 
+    /// CSS `clip-path: circle()` must clip the element's background and
+    /// children, not merely reach the display list. The corners of the 20x20
+    /// red box are outside the 5px circle; the centre is inside.
+    #[test]
+    fn css_clip_path_circle_clips_the_painted_box() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0; background: white }
+               #box { width: 20px; height: 20px; background: red;
+                      clip-path: circle(5px at 10px 10px) }
+               </style><div id="box"></div>"#,
+        );
+        let output = document.render_reference(DocumentRenderOptions::default());
+        assert_eq!(
+            output.raster.surface.pixel(10, 10),
+            Some(Color::rgb(255, 0, 0))
+        );
+        assert_eq!(output.raster.surface.pixel(0, 0), Some(Color::WHITE));
+        assert_eq!(output.raster.surface.pixel(19, 19), Some(Color::WHITE));
+    }
+
     /// `currentColor` inside an inline `svg` takes the element's computed
     /// `color`, and changing that colour under unchanged markup re-rasterises
     /// the icon on the next render.

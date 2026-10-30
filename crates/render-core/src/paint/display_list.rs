@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::css::computed::{ComputedStyle, ComputedValue};
+use crate::css::length::{LengthContext, resolve_length_expr};
 use crate::css::properties::{
     BorderStyle, CssColor, Display, LengthPercentage, LengthResolutionContext, ObjectFit, Overflow,
     Position, Size, TransformFunction, TransformList, TransformOrigin, TypedPropertyValue,
@@ -139,6 +140,7 @@ pub enum CompositingReason {
     Transform,
     Isolation,
     Filter,
+    Clip,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -150,12 +152,37 @@ pub struct StackingContext {
     pub reason: CompositingReason,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipFillRule {
+    NonZero,
+    EvenOdd,
+}
+
+const MAX_CLIP_POLYGON_POINTS: usize = 24;
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a fixed 32-point polygon keeps ClipShape Copy for the clip stack"
+)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ClipShape {
     Rect(PhysicalRect),
     RoundedRect {
         rect: PhysicalRect,
         radii: CornerRadii,
+    },
+    Circle {
+        center: PhysicalPoint,
+        radius: f32,
+    },
+    Ellipse {
+        center: PhysicalPoint,
+        radii: PhysicalSize,
+    },
+    Polygon {
+        points: [PhysicalPoint; MAX_CLIP_POLYGON_POINTS],
+        count: u8,
+        fill_rule: ClipFillRule,
     },
 }
 
@@ -743,7 +770,13 @@ impl<'a> Builder<'a> {
         // same way opacity groups it behind an alpha. When both apply, a
         // single stacking context carries them so rasterization only pays
         // for one offscreen group.
-        let stacking_context = fragment_stacking_context(opacity, transform);
+        let clip_path = clip_path_shape(
+            style,
+            border_rect,
+            style.map_or(16.0, style_font_size),
+            self.fragments.viewport,
+        );
+        let stacking_context = fragment_stacking_context(opacity, transform, clip_path.is_some());
         if let Some(context) = stacking_context {
             self.push_scope(
                 fragment,
@@ -752,6 +785,15 @@ impl<'a> Builder<'a> {
             );
         }
 
+        if let Some(shape) = clip_path {
+            self.push(
+                fragment,
+                PaintPhase::Background,
+                clip_shape_rect(shape),
+                coordinate_space,
+                DisplayCommand::PushClip(shape),
+            );
+        }
         if !hidden {
             match &fragment.kind {
                 FragmentKind::Box(geometry) => {
@@ -837,6 +879,15 @@ impl<'a> Builder<'a> {
                 fragment,
                 PaintPhase::Content,
                 fragment.rect,
+                coordinate_space,
+                DisplayCommand::PopClip,
+            );
+        }
+        if let Some(shape) = clip_path {
+            self.push(
+                fragment,
+                PaintPhase::Background,
+                clip_shape_rect(shape),
                 coordinate_space,
                 DisplayCommand::PopClip,
             );
@@ -1935,9 +1986,313 @@ fn overflow_clip_shape(
     }
 }
 
+/// Parse the CSS `clip-path` basic-shape subset.
+///
+/// Percentages resolve against the element's border box. `url()` references
+/// and `path()` are left for the SVG clipPath resolver; the common `inset()`,
+/// `circle()`, `ellipse()` and `polygon()` forms are handled here.
+fn clip_path_shape(
+    style: Option<&ComputedStyle>,
+    rect: PhysicalRect,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> Option<ClipShape> {
+    let text = style?.get("clip-path")?.css_text();
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let open = trimmed.find('(')?;
+    let close = trimmed.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let name = trimmed[..open].trim().to_ascii_lowercase();
+    let inner = trimmed[open + 1..close].trim();
+    match name.as_str() {
+        "inset" => parse_inset_clip(inner, rect, font_size, viewport),
+        "circle" => parse_circle_clip(inner, rect, font_size, viewport),
+        "ellipse" => parse_ellipse_clip(inner, rect, font_size, viewport),
+        "polygon" => Some(parse_polygon_clip(inner, rect, font_size, viewport)),
+        _ => None,
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "clip-path lengths are device pixels, which are f32"
+)]
+fn resolve_clip_length(
+    text: &str,
+    basis: f32,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> Option<f32> {
+    let context = LengthContext {
+        percentage_base: Some(f64::from(basis)),
+        em_base: f64::from(font_size),
+        rem_base: 16.0,
+        viewport_width: f64::from(viewport.width),
+        viewport_height: f64::from(viewport.height),
+        ..LengthContext::default()
+    };
+    resolve_length_expr(text, &context)
+        .ok()
+        .map(|value| value as f32)
+}
+
+fn split_at_clause(text: &str) -> (&str, &str) {
+    let lower = text.to_ascii_lowercase();
+    match lower.find(" at ") {
+        Some(index) => (&text[..index], &text[index + 4..]),
+        None => (text, ""),
+    }
+}
+
+fn parse_center(
+    text: &str,
+    rect: PhysicalRect,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> PhysicalPoint {
+    let mut parts = text.split_whitespace();
+    let x = parts
+        .next()
+        .and_then(|value| resolve_clip_length(value, rect.size.width, font_size, viewport))
+        .unwrap_or(rect.size.width / 2.0);
+    let y = parts
+        .next()
+        .and_then(|value| resolve_clip_length(value, rect.size.height, font_size, viewport))
+        .unwrap_or(rect.size.height / 2.0);
+    PhysicalPoint {
+        x: rect.origin.x + x,
+        y: rect.origin.y + y,
+    }
+}
+
+fn parse_inset_clip(
+    text: &str,
+    rect: PhysicalRect,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> Option<ClipShape> {
+    let lower = text.to_ascii_lowercase();
+    let (outer, round) = match lower.find(" round ") {
+        Some(index) => (&text[..index], Some(&text[index + 7..])),
+        None => (text, None),
+    };
+    let parts: Vec<&str> = outer.split_whitespace().collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let resolve = |index: usize, basis: f32, fallback: &str| {
+        resolve_clip_length(
+            parts.get(index).copied().unwrap_or(fallback),
+            basis,
+            font_size,
+            viewport,
+        )
+        .unwrap_or(0.0)
+    };
+    let top = resolve(0, rect.size.height, "0");
+    let right = resolve(1, rect.size.width, parts[0]);
+    let bottom = resolve(2, rect.size.height, parts[0]);
+    let left = resolve(
+        3,
+        rect.size.width,
+        parts.get(1).copied().unwrap_or(parts[0]),
+    );
+    let x = rect.origin.x + left;
+    let y = rect.origin.y + top;
+    let width = (rect.size.width - left - right).max(0.0);
+    let height = (rect.size.height - top - bottom).max(0.0);
+    if let Some(round) = round {
+        let values: Vec<f32> = round
+            .split_whitespace()
+            .filter_map(|value| resolve_clip_length(value, width.min(height), font_size, viewport))
+            .collect();
+        let radii = match values.as_slice() {
+            [all] => CornerRadii {
+                top_left: *all,
+                top_right: *all,
+                bottom_right: *all,
+                bottom_left: *all,
+            },
+            [first, second] => CornerRadii {
+                top_left: *first,
+                top_right: *second,
+                bottom_right: *first,
+                bottom_left: *second,
+            },
+            [first, second, third] => CornerRadii {
+                top_left: *first,
+                top_right: *second,
+                bottom_right: *third,
+                bottom_left: *second,
+            },
+            [first, second, third, fourth, ..] => CornerRadii {
+                top_left: *first,
+                top_right: *second,
+                bottom_right: *third,
+                bottom_left: *fourth,
+            },
+            [] => CornerRadii::default(),
+        };
+        if radii.top_left > 0.0
+            || radii.top_right > 0.0
+            || radii.bottom_right > 0.0
+            || radii.bottom_left > 0.0
+        {
+            return Some(ClipShape::RoundedRect {
+                rect: PhysicalRect::new(x, y, width, height),
+                radii,
+            });
+        }
+    }
+    Some(ClipShape::Rect(PhysicalRect::new(x, y, width, height)))
+}
+
+fn parse_circle_clip(
+    text: &str,
+    rect: PhysicalRect,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> Option<ClipShape> {
+    let (radius_text, center_text) = split_at_clause(text);
+    let center = if center_text.is_empty() {
+        PhysicalPoint {
+            x: rect.origin.x + rect.size.width / 2.0,
+            y: rect.origin.y + rect.size.height / 2.0,
+        }
+    } else {
+        parse_center(center_text, rect, font_size, viewport)
+    };
+    let radius = if radius_text.trim().is_empty()
+        || radius_text.trim().eq_ignore_ascii_case("closest-side")
+    {
+        rect.size.width.min(rect.size.height) / 2.0
+    } else {
+        resolve_clip_length(
+            radius_text.trim(),
+            rect.size.width.min(rect.size.height),
+            font_size,
+            viewport,
+        )?
+    };
+    Some(ClipShape::Circle { center, radius })
+}
+
+fn parse_ellipse_clip(
+    text: &str,
+    rect: PhysicalRect,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> Option<ClipShape> {
+    let (radii_text, center_text) = split_at_clause(text);
+    let mut parts = radii_text.split_whitespace();
+    let rx = parts
+        .next()
+        .and_then(|value| resolve_clip_length(value, rect.size.width, font_size, viewport))?;
+    let ry = parts
+        .next()
+        .and_then(|value| resolve_clip_length(value, rect.size.height, font_size, viewport))?;
+    let center = if center_text.is_empty() {
+        PhysicalPoint {
+            x: rect.origin.x + rect.size.width / 2.0,
+            y: rect.origin.y + rect.size.height / 2.0,
+        }
+    } else {
+        parse_center(center_text, rect, font_size, viewport)
+    };
+    Some(ClipShape::Ellipse {
+        center,
+        radii: PhysicalSize {
+            width: rx,
+            height: ry,
+        },
+    })
+}
+
+fn parse_polygon_clip(
+    text: &str,
+    rect: PhysicalRect,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> ClipShape {
+    let mut tokens: Vec<&str> = text
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .filter(|token| !token.is_empty())
+        .collect();
+    let mut fill_rule = ClipFillRule::NonZero;
+    if let Some(first) = tokens.first() {
+        if first.eq_ignore_ascii_case("evenodd") {
+            fill_rule = ClipFillRule::EvenOdd;
+            tokens.remove(0);
+        } else if first.eq_ignore_ascii_case("nonzero") {
+            tokens.remove(0);
+        }
+    }
+    let mut points = [PhysicalPoint { x: 0.0, y: 0.0 }; MAX_CLIP_POLYGON_POINTS];
+    let mut count = 0_usize;
+    for pair in tokens.chunks(2) {
+        if pair.len() < 2 || count >= MAX_CLIP_POLYGON_POINTS {
+            break;
+        }
+        let Some(x) = resolve_clip_length(pair[0], rect.size.width, font_size, viewport) else {
+            continue;
+        };
+        let Some(y) = resolve_clip_length(pair[1], rect.size.height, font_size, viewport) else {
+            continue;
+        };
+        points[count] = PhysicalPoint {
+            x: rect.origin.x + x,
+            y: rect.origin.y + y,
+        };
+        count += 1;
+    }
+    ClipShape::Polygon {
+        points,
+        count: u8::try_from(count).unwrap_or(0),
+        fill_rule,
+    }
+}
+
 fn clip_shape_rect(shape: ClipShape) -> PhysicalRect {
     match shape {
         ClipShape::Rect(rect) | ClipShape::RoundedRect { rect, .. } => rect,
+        ClipShape::Circle { center, radius } => PhysicalRect::new(
+            center.x - radius,
+            center.y - radius,
+            radius * 2.0,
+            radius * 2.0,
+        ),
+        ClipShape::Ellipse { center, radii } => PhysicalRect::new(
+            center.x - radii.width,
+            center.y - radii.height,
+            radii.width * 2.0,
+            radii.height * 2.0,
+        ),
+        ClipShape::Polygon { points, count, .. } => {
+            let count = usize::from(count);
+            if count == 0 {
+                PhysicalRect::new(0.0, 0.0, 0.0, 0.0)
+            } else {
+                let mut minimum = points[0];
+                let mut maximum = points[0];
+                for point in &points[1..count] {
+                    minimum.x = minimum.x.min(point.x);
+                    minimum.y = minimum.y.min(point.y);
+                    maximum.x = maximum.x.max(point.x);
+                    maximum.y = maximum.y.max(point.y);
+                }
+                PhysicalRect::new(
+                    minimum.x,
+                    minimum.y,
+                    maximum.x - minimum.x,
+                    maximum.y - minimum.y,
+                )
+            }
+        }
     }
 }
 
@@ -2392,6 +2747,7 @@ fn fragment_opacity(style: Option<&ComputedStyle>) -> f32 {
 fn fragment_stacking_context(
     opacity: f32,
     transform: Option<Transform2D>,
+    clips: bool,
 ) -> Option<StackingContext> {
     match transform {
         Some(transform) => Some(StackingContext {
@@ -2407,6 +2763,13 @@ fn fragment_stacking_context(
             blend_mode: BlendMode::Normal,
             isolated: true,
             reason: CompositingReason::Opacity,
+        }),
+        None if clips => Some(StackingContext {
+            opacity: 1.0,
+            transform: Transform2D::default(),
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            reason: CompositingReason::Clip,
         }),
         None => None,
     }
@@ -3010,9 +3373,9 @@ mod tests {
     use crate::paint::Color;
 
     use super::{
-        Builder, ClipShape, CompositingReason, DisplayCommand, DisplayListBuildOutput,
-        DisplayListBuilderOptions, GlyphRun, ImagePaint, ListMarkerPaint, ListMarkerShape,
-        ReferenceTextShaper, StackingContext, TextDecoration, TextDecorationLine,
+        Builder, ClipFillRule, ClipShape, CompositingReason, DisplayCommand,
+        DisplayListBuildOutput, DisplayListBuilderOptions, GlyphRun, ImagePaint, ListMarkerPaint,
+        ListMarkerShape, ReferenceTextShaper, StackingContext, TextDecoration, TextDecorationLine,
         TextDecorationStyle, TextShadowPaint, TextShaper, Transform2D, build_display_list,
         build_display_list_with_images,
     };
@@ -3163,6 +3526,95 @@ mod tests {
                     && (radii.top_left - 10.0).abs() < f32::EPSILON
             }),
             "missing rounded padding-box clip: {clips:?}"
+        );
+    }
+
+    #[test]
+    fn css_clip_path_basic_shapes_reach_the_display_list() {
+        let output = parse_document(
+            "<!doctype html><body><div id=inset></div><div id=circle></div><div id=poly></div></body>",
+        );
+        let sheet = parse_stylesheet(
+            "html, body { display:block; margin:0 } div { display:block; width:80px; height:40px } \
+             #inset { clip-path: inset(5px 10px 15px 20px round 4px) } \
+             #circle { clip-path: circle(20px at 30px 10px) } \
+             #poly { clip-path: polygon(0 0, 100% 0, 0 100%) }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let layout = layout_formatting_tree(
+            &output.dom,
+            &formatting,
+            &styles,
+            LayoutOptions::default(),
+            &SimpleTextMeasurer,
+        );
+        let display = build_display_list(
+            &layout.fragments,
+            &formatting,
+            &styles,
+            DisplayListBuilderOptions::default(),
+            &ReferenceTextShaper,
+        );
+        let node = |id: &str| {
+            let selector = parse_selector_list(&format!("#{id}")).unwrap();
+            select_all(
+                &output.dom,
+                output.dom.document(),
+                &selector,
+                &MatchContext::default(),
+            )[0]
+        };
+        let clips = |source: NodeId| {
+            display
+                .list
+                .items()
+                .iter()
+                .filter(|item| item.source == Some(source))
+                .filter_map(|item| match &item.command {
+                    DisplayCommand::PushClip(shape) => Some(*shape),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let inset = clips(node("inset"));
+        assert!(
+            inset.iter().any(|shape| matches!(
+                shape,
+                ClipShape::RoundedRect { rect, radii }
+                    if *rect == PhysicalRect::new(20.0, 5.0, 50.0, 20.0)
+                        && (radii.top_left - 4.0).abs() < f32::EPSILON
+            )),
+            "{inset:?}"
+        );
+        let circle = clips(node("circle"));
+        assert!(
+            circle.iter().any(|shape| matches!(
+                shape,
+                ClipShape::Circle { center, radius }
+                    if *center == PhysicalPoint { x: 30.0, y: 50.0 }
+                        && (*radius - 20.0).abs() < f32::EPSILON
+            )),
+            "{circle:?}"
+        );
+        let polygon = clips(node("poly"));
+        assert!(
+            polygon.iter().any(|shape| matches!(
+                shape,
+                ClipShape::Polygon { count, fill_rule, .. }
+                    if usize::from(*count) == 3 && *fill_rule == ClipFillRule::NonZero
+            )),
+            "{polygon:?}"
         );
     }
 

@@ -1,3 +1,72 @@
+# 交接文档 (2026-10-31, 续二十二) — CSS clip-path 与 SVG clip-rule
+
+接续 IndexedDB 会话。这一轮给 HTML 元素接入 CSS `clip-path` 的常用基本形状,
+并让 SVG `clipPath` 真正遵守 `clip-rule` 的 nonzero/evenodd 差异。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **CSS `clip-path` 属性** | 计算样式注册 `clip-path`;paint 阶段按边框盒解析 |
+| **基本形状** | `inset()`(含 `round`)、`circle()`、`ellipse()`、`polygon()` |
+| **百分比/长度** | 百分比按边框盒宽高解析;像素/em/rem/viewport 长度复用现有长度解析器 |
+| **ClipShape** | 新增 Circle/Ellipse/Polygon(最多 24 点,保持 Copy),光栅器逐像素包含测试 |
+| **层叠/定位** | clip-path 元素创建局部 stacking context,定位后代也在裁剪范围内 |
+| **SVG `clip-rule`** | 默认 nonzero;`clip-rule="evenodd"` 与 `style="clip-rule:evenodd"` 生效;同一 path 的多个子路径参与同一个填充规则 |
+| **测试** | display-list 形状解析、圆裁剪像素、SVG evenodd/nonzero、style 属性 |
+
+## 证据
+
+`clipprobe.html` 像素采样(白色背景):
+
+```
+inset-out  (10,202)  = (255,255,255)   # 左上角被裁掉
+inset-in   (30,222)  = (255,0,0)       # inset 内部保留
+circle-out (130,202) = (255,255,255)   # 圆角外
+circle-in  (180,252) = (0,200,0)       # 圆心保留
+poly-in    (252,202) = (0,0,255)       # 三角形内部
+poly-out   (340,292) = (255,255,255)   # 三角形右下角外
+```
+
+SVG `clip-rule`:
+
+```
+clip-rule="evenodd" 中心像素透明、环带红色
+默认 nonzero       中心像素红色
+style="clip-rule: evenodd" 同样切出洞
+```
+
+Bing / Baidu / JD 冒烟:
+
+```
+Bing:  ready=Complete    dom_elements=472 boxes=167 images_failed=0
+Baidu: ready=Complete    dom_elements=453 boxes=156 images_failed=0
+JD:    ready=Interactive dom_elements=1158 boxes=117 images_failed=1
+```
+
+JD 主商品区仍为空(风控 403,同机 Edge 也 403)。
+
+## 验证
+
+```
+cargo test --workspace                       2742 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+image::svg                                   38 passed
+```
+
+## 明确未做 / 下一步
+
+- CSS `clip-path: url(#id)`、`path()`、`calc()`、`reference-box` 关键字未实现;
+  目前只处理 HTML 的 inset/circle/ellipse/polygon。
+- SVG 内联 CSS 样式表中的 `clip-rule` 仍未接入(仅属性与 style 属性);`mask`/
+  `filter` 的 CSS 形式也未实现。
+- 组级 `opacity` 离屏合成、更多 SVG filter 原语、高级渐变仍未实现。
+- JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;AVIF 依赖系统 dav1d。
+
+---
+
 # 交接文档 (2026-10-31, 续二十一) — IndexedDB 磁盘持久化、索引与升级
 
 接续 AVIF 会话。这一轮把内存版 IndexedDB 接到 profile 磁盘存储,并补齐
@@ -79,7 +148,7 @@ JD:    ready=Loading     dom_elements=968 boxes=117 images_failed=1
 - 事务没有回滚日志;`abort()` 不会撤销已经改动的内存记录;跨标签页没有
   `storage`/`versionchange` 广播,只有同一 realm 内的 `versionchange` 事件。
 - 没有配额管理/驱逐;`indexed-db.txt` 是单文件、全量重写。
-- JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;CSS `clip-path`、组级
+- JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;CSS `clip-path` 已实现(续二十二)、组级
   `opacity`、其它 filter 原语等仍未实现。
 
 ---
@@ -157,8 +226,8 @@ image::svg                                   36 passed
 
 - AVIF 解码依赖系统 dav1d,不是纯 Rust 便携路径;AVIF 动画/序列仍未处理。
 - 非图片小响应回退是视觉占位,不会真正解码 BMP/TIFF 等其它未支持格式。
-- SVG `filter` 仍只有 blur/color-matrix;CSS `filter`、`clip-path`/`clip-rule`、
-  组级 `opacity` 离屏合成、高级渐变仍未实现。
+- SVG `filter` 仍只有 blur/color-matrix;CSS `filter` 未实现;CSS `clip-path`
+  已在续二十二实现,组级 `opacity` 离屏合成、高级渐变仍未实现。
 - 其它图片格式/真实 CDN 变体仍需继续抽样;IndexedDB 已持久化(续二十一);JD 风控、
   GitHub/HN 链路阻断是外部条件。
 
@@ -232,8 +301,8 @@ image::svg                                   36 passed
 - `color-interpolation-filters` 固定 sRGB,未做 linearRGB;`feColorMatrix`
   只做单链,不解析命名 `result`。
 - `filter` 只支持属性,不支持 CSS `filter`;filter 内容中的 `<text>` 不绘制。
-- CSS `clip-path`/`clip-rule`、组级 `opacity` 离屏合成、高级渐变、`content`
-  字符串以外内容仍未实现。
+- CSS `clip-path` 已在续二十二实现;组级 `opacity` 离屏合成、高级渐变、
+  `content` 字符串以外内容仍未实现。
 - IndexedDB 已持久化(续二十一);JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;
   AVIF 已在续二十实现/回退。
 
@@ -303,8 +372,8 @@ image::svg                                   33 passed
 
 - `mask` 只支持属性,不支持 CSS `mask-image`/`mask-mode`;mask 内容中的
   `<text>` 仍不绘制;`filter` 已在续十九实现。
-- 除 `feGaussianBlur`/`feColorMatrix` 外的 filter 原语、CSS `clip-path`/
-  `clip-rule`、组级 `opacity` 离屏合成仍未实现。
+- 除 `feGaussianBlur`/`feColorMatrix` 外的 filter 原语、组级 `opacity`
+  离屏合成仍未实现;CSS `clip-path` 已在续二十二实现。
 - 渐变高级特性(`xlink:href` 继承、`spreadMethod`、径向焦点)仍未做。
 - `content` 仍只支持字符串;IndexedDB 已持久化(续二十一);JD 主商品区仍受风控 403;
   GitHub/HN 本机链路阻断;AVIF 未实现。
@@ -376,8 +445,8 @@ image::svg                                   28 passed
 
 - `<use>` 仅支持同文档引用;外部文档 URL、CSS `width`/`height`(需要计算样式)
   和 `use` 上的 `clip-path` 复杂坐标仍未完全覆盖。
-- `<text>`、CSS `clip-path`/`clip-rule`、组级 `opacity` 离屏合成仍未实现;
-  `mask` 已在续十八、`filter` 已在续十九实现。
+- `<text>`、组级 `opacity` 离屏合成仍未实现;`mask` 已在续十八、`filter`
+  已在续十九、CSS `clip-path` 已在续二十二实现。
 - 渐变高级特性(`xlink:href` 继承、`spreadMethod`、径向焦点)仍未做。
 - `content` 仍只支持字符串;IndexedDB 已持久化(续二十一);JD 主商品区仍受风控 403;
   GitHub/HN 本机链路阻断;AVIF 未实现。
@@ -440,8 +509,8 @@ Baidu smoke: dom_elements=455  boxes=156
 
 ## 明确未做 / 下一步
 
-- `clip-path` 仅支持 **属性**,不支持 CSS `style="clip-path:..."`;`clip-rule`
-  固定 even-odd,未区分 nonzero。
+- SVG 内联元素的 CSS `style="clip-path:..."` 仍未解析;CSS `clip-path` 的
+  HTML 基本形状与 SVG `clip-rule` 已在续二十二实现。
 - `clipPath` 内容的 `text` 不参与裁剪;`<use>` 已在续十七、`mask` 已在
   续十八、`filter` 已在续十九实现。
 - 渐变高级特性(`xlink:href` 继承、`spreadMethod`、径向焦点)与组级 `opacity`

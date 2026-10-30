@@ -107,11 +107,13 @@ impl PropertyRegistry {
             ("border-collapse", "separate"),
             ("empty-cells", "show"),
             ("caption-side", "top"),
+            ("clip-rule", "nonzero"),
         ] {
             registry.define(name, true, initial);
         }
         for (name, initial) in [
             ("content", "normal"),
+            ("clip-path", "none"),
             ("background-color", "transparent"),
             ("background-image", "none"),
             ("background-repeat", "repeat"),

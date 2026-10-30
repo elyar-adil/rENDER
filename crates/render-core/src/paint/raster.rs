@@ -10,7 +10,7 @@ use crate::layout::{PhysicalPoint, PhysicalRect, StickyConstraint};
 
 use super::color::{Color, clamped_rounded_u8};
 use super::display_list::{
-    BorderPaint, BoxShadowPaint, ClipShape, CornerRadii, DisplayCommand, DisplayItem,
+    BorderPaint, BoxShadowPaint, ClipFillRule, ClipShape, CornerRadii, DisplayCommand, DisplayItem,
     DisplayItemId, DisplayList, FontInstanceId, GlyphId, GlyphRun, LinearGradient, ListMarkerPaint,
     ListMarkerShape, PaintCoordinateSpace, StackingContext, TextDecoration, TextDecorationStyle,
     TextShadowPaint, Transform2D,
@@ -452,31 +452,6 @@ impl ClipRegion {
         Self {
             rect,
             shapes: [ClipShape::Rect(rect); MAX_CLIP_SHAPES],
-            shape_count: 1,
-        }
-    }
-
-    const fn rounded(rect: PhysicalRect, radii: CornerRadii) -> Self {
-        Self {
-            rect,
-            shapes: [
-                ClipShape::RoundedRect { rect, radii },
-                ClipShape::Rect(rect),
-                ClipShape::Rect(rect),
-                ClipShape::Rect(rect),
-                ClipShape::Rect(rect),
-                ClipShape::Rect(rect),
-                ClipShape::Rect(rect),
-                ClipShape::Rect(rect),
-                ClipShape::Rect(rect),
-                ClipShape::Rect(rect),
-                ClipShape::Rect(rect),
-                ClipShape::Rect(rect),
-                ClipShape::Rect(rect),
-                ClipShape::Rect(rect),
-                ClipShape::Rect(rect),
-                ClipShape::Rect(rect),
-            ],
             shape_count: 1,
         }
     }
@@ -1092,12 +1067,11 @@ impl<'a> RasterState<'a> {
     }
 
     fn push_clip(&mut self, shape: ClipShape, offset: PhysicalPoint) {
-        let clip = match shape {
-            ClipShape::Rect(rect) => ClipRegion::rect(translate_rect(rect, offset)),
-            ClipShape::RoundedRect { rect, radii } => {
-                ClipRegion::rounded(translate_rect(rect, offset), radii)
-            }
-        };
+        let bounds = translate_rect(clip_shape_bounds(shape), offset);
+        let translated = translate_clip_shape(shape, offset);
+        let mut clip = ClipRegion::rect(bounds);
+        clip.shapes[0] = translated;
+        clip.shape_count = 1;
         self.clips.push(
             combine_clip(self.current_clip().as_ref(), &clip)
                 .unwrap_or_else(|| ClipRegion::rect(PhysicalRect::new(0.0, 0.0, 0.0, 0.0))),
@@ -1384,10 +1358,141 @@ fn normalize_radii(mut radii: CornerRadii, rect: PhysicalRect) -> CornerRadii {
     radii
 }
 
+fn clip_shape_bounds(shape: ClipShape) -> PhysicalRect {
+    match shape {
+        ClipShape::Rect(rect) | ClipShape::RoundedRect { rect, .. } => rect,
+        ClipShape::Circle { center, radius } => PhysicalRect::new(
+            center.x - radius,
+            center.y - radius,
+            radius * 2.0,
+            radius * 2.0,
+        ),
+        ClipShape::Ellipse { center, radii } => PhysicalRect::new(
+            center.x - radii.width,
+            center.y - radii.height,
+            radii.width * 2.0,
+            radii.height * 2.0,
+        ),
+        ClipShape::Polygon { points, count, .. } => {
+            let count = usize::from(count);
+            if count == 0 {
+                PhysicalRect::new(0.0, 0.0, 0.0, 0.0)
+            } else {
+                let mut minimum = points[0];
+                let mut maximum = points[0];
+                for point in &points[1..count] {
+                    minimum.x = minimum.x.min(point.x);
+                    minimum.y = minimum.y.min(point.y);
+                    maximum.x = maximum.x.max(point.x);
+                    maximum.y = maximum.y.max(point.y);
+                }
+                PhysicalRect::new(
+                    minimum.x,
+                    minimum.y,
+                    maximum.x - minimum.x,
+                    maximum.y - minimum.y,
+                )
+            }
+        }
+    }
+}
+
+fn translate_clip_shape(shape: ClipShape, offset: PhysicalPoint) -> ClipShape {
+    match shape {
+        ClipShape::Rect(rect) => ClipShape::Rect(translate_rect(rect, offset)),
+        ClipShape::RoundedRect { rect, radii } => ClipShape::RoundedRect {
+            rect: translate_rect(rect, offset),
+            radii,
+        },
+        ClipShape::Circle { center, radius } => ClipShape::Circle {
+            center: PhysicalPoint {
+                x: center.x + offset.x,
+                y: center.y + offset.y,
+            },
+            radius,
+        },
+        ClipShape::Ellipse { center, radii } => ClipShape::Ellipse {
+            center: PhysicalPoint {
+                x: center.x + offset.x,
+                y: center.y + offset.y,
+            },
+            radii,
+        },
+        ClipShape::Polygon {
+            mut points,
+            count,
+            fill_rule,
+        } => {
+            for point in &mut points[..usize::from(count)] {
+                point.x += offset.x;
+                point.y += offset.y;
+            }
+            ClipShape::Polygon {
+                points,
+                count,
+                fill_rule,
+            }
+        }
+    }
+}
+
 fn clip_shape_contains(shape: ClipShape, point: PhysicalPoint) -> bool {
     match shape {
         ClipShape::Rect(rect) => point_in_rounded_rect(rect, CornerRadii::default(), point),
         ClipShape::RoundedRect { rect, radii } => point_in_rounded_rect(rect, radii, point),
+        ClipShape::Circle { center, radius } => {
+            let dx = point.x - center.x;
+            let dy = point.y - center.y;
+            dx.mul_add(dx, dy * dy) <= radius * radius
+        }
+        ClipShape::Ellipse { center, radii } => {
+            if radii.width <= 0.0 || radii.height <= 0.0 {
+                return false;
+            }
+            let dx = (point.x - center.x) / radii.width;
+            let dy = (point.y - center.y) / radii.height;
+            dx.mul_add(dx, dy * dy) <= 1.0
+        }
+        ClipShape::Polygon {
+            points,
+            count,
+            fill_rule,
+        } => point_in_clip_polygon(&points, usize::from(count), fill_rule, point),
+    }
+}
+
+fn point_in_clip_polygon(
+    points: &[PhysicalPoint],
+    count: usize,
+    fill_rule: ClipFillRule,
+    point: PhysicalPoint,
+) -> bool {
+    if count < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut winding = 0_i32;
+    for index in 0..count {
+        let first = points[index];
+        let second = points[(index + 1) % count];
+        if (first.y > point.y) != (second.y > point.y) {
+            let crossing =
+                (second.x - first.x) * (point.y - first.y) / (second.y - first.y) + first.x;
+            if point.x < crossing {
+                inside = !inside;
+            }
+        }
+        let orientation =
+            (second.x - first.x) * (point.y - first.y) - (point.x - first.x) * (second.y - first.y);
+        if second.y > first.y && orientation > 0.0 {
+            winding += 1;
+        } else if second.y < first.y && orientation < 0.0 {
+            winding -= 1;
+        }
+    }
+    match fill_rule {
+        ClipFillRule::EvenOdd => inside,
+        ClipFillRule::NonZero => winding != 0,
     }
 }
 

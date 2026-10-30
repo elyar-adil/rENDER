@@ -255,11 +255,23 @@ struct ClipStack {
     layers: Vec<ClipLayer>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipFillRule {
+    NonZero,
+    EvenOdd,
+}
+
+#[derive(Clone, Debug)]
+struct ClipPolygon {
+    contours: Vec<Vec<(f32, f32)>>,
+    fill_rule: ClipFillRule,
+}
+
 #[derive(Clone, Debug)]
 struct ClipLayer {
     /// Polygons in device space. An empty layer clips everything, which is
     /// what an empty `<clipPath>` means.
-    polygons: Vec<Vec<(f32, f32)>>,
+    polygons: Vec<ClipPolygon>,
 }
 
 impl ClipStack {
@@ -276,29 +288,47 @@ impl ClipStack {
             layer
                 .polygons
                 .iter()
-                .any(|polygon| point_in_polygon(polygon, x, y))
+                .any(|polygon| point_in_contours(&polygon.contours, polygon.fill_rule, x, y))
         })
     }
 }
 
-/// Even-odd point-in-polygon. Clip paths use this test; the paint scanline
-/// fill uses the same rule, so clipped edges agree with the shape edges.
-fn point_in_polygon(points: &[(f32, f32)], x: f32, y: f32) -> bool {
-    if points.len() < 3 {
-        return false;
-    }
+/// Point-in-polygon for SVG clip paths. A `path` contributes all of its
+/// subpaths to one geometry, so a nested counter-clockwise contour is a hole
+/// under `evenodd` and a second winding under `nonzero`.
+fn point_in_contours(
+    contours: &[Vec<(f32, f32)>],
+    fill_rule: ClipFillRule,
+    x: f32,
+    y: f32,
+) -> bool {
     let mut inside = false;
-    for index in 0..points.len() {
-        let (x1, y1) = points[index];
-        let (x2, y2) = points[(index + 1) % points.len()];
-        if (y1 > y) != (y2 > y) {
-            let crossing = (x2 - x1).mul_add((y - y1) / (y2 - y1), x1);
-            if x < crossing {
-                inside = !inside;
+    let mut winding = 0_i32;
+    for points in contours {
+        if points.len() < 3 {
+            continue;
+        }
+        for index in 0..points.len() {
+            let (x1, y1) = points[index];
+            let (x2, y2) = points[(index + 1) % points.len()];
+            if (y1 > y) != (y2 > y) {
+                let crossing = (x2 - x1).mul_add((y - y1) / (y2 - y1), x1);
+                if x < crossing {
+                    inside = !inside;
+                }
+            }
+            let orientation = (x2 - x1) * (y - y1) - (x - x1) * (y2 - y1);
+            if y2 > y1 && orientation > 0.0 {
+                winding += 1;
+            } else if y2 < y1 && orientation < 0.0 {
+                winding -= 1;
             }
         }
     }
-    inside
+    match fill_rule {
+        ClipFillRule::NonZero => winding != 0,
+        ClipFillRule::EvenOdd => inside,
+    }
 }
 
 /// Decode an SVG document into an RGBA image.
@@ -1158,6 +1188,7 @@ fn paint_masked_element(
         (region_x, region_y + region_height),
     ]
     .map(|(x, y)| element_transform.apply(x, y));
+    let region_contours = [region.to_vec()];
     let mask_is_alpha = attribute(mask, "mask-type")
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("alpha"))
         || attribute(mask, "style").is_some_and(|style| {
@@ -1169,7 +1200,12 @@ fn paint_masked_element(
 
     for y in 0..raster.height {
         for x in 0..raster.width {
-            if !point_in_polygon(&region, x as f32 + 0.5, y as f32 + 0.5) {
+            if !point_in_contours(
+                &region_contours,
+                ClipFillRule::NonZero,
+                x as f32 + 0.5,
+                y as f32 + 0.5,
+            ) {
                 continue;
             }
             let index = y as usize * raster.width as usize + x as usize;
@@ -1360,10 +1396,16 @@ fn paint_filtered_element(
         (region_x, region_y + region_height),
     ]
     .map(|(x, y)| element_transform.apply(x, y));
+    let region_contours = [region.to_vec()];
 
     for y in 0..raster.height {
         for x in 0..raster.width {
-            if !point_in_polygon(&region, x as f32 + 0.5, y as f32 + 0.5) {
+            if !point_in_contours(
+                &region_contours,
+                ClipFillRule::NonZero,
+                x as f32 + 0.5,
+                y as f32 + 0.5,
+            ) {
                 continue;
             }
             let index = y as usize * raster.width as usize + x as usize;
@@ -2196,6 +2238,7 @@ fn push_element_clip(
         }
     };
     let clip_transform = attribute(clip, "transform").map_or(Affine::IDENTITY, parse_transform);
+    let fill_rule = clip_fill_rule(clip, ClipFillRule::NonZero);
     let mut polygons = Vec::new();
     collect_clip_geometry(
         clip,
@@ -2203,6 +2246,7 @@ fn push_element_clip(
         transform,
         units,
         bounds,
+        fill_rule,
         &mut polygons,
     );
     raster.clip.push(ClipLayer { polygons });
@@ -2215,18 +2259,23 @@ fn collect_clip_geometry(
     element_transform: Affine,
     units: ClipPathUnits,
     bounds: Option<Bounds>,
-    polygons: &mut Vec<Vec<(f32, f32)>>,
+    fill_rule: ClipFillRule,
+    polygons: &mut Vec<ClipPolygon>,
 ) {
     for child in &container.children {
         let child_transform = match attribute(child, "transform") {
             Some(specification) => clip_transform.then(parse_transform(specification)),
             None => clip_transform,
         };
+        let child_fill_rule = clip_fill_rule(child, fill_rule);
         let mut push = |points: &[(f32, f32)]| {
-            if let Some(polygon) =
+            if let Some(points) =
                 clip_device_polygon(points, child_transform, element_transform, units, bounds)
             {
-                polygons.push(polygon);
+                polygons.push(ClipPolygon {
+                    contours: vec![points],
+                    fill_rule: child_fill_rule,
+                });
             }
         };
         match child.name.as_str() {
@@ -2271,10 +2320,25 @@ fn collect_clip_geometry(
             }
             "path" => {
                 if let Some(specification) = attribute(child, "d") {
+                    let mut contours = Vec::new();
                     for (subpath, _) in parse_path(specification) {
-                        if subpath.len() >= 3 {
-                            push(&subpath);
+                        if subpath.len() >= 3
+                            && let Some(points) = clip_device_polygon(
+                                &subpath,
+                                child_transform,
+                                element_transform,
+                                units,
+                                bounds,
+                            )
+                        {
+                            contours.push(points);
                         }
+                    }
+                    if !contours.is_empty() {
+                        polygons.push(ClipPolygon {
+                            contours,
+                            fill_rule: child_fill_rule,
+                        });
                     }
                 }
             }
@@ -2285,12 +2349,33 @@ fn collect_clip_geometry(
                     element_transform,
                     units,
                     bounds,
+                    child_fill_rule,
                     polygons,
                 );
             }
             _ => {}
         }
     }
+}
+
+fn clip_fill_rule(element: &XmlNode, inherited: ClipFillRule) -> ClipFillRule {
+    if let Some(value) = attribute(element, "clip-rule") {
+        return if value.trim().eq_ignore_ascii_case("evenodd") {
+            ClipFillRule::EvenOdd
+        } else {
+            ClipFillRule::NonZero
+        };
+    }
+    if let Some(style) = attribute(element, "style") {
+        let style = style.to_ascii_lowercase().replace(' ', "");
+        if style.contains("clip-rule:evenodd") {
+            return ClipFillRule::EvenOdd;
+        }
+        if style.contains("clip-rule:nonzero") {
+            return ClipFillRule::NonZero;
+        }
+    }
+    inherited
 }
 
 fn clip_device_polygon(
@@ -3417,6 +3502,31 @@ mod tests {
             <rect x="2" y="2" width="6" height="6" fill="red" filter="url(#f)"/></svg>"#;
         let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
         assert_eq!(image.pixel(4, 4), Some(Color::rgb(0, 255, 0)));
+    }
+
+    #[test]
+    fn clip_rule_evenodd_cuts_a_hole_while_nonzero_fills_it() {
+        let evenodd = br#"<svg width="10" height="10"><defs>
+            <clipPath id="c" clip-rule="evenodd"><path d="M0 0H10V10H0Z M3 3H7V7H3Z"/></clipPath>
+            </defs><rect width="10" height="10" fill="red" clip-path="url(#c)"/></svg>"#;
+        let nonzero = br#"<svg width="10" height="10"><defs>
+            <clipPath id="c"><path d="M0 0H10V10H0Z M3 3H7V7H3Z"/></clipPath>
+            </defs><rect width="10" height="10" fill="red" clip-path="url(#c)"/></svg>"#;
+        let evenodd = decode_svg(evenodd, ImageLimits::default()).expect("evenodd decodes");
+        let nonzero = decode_svg(nonzero, ImageLimits::default()).expect("nonzero decodes");
+        assert_eq!(evenodd.pixel(1, 1), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(evenodd.pixel(5, 5), Some(Color::TRANSPARENT));
+        assert_eq!(nonzero.pixel(5, 5), Some(Color::rgb(255, 0, 0)));
+    }
+
+    #[test]
+    fn clip_rule_in_the_style_attribute_is_honoured() {
+        let svg = br#"<svg width="10" height="10"><defs>
+            <clipPath id="c" style="clip-rule: evenodd">
+              <path d="M0 0H10V10H0Z M3 3H7V7H3Z"/></clipPath>
+            </defs><rect width="10" height="10" fill="red" clip-path="url(#c)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(5, 5), Some(Color::TRANSPARENT));
     }
 
     #[test]
