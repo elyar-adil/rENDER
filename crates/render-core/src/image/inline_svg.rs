@@ -33,12 +33,12 @@
 //!
 //! # What is deliberately not done
 //!
-//! * `text`, `<image>` and filter primitives other than `feGaussianBlur` and
-//!   `feColorMatrix`: outside the rasteriser's documented subset, so they
-//!   contribute nothing there either. Gradients, attribute `clip-path`,
-//!   `mask` and those two filter primitives are supported, but `xlink:href`
-//!   inheritance between gradient definitions and spread modes other than
-//!   `pad` are not.
+//! * `text`, `<image>` and filter primitives other than `feGaussianBlur`,
+//!   `feColorMatrix`, `feOffset`, `feBlend` and `feComposite`: outside the
+//!   rasteriser's documented subset, so they contribute nothing there either.
+//!   Gradients, attribute `clip-path`, `mask` and those filter primitives are
+//!   supported, but `xlink:href` inheritance between gradient definitions and
+//!   spread modes other than `pad` are not.
 //! * `foreignObject`: its HTML subtree is laid out by render-layout as
 //!   ordinary in-flow HTML rather than in the SVG viewport coordinate system,
 //!   so it is positioned correctly only for `x=0 y=0` with no viewBox

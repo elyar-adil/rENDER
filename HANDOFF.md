@@ -1,3 +1,64 @@
+# 交接文档 (2026-10-31, 续二十五) — feOffset / feBlend / feComposite
+
+接续组级 opacity 会话。这一轮把 SVG filter 从 blur/color-matrix 扩展到常用的
+位移、混合与合成,并支持命名 `result` 与 `in`/`in2`。
+
+## 实现
+
+| 内容 | 落点 |
+|---|---|
+| **命名结果** | 每个原语的 `result` 存入 map;后续 `in`/`in2` 可引用 `SourceGraphic`/`SourceAlpha`/命名结果 |
+| **默认链** | 未写 `in` 时沿用前一个原语结果,保持线性链语义 |
+| **feOffset** | `dx`/`dy`;`primitiveUnits=objectBoundingBox` 按 bbox 缩放,元素变换作用于位移向量 |
+| **feBlend** | normal/multiply/screen/darken/lighten/difference/exclusion;straight-alpha source-over |
+| **feComposite** | over/in/out/atop/xor/arithmetic(arithmetic 目前按 source-over 近似) |
+| **测试** | offset、composite over、blend normal + 命名彩色结果,共 3 个 |
+
+## 证据
+
+单元测试像素断言:
+
+```
+feOffset dx=5 dy=2:
+  (3,3) 透明 → (8,5) 红色
+
+feOffset result=shifted + feComposite over:
+  (3,3) 红色(原图), (8,5) 红色(位移结果)
+
+feOffset → feColorMatrix(红变蓝, result=blueShifted) → feBlend normal:
+  (3,3) 红色, (8,5) 蓝色
+```
+
+Bing / Baidu / JD 冒烟:
+
+```
+Bing:  ready=Complete    dom_elements=471 boxes=167 images_failed=0
+Baidu: ready=Complete    dom_elements=453 boxes=156 images_failed=0
+JD:    ready=Interactive dom_elements=1158 boxes=117 images_failed=1
+```
+
+JD 主商品区仍为空(风控 403,同机 Edge 也 403)。
+
+## 验证
+
+```
+cargo test --workspace                       2752 passed, 0 failed
+cargo clippy --workspace --all-targets -D warnings   clean
+cargo fmt --all --check                      clean
+real_site_tasks                              66 passed, 0 failed
+image::svg                                   46 passed
+```
+
+## 明确未做 / 下一步
+
+- `feFlood`/`feImage`/`feMorphology`/`feTurbulence`/`feDisplacementMap` 等原语
+  未实现;`feComposite arithmetic` 的 k1..k4 仍按 source-over 近似。
+- `color-interpolation-filters` 固定 sRGB;filter 的完整 DAG/分支语义未覆盖。
+- CSS `filter`、CSS mask、高级渐变、IndexedDB 值类型覆盖仍未完成。
+- JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;AVIF 依赖系统 dav1d。
+
+---
+
 # 交接文档 (2026-10-31, 续二十四) — SVG 组级 opacity
 
 接续 CSS clip-path 会话。这一轮给 SVG `<g opacity>`(以及形状/`use` 的
@@ -119,7 +180,8 @@ image::svg                                   38 passed
   多条轮廓形成的洞还不支持。
 - `fill-box`/`stroke-box`/`view-box` reference-box、CSS 样式表中的 `clip-rule`
   仍未接入。
-- 更多 SVG filter 原语、高级渐变仍未实现;组级 `opacity` 已在续二十四实现。
+- 更多 SVG filter 原语、高级渐变仍未实现;组级 `opacity` 已在续二十四、
+  `feOffset`/`feBlend`/`feComposite` 已在续二十五实现。
 - JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;AVIF 依赖系统 dav1d。
 
 ---
@@ -189,7 +251,8 @@ image::svg                                   38 passed
   `view-box` 仍回退边框盒。
 - SVG 内联 CSS 样式表中的 `clip-rule` 仍未接入(仅属性与 style 属性);`mask`/
   `filter` 的 CSS 形式也未实现。
-- 更多 SVG filter 原语、高级渐变仍未实现;组级 `opacity` 已在续二十四实现。
+- 更多 SVG filter 原语、高级渐变仍未实现;组级 `opacity` 已在续二十四、
+  `feOffset`/`feBlend`/`feComposite` 已在续二十五实现。
 - JD 主商品区仍受风控 403;GitHub/HN 本机链路阻断;AVIF 依赖系统 dav1d。
 
 ---
@@ -353,7 +416,8 @@ image::svg                                   36 passed
 
 - AVIF 解码依赖系统 dav1d,不是纯 Rust 便携路径;AVIF 动画/序列仍未处理。
 - 非图片小响应回退是视觉占位,不会真正解码 BMP/TIFF 等其它未支持格式。
-- SVG `filter` 仍只有 blur/color-matrix;CSS `filter` 未实现;CSS `clip-path`
+- SVG `filter` 已支持 blur/color-matrix/offset/blend/composite;CSS `filter`
+  未实现;CSS `clip-path`
   已在续二十二实现;组级 `opacity` 已在续二十四实现,高级渐变仍未实现。
 - 其它图片格式/真实 CDN 变体仍需继续抽样;IndexedDB 已持久化(续二十一);JD 风控、
   GitHub/HN 链路阻断是外部条件。
@@ -423,8 +487,8 @@ image::svg                                   36 passed
 
 ## 明确未做 / 下一步
 
-- 仅支持 `feGaussianBlur`/`feColorMatrix`;`feOffset`/`feBlend`/`feComposite`/
-  `feFlood`/`feImage` 等原语未实现。
+- 已支持 `feGaussianBlur`/`feColorMatrix`/`feOffset`/`feBlend`/`feComposite`;
+  `feFlood`/`feImage`/`feMorphology`/`feTurbulence` 等仍未实现。
 - `color-interpolation-filters` 固定 sRGB,未做 linearRGB;`feColorMatrix`
   只做单链,不解析命名 `result`。
 - `filter` 只支持属性,不支持 CSS `filter`;filter 内容中的 `<text>` 不绘制。
@@ -499,8 +563,8 @@ image::svg                                   33 passed
 
 - `mask` 只支持属性,不支持 CSS `mask-image`/`mask-mode`;mask 内容中的
   `<text>` 仍不绘制;`filter` 已在续十九实现。
-- 除 `feGaussianBlur`/`feColorMatrix` 外的 filter 原语仍未实现;组级
-  `opacity` 已在续二十四实现,CSS `clip-path` 已在续二十二实现。
+- 除 blur/color-matrix/offset/blend/composite 外的 filter 原语仍未实现;
+  组级 `opacity` 已在续二十四实现,CSS `clip-path` 已在续二十二实现。
 - 渐变高级特性(`xlink:href` 继承、`spreadMethod`、径向焦点)仍未做。
 - `content` 仍只支持字符串;IndexedDB 已持久化(续二十一);JD 主商品区仍受风控 403;
   GitHub/HN 本机链路阻断;AVIF 未实现。

@@ -20,13 +20,13 @@
 //!   element's `width`/`height`;
 //! - `mask` references on shapes and groups, with offscreen alpha or
 //!   luminance compositing, `maskUnits` and `maskContentUnits`;
-//! - `filter` references with `feGaussianBlur` and `feColorMatrix`,
-//!   composited through offscreen buffers;
+//! - `filter` references with `feGaussianBlur`, `feColorMatrix`, `feOffset`,
+//!   `feBlend` and `feComposite`, composited through offscreen buffers;
 //! - root sizing by `width`/`height` (percentages resolve against the
 //!   `viewBox`), falling back to `viewBox`, then the spec default 300×150.
 //!
-//! Everything outside the subset (text, filter primitives other than blur
-//! and color matrix, embedded images, scripting, external-document `<use>`
+//! Everything outside the subset (text, filter primitives other than the
+//! five above, embedded images, scripting, external-document `<use>`
 //! references, gradient `xlink:href` inheritance and spread modes other than
 //! `pad`) contributes nothing, matching how an `<img>`-loaded SVG must
 //! render: static and script-free.
@@ -1372,8 +1372,9 @@ fn paint_masked_element(
 /// Like masks, the element is painted into an offscreen buffer with its
 /// `filter` attribute removed. The filter primitives then transform that
 /// buffer, and the result is composited through the filter region. The first
-/// supported primitives are `feGaussianBlur` and `feColorMatrix`; a chain is
-/// processed in document order, and `in="SourceGraphic"` resets the chain.
+/// Supported primitives are `feGaussianBlur`, `feColorMatrix`, `feOffset`,
+/// `feBlend` and `feComposite`; a chain is processed in document order, with
+/// `result` names and `in`/`in2` references.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -1442,18 +1443,20 @@ fn paint_filtered_element(
         &mut content,
     );
 
-    let original = content.pixels.clone();
-    let mut pixels = content.pixels;
+    let source = content.pixels;
+    let source_alpha: Vec<Color> = source
+        .iter()
+        .map(|pixel| Color::rgba(0, 0, 0, pixel.alpha))
+        .collect();
+    let mut results: BTreeMap<String, Vec<Color>> = BTreeMap::new();
+    let mut pixels = source.clone();
     let object_primitives = attribute(filter, "primitiveUnits")
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("objectBoundingBox"));
     let transform_scale = affine_scale(element_transform);
     for primitive in &filter.children {
-        if attribute(primitive, "in")
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("SourceGraphic"))
-        {
-            pixels.clone_from(&original);
-        }
-        match primitive.name.as_str() {
+        let input = filter_input(primitive, "in", &source, &source_alpha, &results, &pixels);
+        let input2 = filter_input(primitive, "in2", &source, &source_alpha, &results, &pixels);
+        let output = match primitive.name.as_str() {
             "feGaussianBlur" => {
                 let (mut sigma_x, mut sigma_y) =
                     parse_std_deviation(attribute(primitive, "stdDeviation").unwrap_or("0"));
@@ -1461,22 +1464,59 @@ fn paint_filtered_element(
                     sigma_x *= bounds.width;
                     sigma_y *= bounds.height;
                 }
-                pixels = blur_pixels(
-                    &pixels,
+                blur_pixels(
+                    &input,
                     raster.width,
                     raster.height,
                     sigma_x * transform_scale,
                     sigma_y * transform_scale,
-                );
+                )
             }
             "feColorMatrix" => {
                 let matrix = parse_color_matrix(primitive);
-                for pixel in &mut pixels {
+                let mut output = input;
+                for pixel in &mut output {
                     *pixel = apply_color_matrix(*pixel, &matrix);
                 }
+                output
             }
-            _ => {}
+            "feOffset" => {
+                let mut dx = attribute(primitive, "dx")
+                    .and_then(parse_length)
+                    .unwrap_or(0.0);
+                let mut dy = attribute(primitive, "dy")
+                    .and_then(parse_length)
+                    .unwrap_or(0.0);
+                if object_primitives {
+                    dx *= bounds.width;
+                    dy *= bounds.height;
+                }
+                let translated_x = element_transform.a * dx + element_transform.c * dy;
+                let translated_y = element_transform.b * dx + element_transform.d * dy;
+                offset_pixels(
+                    &input,
+                    raster.width,
+                    raster.height,
+                    translated_x,
+                    translated_y,
+                )
+            }
+            "feBlend" => blend_pixels(
+                &input2,
+                &input,
+                attribute(primitive, "mode").unwrap_or("normal"),
+            ),
+            "feComposite" => composite_pixels(
+                &input2,
+                &input,
+                attribute(primitive, "operator").unwrap_or("over"),
+            ),
+            _ => input,
+        };
+        if let Some(result) = attribute(primitive, "result") {
+            results.insert(result.trim().to_owned(), output.clone());
         }
+        pixels = output;
     }
 
     let object_units = !attribute(filter, "filterUnits")
@@ -1552,6 +1592,143 @@ fn paint_filtered_element(
         }
     }
     true
+}
+
+fn filter_input(
+    primitive: &XmlNode,
+    name: &str,
+    source: &[Color],
+    source_alpha: &[Color],
+    results: &BTreeMap<String, Vec<Color>>,
+    previous: &[Color],
+) -> Vec<Color> {
+    match attribute(primitive, name).map(str::trim) {
+        Some("SourceGraphic") => source.to_vec(),
+        Some("SourceAlpha") => source_alpha.to_vec(),
+        Some(result) => results
+            .get(result)
+            .cloned()
+            .unwrap_or_else(|| previous.to_vec()),
+        None => previous.to_vec(),
+    }
+}
+
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "image dimensions are bounded by ImageLimits"
+)]
+fn offset_pixels(source: &[Color], width: u32, height: u32, dx: f32, dy: f32) -> Vec<Color> {
+    let mut output = vec![Color::TRANSPARENT; source.len()];
+    let shift_x = dx.round() as i32;
+    let shift_y = dy.round() as i32;
+    for y in 0..height as i32 {
+        for x in 0..width as i32 {
+            let source_x = x - shift_x;
+            let source_y = y - shift_y;
+            if source_x < 0 || source_y < 0 || source_x >= width as i32 || source_y >= height as i32
+            {
+                continue;
+            }
+            output[y as usize * width as usize + x as usize] =
+                source[source_y as usize * width as usize + source_x as usize];
+        }
+    }
+    output
+}
+
+fn blend_pixels(backdrop: &[Color], source: &[Color], mode: &str) -> Vec<Color> {
+    let mode = mode.trim().to_ascii_lowercase();
+    backdrop
+        .iter()
+        .zip(source)
+        .map(|(backdrop, source)| {
+            if mode == "normal" {
+                return source_over(*source, *backdrop);
+            }
+            let sa = f32::from(source.alpha) / 255.0;
+            let da = f32::from(backdrop.alpha) / 255.0;
+            let output_alpha = sa + da * (1.0 - sa);
+            if output_alpha <= 0.0001 {
+                return Color::TRANSPARENT;
+            }
+            let channel = |source: u8, backdrop: u8| -> u8 {
+                let source = f32::from(source) / 255.0;
+                let backdrop = f32::from(backdrop) / 255.0;
+                let blended = match mode.as_str() {
+                    "multiply" => source * backdrop,
+                    "screen" => 1.0 - (1.0 - source) * (1.0 - backdrop),
+                    "darken" => source.min(backdrop),
+                    "lighten" => source.max(backdrop),
+                    "difference" => (source - backdrop).abs(),
+                    "exclusion" => source + backdrop - 2.0 * source * backdrop,
+                    _ => source,
+                };
+                let value = (blended * sa + backdrop * da * (1.0 - sa)) / output_alpha;
+                (value.clamp(0.0, 1.0) * 255.0).round() as u8
+            };
+            Color::rgba(
+                channel(source.red, backdrop.red),
+                channel(source.green, backdrop.green),
+                channel(source.blue, backdrop.blue),
+                (output_alpha * 255.0).round().clamp(0.0, 255.0) as u8,
+            )
+        })
+        .collect()
+}
+
+fn composite_pixels(backdrop: &[Color], source: &[Color], operator: &str) -> Vec<Color> {
+    let operator = operator.trim().to_ascii_lowercase();
+    backdrop
+        .iter()
+        .zip(source)
+        .map(|(backdrop, source)| {
+            let sa = f32::from(source.alpha) / 255.0;
+            let da = f32::from(backdrop.alpha) / 255.0;
+            let (out_alpha, source_weight, backdrop_weight) = match operator.as_str() {
+                "in" => (sa * da, 1.0, 0.0),
+                "out" => (sa * (1.0 - da), 1.0, 0.0),
+                "atop" => (da, da, 1.0 - sa),
+                "xor" => (sa + da - 2.0 * sa * da, 1.0 - da, 1.0 - sa),
+                "arithmetic" => (sa + da - sa * da, 1.0, 1.0),
+                _ => (sa + da * (1.0 - sa), 1.0, 1.0 - sa),
+            };
+            if out_alpha <= 0.0001 {
+                return Color::TRANSPARENT;
+            }
+            let channel = |source: u8, backdrop: u8| -> u8 {
+                let value = (f32::from(source) * sa * source_weight
+                    + f32::from(backdrop) * da * backdrop_weight)
+                    / (out_alpha * 255.0);
+                (value.clamp(0.0, 1.0) * 255.0).round() as u8
+            };
+            Color::rgba(
+                channel(source.red, backdrop.red),
+                channel(source.green, backdrop.green),
+                channel(source.blue, backdrop.blue),
+                (out_alpha * 255.0).round().clamp(0.0, 255.0) as u8,
+            )
+        })
+        .collect()
+}
+
+fn source_over(source: Color, backdrop: Color) -> Color {
+    let sa = f32::from(source.alpha) / 255.0;
+    let da = f32::from(backdrop.alpha) / 255.0;
+    let output_alpha = sa + da * (1.0 - sa);
+    if output_alpha <= 0.0001 {
+        return Color::TRANSPARENT;
+    }
+    let channel = |source: u8, backdrop: u8| -> u8 {
+        let value = (f32::from(source) * sa + f32::from(backdrop) * da * (1.0 - sa))
+            / (output_alpha * 255.0);
+        (value.clamp(0.0, 1.0) * 255.0).round() as u8
+    };
+    Color::rgba(
+        channel(source.red, backdrop.red),
+        channel(source.green, backdrop.green),
+        channel(source.blue, backdrop.blue),
+        (output_alpha * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
 }
 
 fn parse_std_deviation(raw: &str) -> (f32, f32) {
@@ -3771,6 +3948,45 @@ mod tests {
             <rect width="10" height="10" fill="red"/></g></svg>"#;
         let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
         assert_eq!(image.pixel(5, 5).expect("pixel").alpha, 128);
+    }
+
+    #[test]
+    fn fe_offset_moves_the_source() {
+        let svg = br#"<svg width="20" height="20"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="20" height="20">
+              <feOffset dx="5" dy="2"/></filter></defs>
+            <rect x="2" y="2" width="5" height="5" fill="red" filter="url(#f)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(3, 3), Some(Color::TRANSPARENT));
+        assert_eq!(image.pixel(8, 5), Some(Color::rgb(255, 0, 0)));
+    }
+
+    #[test]
+    fn fe_composite_over_combines_named_offset_and_source() {
+        let svg = br#"<svg width="20" height="20"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="20" height="20">
+              <feOffset dx="5" result="shifted"/>
+              <feComposite in="SourceGraphic" in2="shifted" operator="over"/>
+            </filter></defs>
+            <rect x="2" y="2" width="5" height="5" fill="red" filter="url(#f)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(3, 3), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(8, 5), Some(Color::rgb(255, 0, 0)));
+    }
+
+    #[test]
+    fn fe_blend_normal_uses_the_named_colored_result() {
+        let svg = br#"<svg width="20" height="20"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="20" height="20">
+              <feOffset dx="5" result="shifted"/>
+              <feColorMatrix in="shifted" type="matrix"
+                values="0 0 1 0 0  0 1 0 0 0  1 0 0 0 0  0 0 0 1 0" result="blueShifted"/>
+              <feBlend in="SourceGraphic" in2="blueShifted" mode="normal"/>
+            </filter></defs>
+            <rect x="2" y="2" width="5" height="5" fill="red" filter="url(#f)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(3, 3), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(8, 5), Some(Color::rgb(0, 0, 255)));
     }
 
     #[test]
