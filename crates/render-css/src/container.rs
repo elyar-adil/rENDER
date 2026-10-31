@@ -519,7 +519,8 @@ impl ContainerContext {
     /// container: the nearest ancestor that matches the optional name and can
     /// answer every axis the condition names. Style-only conditions need no
     /// geometry and therefore need no `container-type`; CSS Conditional 5 §3.1
-    /// makes every element a style container.
+    /// makes every element a style container. The queried element itself is
+    /// not a container (CSS Conditional 5 §5).
     #[must_use]
     pub fn matches_with_style(
         &self,
@@ -528,9 +529,40 @@ impl ContainerContext {
         condition: &ContainerCondition,
         styles: &dyn StyleQueryEnvironment,
     ) -> bool {
+        self.matches_with_style_from(dom, element, condition, styles, false)
+    }
+
+    /// Style-aware evaluation for a generated-content pseudo-element.
+    ///
+    /// CSS Conditional 5 §5 makes `::before` and `::after` query their
+    /// originating element, so the lookup starts at that element rather than
+    /// at its parent.
+    #[must_use]
+    pub fn matches_with_style_inclusive(
+        &self,
+        dom: &Dom,
+        element: NodeId,
+        condition: &ContainerCondition,
+        styles: &dyn StyleQueryEnvironment,
+    ) -> bool {
+        self.matches_with_style_from(dom, element, condition, styles, true)
+    }
+
+    fn matches_with_style_from(
+        &self,
+        dom: &Dom,
+        element: NodeId,
+        condition: &ContainerCondition,
+        styles: &dyn StyleQueryEnvironment,
+        include_self: bool,
+    ) -> bool {
         let axes = condition.query.axes();
         let needs_geometry = axes.inline || axes.block;
-        let mut current = dom.parent(element);
+        let mut current = if include_self {
+            Some(element)
+        } else {
+            dom.parent(element)
+        };
         while let Some(node) = current {
             let geometry = self.containers.get(&node);
             let name_matches = condition.name.as_ref().is_none_or(|name| {

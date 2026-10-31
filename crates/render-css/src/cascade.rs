@@ -403,9 +403,24 @@ fn cascade_element_with_origins_impl(
             // An empty context answers false for every size query, never
             // "maybe".
             if !rule.container.iter().all(|condition| {
-                context
-                    .containers
-                    .matches_with_style(dom, element, condition, lookup.style_queries)
+                // CSS Conditional 5 §5: a generated-content pseudo-element
+                // queries its originating element, while an element queries
+                // its ancestors only.
+                if context.pseudo_element.is_some() {
+                    context.containers.matches_with_style_inclusive(
+                        dom,
+                        element,
+                        condition,
+                        lookup.style_queries,
+                    )
+                } else {
+                    context.containers.matches_with_style(
+                        dom,
+                        element,
+                        condition,
+                        lookup.style_queries,
+                    )
+                }
             }) {
                 continue;
             }

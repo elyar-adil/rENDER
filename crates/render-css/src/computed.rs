@@ -1219,13 +1219,26 @@ impl RegisteredProperties {
 /// query cannot observe a descendant and cannot form a cycle.
 struct ComputedStyleQueries<'a> {
     styles: &'a BTreeMap<NodeId, ComputedStyle>,
+    /// The originating element's style while its generated-content
+    /// pseudo-element is cascaded. `styles` does not contain it yet: the
+    /// element's own entry is inserted after the pseudo-element loop.
+    current: Option<(NodeId, &'a ComputedStyle)>,
     registered: &'a RegisteredProperties,
     limits: &'a ComputationLimits,
 }
 
+impl ComputedStyleQueries<'_> {
+    fn style_for(&self, element: NodeId) -> Option<&ComputedStyle> {
+        match self.current {
+            Some((node, style)) if node == element => Some(style),
+            _ => self.styles.get(&element),
+        }
+    }
+}
+
 impl StyleQueryEnvironment for ComputedStyleQueries<'_> {
     fn container_has_name(&self, element: NodeId, name: &str) -> bool {
-        self.styles.get(&element).is_some_and(|style| {
+        self.style_for(element).is_some_and(|style| {
             style.get("container-name").is_some_and(|value| {
                 parse_container_names(value.css_text())
                     .iter()
@@ -1235,7 +1248,7 @@ impl StyleQueryEnvironment for ComputedStyleQueries<'_> {
     }
 
     fn style_feature_matches(&self, element: NodeId, feature: &StyleFeature) -> bool {
-        self.styles.get(&element).is_some_and(|style| {
+        self.style_for(element).is_some_and(|style| {
             style_feature_matches(style, feature, self.registered, self.limits)
         })
     }
@@ -2030,6 +2043,7 @@ pub fn compute_document_styles_with_hints(
                     rule_index: Some(&rule_index),
                     style_queries: &ComputedStyleQueries {
                         styles: &styles,
+                        current: None,
                         registered: &registered,
                         limits,
                     },
@@ -2071,6 +2085,7 @@ pub fn compute_document_styles_with_hints(
                         rule_index: Some(&rule_index),
                         style_queries: &ComputedStyleQueries {
                             styles: &styles,
+                            current: Some((node, &style)),
                             registered: &registered,
                             limits,
                         },
@@ -3669,6 +3684,40 @@ mod tests {
                 .map(super::ComputedValue::css_text),
             Some("green"),
             "a different color does not match"
+        );
+    }
+
+    /// CSS Conditional 5 §5: `::before` and `::after` query their originating
+    /// element, including that element itself. The element's style is not in
+    /// the map yet while its pseudo-element is cascaded, so the environment
+    /// overlays it rather than looking only at ancestors.
+    #[test]
+    fn style_queries_on_generated_content_include_the_originating_element() {
+        let output = parse_document("<!doctype html><div id='host'></div>");
+        let sheet = parse_stylesheet(
+            "#host { --theme: dark } \
+             #host::before { content: \"x\"; color: blue } \
+             @container style(--theme: dark) { #host::before { color: red } }",
+        );
+        let host = target_id(&output.dom, "#host");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let pseudo = crate::pseudo::style_source(host, crate::pseudo::PseudoElement::Before);
+        assert_eq!(
+            styles
+                .get(&pseudo)
+                .and_then(|style| style.get("color"))
+                .map(super::ComputedValue::css_text),
+            Some("red"),
+            "a style query on ::before reads its originating element"
         );
     }
 

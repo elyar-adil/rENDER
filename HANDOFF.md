@@ -1,3 +1,45 @@
+# 交接文档 (2026-10-31, 续五十) — 生成内容伪元素的包含式样式查询
+
+这一轮补齐 CSS Conditional 5 §5 的伪元素查询容器规则：`::before`/`::after` 查询其
+originating element，而普通元素只查询祖先。没有站点特判。
+
+## 语义与接入
+
+- `ContainerContext::matches_with_style_inclusive` 从 originating element 自身开始查找
+  查询容器；普通元素的 `matches_with_style` 仍从父节点开始。
+- 级联在 `context.pseudo_element.is_some()` 时选择包含式查找。
+- 伪元素级联发生在 originating element 的 computed style 写入样式表之前，因此
+  `ComputedStyleQueries` 增加 `current` 覆盖项：查询 originating element 时直接读刚算出的
+  元素样式，其余节点仍读已完成的祖先样式表。
+- 尺寸查询与样式查询共用同一次容器选择：若 originating element 是尺寸容器，伪元素也能
+  查询它的几何；普通元素自身仍不是自己的容器。
+
+## 测试
+
+- `#host { --theme: dark }` + `#host::before { content: "x" }` +
+  `@container style(--theme: dark) { #host::before { color: red } }`：伪元素样式为 `red`，
+  证明查询包含 originating element 且能读到尚未写入样式表的当前样式。
+
+## 验证
+
+```
+cargo test -p render-css --lib                     255 passed, 0 failed
+cargo test -p render-layout --lib                  318 passed, 1 ignored
+cargo fmt --all --check                            clean
+cargo clippy -p render-css --all-targets -D warnings  clean
+python tools/check_site_neutrality.py              0 blocking, 26 advisory
+```
+
+## 下一步
+
+- 布局包含对 fixed 定位后代的包含块（当前 `position: fixed` 仍直接取 viewport）。
+- 布局包含隐含的 stacking context，以及 style containment 的计数器隔离。
+- `scroll-state()` 容器查询。
+- 独立的 `contain: size/layout/style/paint` 属性（当前只由 `container-type` 触发）。
+- 继续现代 CSS：`@scope`、`@starting-style`、`@font-face` 描述符、`color-mix()` 等。
+
+---
+
 # 交接文档 (2026-10-31, 续四十九) — `style()` 容器查询
 
 这一轮把 CSS Conditional 5 §3.1/§6.2 的 `style()` 容器查询接到自顶向下样式过程：

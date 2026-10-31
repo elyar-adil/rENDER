@@ -67,7 +67,8 @@ boxes, with a bounded three-pass style/layout feedback loop. `style()` queries r
 container's already-computed style during the same top-down cascade, so every element is a style
 container without `container-type` or geometry; declarations, boolean features, registered syntax,
 and `<color>` equivalence are supported, and a condition mixing size and style features is
-answered by one container. Container-relative units
+answered by one container. Generated-content pseudo-elements query their originating element
+inclusively, including a style computed in the same pass. Container-relative units
 (`cqw`/`cqh`/`cqi`/`cqb`/`cqmin`/`cqmax`) resolve per axis against the nearest eligible ancestor,
 falling back to the small viewport size when none exists. The `container-type` that enables those
 queries also applies CSS Containment 3 §3: layout containment makes the box an independent
