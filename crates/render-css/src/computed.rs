@@ -247,6 +247,10 @@ impl PropertyRegistry {
             // query container chain until it says otherwise.
             ("container-type", "normal"),
             ("container-name", "none"),
+            // CSS Containment 2 §2: `contain` does not inherit. Every element
+            // starts with `none` so the containment helpers can read one
+            // typed value without special-casing absence.
+            ("contain", "none"),
         ] {
             registry.define(name, false, initial);
         }

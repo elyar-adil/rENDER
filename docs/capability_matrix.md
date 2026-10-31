@@ -70,12 +70,15 @@ and `<color>` equivalence are supported, and a condition mixing size and style f
 answered by one container. Generated-content pseudo-elements query their originating element
 inclusively, including a style computed in the same pass. Container-relative units
 (`cqw`/`cqh`/`cqi`/`cqb`/`cqmin`/`cqmax`) resolve per axis against the nearest eligible ancestor,
-falling back to the small viewport size when none exists. The `container-type` that enables those
-queries also applies CSS Containment 3 §3: layout containment makes the box an independent
-formatting context and a containing block for absolutely positioned descendants, while size
-containment zeroes the intrinsic size of the contained axes, so an `auto` block size no longer
-grows with the content. `scroll-state()` queries, pseudo-element inclusive style queries, and
-`style()` shorthand features remain gaps.
+falling back to the small viewport size when none exists. `container-type` applies size/inline-size
+containment and makes the box an independent formatting context, but by itself is not a positioning
+containing block (CSS Conditional 5 §5.1). The independent `contain` property is implemented per
+CSS Containment 2 §2: `size`/`inline-size` zero the intrinsic size of the contained axes,
+`layout`/`paint` add an independent formatting context, a containing block for absolute and fixed
+descendants, and a stacking context; `paint` also clips to the padding box. `strict` and `content`
+expand at parse time and serialization follows grammar order. `style` containment is parsed but its
+counter/quote isolation is not yet observable. `scroll-state()` queries and `style()` shorthand
+features remain gaps.
 
 **Table layout.** 47 tests. CSS 2.1 §17 including border-collapse conflict resolution, row groups,
 `colspan`/`rowspan`, `caption-side`, fixed layout, intrinsic widths. This is the single most-used

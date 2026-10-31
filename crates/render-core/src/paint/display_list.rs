@@ -143,6 +143,7 @@ pub enum CompositingReason {
     Isolation,
     Filter,
     Clip,
+    Containment,
 }
 
 /// One function in a CSS `filter` list, in source order.
@@ -896,7 +897,8 @@ impl<'a> Builder<'a> {
             return;
         };
         let style = self.style_for(fragment);
-        let coordinate_space = fragment_coordinate_space(style, parent_space);
+        let coordinate_space =
+            fragment_coordinate_space(style, parent_space, self.fixed_is_viewport(fragment.source));
         let current_color = self.current_color(style);
         let opacity = fragment_opacity(style);
         // Transforms are anchored to the border box: percentages in the
@@ -958,8 +960,14 @@ impl<'a> Builder<'a> {
             self.images,
             fragment.source,
         );
-        let stacking_context =
-            fragment_stacking_context(opacity, transform, clip_path.is_some(), filter, mask);
+        let stacking_context = fragment_stacking_context(
+            opacity,
+            transform,
+            clip_path.is_some(),
+            filter,
+            mask,
+            containment_stacking_context(style),
+        );
         if let Some(context) = stacking_context.clone() {
             self.push_scope(
                 fragment,
@@ -2107,6 +2115,27 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Whether a fixed positioned box still resolves against the viewport.
+    /// An ancestor with containment, a transform, or a filter establishes a
+    /// fixed positioning containing block (CSS Position 3 §2.1), in which case
+    /// the box scrolls with the document instead of staying viewport-attached.
+    fn fixed_is_viewport(&self, source: Option<NodeId>) -> bool {
+        let Some(dom) = self.dom else {
+            return true;
+        };
+        let Some(source) = source else {
+            return true;
+        };
+        let mut ancestor = dom.parent(source);
+        while let Some(node) = ancestor {
+            if establishes_fixed_containing_block(self.styles.get(&node)) {
+                return false;
+            }
+            ancestor = dom.parent(node);
+        }
+        true
+    }
+
     fn style_for(&mut self, fragment: &Fragment) -> Option<&'a ComputedStyle> {
         let formatting = self.formatting;
         let styles = self.styles;
@@ -2176,7 +2205,7 @@ fn overflow_clip_shape(
         Some(TypedPropertyValue::Overflow(value))
             if !matches!(value, Overflow::Visible)
     );
-    if clips_x || clips_y {
+    if clips_x || clips_y || has_paint_containment(Some(style)) {
         let rect = geometry.padding_rect();
         let radii = inset_corner_radii(
             corner_radii(Some(style), geometry.border_rect()),
@@ -3934,11 +3963,61 @@ fn background_position(value: &str) -> (f32, f32) {
 fn fragment_coordinate_space(
     style: Option<&ComputedStyle>,
     parent: PaintCoordinateSpace,
+    fixed_relative_to_viewport: bool,
 ) -> PaintCoordinateSpace {
     match style.and_then(|style| style.typed("position")) {
-        Some(TypedPropertyValue::Position(Position::Fixed)) => PaintCoordinateSpace::Viewport,
+        Some(TypedPropertyValue::Position(Position::Fixed)) if fixed_relative_to_viewport => {
+            PaintCoordinateSpace::Viewport
+        }
         _ => parent,
     }
+}
+
+/// Whether a fixed positioned box still resolves against the viewport.
+///
+/// CSS Position 3 §2.1: an ancestor with layout/paint containment, a
+/// transform, or a filter establishes a fixed positioning containing block, so
+/// the box scrolls with that ancestor instead of staying viewport-attached.
+fn establishes_fixed_containing_block(style: Option<&ComputedStyle>) -> bool {
+    let containment = match style.and_then(|style| style.typed("contain")) {
+        Some(TypedPropertyValue::Contain(value)) => *value,
+        _ => return false,
+    };
+    if containment.has_layout_containment() || containment.has_paint_containment() {
+        return true;
+    }
+    let transform = matches!(
+        style.and_then(|style| style.typed("transform")),
+        Some(TypedPropertyValue::Transform(TransformList(functions))) if !functions.is_empty()
+    );
+    let filter = style
+        .and_then(|style| style.get("filter"))
+        .is_some_and(|value| {
+            let text = value.css_text();
+            let text = text.trim();
+            !text.is_empty() && !text.eq_ignore_ascii_case("none")
+        });
+    transform || filter
+}
+
+/// The paint-side stacking-context requirement of `contain: layout|paint`
+/// (CSS Containment 2 §3.3/§3.5). Size and style containment do not create
+/// one.
+fn containment_stacking_context(style: Option<&ComputedStyle>) -> bool {
+    match style.and_then(|style| style.typed("contain")) {
+        Some(TypedPropertyValue::Contain(value)) => {
+            value.has_layout_containment() || value.has_paint_containment()
+        }
+        _ => false,
+    }
+}
+
+/// Whether the principal box clips its contents because of `contain: paint`.
+fn has_paint_containment(style: Option<&ComputedStyle>) -> bool {
+    matches!(
+        style.and_then(|style| style.typed("contain")),
+        Some(TypedPropertyValue::Contain(value)) if value.has_paint_containment()
+    )
 }
 
 fn fragment_opacity(style: Option<&ComputedStyle>) -> f32 {
@@ -3959,6 +4038,7 @@ fn fragment_stacking_context(
     clips: bool,
     filter: Option<FilterEffect>,
     mask: Option<MaskLayer>,
+    containment: bool,
 ) -> Option<StackingContext> {
     let reason = if transform.is_some() {
         CompositingReason::Transform
@@ -3968,6 +4048,8 @@ fn fragment_stacking_context(
         CompositingReason::Filter
     } else if mask.is_some() || clips {
         CompositingReason::Clip
+    } else if containment {
+        CompositingReason::Containment
     } else {
         return None;
     };
@@ -4607,9 +4689,10 @@ mod tests {
     use super::{
         Builder, ClipFillRule, ClipShape, CompositingReason, DisplayCommand,
         DisplayListBuildOutput, DisplayListBuilderOptions, GlyphRun, ImagePaint, ListMarkerPaint,
-        ListMarkerShape, ReferenceTextShaper, StackingContext, SystemPalette, TextDecoration,
-        TextDecorationLine, TextDecorationStyle, TextShadowPaint, TextShaper, Transform2D,
-        build_display_list, build_display_list_with_images, parse_conic_gradient,
+        ListMarkerShape, PaintCoordinateSpace, ReferenceTextShaper, StackingContext, SystemPalette,
+        TextDecoration, TextDecorationLine, TextDecorationStyle, TextShadowPaint, TextShaper,
+        Transform2D, build_display_list, build_display_list_with_images,
+        build_display_list_with_images_clip_paths_and_containers, parse_conic_gradient,
         parse_linear_gradient, parse_radial_gradient,
     };
 
@@ -5783,6 +5866,46 @@ mod tests {
         (output, display)
     }
 
+    /// Builds the display list for the same fixed document as
+    /// [`transform_display`], but with the DOM available so paint can resolve
+    /// ancestor-dependent state such as fixed positioning containing blocks.
+    fn dom_display(css: &str) -> (ParseOutput, DisplayListBuildOutput) {
+        let output =
+            parse_document("<!doctype html><body><div id=box><div id=inner>x</div></div></body>");
+        let sheet = parse_stylesheet(css);
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let layout = layout_formatting_tree(
+            &output.dom,
+            &formatting,
+            &styles,
+            LayoutOptions::default(),
+            &SimpleTextMeasurer,
+        );
+        let display = build_display_list_with_images_clip_paths_and_containers(
+            Some(&output.dom),
+            &layout.fragments,
+            &formatting,
+            &styles,
+            DisplayListBuilderOptions::default(),
+            &ReferenceTextShaper,
+            None,
+            None,
+            None,
+        );
+        assert!(display.diagnostics.is_empty(), "{:?}", display.diagnostics);
+        (output, display)
+    }
+
     fn node_contexts<'a>(
         output: &ParseOutput,
         selector: &str,
@@ -5894,6 +6017,150 @@ mod tests {
         assert!((contexts[0].opacity - 0.5).abs() < 1e-6);
         assert!(!contexts[0].transform.is_identity());
         assert_eq!(contexts[0].reason, CompositingReason::Transform);
+    }
+
+    #[test]
+    fn paint_containment_clips_descendants_at_the_padding_box() {
+        let (output, display) = transform_display(
+            "html, body, #box, #inner { display:block; margin:0 } \
+             #box { width:100px; height:50px; padding:4px; contain:paint } \
+             #inner { width:10px; height:10px; background-color:#123456 }",
+        );
+        let selector = parse_selector_list("#box").unwrap();
+        let box_node = select_all(
+            &output.dom,
+            output.dom.document(),
+            &selector,
+            &MatchContext::default(),
+        )[0];
+        let clips: Vec<_> = display
+            .list
+            .items()
+            .iter()
+            .filter(|item| item.source == Some(box_node))
+            .filter_map(|item| match item.command {
+                DisplayCommand::PushClip(shape) => Some(shape),
+                _ => None,
+            })
+            .collect();
+        // CSS Containment 2 §3.5: paint containment clips to the overflow clip
+        // edge (the padding box here); `overflow` stays visible, so this clip
+        // can only come from containment.
+        assert!(
+            clips.iter().any(|shape| matches!(
+                shape,
+                ClipShape::Rect(rect)
+                    if *rect == PhysicalRect::new(0.0, 0.0, 108.0, 58.0)
+            )),
+            "{clips:?}"
+        );
+        assert!(display.list.items().iter().any(|item| {
+            item.source == Some(box_node) && matches!(item.command, DisplayCommand::PopClip)
+        }));
+    }
+
+    #[test]
+    fn size_and_style_containment_do_not_clip_or_create_a_stacking_context() {
+        for contain in ["size", "inline-size", "style"] {
+            let (output, display) = transform_display(&format!(
+                "html, body, #box, #inner {{ display:block; margin:0 }} \
+                 #box {{ width:100px; height:50px; contain:{contain} }}"
+            ));
+            assert!(
+                node_contexts(&output, "#box", &display).is_empty(),
+                "{contain} must not create a stacking context"
+            );
+            let selector = parse_selector_list("#box").unwrap();
+            let box_node = select_all(
+                &output.dom,
+                output.dom.document(),
+                &selector,
+                &MatchContext::default(),
+            )[0];
+            assert!(
+                !display.list.items().iter().any(|item| {
+                    item.source == Some(box_node)
+                        && matches!(item.command, DisplayCommand::PushClip(_))
+                }),
+                "{contain} must not clip"
+            );
+        }
+    }
+
+    #[test]
+    fn layout_and_paint_containment_create_a_stacking_context() {
+        for contain in ["layout", "paint", "strict", "content"] {
+            let (output, display) = transform_display(&format!(
+                "html, body, #box, #inner {{ display:block; margin:0 }} \
+                 #box {{ width:100px; height:50px; contain:{contain} }}"
+            ));
+            let contexts = node_contexts(&output, "#box", &display);
+            assert_eq!(contexts.len(), 1, "{contain}");
+            assert_eq!(
+                contexts[0].reason,
+                CompositingReason::Containment,
+                "{contain}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_boxes_inside_a_containment_box_use_the_document_coordinate_space() {
+        let (output, display) = dom_display(
+            "html, body, #box, #inner { display:block; margin:0 } \
+             #box { width:100px; height:50px; contain:layout } \
+             #inner { position:fixed; left:10px; top:10px; width:5px; height:5px; background-color:#123456 }",
+        );
+        let selector = parse_selector_list("#inner").unwrap();
+        let inner_node = select_all(
+            &output.dom,
+            output.dom.document(),
+            &selector,
+            &MatchContext::default(),
+        )[0];
+        let items: Vec<_> = display
+            .list
+            .items()
+            .iter()
+            .filter(|item| item.source == Some(inner_node))
+            .collect();
+        assert!(!items.is_empty());
+        // CSS Position 3 §2.1: the containment box is the fixed positioned
+        // box's containing block, so it scrolls with the document.
+        assert!(
+            items
+                .iter()
+                .all(|item| item.coordinate_space == PaintCoordinateSpace::Document),
+            "{items:?}"
+        );
+
+        let (plain_output, plain) = dom_display(
+            "html, body, #box, #inner { display:block; margin:0 } \
+             #box { width:100px; height:50px } \
+             #inner { position:fixed; left:10px; top:10px; width:5px; height:5px; background-color:#123456 }",
+        );
+        let selector = parse_selector_list("#inner").unwrap();
+        let inner_node = select_all(
+            &plain_output.dom,
+            plain_output.dom.document(),
+            &selector,
+            &MatchContext::default(),
+        )[0];
+        assert!(
+            plain
+                .list
+                .items()
+                .iter()
+                .any(|item| item.source == Some(inner_node))
+        );
+        assert!(
+            plain
+                .list
+                .items()
+                .iter()
+                .filter(|item| item.source == Some(inner_node))
+                .all(|item| item.coordinate_space == PaintCoordinateSpace::Viewport)
+        );
     }
 
     #[test]

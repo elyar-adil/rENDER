@@ -21,23 +21,34 @@ use render_css::container::ContainerType;
 use render_css::properties::AspectRatio;
 use render_css::properties::BoxSizing;
 use render_css::properties::Clear;
+use render_css::properties::Containment;
 use render_css::properties::Display;
 use render_css::properties::DisplayInside;
 use render_css::properties::Float;
 use render_css::properties::Overflow;
 use render_css::properties::Position;
+use render_css::properties::TransformList;
 use render_css::properties::TypedPropertyValue;
 use render_dom::NodeId;
 
 use crate::scrollport::ClipMode;
 
+/// The computed `contain` value, or the initial `none`.
+pub(super) fn declared_containment(style: Option<&ComputedStyle>) -> Containment {
+    match style.and_then(|style| style.typed("contain")) {
+        Some(TypedPropertyValue::Contain(value)) => *value,
+        _ => Containment::default(),
+    }
+}
+
 pub(super) fn establishes_block_formatting_context(style: Option<&ComputedStyle>) -> bool {
-    // CSS Containment 3 §3: `container-type: size` and `inline-size` both
-    // apply layout containment, and layout containment makes the principal box
-    // an independent formatting context. Like `overflow: hidden`, that keeps
-    // an in-flow float's height inside the box instead of letting it escape
-    // into the parent flow.
-    style.is_some_and(|style| ContainerType::from_style(style) != ContainerType::Normal)
+    // CSS Containment 2 §3.3 and §3.5: layout and paint containment both make
+    // the principal box an independent formatting context. CSS Conditional 5
+    // §5.1 gives `container-type` the same effect through size/inline-size
+    // containment. Like `overflow: hidden`, that keeps an in-flow float's
+    // height inside the box instead of letting it escape into the parent flow.
+    declared_containment(style).establishes_independent_formatting_context()
+        || style.is_some_and(|style| ContainerType::from_style(style) != ContainerType::Normal)
         || ["overflow-x", "overflow-y"].into_iter().any(|property| {
             matches!(
                 style.and_then(|style| style.typed(property)),
@@ -48,18 +59,57 @@ pub(super) fn establishes_block_formatting_context(style: Option<&ComputedStyle>
 
 /// Whether a box applies block-axis size containment.
 ///
-/// CSS Containment 3 §3: `container-type: size` applies size containment, so
-/// the intrinsic block size is zero and an `auto` height no longer grows to
-/// fit the contents. `inline-size` does not contain the block axis.
+/// CSS Containment 2 §3.1: `contain: size` applies size containment in both
+/// axes, so the intrinsic block size is zero and an `auto` height no longer
+/// grows to fit the contents. `inline-size` does not contain the block axis.
 pub(super) fn has_size_containment(style: Option<&ComputedStyle>) -> bool {
-    style.is_some_and(|style| ContainerType::from_style(style) == ContainerType::Size)
+    declared_containment(style).contains_size()
+        || style.is_some_and(|style| ContainerType::from_style(style) == ContainerType::Size)
 }
 
 /// Whether a box applies inline-axis size containment.
 ///
-/// Both `size` and `inline-size` contain the inline axis.
+/// Both `contain: size` and `contain: inline-size` contain the inline axis, as
+/// do `container-type: size` and `container-type: inline-size`.
 pub(super) fn has_inline_size_containment(style: Option<&ComputedStyle>) -> bool {
-    style.is_some_and(|style| ContainerType::from_style(style).supports_inline_axis())
+    declared_containment(style).contains_inline_size()
+        || style.is_some_and(|style| ContainerType::from_style(style).supports_inline_axis())
+}
+
+/// Whether the principal box is a containing block for absolutely and fixed
+/// positioned descendants. CSS Containment 2 §3.3/§3.5 give this to layout and
+/// paint containment; a transform or filter also establishes one for fixed
+/// positioned descendants (CSS Position 3 §2.1).
+pub(super) fn establishes_positioning_containing_block(style: Option<&ComputedStyle>) -> bool {
+    let containment = declared_containment(style);
+    containment.has_layout_containment() || containment.has_paint_containment()
+}
+
+/// Whether the box establishes a fixed positioning containing block.
+///
+/// In addition to containment, CSS Position 3 §2.1 lists transforms, filters,
+/// perspective and will-change. The transform and filter grammars this engine
+/// supports are checked directly; the effect is the same one that makes the
+/// box a stacking context.
+pub(super) fn establishes_fixed_positioning_containing_block(
+    style: Option<&ComputedStyle>,
+) -> bool {
+    let containment = declared_containment(style);
+    if containment.has_layout_containment() || containment.has_paint_containment() {
+        return true;
+    }
+    let transform = matches!(
+        style.and_then(|style| style.typed("transform")),
+        Some(TypedPropertyValue::Transform(TransformList(functions))) if !functions.is_empty()
+    );
+    let filter = style
+        .and_then(|style| style.get("filter"))
+        .is_some_and(|value| {
+            let text = value.css_text();
+            let text = text.trim();
+            !text.is_empty() && !text.eq_ignore_ascii_case("none")
+        });
+    transform || filter
 }
 
 /// The computed `overflow-x` and `overflow-y` of a box. An absent value is
@@ -287,23 +337,24 @@ impl Solver<'_> {
         }
         let position = position(style);
         let out_of_flow = matches!(position, Position::Absolute | Position::Fixed);
-        // CSS Containment 3 §3: both container types apply layout containment,
-        // which makes the principal box a containing block for absolutely
-        // positioned descendants even when it is statically positioned.
-        let layout_contained =
-            style.is_some_and(|style| ContainerType::from_style(style) != ContainerType::Normal);
-        // An out-of-flow box is never subject to the CSS 2 §10.5
-        // "percentage height computes to auto" rule: its containing block is
-        // the positioning ancestor's padding box (or the viewport), whose
-        // used height is known by the time positioned children are laid out.
+        // CSS Containment 2 §3.3/§3.5: layout and paint containment each make
+        // the principal box a containing block for absolutely and fixed
+        // positioned descendants. `container-type` only establishes an
+        // independent formatting context and size containment; it does not
+        // create a positioning containing block.
+        let positioning_contained = establishes_positioning_containing_block(style);
+        let establishes_fixed_containing = establishes_fixed_positioning_containing_block(style);
+        let saved_fixed_containing = self.fixed_positioning_containing;
         let (containing, containing_height_definite) = match position {
             Position::Fixed => (
-                PhysicalRect::new(
-                    0.0,
-                    0.0,
-                    self.options.viewport.width,
-                    self.options.viewport.height,
-                ),
+                self.fixed_positioning_containing.unwrap_or_else(|| {
+                    PhysicalRect::new(
+                        0.0,
+                        0.0,
+                        self.options.viewport.width,
+                        self.options.viewport.height,
+                    )
+                }),
                 true,
             ),
             Position::Absolute => (positioning_containing, true),
@@ -563,6 +614,18 @@ impl Solver<'_> {
         // 0 basis that children must ignore.
         let child_containing_height = specified_content_height.unwrap_or(0.0);
         let child_containing_height_definite = specified_content_height.is_some();
+        // Fixed descendants are laid out while this box's in-flow content is
+        // still being sized, so install its padding box as the fixed
+        // positioning containing block before recursing. The height is
+        // updated once the used content height is known.
+        if establishes_fixed_containing {
+            self.fixed_positioning_containing = Some(PhysicalRect::new(
+                content_x - padding.left,
+                content_y - padding.top,
+                content_width + padding.horizontal(),
+                child_containing_height + padding.vertical(),
+            ));
+        }
         let relative_offset = if position == Position::Relative {
             let horizontal = match (left, right) {
                 (Some(left), _) => left,
@@ -578,7 +641,8 @@ impl Solver<'_> {
         } else {
             (0.0, 0.0)
         };
-        let positioned_child_containing = if position == Position::Static && !layout_contained {
+        let positioned_child_containing = if position == Position::Static && !positioning_contained
+        {
             // An absolute descendant may cross one or more static wrappers
             // before reaching its positioned ancestor.  During the first
             // pass an auto-height positioned ancestor has a zero provisional
@@ -830,7 +894,18 @@ impl Solver<'_> {
             box_sizing,
         );
         self.finish_box(fragment, content_height, children.clone());
-        let positioned_child_containing = if position == Position::Static && !layout_contained {
+        if establishes_fixed_containing {
+            // Now that the used content height is known, expose the final
+            // padding box to positioned children and descendants.
+            self.fixed_positioning_containing = Some(PhysicalRect::new(
+                content_x - padding.left,
+                content_y - padding.top,
+                content_width + padding.horizontal(),
+                content_height + padding.vertical(),
+            ));
+        }
+        let positioned_child_containing = if position == Position::Static && !positioning_contained
+        {
             if positioning_containing.size.height <= 0.0 {
                 // The positioning ancestor's provisional padding box had no
                 // height because its auto height comes from this wrapper's
@@ -928,6 +1003,7 @@ impl Solver<'_> {
                 target_y - outer.origin.y,
             );
         }
+        self.fixed_positioning_containing = saved_fixed_containing;
         Some(BlockResult {
             fragment,
             outer_height: if out_of_flow {

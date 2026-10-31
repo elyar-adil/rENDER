@@ -1,3 +1,71 @@
+# 交接文档 (2026-10-31, 续五十一) — 独立的 `contain` 属性与包含块语义
+
+这一轮实现 CSS Containment 2 §2 的 `contain` 属性，并据规格修正 `container-type` 的
+包含效果：`container-type` 只施加尺寸包含、style containment 与独立格式化上下文，不再
+被误当作定位包含块。没有站点特判。
+
+## 语义与接入
+
+- `Containment { size, inline_size, layout, style, paint }` 作为 `contain` 的 computed value；
+  `strict` 展开为 `size layout style paint`，`content` 展开为 `layout style paint`。
+  解析接受 `[ [ size | inline-size ] || layout || style || paint ]` 的任意顺序并拒绝重复，
+  serialization 按 grammar 顺序输出，`size` 与 `inline-size` 互斥。
+- 布局（`render-layout::solver::block`）：
+  - `layout`/`paint` 建立独立格式化上下文（BFC），因此 float 计入 auto 高度。
+  - `layout`/`paint` 成为 absolute 定位包含块；同时成为 fixed 定位包含块。
+  - `size`/`inline-size` 对相应轴施加 size containment，内容不参与自身内在尺寸。
+  - `container-type` 只保留独立格式化上下文 + size containment，不再建立定位包含块
+    （CSS Conditional 5 §5.1）。
+  - `Solver.fixed_positioning_containing` 保存最近的 fixed 包含块 padding box；块递归在
+    子布局前安装暂定盒、内容高度确定后更新，并在离开时恢复。`position: fixed` 优先使用
+    该盒，否则回退 viewport。
+- 绘制（`render-core::paint::display_list`）：
+  - `contain: layout|paint` 生成 `CompositingReason::Containment` stacking context。
+  - `contain: paint` 在 overflow clip 之外额外把后代裁剪到 padding box。
+  - fixed 元素若任一 DOM 祖先带 `contain: layout|paint`、非空 transform 或 filter，
+    其显示项使用 `PaintCoordinateSpace::Document`，随文档滚动。
+- 注册表把 `contain` 定义为不可继承、初始值 `none`；support oracle 通过
+  `DECLARED_GRAMMARS` 回答。
+
+## 测试
+
+- CSS：关键字展开、任意顺序、互斥重复拒绝、grammar 顺序 serialization、非法值拒绝。
+- 布局：`contain: layout`/`paint` 的 absolute 包含块；`contain: layout`/`paint` 的 fixed
+  包含块；`container-type` 不建立定位包含块；layout containment 包含 float。
+- 绘制：paint containment padding-box 裁剪；`size`/`inline-size`/`style` 不裁剪、不建
+  stacking context；`layout`/`paint`/`strict`/`content` 建 stacking context；包含盒内
+  fixed 后代使用 Document 坐标空间，普通 fixed 仍为 Viewport。
+
+## 验证
+
+```
+cargo test -p render-css --lib                     257 passed, 0 failed
+cargo test -p render-layout --lib                  322 passed, 1 ignored
+cargo test -p render-core --lib                    439 passed, 1 failed
+                                                   （临时关闭 avif-native；失败仅为 AVIF 解码测试）
+cargo fmt --all --check                            clean
+cargo clippy -p render-css -p render-layout -p render-core --all-targets -D warnings  clean
+python tools/check_site_neutrality.py              0 blocking, 26 advisory
+```
+
+本机全工作区门禁仍被 `dav1d-sys v0.8.3` 的 `pkg-config` 缺失阻塞，与本轮代码无关。
+
+## 已知缺口
+
+- `contain: style` 尚未隔离 counter/quotes（当前只解析，无观察效果）。
+- 大幅 auto-height 包含盒内 fixed 后代的百分比高度仍可能使用暂定高度，需布局迭代完善。
+- `contain: layout|paint` 的 fixed 包含块已接入布局与绘制坐标空间；嵌套滚动容器的
+  fixed 包含块尚未与滚动偏移联动。
+
+## 下一步
+
+- `contain: style` 的计数器/quotes 隔离。
+- `scroll-state()` 容器查询。
+- `@scope`、`@starting-style`、`@font-face` 描述符、`color-mix()`。
+- fixed 包含块与滚动容器偏移联动。
+
+---
+
 # 交接文档 (2026-10-31, 续五十) — 生成内容伪元素的包含式样式查询
 
 这一轮补齐 CSS Conditional 5 §5 的伪元素查询容器规则：`::before`/`::after` 查询其

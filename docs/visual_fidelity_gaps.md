@@ -2533,12 +2533,14 @@ report it had been given wrong in its mechanism while right about its consequenc
   inline/block axis eligibility, range syntax, orientation/aspect-ratio, and bounded
   style/layout feedback. Container-relative units (`cqw`/`cqh`/`cqi`/`cqb`/`cqmin`/`cqmax`)
   resolve per axis against the nearest eligible ancestor and fall back to the small viewport.
-  `container-type: size`/`inline-size` now also apply their CSS Containment 3 §3 semantics
-  (HANDOFF 续四十八): layout containment makes the box an independent formatting context and a
-  containing block for absolutely positioned descendants, and size containment zeroes intrinsic
-  sizes on the contained axes. A fixed-position descendant is not yet contained, `style()`
-  containment does not isolate counters, and `container-type` does not yet create the stacking
-  context layout containment implies.
+  `container-type: size`/`inline-size` apply their containment semantics (HANDOFF 续四十八):
+  the box becomes an independent formatting context and size containment zeroes intrinsic sizes
+  on the contained axes. `container-type` alone is deliberately not a positioning containing block
+  (CSS Conditional 5 §5.1). The independent `contain` property has since landed (HANDOFF 续五十一):
+  `layout`/`paint` establish an independent formatting context, an absolute/fixed positioning
+  containing block and a stacking context; `paint` clips descendants to the padding box; fixed
+  descendants of a contained box paint in the document coordinate space; `size`/`inline-size`
+  zero the contained axes. `contain: style` is parsed but does not yet isolate counters or quotes.
   `style()` queries have since landed (HANDOFF 续四十九): every element is a style container
   without `container-type` or geometry, declarations/boolean features/registered `<color>`
   equivalence compare against the query container's computed style, and mixed size+style

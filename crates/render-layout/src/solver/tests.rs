@@ -2573,14 +2573,14 @@ fn layout_containment_makes_a_static_box_the_containing_block_for_absolute_child
     let (output, _, layout) = pipeline(
         "<!doctype html><body><div id='container'><div id='child'></div></div></body>",
         "html, body, div { display:block; margin:0 }\
-         #container { container-type: size; margin-left:50px; width:200px; height:100px }\
+         #container { contain: layout; margin-left:50px; width:200px; height:100px }\
          #child { position:absolute; left:10px; top:10px; width:5px; height:5px }",
         400.0,
     );
     let child = fragment(&layout, find(&output.dom, "#child"));
-    // CSS Containment 3 §3: layout containment makes the static container the
-    // containing block for absolutely positioned descendants, so `left:10px`
-    // resolves against the container's padding box at x=50.
+    // CSS Containment 2 §3.3: layout containment makes the static container
+    // the containing block for absolutely positioned descendants, so
+    // `left:10px` resolves against the container's padding box at x=50.
     assert_eq!(child.rect.origin.x, 60.0);
     assert_eq!(child.rect.origin.y, 10.0);
 
@@ -2599,5 +2599,94 @@ fn layout_containment_makes_a_static_box_the_containing_block_for_absolute_child
             .origin
             .x,
         10.0
+    );
+}
+
+#[test]
+fn paint_containment_also_makes_a_static_box_the_containing_block() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='container'><div id='child'></div></div></body>",
+        "html, body, div { display:block; margin:0 }\
+         #container { contain: paint; margin-left:50px; width:200px; height:100px }\
+         #child { position:absolute; left:10px; top:10px; width:5px; height:5px }",
+        400.0,
+    );
+    // CSS Containment 2 §3.5: paint containment establishes an absolute
+    // positioning containing block just like layout containment.
+    assert_eq!(
+        fragment(&layout, find(&output.dom, "#child")).rect.origin.x,
+        60.0
+    );
+}
+
+#[test]
+fn container_type_does_not_establish_a_positioning_containing_block() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='container'><div id='child'></div></div></body>",
+        "html, body, div { display:block; margin:0 }\
+         #container { container-type: size; margin-left:50px; width:200px; height:100px }\
+         #child { position:absolute; left:10px; top:10px; width:5px; height:5px }",
+        400.0,
+    );
+    // CSS Conditional 5 §5.1: container-type establishes an independent
+    // formatting context and size containment, but unlike `contain: layout`
+    // it is not a positioning containing block. The absolute child therefore
+    // still resolves against the initial containing block.
+    assert_eq!(
+        fragment(&layout, find(&output.dom, "#child")).rect.origin.x,
+        10.0
+    );
+}
+
+#[test]
+fn layout_containment_makes_a_static_box_the_containing_block_for_fixed_children() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='container'><div id='child'></div></div></body>",
+        "html, body, div { display:block; margin:0 }\
+         #container { contain: layout; margin-left:50px; width:200px; height:100px }\
+         #child { position:fixed; left:10px; top:10px; width:5px; height:5px }",
+        400.0,
+    );
+    // CSS Containment 2 §3.3: layout containment establishes a fixed
+    // positioning containing block, so fixed descendants resolve against the
+    // containment box rather than the viewport.
+    assert_eq!(
+        fragment(&layout, find(&output.dom, "#child")).rect.origin.x,
+        60.0
+    );
+
+    let (plain_output, _, plain) = pipeline(
+        "<!doctype html><body><div id='container'><div id='child'></div></div></body>",
+        "html, body, div { display:block; margin:0 }\
+         #container { margin-left:50px; width:200px; height:100px }\
+         #child { position:fixed; left:10px; top:10px; width:5px; height:5px }",
+        400.0,
+    );
+    assert_eq!(
+        fragment(&plain, find(&plain_output.dom, "#child"))
+            .rect
+            .origin
+            .x,
+        10.0
+    );
+}
+
+#[test]
+fn layout_containment_contains_floats_like_a_flow_root() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='container'><div id='float'></div></div></body>",
+        "html, body, div { display:block; margin:0 }\
+         #container { contain: layout }\
+         #float { float:left; width:50px; height:35px }",
+        200.0,
+    );
+    // CSS Containment 2 §3.3: a layout containment box is an independent
+    // formatting context, so the float contributes to its auto height.
+    assert_eq!(
+        fragment(&layout, find(&output.dom, "#container"))
+            .rect
+            .size
+            .height,
+        35.0
     );
 }

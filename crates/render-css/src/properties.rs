@@ -826,6 +826,87 @@ keyword_enum!(Visibility {
     Collapse => "collapse",
 });
 
+/// The computed value of `contain` (CSS Containment 2 §2).
+///
+/// `strict` and `content` are expanded at parse time; the flags then describe
+/// exactly which containment types are active. `size` and `inline-size` are
+/// mutually exclusive because the grammar selects one of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Containment {
+    pub size: bool,
+    pub inline_size: bool,
+    pub layout: bool,
+    pub style: bool,
+    pub paint: bool,
+}
+
+impl Containment {
+    #[must_use]
+    pub const fn is_none(self) -> bool {
+        !self.size && !self.inline_size && !self.layout && !self.style && !self.paint
+    }
+
+    /// Whether intrinsic sizes in both axes are determined as if the box had
+    /// no contents. `inline-size` restricts that to the inline axis.
+    #[must_use]
+    pub const fn contains_size(self) -> bool {
+        self.size
+    }
+
+    /// Whether the inline-axis intrinsic size is determined as if the box had
+    /// no contents.
+    #[must_use]
+    pub const fn contains_inline_size(self) -> bool {
+        self.size || self.inline_size
+    }
+
+    /// Whether layout containment is active. This is what makes the principal
+    /// box an absolute/fixed positioning containing block and a stacking
+    /// context; paint containment has the same containing-block effect but is
+    /// tracked separately because its defining effect is clipping.
+    #[must_use]
+    pub const fn has_layout_containment(self) -> bool {
+        self.layout
+    }
+
+    #[must_use]
+    pub const fn has_paint_containment(self) -> bool {
+        self.paint
+    }
+
+    /// CSS Containment 2 §3.3 and §3.5: a layout or paint containment box
+    /// establishes an independent formatting context and is a containing block
+    /// for absolutely and fixed positioned descendants.
+    #[must_use]
+    pub const fn establishes_independent_formatting_context(self) -> bool {
+        self.layout || self.paint
+    }
+
+    /// The canonical serialization in grammar order.
+    #[must_use]
+    pub fn to_css(self) -> String {
+        if self.is_none() {
+            return "none".to_owned();
+        }
+        let mut parts = Vec::new();
+        if self.size {
+            parts.push("size");
+        } else if self.inline_size {
+            parts.push("inline-size");
+        }
+        if self.layout {
+            parts.push("layout");
+        }
+        if self.style {
+            parts.push("style");
+        }
+        if self.paint {
+            parts.push("paint");
+        }
+        parts.join(" ")
+    }
+}
+
 keyword_enum!(ObjectFit {
     Fill => "fill",
     Contain => "contain",
@@ -1295,6 +1376,7 @@ pub enum TypedPropertyValue {
     BoxSizing(BoxSizing),
     Overflow(Overflow),
     Visibility(Visibility),
+    Contain(Containment),
     ObjectFit(ObjectFit),
     Opacity(f32),
     Size(Size),
@@ -1354,6 +1436,7 @@ impl TypedPropertyValue {
             Self::BoxSizing(_) => "box-sizing",
             Self::Overflow(_) => "overflow",
             Self::Visibility(_) => "visibility",
+            Self::Contain(_) => "contain",
             Self::ObjectFit(_) => "object-fit",
             Self::Opacity(_) => "opacity",
             Self::Size(_) => "size",
@@ -1413,6 +1496,7 @@ impl TypedPropertyValue {
             Self::BoxSizing(value) => value.as_str().to_owned(),
             Self::Overflow(value) => value.as_str().to_owned(),
             Self::Visibility(value) => value.as_str().to_owned(),
+            Self::Contain(value) => value.to_css(),
             Self::ObjectFit(value) => value.as_str().to_owned(),
             Self::Opacity(value) | Self::FlexGrow(value) | Self::FlexShrink(value) => {
                 format_number(*value)
@@ -1717,6 +1801,7 @@ pub const DECLARED_GRAMMARS: &[&str] = &[
     "float",
     "clear",
     "box-sizing",
+    "contain",
     "overflow-x",
     "overflow-y",
     "visibility",
@@ -1850,6 +1935,7 @@ fn parse_property<'i>(
         "box-sizing" => parse_keyword(input, BoxSizing::parse).map(TypedPropertyValue::BoxSizing),
         "overflow-x" | "overflow-y" => parse_overflow(input).map(TypedPropertyValue::Overflow),
         "visibility" => parse_keyword(input, Visibility::parse).map(TypedPropertyValue::Visibility),
+        "contain" => parse_containment(input).map(TypedPropertyValue::Contain),
         "object-fit" => parse_keyword(input, ObjectFit::parse).map(TypedPropertyValue::ObjectFit),
         "opacity" => parse_opacity(input).map(TypedPropertyValue::Opacity),
         "flex-direction" => {
@@ -1995,6 +2081,76 @@ fn parse_overflow<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, Overflow> {
         Ok(Overflow::Auto)
     } else {
         Overflow::parse(&ident).ok_or_else(|| location.new_custom_error(()))
+    }
+}
+
+/// Parse `contain` (CSS Containment 2 §2).
+///
+/// The grammar is
+/// `none | strict | content | [ [ size | inline-size ] || layout || style || paint ]`.
+/// The `||` combinator allows the longhands in any order and forbids a
+/// repeated component; `size` and `inline-size` are alternatives, not
+/// independent flags.
+fn parse_containment<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, Containment> {
+    let location = input.current_source_location();
+    let mut idents = vec![input.expect_ident_cloned()?.to_ascii_lowercase()];
+    while !input.is_exhausted() {
+        idents.push(input.expect_ident_cloned()?.to_ascii_lowercase());
+    }
+    if idents.len() == 1 {
+        match idents[0].as_str() {
+            "none" => return Ok(Containment::default()),
+            "strict" => {
+                return Ok(Containment {
+                    size: true,
+                    layout: true,
+                    style: true,
+                    paint: true,
+                    ..Containment::default()
+                });
+            }
+            "content" => {
+                return Ok(Containment {
+                    layout: true,
+                    style: true,
+                    paint: true,
+                    ..Containment::default()
+                });
+            }
+            _ => {}
+        }
+    }
+    let mut value = Containment::default();
+    for ident in idents {
+        let slot = match ident.as_str() {
+            "size" => {
+                if value.size || value.inline_size {
+                    return Err(location.new_custom_error(()));
+                }
+                value.size = true;
+                continue;
+            }
+            "inline-size" => {
+                if value.size || value.inline_size {
+                    return Err(location.new_custom_error(()));
+                }
+                value.inline_size = true;
+                continue;
+            }
+            "layout" => &mut value.layout,
+            "style" => &mut value.style,
+            "paint" => &mut value.paint,
+            _ => return Err(location.new_custom_error(())),
+        };
+        if *slot {
+            return Err(location.new_custom_error(()));
+        }
+        *slot = true;
+    }
+    if value.is_none() {
+        Err(location.new_custom_error(()))
+    } else {
+        Ok(value)
     }
 }
 
@@ -3758,9 +3914,10 @@ mod tests {
     #![allow(clippy::float_cmp)]
 
     use super::{
-        AspectRatio, CssColor, Display, DisplayInside, DisplayOutside, Length, LengthPercentage,
-        LengthUnit, MaxSize, PropertyParseError, Size, TextAlign, TransformFunction, TransformList,
-        TransformOrigin, TypedPropertyValue, parse_typed_property,
+        AspectRatio, Containment, CssColor, Display, DisplayInside, DisplayOutside, Length,
+        LengthPercentage, LengthUnit, MaxSize, PropertyParseError, Size, TextAlign,
+        TransformFunction, TransformList, TransformOrigin, TypedPropertyValue,
+        parse_typed_property,
     };
 
     fn parse(name: &str, css: &str) -> TypedPropertyValue {
@@ -3894,6 +4051,100 @@ mod tests {
                 parse_typed_property("aspect-ratio", value)
                     .expect("supported property")
                     .is_err()
+            );
+        }
+    }
+
+    /// CSS Containment 2 §2 grammar:
+    /// `none | strict | content | [ [ size | inline-size ] || layout || style || paint ]`.
+    #[test]
+    fn parses_contain_keywords_and_longhand_combination() {
+        let containment = |css: &str| match parse("contain", css) {
+            TypedPropertyValue::Contain(value) => value,
+            other => panic!("expected contain, got {other:?}"),
+        };
+        assert_eq!(containment("none"), Containment::default());
+        assert_eq!(
+            containment("strict"),
+            Containment {
+                size: true,
+                layout: true,
+                style: true,
+                paint: true,
+                ..Containment::default()
+            }
+        );
+        assert_eq!(
+            containment("content"),
+            Containment {
+                layout: true,
+                style: true,
+                paint: true,
+                ..Containment::default()
+            }
+        );
+        assert_eq!(
+            containment("size"),
+            Containment {
+                size: true,
+                ..Containment::default()
+            }
+        );
+        assert_eq!(
+            containment("inline-size"),
+            Containment {
+                inline_size: true,
+                ..Containment::default()
+            }
+        );
+        // `||` accepts any order.
+        assert_eq!(containment("paint layout"), containment("layout paint"));
+        assert_eq!(
+            containment("paint layout"),
+            Containment {
+                layout: true,
+                paint: true,
+                ..Containment::default()
+            }
+        );
+        assert_eq!(
+            containment("style size layout"),
+            Containment {
+                size: true,
+                layout: true,
+                style: true,
+                ..Containment::default()
+            }
+        );
+        // Serialization follows grammar order rather than source order.
+        assert_eq!(
+            containment("paint style inline-size").to_css(),
+            "inline-size style paint"
+        );
+        assert_eq!(containment("strict").to_css(), "size layout style paint");
+        assert_eq!(containment("content").to_css(), "layout style paint");
+        assert_eq!(containment("none").to_css(), "none");
+    }
+
+    #[test]
+    fn rejects_invalid_contain_values() {
+        for invalid in [
+            "",
+            "size layout paint size",
+            "size inline-size",
+            "inline-size size",
+            "layout layout",
+            "strict layout",
+            "content paint",
+            "none paint",
+            "auto",
+            "size, layout",
+        ] {
+            assert!(
+                parse_typed_property("contain", invalid)
+                    .expect("supported property")
+                    .is_err(),
+                "{invalid:?} must not parse as contain"
             );
         }
     }

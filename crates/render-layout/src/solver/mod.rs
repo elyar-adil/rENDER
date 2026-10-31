@@ -417,6 +417,7 @@ fn run_reference_layout(
         flex_intrinsic_misses: 0,
         sticky_boxes: Vec::new(),
         clipping_boxes: Vec::new(),
+        fixed_positioning_containing: None,
     };
     let viewport_rect = PhysicalRect::new(
         0.0,
@@ -515,6 +516,10 @@ struct Solver<'a> {
     /// declaration from. Like the sticky boxes, the geometry is resolved once
     /// the tree is finished.
     clipping_boxes: Vec<(FragmentId, Option<NodeId>)>,
+    /// The padding box of the nearest ancestor that establishes a fixed
+    /// positioning containing block (CSS Position 3 §2.1). `None` means the
+    /// viewport is the containing block.
+    fixed_positioning_containing: Option<PhysicalRect>,
 }
 
 /// The used border and padding of a box whose edges the table algorithm has
