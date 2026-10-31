@@ -168,9 +168,13 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 `isConnected`, `getRootNode`, named and manual slot assignment, \
                 retargeted event targets and `relatedTarget`, `composedPath`, the \
                 flat tree that style and layout walk, and image and video discovery \
-                through the shadow-including tree. `slotchange` is not dispatched, \
-                and shadow-tree stylesheets are not collected, so `:host` and \
-                `::slotted` match nothing.",
+                through the shadow-including tree. `slotchange` fires after a \
+                slot's assigned nodes change, and author stylesheets declared \
+                inside a shadow tree are collected and scoped to that tree; \
+                `:host`, `:host()`, `:host-context()` and `::slotted()` match \
+                through the cascade. `::part()`, `:has-slotted()`, declarative \
+                shadow roots (`shadowrootmode`) and `::slotted()::before/after` \
+                are absent.",
         dependencies: &[],
         tests: DOM_TESTS,
     },
@@ -337,7 +341,11 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 always shows the ring, pointer focus only on text entry, script focus \
                 inherits the last input. One limit remains: `:visited` never matches because \
                 no visited-link history is exposed. Quirks-mode case-insensitive `id`/`class` \
-                matching is implemented and driven by the document's mode.",
+                matching is implemented and driven by the document's mode. CSS \
+                Shadow 1's `:host`, `:host()`, `:host-context()` and \
+                `::slotted()` parse, match and carry their specification \
+                specificity; a featureless shadow host is reachable only through \
+                the host pseudo-class family.",
         dependencies: &[DOM_TREE, CSS_SYNTAX],
         tests: SELECTOR_TESTS,
     },
@@ -371,7 +379,10 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 with explicit and implicit roots, scoping limits, relative preludes, \
                 nested scopes, scoped declarations and scope proximity between \
                 specificity and order of appearance; `@import ... scope(...)` is the \
-                remaining scope surface. One documented origin \
+                remaining scope surface. Author sheets are scoped to the node \
+                tree they belong to, with the Context sort step ranking normal \
+                outer-tree declarations above inner-tree ones and important \
+                inner-tree declarations above outer ones. One documented origin \
                 error remains: HTML presentational hints cascade at the user-agent \
                 origin rather than the author origin the standard specifies, so the \
                 user-agent sheet has to declare `td, th` and `table` through `:where` \
@@ -428,16 +439,17 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
         id: CSS_COLORS,
         family: StandardFamily::Css,
         specification: "CSS Color Level 4",
-        section: "4 RGB and HSL, 10 HWB, 12 Lab and LCH, 13 OKLab and OKLCH, 14 color()",
+        section: "4 RGB and HSL, 10 HWB, 12 Lab and LCH, 13 OKLab and OKLCH, 14 color(), 15 color-mix()",
         status: SupportStatus::Partial,
-        notes: "Named colours, all the rgb() and hsl() syntaxes, `hwb()`, the legacy \
-                comma and modern space forms, `color(srgb)`, `color(srgb-linear)` and \
-                `color(display-p3)` with the documented conversion, and a `<bg-image>#` \
-                layer list are implemented; the spec's own `color(srgb ...)` and \
-                `color(display-p3 ...)` example is a test. Rejected with a typed \
-                diagnostic that names the space: `lab()`, `lch()`, `oklab()`, `oklch()`, \
-                `color-mix()` and every other colour space, because supporting a second \
-                space properly needs a second colour representation and gamut mapping.",
+        notes: "Named colours, all the rgb() and hsl() syntaxes, `hwb()`, `lab()`/`lch()`, \
+                `oklab()`/`oklch()`, `color()` in every predefined space, and \
+                `color-mix()` in those spaces with premultiplied alpha and all four \
+                hue paths are implemented. Missing (`none`) components parse in every \
+                modern function, carry forward to analogous components during \
+                interpolation, and behave as zero elsewhere. Out-of-gamut results use \
+                the §14.2.2 Binary Search + Local MINDE mapping at the sRGB device \
+                boundary rather than per-channel clipping. Relative color syntax, \
+                `light-dark()`, `device-cmyk()` and `contrast-color()` remain absent.",
         dependencies: &[CSS_TYPED_VALUES],
         tests: TYPED_VALUE_TESTS,
     },

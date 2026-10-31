@@ -48,6 +48,28 @@ window controls, dark-theme colors, and fractional-DPI painting. HTTP/HTTPS
 documents load on background workers; HTML encoding detection and external
 stylesheets flow into the same DOM/style/layout/paint pipeline.
 
+### Native AVIF prerequisite
+
+`render-core` decodes AVIF through `image`'s `avif-native` feature, which links
+the system `libdav1d` through `system-deps`. A machine without `dav1d` fails in
+`dav1d-sys`'s build script with `The pkg-config command could not be found`
+(or a version error), before any rENDER code runs.
+
+Use one of these setups:
+
+- Install `pkg-config` and `dav1d` for the target toolchain. With vcpkg:
+  `vcpkg install dav1d:x64-windows`, then put the vcpkg `lib/pkgconfig`
+  directory on `PKG_CONFIG_PATH` and its `bin` directory on `PATH`.
+- Or point `system-deps` at an existing dav1d build by setting
+  `SYSTEM_DEPS_DAV1D_NO_PKG_CONFIG=1`, `SYSTEM_DEPS_DAV1D_LIB=dav1d`,
+  `SYSTEM_DEPS_DAV1D_SEARCH_NATIVE=<prefix>\lib`,
+  `SYSTEM_DEPS_DAV1D_INCLUDE=<prefix>\include`, and adding `<prefix>\bin` to
+  `PATH` so the loader finds `dav1d.dll`.
+
+The release binary loads `dav1d.dll` at startup. Keeping a copy next to
+`target\release\render-browser.exe` (or `<prefix>\bin` on `PATH`) makes a
+direct launch independent of the current shell.
+
 ## Performance Measurements
 
 Use the headless, deterministic `render-perf` binary to measure the stable

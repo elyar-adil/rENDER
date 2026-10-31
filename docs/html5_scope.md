@@ -590,7 +590,7 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 | 能力 | 状态 |
 |------|------|
 | `customElements.define` + 自动升级 | ✅ 自主 custom elements 的定义、升级、`connectedCallback` 等反应已实现；customized built-ins 仍 🔴 |
-| Shadow DOM `attachShadow({mode})` | ✅ open/closed 两种模式、`ShadowRoot`、retargeting 已实现；shadow-scoped 样式表仍 🔴 |
+| Shadow DOM `attachShadow({mode})` | ✅ open/closed 两种模式、`ShadowRoot`、retargeting、shadow-tree 样式表、`:host`/`:host-context()`/`::slotted()` 与 `slotchange` 已实现；`::part()`、declarative shadow DOM 仍 🔴 |
 | `<slot>` 投影 | ✅ named/manual slot 投影与 flat tree 已实现 |
 | `<template>` 内容文档 | ✅ 内容位于无父 `DocumentFragment`，默认惰性；克隆/激活边界见 `registry.rs` 的 `html.template-contents` |
 | `closed` shadow root / declarative shadow DOM | 🟡 closed 模式 ✅；declarative shadow DOM（`<template shadowrootmode>`）仍 🔴 |

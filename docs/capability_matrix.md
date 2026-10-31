@@ -15,14 +15,14 @@ says so. `docs/visual_fidelity_gaps.md` is the working register; this file is th
 | what | number | when |
 | --- | --- | --- |
 | `render-js` unit tests | 1,116 passed, 0 failed | 2026-10-22 |
-| `render-css` unit tests | 266 passed, 0 failed | 2026-10-31 |
-| `render-core` unit tests | 441 passed, 1 failed (temporary local build without `avif-native`; failure is the AVIF decoder test) | 2026-10-31 |
-| `render-layout` unit tests | 322 passed, 1 ignored | 2026-10-31 |
-| `render-browser` unit tests | 198 passed, 0 failed | 2026-10-23 |
-| `render-browser` app tests (binary) | 99 passed, 0 failed | 2026-10-23 |
+| `render-css` unit tests | 295 passed, 0 failed | 2026-11-01 |
+| `render-core` unit tests | 453 passed, 0 failed | 2026-11-01 |
+| `render-layout` unit tests | 322 passed, 1 ignored | 2026-11-01 |
+| `render-browser` unit tests | 206 passed, 0 failed | 2026-11-01 |
+| `render-browser` app tests (binary) | 114 passed, 0 failed | 2026-11-01 |
 | `render-html` unit tests | 149 passed, 0 failed | 2026-10-22 |
 | `render-net` unit tests | 32 passed, 0 failed | 2026-10-22 |
-| `render-dom` unit tests | 77 passed, 0 failed | 2026-10-22 |
+| `render-dom` unit tests | 78 passed, 0 failed | 2026-11-01 |
 | real-site acceptance harness | 25 passed, 5 `#[ignore]`s each mapped to a named gap | last recorded |
 | Python static gate | 15 passed, 55 subtests | last recorded |
 | site-neutrality gate | **9 rules, 269 Rust source files, exit 0** with 25 advisory findings | 2026-10-23 |
@@ -57,13 +57,19 @@ The last correction here was the sixth agent to overturn a spec claim I wrote in
 at the correct origin, CSS Nesting, `@supports` evaluated against a three-state oracle. CSS Cascade 6
 `@scope` is evaluated: explicit and implicit scoping roots, scoping limits, relative preludes with
 zero-specificity `:where(:scope)` anchoring, `:scope` and `&`, nested scopes, declarations directly
-in `@scope`, and scope proximity between specificity and order of appearance. CSS Color 4
-is implemented through a single conversion layer: `hsl()`/`hsla()`/`hwb()`, `lab()`/`lch()`,
-`oklab()`/`oklch()`, `color()` in every predefined space (sRGB, linear sRGB, Display P3, A98 RGB,
-ProPhoto RGB, Rec. 2020, XYZ D50/D65), and `color-mix()` in those spaces with premultiplied alpha
-and all four hue paths. Absolute mixes resolve at parse time; mixes naming `currentcolor` or a
-system color resolve at paint time. Out-of-gamut colors are clipped per channel (perceptual gamut
-mapping is not implemented), and `none` components are currently treated as zero. Shorthand expansion is now
+in `@scope`, and scope proximity between specificity and order of appearance. Author stylesheets
+are scoped to their node tree, with Cascade Context ordering; stylesheets inside shadow roots are
+collected and reach their own tree, and `:host`/`:host()`/`:host-context()`/`::slotted()` provide
+the two intentional cross-tree paths. `slotchange` fires after a slot's assigned nodes change.
+CSS Color 4 is implemented through a single conversion layer: `hsl()`/`hsla()`/`hwb()`,
+`lab()`/`lch()`, `oklab()`/`oklch()`, `color()` in every predefined space (sRGB, linear sRGB,
+Display P3, A98 RGB, ProPhoto RGB, Rec. 2020, XYZ D50/D65), and `color-mix()` in those spaces
+with premultiplied alpha and all four hue paths. Absolute mixes resolve at parse time; mixes
+naming `currentcolor` or a system color resolve at paint time. Out-of-gamut colors use the
+CSS Color 4 §14.2.2 Binary Search + Local MINDE mapping at the sRGB device boundary. `none`
+components carry forward to analogous components during `color-mix()` and serialize as `none`;
+outside interpolation they behave as zero, including canvas paint and transitions. Shorthand
+expansion is now
 spec-correct for `text-decoration`, which is what fixed the most-reported visual symptom in the
 project's history. `@property` registrations validate their syntax and initial value, stop
 `inherits: false` properties from inheriting, and replace invalid computed values with the
@@ -135,7 +141,7 @@ Verified by grep, not inferred. Full discussion in the register's S30.
 | **Iframe painting** | a nested document runs scripts in its own realm, but it is not laid out or painted, so a page embedding one loses that content visually |
 | **Animations and transitions** | *Closed for the CSS surface.* `@keyframes`, `animation-*`, and CSS transitions are sampled by a browser-driven 16 ms timeline clock; keyframes inside `@media` are gated, while keyframes inside `@container` are global per CSS Conditional 5 §5.4. Multi-animation lists, reversing shortening and WAAPI edge cases remain partial. |
 | **Selection / Range** | Range is implemented (DOM §5): `Range`, `StaticRange`, `createRange`, the boundary-point and content algorithms, and live updates on every tree mutation. There is no `getSelection` selection state, so `getSelection()` reports an empty selection, and no caret position APIs |
-| **Shadow-scoped styling** | shadow trees, `attachShadow` and autonomous `customElements` exist; shadow-tree stylesheets are not collected, `:host`/`::slotted` match nothing, and `slotchange` is not dispatched |
+| **Shadow-scoped styling** | shadow trees, `attachShadow` and autonomous `customElements` exist; shadow-tree stylesheets are collected and isolated per tree, `:host`/`:host()`/`:host-context()`/`::slotted()` match, and `slotchange` fires. `::part()`, `:has-slotted()`, declarative shadow roots and `::slotted()::before/after` remain |
 | **Compositing** | there is no compositor. Every frame is one raster of the whole document, which is why scrolling cannot be cheap and why `position: fixed` cannot be a layer |
 | **Bidi** | UAX #9 has zero occurrences, so right-to-left scripts lay out left-to-right. Correctly lower priority given the corpus, but recorded rather than left to be rediscovered |
 | **HTTP/2** | structurally rejected: a pooled connection leaves the pool while in use and is held for the whole request, so one connection carries one in-flight request. Multiplexing is the inverse |
@@ -269,8 +275,8 @@ them would break more real pages than everything else combined:
    independent per-child timing, Effect.updateTiming and animation.effect
    replacement, and finish/cancel events; several timing-model edge cases remain
    incomplete
-3. **Shadow-scoped styling** - shadow trees exist, but a `<style>` inside a shadow root applies
-   nowhere and `:host`/`::slotted` match nothing
+3. **Shadow-scoped styling** - stylesheets, `:host` and `::slotted` now work; `::part()`,
+   declarative shadow roots and nested pseudo-elements on `::slotted()` remain
 4. **Selection, bidi, workers and compositing** - the remaining structural absences. The
    compositor in particular is an architectural fact rather than a gap: it changes what scrolling
    and fixed positioning can cost

@@ -1,3 +1,106 @@
+# 交接文档 (2026-11-01, 续五十四) — Shadow DOM 样式/slotchange、Color `none` 与感知色域映射、截图唤醒
+
+这一轮并行推进四块现代浏览器能力：shadow-tree 样式与 `slotchange`、CSS Color 4 的
+`none`/感知色域映射、`--screenshot` 事件循环唤醒，以及本机 `dav1d` 构建前提。
+没有站点特判。
+
+## Shadow DOM 样式
+
+- `StyleSheet::tree_root` 记录样式表所属节点树（`None` 视为 document）。样式发现按
+  shadow-including tree order 遍历；shadow root 内的 `<style>` 与外部 `<link>` 都带
+  自己的 tree root。
+- 级联只让 author sheet 作用于其所属树。唯二跨树路径：
+  - `:host` / `:host(<compound>)` / `:host-context(<compound>)`：shadow host 在自身
+    shadow tree 中是 featureless 的，只能经 host 伪类家族命中；
+  - `::slotted(<compound>)`：通过 originating slot 命中被分配的 light-DOM 元素，
+    支持 flatten 后的 assignment chain。
+- 级联新增 Cascade 5 §6.1 Context 步骤：normal 外层树声明胜内层，important 内层
+  声明胜外层。`Priority.context` 位于 origin 之后、layer 之前。
+- 语义细节：`:host` 特异性为伪类 + 参数；`::slotted` 为伪元素 + 参数；`:host:hover`
+  不匹配（必须写 `:host(:hover)`）；`:host-context()` 会向上跨 shadow 边界。
+- `@scope` 的隐式根恢复和祖先链改为 shadow-aware：shadow 内 `<style>` 的隐式根回退
+  到 shadow host，祖先匹配止于 host，不泄漏到外层 document。
+
+## `slotchange`
+
+- `Dom::slot_assignment_snapshot()` 给出所有 shadow tree 中每个 slot 的 assigned
+  nodes；`Dom::has_shadow_roots()` 与内部计数让没有 shadow root 的页面零成本跳过。
+- `Page` 保存上一回合快照；每个回合微任务检查点之后比较并派发 `slotchange`。
+  事件在 slot 上触发，冒泡、不可取消、非 composed，记录为
+  `PageJob::SlotChange { slot }`。监听器再次改分配时最多追加 8 轮，避免自激循环。
+- `render-dom` 新增快照单元测试；`render-core` 新增 attachShadow → 初始分配 →
+  移除 slottable 的端到端测试。
+
+## CSS Color 4/5
+
+- 新增 `SpaceColor { space, components: [Option<f32>; 3], alpha }` 与
+  `CssColor::Space`。`none` 在所有现代颜色函数中可解析（含 `/ none` alpha），
+  legacy comma 语法仍拒绝。
+- `color-mix()` 保留 authored space，实现 analogous component 的 missing
+  carry-forward、analogous set（Lab a/b ↔ LCH C/H）、both-missing 保留、alpha
+  carry；缺失分量在插值之外按 0 处理。
+- powerless 阈值采用 CSS Color 4 §19 样例：HSL 0.001、HWB 0.99999、LCH 0.0015、
+  OKLCH 0.000004。
+- sRGB 设备边界改用 §14.2.2 Binary Search + Local MINDE 感知色域映射（OKLCH
+  chroma 二分，JND 0.02，epsilon 0.0001），替换逐通道裁剪。P3 原色、oklch 越界色和
+  CSS Color 5 的 HSL/P3 示例均有数值测试。
+- Canvas `fillStyle` 与 CSS transition 通过 `resolve_absolute` 接受现代/非 sRGB
+  颜色；`none` 在两者中按 0 处理。
+
+## `--screenshot` 卡死
+
+- 根因：截图 deadline 没有进入 `ControlFlow`。页面稳定后无网络/脚本/动画/timer，
+  事件循环进入 `Wait`，deadline 到点也无事件唤醒。
+- 修复：`next_control_flow()` 把截图 deadline 与帧轮询、页面 timer 取最小值；
+  窗口已存在但 frame 为空时明确报错；事件循环在截图未写出就停止时非零退出。
+- 实测生成 122,219 字节 PNG，`@scope` 演示的颜色/限制/嵌套/隐式根全部正确。
+
+## 构建前提
+
+- `image` 的 `avif-native` 经 `dav1d-sys` 链接系统 `libdav1d`。本机用 MSVC +
+  meson 构建 dav1d 1.5.1 到 `C:\Users\Elyar\dav1d-install`，设置
+  `SYSTEM_DEPS_DAV1D_NO_PKG_CONFIG=1`、`SYSTEM_DEPS_DAV1D_LIB=dav1d`、
+  `SYSTEM_DEPS_DAV1D_SEARCH_NATIVE`、`SYSTEM_DEPS_DAV1D_INCLUDE`，并把其 `bin`
+  加入 PATH。README 已记录通用做法。
+- 该设置下 `cargo run --release -- --help` 与 AVIF 解码测试均通过。
+
+## 验证
+
+```
+cargo test -p render-css --lib                    295 passed, 0 failed
+cargo test -p render-core --lib                   453 passed, 0 failed
+cargo test -p render-browser -- --test-threads=1  206 + 114 + 2 passed, 0 failed
+cargo test -p render-layout --lib                 322 passed, 1 ignored
+cargo test -p render-dom --lib                    78 passed, 0 failed
+cargo fmt --all --check                           clean
+cargo clippy -p render-css -p render-core -p render-browser -p render-dom -p render-layout \
+  --all-targets -- -D warnings                    clean
+python tools/check_site_neutrality.py             0 blocking, 26 advisory
+```
+
+## 已知缺口
+
+- 相对颜色语法（`rgb(from ...)`）、`light-dark()`、`device-cmyk()`、
+  `contrast-color()` 尚未实现。
+- 绘制仍统一落到 8-bit sRGB，感知色域映射在 sRGB 边界执行，尚无宽色域合成；
+  颜色动画仍按 sRGB 通道插值。
+- `::part()`、`:has-slotted()`、声明式 shadow root、`::slotted()::before/after`
+  尚未实现；shadow 样式失效根尚未加入 host。
+- `@import ... scope(...)` 仍未接入；`@scope` 大规模文档的根/限制缓存仍可优化。
+- `slotchange` 的派发点在回合微任务检查点之后，回合外直接 DOM 变更要到下一回合
+  才被观察到。
+
+## 下一步
+
+- 相对颜色语法与 `light-dark()`。
+- `contain: style` 的计数器/quotes 隔离。
+- `scroll-state()` 容器查询。
+- `@starting-style`、`@font-face` 描述符。
+- fixed 包含块与滚动容器偏移联动。
+- `::part()` / `:has-slotted()` / 声明式 shadow root。
+
+---
+
 # 交接文档 (2026-10-31, 续五十三) — CSS Cascade 6 `@scope`
 
 这一轮实现 CSS Cascade 6 §3.5 的 `@scope`：作用域根/限制、相对选择器、

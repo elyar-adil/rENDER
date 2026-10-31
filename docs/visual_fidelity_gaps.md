@@ -15,6 +15,9 @@ Kept so the work is not repeated, and so the cost of the fix stays visible.
 
 | Gap | Closed by | Evidence |
 | --- | --- | --- |
+| **Shadow-tree styling was unreachable and `slotchange` never fired.** A `<style>` inside a shadow root applied nowhere, `:host`/`::slotted` matched nothing, and a script waiting for `slotchange` hung forever. | `crates/render-core/src/{document,page}.rs`, `crates/render-css/src/{cascade,selector,stylesheet}.rs`, `crates/render-dom/src/{lib,shadow}.rs` | Shadow-including style discovery with per-sheet `tree_root`, tree-isolated author sheets, Cascade Context ordering, `:host`/`:host()`/`:host-context()`/`::slotted()`, and a bounded `slotchange` dispatch after each microtask checkpoint. `render-core` **453 passed**, `render-css` **295 passed**, `render-dom` **78 passed**. |
+| **`none` components and perceptual gamut mapping were absent.** `none` was zero at parse time, out-of-gamut colours were clipped per channel, and canvas/transitions rejected non-sRGB colours. | `crates/render-css/src/{color,properties,animation}.rs`, `crates/render-core/src/{paint/color,canvas/style}.rs` | `SpaceColor` retains authored space and carries missing components to analogous ones; §14.2.2 Binary Search + Local MINDE maps to sRGB at the device boundary; missing components are zero in canvas and transitions. Known values pinned for P3 primaries, `oklch(0.7 0.4 150)` and the Colour 5 HSL/P3 example. |
+| **`--screenshot` could hang forever on a settled page.** The deadline was not part of `ControlFlow`, so the event loop slept with nothing to wake it. | `crates/render-browser/src/app.rs`, `main.rs` | Deadline joins the minimum wait; empty frame after a window exists is a reported error; loop stop with a pending request exits non-zero. Regression tests plus a real 122,219-byte PNG of the `@scope` demo. |
 | **CSS 2.1 §17 table layout was entirely absent.** `tree.rs` produced `FormattingContextKind::Table` but the solver mapped every non-Flex/Grid context to `Block`, so every `display: table` page laid out as one stacked column. | `crates/render-layout/src/solver/table.rs`, in four reviewed rounds | `cargo test -p render-layout`: 81 → 101 → 112 → 119 → **126 passed, 0 failed**. Covers anonymous table boxes, §17.5.2 column widths, §17.5.3 row heights, cell and row-group `vertical-align`, colspan/rowspan, §17.4 caption, §17.5.1 `<col>`/`<colgroup>` widths, §17.5.2.1 `table-layout: fixed`, §17.6 `border-collapse: collapse` with conflict resolution and `hidden` override, §17.5.1.1 `empty-cells` (correctly ignored under collapse, as the spec restricts it to the separated model), shrink-to-fit used width, and over-constrained growth. |
 
 ### Table layout verification notes worth keeping
@@ -1457,12 +1460,14 @@ Verified against known values: `color-mix(in oklab, red, blue)` = `rgb(140, 83, 
 `oklch(0.7 0.1 120)` = `rgb(150, 168, 94)`, `color-mix(in srgb-linear, red, blue)` =
 `rgb(188, 0, 188)`, and `color-mix(in srgb, red, transparent)` = `rgba(255, 0, 0, 0.5)`.
 
-**Remaining colour gaps:** `none` components are parsed as zero instead of carrying missing
-components through interpolation and serialization; gamut mapping is still per-channel
-clipping rather than perceptual OKLCH mapping; relative colour syntax (`rgb(from ...)`),
-`light-dark()`, `device-cmyk()` and `contrast-color()` are not implemented; colour
-animations still interpolate sRGB channels rather than using the specified interpolation
-space and premultiplication.
+**Remaining colour gaps:** relative colour syntax (`rgb(from ...)`), `light-dark()`,
+`device-cmyk()` and `contrast-color()` are not implemented; colour animations still
+interpolate sRGB channels rather than using the specified interpolation space and
+premultiplication; and the engine flattens every computed colour to its 8-bit sRGB paint
+contract, so the §14.2.2 gamut mapping happens at the sRGB boundary rather than in a
+wide-gamut compositing pipeline. Missing (`none`) components now carry across analogous
+components during `color-mix()` and serialize as `none`; elsewhere they behave as zero,
+including transitions and canvas paint.
 
 ## S17 - Closed, see "S17 - Closed: two media-query evaluators" below
 
@@ -2657,40 +2662,44 @@ The rules that follow, for briefs and for me:
   themselves doing this and corrected the test rather than the code; that is the signal
   the standard is working.
 
-## Shadow trees: the core is in, and shadow-scoped styling is open
+## Shadow trees: styling and slotchange are closed; parts and declarative roots are not
 
 Shadow trees exist now (DOM §4.2.2, §2.9): `attachShadow`, named and manual slot
 assignment, the flat tree that style and layout walk, retargeted events, and image and
-video discovery through the shadow-including tree, so a shadow tree's images load. Three
-items are not closed, and they are recorded here rather than papered over.
+video discovery through the shadow-including tree, so a shadow tree's images load.
 
-- **Shadow-tree stylesheets are not collected.** The author-sheet walk in
-  `crates/render-core/src/document.rs` (`collect_author_style_sheets`) follows the DOM
-  child lists from the document, and a shadow root is never one of them, so a `<style>`
-  or `<link rel=stylesheet>` inside a shadow root applies nowhere. The cascade
-  (`crates/render-css/src/cascade.rs`, `cascade_element_with_origins`) also drops every
-  author-origin sheet for an element inside a shadow tree, so a document rule cannot leak
-  into shadow content. User-agent and user rules, and inline styles, still apply there.
-  The consequence is that shadow content is styled by the user-agent sheet and by
-  inheritance only.
-- **`:host` and `::slotted` match nothing.** The selector grammar parses them, and
-  `crates/render-css/src/selector.rs` (`shadow_dom_pseudo_classes_parse_and_match_nothing`)
-  pins that. Closing the first item is what makes `:host` meaningful, because a
-  shadow sheet has to be scoped to its own root and matched with `:host` against the
-  host.
-- **`slotchange` is not dispatched.** The slot-change signal of DOM §4.2.2.5 is absent,
-  so a script that waits for `slotchange` never runs. Assignment itself is current:
-  `assignedNodes`, `assignedElements` and `assignedSlot` read the live assignment.
+- **Shadow-tree stylesheets are collected and scoped.** Discovery follows
+  shadow-including tree order, and every `StyleSheet` records its `tree_root`
+  (`crates/render-core/src/document.rs`). The cascade compares that root with the
+  element's tree: a document sheet never reaches shadow content, and a shadow sheet
+  styles only its own tree. The intentional cross-tree paths are `:host` (the host
+  element) and `::slotted()` (a light-DOM element assigned to a slot in that tree).
+  Cascade Context ordering follows CSS Cascade 5 §6.1: normal outer-tree declarations
+  win, important inner-tree declarations win.
+- **`:host`, `:host()`, `:host-context()` and `::slotted()` match.** The host is
+  featureless in its own shadow tree and is reachable only through the host family;
+  `::slotted(<compound>)` matches the assigned light-DOM element through its
+  originating slot, including flattened assignment chains. Specificity is the
+  pseudo-class/pseudo-element plus the argument's specificity.
+- **`slotchange` is dispatched.** The page keeps a slot-assignment snapshot
+  (`Dom::slot_assignment_snapshot`) and, after each turn's microtask checkpoint,
+  fires a bubbling, non-cancelable, non-composed `slotchange` on every slot whose
+  assigned nodes changed. Listener-driven reassignment is bounded to eight follow-up
+  rounds. `assignedNodes`, `assignedElements` and `assignedSlot` continue to read the
+  live assignment.
 
-What closing the styling items needs: collect `<style>` and stylesheet `<link>` elements
-under each shadow root with the root as their owner; pass the owner to the cascade so a
-sheet applies only to elements whose root is that owner; give `MatchContext` the host of
-the element's shadow tree so `:host` can match it; and match `::slotted()` against the
-nodes assigned to a slot in that tree. The style-invalidation roots also need the host
-added when a mutation lands inside a shadow tree, because the invalidation keys on the
-mutation target and a shadow root is not in the flat tree. Closing `slotchange` needs a
-slot-change signal queued from assignment changes and delivered at the microtask
-checkpoint, as DOM §4.2.2.5 describes.
+Still open on this row: `::part()` and `:has-slotted()` do not match,
+declarative shadow roots (`shadowrootmode`) are not parsed, `::slotted()::before` /
+`::slotted()::after` are rejected because the selector parser still allows only one
+pseudo-element, and style invalidation still keys on the mutation target rather than
+adding a shadow host root.
+
+Evidence: `crates/render-css/src/selector.rs`
+(`host_and_slotted_selectors_match_in_a_shadow_tree_context`),
+`crates/render-core/src/document.rs` (isolation, nested-tree, host, slotted, external
+shadow link and implicit-`@scope` tests), and
+`crates/render-core/src/page.rs`
+(`slotchange_fires_when_a_slots_assigned_nodes_change`).
 
 ## CSS Cascade 6 `@scope` - closed for rule blocks, with named limits
 
@@ -2703,18 +2712,18 @@ scope proximity, which sorts after specificity and before order of appearance. A
 `@scope` with no start is rooted at the parent of the stylesheet's owner element, which
 `render-core` supplies for both embedded and external sheets.
 
-Scoped preludes follow ��3.5.3: ordinary selectors receive an implicit
+Scoped preludes follow ��3.5.3: ordinary selectors receive an implicit
 `:where(:scope)` descendant anchor, a leading combinator is relative to the same root,
 `:scope` keeps its `(0,1,0)` specificity, and `&` is `:where(:scope)`. Nested scopes
 parse their start relative to the enclosing root and their end relative to their own
 root. Declarations written directly inside `@scope` become zero-specificity rules that
 match the root, in contiguous runs and in source order.
 
-Pseudo-elements are rejected in either boundary as ��3.5.2 requires, and an invalid or
+Pseudo-elements are rejected in either boundary as ��3.5.2 requires, and an invalid or
 unforgiving prelude drops the block with a diagnostic instead of silently applying it.
 While wiring the scope selectors through `matching_specificity`, one pre-existing
 selector bug surfaced and was fixed: functional pseudo-class arguments (`:is()`,
-`:where()`, `:not()`, `:has()`, `:nth-child(�� of ��)`) were inheriting the outer
+`:where()`, `:not()`, `:has()`, `:nth-child(�� of ��)`) were inheriting the outer
 pseudo-element context, so `:is(.host) p::before` could not match; those lists now
 match elements, as only the outermost subject may carry the generated pseudo-element.
 
