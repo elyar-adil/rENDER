@@ -21,6 +21,7 @@ use render_net::{FetchConfig, FetchRequest, HttpTransport, Url};
 use winit::dpi::{PhysicalPosition, PhysicalSize as WindowSize};
 use winit::event::ElementState;
 use winit::event::MouseScrollDelta;
+use winit::event_loop::ControlFlow;
 use winit::keyboard::Key;
 use winit::keyboard::NamedKey;
 
@@ -72,6 +73,43 @@ use render_browser::worker::RenderFailure;
 use render_browser::worker::RenderJob;
 use render_browser::worker::RenderWorkerOptions;
 use render_core::js::ElementRect;
+
+#[test]
+fn screenshot_deadline_wakes_a_settled_event_loop() {
+    let now = Instant::now();
+    let deadline = now + Duration::from_millis(1_500);
+    assert_eq!(
+        crate::app::next_control_flow(now, false, None, Some(deadline)),
+        ControlFlow::WaitUntil(deadline)
+    );
+}
+
+#[test]
+fn screenshot_deadline_precedes_page_timers_and_frame_polling() {
+    let now = Instant::now();
+    let deadline = now + Duration::from_millis(5);
+    assert_eq!(
+        crate::app::next_control_flow(
+            now,
+            false,
+            Some(now + Duration::from_secs(10)),
+            Some(deadline)
+        ),
+        ControlFlow::WaitUntil(deadline)
+    );
+    assert_eq!(
+        crate::app::next_control_flow(now, true, None, Some(deadline)),
+        ControlFlow::WaitUntil(deadline)
+    );
+    assert_eq!(
+        crate::app::next_control_flow(now, true, None, None),
+        ControlFlow::WaitUntil(now + Duration::from_millis(16))
+    );
+    assert_eq!(
+        crate::app::next_control_flow(now, false, None, None),
+        ControlFlow::Wait
+    );
+}
 
 #[test]
 fn converts_core_surface_to_softbuffer_rgb_words() {

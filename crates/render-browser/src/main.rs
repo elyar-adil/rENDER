@@ -129,8 +129,15 @@ fn browser_main() -> Result<(), String> {
     if let Some((path, delay)) = launch.screenshot {
         app.schedule_screenshot(path, delay);
     }
-    event_loop
+    let run_result = event_loop
         .run_app(&mut app)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string());
+    run_result?;
+    // Without this, a platform failure that stopped the event loop before the
+    // deadline (for example when no window surface could be created) would
+    // leave no PNG but still exit successfully.
+    if app.screenshot.is_some() {
+        return Err("the event loop stopped before the screenshot was written".to_owned());
+    }
     Ok(())
 }

@@ -1029,8 +1029,26 @@ impl BrowserApp {
         let Some(request) = &self.screenshot else {
             return false;
         };
-        if Instant::now() < request.deadline || self.frame.is_empty() {
+        if Instant::now() < request.deadline {
             return false;
+        }
+        if self.frame.is_empty() {
+            // A zero-delay screenshot can come due before `resumed` creates
+            // the window. Keep the request pending until the window exists;
+            // once it does, an empty frame means the platform could not give
+            // us a renderable surface, so report that instead of spinning or
+            // waiting forever.
+            if self.window.is_none() {
+                return false;
+            }
+            let request = self.screenshot.take().expect("checked above");
+            eprintln!(
+                "render-browser screenshot failed: no composed frame is available for {} (window size {}x{}); the platform did not provide a renderable window surface",
+                request.path.display(),
+                self.frame_size.width,
+                self.frame_size.height
+            );
+            return true;
         }
         let request = self.screenshot.take().expect("checked above");
         if env::var_os("RENDER_DEBUG_LAYOUT").is_some() {
@@ -5105,30 +5123,52 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
             // queueing one render per tick.
             self.schedule_page_render_for_tab(active);
         }
-        if self.has_pending_network()
+        let pending_work = self.has_pending_network()
             || self.has_pending_script_work()
             || self.has_unresolved_render_request()
-            || animating
-        {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(16),
-            ));
-            return;
-        }
-        if let Some(wake) = self
+            || animating;
+        let page_wake = self
             .pages
             .values()
             .filter_map(PageState::next_wake_instant)
-            .min()
-        {
-            // Cap the sleep so far-future timers still poll at a sane rate.
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                wake.min(Instant::now() + Duration::from_millis(250)),
-            ));
-            return;
-        }
-        event_loop.set_control_flow(ControlFlow::Wait);
+            .min();
+        // The screenshot deadline is a wakeup like any page timer. Leaving it
+        // out of the wait strands a settled page in `ControlFlow::Wait` forever,
+        // because nothing else wakes the loop when the delay expires.
+        let screenshot_deadline = if self.window.is_some() {
+            self.screenshot.as_ref().map(|request| request.deadline)
+        } else {
+            None
+        };
+        event_loop.set_control_flow(next_control_flow(
+            Instant::now(),
+            pending_work,
+            page_wake,
+            screenshot_deadline,
+        ));
     }
+}
+
+/// Chooses how long the event loop may sleep after a pass of application work.
+///
+/// Pending pipeline work polls at frame cadence, page timers wake at their
+/// deadline (capped so a far-future timer cannot stall other work), and a
+/// pending screenshot contributes its own deadline.
+pub(super) fn next_control_flow(
+    now: Instant,
+    pending_work: bool,
+    page_wake: Option<Instant>,
+    screenshot_deadline: Option<Instant>,
+) -> ControlFlow {
+    let mut wait_until = if pending_work {
+        Some(now + Duration::from_millis(16))
+    } else {
+        page_wake.map(|wake| wake.min(now + Duration::from_millis(250)))
+    };
+    if let Some(deadline) = screenshot_deadline {
+        wait_until = Some(wait_until.map_or(deadline, |wait| wait.min(deadline)));
+    }
+    wait_until.map_or(ControlFlow::Wait, ControlFlow::WaitUntil)
 }
 
 /// One `--screenshot` request: where to write and when it is due.
