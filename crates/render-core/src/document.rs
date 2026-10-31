@@ -21,7 +21,7 @@ use crate::css::computed::{
 use crate::css::container::{ContainerContext, container_geometry_for_style};
 use crate::css::length::{LengthContext, resolve_length_expr};
 use crate::css::properties::TypedPropertyValue;
-use crate::css::selector::{InteractionState, MatchContext};
+use crate::css::selector::{ColorScheme, InteractionState, MatchContext};
 use crate::css::stylesheet::{Declaration, StyleSheet, StyleSheetDiagnostic, parse_stylesheet};
 use crate::css::transition::{TransitionEvent, TransitionState, sample_transitions};
 use crate::dom::{Dom, DomRevision, ElementData, Namespace, Node, NodeId, NodeKind};
@@ -790,6 +790,11 @@ pub struct DocumentRenderOptions {
     /// How far into the CSS Animations timeline this frame samples, in seconds.
     /// `0.0` is the first frame; a caller with a clock passes the elapsed time.
     pub animation_time: f32,
+    /// The used color scheme for this render: `prefers-color-scheme` media
+    /// queries, the `light-dark()` function and the paint palette's system
+    /// colors all read it. It is a render input rather than a stylesheet
+    /// property because no `color-scheme` property is computed yet.
+    pub color_scheme: ColorScheme,
     pub display_list: DisplayListBuilderOptions,
     pub raster_background: Color,
     /// The document's scripting mode, as HTML 13.2.4.5 defines it.
@@ -820,6 +825,7 @@ impl Default for DocumentRenderOptions {
             layout: LayoutOptions::default(),
             scroll_offset: PhysicalPoint::default(),
             animation_time: 0.0,
+            color_scheme: ColorScheme::Light,
             raster_background: display_list.palette.canvas,
             display_list,
             scripting_enabled: true,
@@ -1516,6 +1522,10 @@ fn render_dom(
 ) -> DocumentRenderOutput {
     let stage_timing = std::env::var_os("RENDER_STAGE_TIMING").is_some();
     let mut stage_mark = std::time::Instant::now();
+    let mut options = options;
+    // The used color scheme is a single answer for the frame: media queries,
+    // `light-dark()` and the palette's system colors must not disagree.
+    options.display_list.palette.dark = options.color_scheme == ColorScheme::Dark;
     let stage_elapsed = |name: &str, mark: &mut std::time::Instant| {
         if stage_timing {
             let now = std::time::Instant::now();
@@ -1539,6 +1549,7 @@ fn render_dom(
         viewport_width: Some(options.layout.viewport.width),
         viewport_height: Some(options.layout.viewport.height),
         quirks_mode: is_quirks_mode(quirks_mode),
+        prefers_color_scheme: options.color_scheme,
         focused: environment.interaction.focused,
         focus_visible: environment.interaction.focus_visible,
         target: environment.interaction.target,
@@ -2319,7 +2330,9 @@ mod tests {
         ExternalStyleSheets,
     };
     use crate::css::computed::ComputedValue;
-    use crate::css::selector::{InteractionState, MatchContext, parse_selector_list, select_all};
+    use crate::css::selector::{
+        ColorScheme, InteractionState, MatchContext, parse_selector_list, select_all,
+    };
     use crate::css::transition::TransitionState;
     use crate::dom::{Dom, NodeId, NodeKind, ShadowRootMode, SlotAssignmentMode};
     use crate::image::{DecodedImage, ImageLimits, ImageResources, discover_images};
@@ -2738,6 +2751,58 @@ mod tests {
         assert_eq!(
             node_typed_css(&render, shadow_span, "background-color"),
             "rgb(0, 128, 0)"
+        );
+    }
+
+    /// The used color scheme is one answer for the whole frame: it drives
+    /// `prefers-color-scheme`, `light-dark()`, and the paint palette.
+    #[test]
+    fn the_used_color_scheme_drives_media_and_light_dark() {
+        let document = Document::parse(
+            "<!doctype html><style>\
+             html, body { margin:0 }\
+             #a { display:block; width:10px; height:10px; \
+                  background-color: light-dark(rgb(1 2 3), rgb(4 5 6)) }\
+             #b { display:block; width:10px; height:10px; \
+                  background-color: rgb(10 10 10) }\
+             @media (prefers-color-scheme: dark) { \
+               #b { background-color: rgb(20 20 20) } }\
+             </style><div id=a></div><div id=b></div>",
+        );
+        let light = document.render_reference(DocumentRenderOptions::default());
+        let dark = document.render_reference(DocumentRenderOptions {
+            color_scheme: ColorScheme::Dark,
+            ..DocumentRenderOptions::default()
+        });
+        let painted = |render: &super::DocumentRenderOutput| {
+            render
+                .display
+                .list
+                .items()
+                .iter()
+                .filter_map(|item| match item.command {
+                    DisplayCommand::SolidRect { color, .. } => Some(color),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let light_colors = painted(&light);
+        assert!(
+            light_colors.contains(&Color::rgb(1, 2, 3)),
+            "light arm of light-dark(): {light_colors:?}"
+        );
+        assert!(
+            light_colors.contains(&Color::rgb(10, 10, 10)),
+            "light prefers-color-scheme: {light_colors:?}"
+        );
+        let dark_colors = painted(&dark);
+        assert!(
+            dark_colors.contains(&Color::rgb(4, 5, 6)),
+            "dark arm of light-dark(): {dark_colors:?}"
+        );
+        assert!(
+            dark_colors.contains(&Color::rgb(20, 20, 20)),
+            "dark prefers-color-scheme: {dark_colors:?}"
         );
     }
 

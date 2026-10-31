@@ -89,6 +89,10 @@ impl SystemPalette {
                 let origin = self.resolve_space(relative.origin.clone(), current_color);
                 crate::css::color::resolve_relative_space(&relative, origin)
             }
+            CssColor::Alpha(alpha) => {
+                let origin = self.resolve_space(alpha.origin.clone(), current_color);
+                crate::css::color::resolve_alpha_space(&alpha, origin)
+            }
             CssColor::CurrentColor => SpaceColor::from_rgba(rgba_from_color(current_color)),
             CssColor::Canvas => SpaceColor::from_rgba(rgba_from_color(self.canvas)),
             CssColor::CanvasText => SpaceColor::from_rgba(rgba_from_color(self.canvas_text)),
@@ -218,6 +222,13 @@ mod tests {
                 Color::rgb(10, 20, 30)
             ),
             Color::rgb(20, 20, 30)
+        );
+        assert_eq!(
+            light.resolve(
+                parsed("alpha(from currentcolor / 0.5)"),
+                Color::rgb(10, 20, 30)
+            ),
+            Color::rgba(10, 20, 30, 128)
         );
     }
 

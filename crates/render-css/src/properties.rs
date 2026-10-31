@@ -1278,6 +1278,8 @@ pub enum CssColor {
     Relative(Box<super::color::RelativeColor>),
     /// `light-dark(<color>, <color>)` (CSS Color 5 §7).
     LightDark(Box<super::color::LightDarkColor>),
+    /// `alpha(from <color> / <alpha-value>)` (CSS Color 5 §4.10).
+    Alpha(Box<super::color::AlphaColor>),
 }
 
 impl CssColor {
@@ -1303,6 +1305,7 @@ impl CssColor {
             Self::Space(color) => color.to_css(),
             Self::Relative(relative) => relative.to_css(),
             Self::LightDark(light_dark) => light_dark.to_css(),
+            Self::Alpha(alpha) => alpha.to_css(),
         }
     }
 }
@@ -2260,6 +2263,10 @@ fn parse_color_with_space<'i>(
         Token::Function(name) if name.eq_ignore_ascii_case("light-dark") => {
             input.parse_nested_block(|input| parse_light_dark(input, preserve_space))
         }
+        // CSS Color 5 §4.10 `alpha()`.
+        Token::Function(name) if name.eq_ignore_ascii_case("alpha") => {
+            input.parse_nested_block(|input| parse_alpha_color(input, preserve_space))
+        }
         _ => Err(location.new_custom_error(())),
     }
 }
@@ -2281,6 +2288,73 @@ fn parse_light_dark<'i>(
     Ok(CssColor::LightDark(Box::new(
         crate::color::LightDarkColor { light, dark },
     )))
+}
+
+/// CSS Color 5 §4.10: `alpha(from <color> / <alpha-value>)`.
+fn parse_alpha_color<'i>(
+    input: &mut Parser<'i, '_>,
+    preserve_space: bool,
+) -> CssResult<'i, CssColor> {
+    let location = input.current_source_location();
+    if input
+        .try_parse(|candidate| candidate.expect_ident_matching("from"))
+        .is_err()
+    {
+        return Err(
+            location.new_custom_error(ValueError::detail("alpha() requires `from <color>`"))
+        );
+    }
+    let origin = parse_color_with_space(input, true)?;
+    input.expect_delim('/')?;
+    let alpha = parse_alpha_only(input, &["", "", ""])?;
+    if !input.is_exhausted() {
+        return Err(location.new_custom_error(ValueError::detail(
+            "trailing tokens after the alpha() argument",
+        )));
+    }
+    let value = crate::color::AlphaColor { origin, alpha };
+    if let Some(color) =
+        crate::color::resolve_absolute_space(&CssColor::Alpha(Box::new(value.clone())))
+    {
+        if preserve_space || color.has_missing() {
+            Ok(CssColor::Space(Box::new(color)))
+        } else {
+            Ok(crate::color::rgba_to_css(color.to_rgba()))
+        }
+    } else {
+        Ok(CssColor::Alpha(Box::new(value)))
+    }
+}
+
+/// Parse the alpha-only argument of `alpha()` and of an alpha slot. Component
+/// keywords are not part of this grammar: only `alpha` itself, a number,
+/// a percentage, `none`, or `calc()`.
+fn parse_alpha_only<'i>(
+    input: &mut Parser<'i, '_>,
+    names: &[&str; 3],
+) -> CssResult<'i, crate::color::RelativeChannel> {
+    let location = input.current_source_location();
+    let token = input.next()?.clone();
+    match token {
+        Token::Number { value, .. } => Ok(crate::color::RelativeChannel::Number(value)),
+        Token::Percentage { unit_value, .. } => {
+            Ok(crate::color::RelativeChannel::Percentage(unit_value))
+        }
+        Token::Ident(value) if value.eq_ignore_ascii_case("none") => {
+            Ok(crate::color::RelativeChannel::Missing)
+        }
+        Token::Ident(value) if value.eq_ignore_ascii_case("alpha") => Ok(
+            crate::color::RelativeChannel::Keyword(crate::color::RelativeKeyword::Alpha),
+        ),
+        Token::Function(name) if name.eq_ignore_ascii_case("calc") => {
+            input.parse_nested_block(|input| {
+                Ok(crate::color::RelativeChannel::Calc(Box::new(
+                    parse_calc_expr(input, names, false)?,
+                )))
+            })
+        }
+        _ => Err(location.new_custom_error(())),
+    }
 }
 
 /// Detect and consume `from <color>` at the start of a relative color
@@ -5957,6 +6031,43 @@ mod tests {
                 assert!(relative.to_css().contains("currentcolor"));
             }
             other => panic!("expected an unresolved relative color, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alpha_function_replaces_or_modifies_the_origin_alpha() {
+        assert_eq!(
+            srgb("alpha(from rgb(0 0 255 / 0.4) / 80%)"),
+            (0, 0, 255, 0.8)
+        );
+        assert_eq!(
+            srgb("alpha(from red / calc(alpha * 0.5))"),
+            (255, 0, 0, 0.5)
+        );
+        assert_eq!(srgb("alpha(from rgb(1 2 3 / none) / none)"), (1, 2, 3, 0.0));
+        match parse("color", "alpha(from currentcolor / 0.5)") {
+            TypedPropertyValue::Color(CssColor::Alpha(alpha)) => {
+                assert!(alpha.to_css().contains("currentcolor"));
+            }
+            other => panic!("expected an unresolved alpha color, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_alpha_functions() {
+        for invalid in [
+            "alpha(red)",
+            "alpha(from red)",
+            "alpha(from red /)",
+            "alpha(from red / 50% 2)",
+            "alpha(from red / r)",
+        ] {
+            assert!(
+                parse_typed_property("color", invalid)
+                    .expect("supported property")
+                    .is_err(),
+                "{invalid:?} must not parse"
+            );
         }
     }
 

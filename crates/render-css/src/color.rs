@@ -379,6 +379,38 @@ pub struct RelativeColor {
     pub alpha: RelativeAlpha,
 }
 
+/// `alpha(from <color> / <alpha-value>)` (CSS Color 5 §4.10): the origin's
+/// color components are unchanged and only its alpha is replaced or modified.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlphaColor {
+    pub origin: CssColor,
+    pub alpha: RelativeChannel,
+}
+
+impl AlphaColor {
+    #[must_use]
+    pub fn to_css(&self) -> String {
+        let units = RelativeUnits {
+            names: ["", "", ""],
+            number_scale: [1.0; 3],
+            percentage_scale: [0.0; 3],
+        };
+        format!(
+            "alpha(from {} / {})",
+            self.origin.to_css(),
+            relative_channel_to_css(&self.alpha, &units)
+        )
+    }
+}
+
+/// Evaluate an `alpha()` relative color against its resolved origin. The
+/// origin's components are retained exactly; only alpha changes.
+#[must_use]
+pub fn resolve_alpha_space(value: &AlphaColor, origin: SpaceColor) -> SpaceColor {
+    let alpha = eval_relative_alpha(&value.alpha, &[None; 3], origin.alpha);
+    SpaceColor::new(origin.space, origin.components, alpha)
+}
+
 /// `light-dark(<color>, <color>)` (CSS Color 5 §7). The used color scheme
 /// selects one arm at paint time.
 #[derive(Clone, Debug, PartialEq)]
@@ -876,6 +908,10 @@ pub fn resolve_absolute_space(value: &CssColor) -> Option<SpaceColor> {
         }
         CssColor::CurrentColor | CssColor::Canvas | CssColor::CanvasText => None,
         CssColor::LightDark(_) => None,
+        CssColor::Alpha(alpha) => {
+            let origin = resolve_absolute_space(&alpha.origin)?;
+            Some(resolve_alpha_space(alpha, origin))
+        }
         CssColor::Relative(relative) => {
             let origin = resolve_absolute_space(&relative.origin)?;
             Some(resolve_relative_space(relative, origin))
