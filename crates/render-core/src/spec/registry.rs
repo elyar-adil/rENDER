@@ -451,11 +451,13 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 boundary rather than per-channel clipping. Relative color syntax is \
                 implemented for rgb(), hsl(), hwb(), lab(), lch(), oklab(), oklch() \
                 and color(), including channel keywords, `none`, alpha inheritance \
-                and basic `calc()` arithmetic. `light-dark()` selects its arm from \
-                the used paint color scheme; the scheme is currently supplied by \
-                `SystemPalette.dark` because there is no `color-scheme` property \
-                yet. `alpha()`, `device-cmyk()` and `contrast-color()` remain \
-                absent.",
+                and basic `calc()` arithmetic. `alpha()` changes only the origin's \
+                alpha while retaining its components. `light-dark()` selects its \
+                arm from the used paint color scheme; `DocumentRenderOptions` now \
+                carries that scheme and feeds both `prefers-color-scheme` and \
+                `SystemPalette.dark`. A `color-scheme` property is still absent, \
+                so the scheme is a render input rather than an element property. \
+                `device-cmyk()` and `contrast-color()` remain absent.",
         dependencies: &[CSS_TYPED_VALUES],
         tests: TYPED_VALUE_TESTS,
     },

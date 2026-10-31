@@ -15,8 +15,8 @@ says so. `docs/visual_fidelity_gaps.md` is the working register; this file is th
 | what | number | when |
 | --- | --- | --- |
 | `render-js` unit tests | 1,116 passed, 0 failed | 2026-10-22 |
-| `render-css` unit tests | 300 passed, 0 failed | 2026-11-01 |
-| `render-core` unit tests | 454 passed, 0 failed | 2026-11-01 |
+| `render-css` unit tests | 302 passed, 0 failed | 2026-11-01 |
+| `render-core` unit tests | 455 passed, 0 failed | 2026-11-01 |
 | `render-layout` unit tests | 322 passed, 1 ignored | 2026-11-01 |
 | `render-browser` unit tests | 206 passed, 0 failed | 2026-11-01 |
 | `render-browser` app tests (binary) | 114 passed, 0 failed | 2026-11-01 |
@@ -70,8 +70,10 @@ CSS Color 4 §14.2.2 Binary Search + Local MINDE mapping at the sRGB device boun
 components carry forward to analogous components during `color-mix()` and serialize as `none`;
 outside interpolation they behave as zero, including canvas paint and transitions. Relative color
 syntax works in `rgb()`/`hsl()`/`hwb()`/`lab()`/`lch()`/`oklab()`/`oklch()`/`color()` with
-channel keywords, `none`, inherited alpha and basic `calc()` arithmetic; `light-dark()` selects
-its arm from the used paint color scheme. Shorthand
+channel keywords, `none`, inherited alpha and basic `calc()` arithmetic; `alpha()` changes
+only the origin's alpha, and `light-dark()` selects its arm from
+`DocumentRenderOptions.color_scheme`, which also drives `prefers-color-scheme`. There is no
+`color-scheme` property yet. Shorthand
 expansion is now
 spec-correct for `text-decoration`, which is what fixed the most-reported visual symptom in the
 project's history. `@property` registrations validate their syntax and initial value, stop

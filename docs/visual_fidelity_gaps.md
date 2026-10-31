@@ -1460,17 +1460,18 @@ Verified against known values: `color-mix(in oklab, red, blue)` = `rgb(140, 83, 
 `oklch(0.7 0.1 120)` = `rgb(150, 168, 94)`, `color-mix(in srgb-linear, red, blue)` =
 `rgb(188, 0, 188)`, and `color-mix(in srgb, red, transparent)` = `rgba(255, 0, 0, 0.5)`.
 
-**Remaining colour gaps:** relative color syntax and `light-dark()` are implemented,
-including channel keywords, missing components, alpha inheritance and basic `calc()`
-arithmetic; `alpha()`, `device-cmyk()` and `contrast-color()` are not. `light-dark()`
-currently takes its used scheme from `SystemPalette.dark` because the engine has no
-`color-scheme` property or used-scheme propagation yet. Colour animations still
-interpolate sRGB channels rather than using the specified interpolation space and
-premultiplication; and the engine flattens every computed colour to its 8-bit sRGB paint
-contract, so the §14.2.2 gamut mapping happens at the sRGB boundary rather than in a
-wide-gamut compositing pipeline. Missing (`none`) components now carry across analogous
-components during `color-mix()` and serialize as `none`; elsewhere they behave as zero,
-including transitions and canvas paint.
+**Remaining colour gaps:** relative color syntax, `light-dark()` and `alpha()` are
+implemented, including channel keywords, missing components, alpha inheritance and
+basic `calc()` arithmetic; `device-cmyk()` and `contrast-color()` are not.
+`DocumentRenderOptions.color_scheme` supplies the used scheme to both
+`prefers-color-scheme` and `light-dark()`; there is no `color-scheme` property yet, so
+an element cannot select its own scheme. Colour animations still interpolate sRGB
+channels rather than using the specified interpolation space and premultiplication; and
+the engine flattens every computed colour to its 8-bit sRGB paint contract, so the
+§14.2.2 gamut mapping happens at the sRGB boundary rather than in a wide-gamut
+compositing pipeline. Missing (`none`) components now carry across analogous components
+during `color-mix()` and serialize as `none`; elsewhere they behave as zero, including
+transitions and canvas paint.
 
 ## S17 - Closed, see "S17 - Closed: two media-query evaluators" below
 

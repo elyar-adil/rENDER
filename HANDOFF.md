@@ -1,3 +1,69 @@
+# 交接文档 (2026-11-01, 续五十六) — CSS Color 5 `alpha()` 与 used color scheme 接线
+
+这一轮补齐 CSS Color 5 §4.10 的 `alpha()`，并把 `light-dark()` 从“只有一个
+`SystemPalette.dark` 入口”接到真正的渲染输入 `DocumentRenderOptions.color_scheme`。
+没有站点特判。
+
+## `alpha()`
+
+- `alpha(from <color> / <alpha-value>)`：origin 颜色分量完全保持不变，只替换或修改
+  alpha；结果保留 origin 的颜色空间，alpha 省略/`none`/calc 与规范一致。
+- 实现为 `CssColor::Alpha(Box<AlphaColor>)`：origin 绝对时解析期求值，含
+  `currentcolor`/系统色/`light-dark()` 时保留到绘制期。
+- `alpha` 关键字、number、percentage、`none`、基础 `calc()` 均可用于 alpha 参数；
+  component 关键字（如 `r`）在 `alpha()` 中明确拒绝。
+- 绘制期 `SystemPalette::resolve_space` 递归解析 origin，再 `resolve_alpha_space`
+  只替换 alpha。
+
+## used color scheme
+
+- `DocumentRenderOptions` 新增 `color_scheme: ColorScheme`（默认 Light）。
+- `render_dom` 把该值同时用于：
+  - `MatchContext.prefers_color_scheme`，因此 `@media (prefers-color-scheme: dark)`
+    与 `light-dark()` 得到同一答案；
+  - `DisplayListBuilderOptions.palette.dark`，因此 `light-dark()` 的绘制分支一致。
+- 这不是 `color-scheme` 属性：元素尚不能自选 scheme；当前是 render input。
+
+## 测试
+
+- `alpha(from rgb(0 0 255 / 0.4) / 80%)` → `(0, 0, 255, 0.8)`。
+- `alpha(from red / calc(alpha * 0.5))` → `(255, 0, 0, 0.5)`。
+- `alpha(from rgb(1 2 3 / none) / none)` → alpha 0。
+- `alpha(from currentcolor / 0.5)` 在绘制期解析为当前色 components + alpha 0.5。
+- 文档层：同一份 HTML 在 `color_scheme: Light` / `Dark` 下分别绘制
+  `light-dark(rgb(1 2 3), rgb(4 5 6))` 的对应分支，并验证
+  `@media (prefers-color-scheme: dark)` 同步切换。
+
+## 验证
+
+```
+cargo test -p render-css --lib                    302 passed, 0 failed
+cargo test -p render-core --lib                   455 passed, 0 failed
+cargo test --workspace                            all crates passed, 0 failed
+cargo fmt --all --check                           clean
+cargo clippy -p render-css -p render-core -p render-browser -p render-dom -p render-layout \
+  --all-targets -- -D warnings                    clean
+python tools/check_site_neutrality.py             0 blocking, 26 advisory
+```
+
+## 已知缺口
+
+- `color-scheme` 属性/元素级 used scheme 仍未实现；只有文档级 render input。
+- `device-cmyk()`、`contrast-color()` 未实现。
+- `calc()` 仅基础四则；`min/max/clamp` 等数学函数尚未接入相对颜色。
+- Canvas `fillStyle`、CSS transition 尚未完整消费 `alpha()`/`light-dark()`；
+  宽色域合成和颜色动画的指定插值空间仍待实现。
+
+## 下一步
+
+- `color-scheme` 属性与元素级 used scheme。
+- `device-cmyk()` / `contrast-color()`。
+- `calc()` 的 `min/max/clamp` 与百分比语义。
+- 相对色/`light-dark()` 在 canvas、transition、gradient 中的完整解析。
+- 转到 `contain: style`、`scroll-state()`、`@starting-style`、`@font-face` 描述符。
+
+---
+
 # 交接文档 (2026-11-01, 续五十五) — CSS Color 5 相对颜色语法与 `light-dark()`
 
 这一轮补齐 CSS Color 5 §4 的相对颜色语法（`rgb(from ...)`、`hsl(from ...)`、
