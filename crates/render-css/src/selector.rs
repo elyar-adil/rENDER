@@ -199,6 +199,10 @@ impl ComplexSelector {
             .and_then(|compound| compound.pseudo_element.as_ref())
         {
             None => SubjectPseudo::None,
+            // `::slotted()` is an alias for the slotted element itself, not a
+            // generated box, so its declarations are collected in the ordinary
+            // element context (CSS Shadow 1 §3.2.4).
+            Some(element) if element.name.eq_ignore_ascii_case("slotted") => SubjectPseudo::None,
             Some(element) if element.argument.is_some() => SubjectPseudo::Never,
             Some(element) => SubjectPseudo::Named(&element.name),
         }
@@ -259,6 +263,11 @@ struct CompoundSelector {
 struct PseudoElementSelector {
     name: String,
     argument: Option<String>,
+    /// The parsed `<compound-selector>` of `::slotted()`. CSS Shadow 1 §3.2.4
+    /// makes the argument a compound selector, so it is parsed once here
+    /// rather than at match time; a selector whose argument is invalid is
+    /// dropped with the rule that carried it.
+    slotted: Option<SelectorList>,
 }
 
 impl CompoundSelector {
@@ -283,8 +292,13 @@ impl CompoundSelector {
         for selector in &self.simple {
             result = result.add(selector.specificity());
         }
-        if self.pseudo_element.is_some() {
+        if let Some(pseudo_element) = &self.pseudo_element {
             result = result.add(Specificity::type_selector());
+            // CSS Shadow 1 §3.2.4: the specificity of `::slotted()` is that of
+            // a pseudo-element plus the specificity of its argument.
+            if let Some(argument) = &pseudo_element.slotted {
+                result = result.add(argument.max_specificity());
+            }
         }
         result
     }
@@ -372,6 +386,11 @@ enum PseudoClass {
     Active,
     Target,
     Lang(Vec<String>),
+    /// `:host` and `:host(<compound-selector>)` (CSS Shadow 1 §3.2.3). The
+    /// argument is `None` for the non-functional form.
+    Host(Option<SelectorList>),
+    /// `:host-context(<compound-selector>)` (CSS Shadow 1 §3.2.3).
+    HostContext(SelectorList),
     /// Vendor and shadow-DOM pseudo-classes that this renderer does not
     /// expose yet.  They remain syntactically valid and simply do not match
     /// in the current document tree, as a browser does outside that context.
@@ -402,6 +421,16 @@ impl PseudoClass {
                 .map(|selector| selector.selector.specificity())
                 .max()
                 .unwrap_or_default(),
+            // CSS Shadow 1 §3.2.3: `:host()` and `:host-context()` are a
+            // pseudo-class plus the specificity of their argument. Unlike
+            // `:is()`/`:not()` they do not discard the pseudo-class's own
+            // class-level weight.
+            Self::Host(argument) => Specificity::class().add(
+                argument
+                    .as_ref()
+                    .map_or_else(Specificity::default, SelectorList::max_specificity),
+            ),
+            Self::HostContext(argument) => Specificity::class().add(argument.max_specificity()),
             Self::NthChild(expression) | Self::NthLastChild(expression) => Specificity::class()
                 .add(
                     expression
@@ -430,6 +459,20 @@ struct RelativeSelector {
 #[derive(Clone, Debug, Default)]
 pub struct MatchContext {
     pub scope: Option<NodeId>,
+    /// The root of the node tree whose stylesheet selectors are being matched
+    /// (CSS Shadow 1 §3.2.1). `None` is the document tree; `Some(root)` is a
+    /// shadow tree rooted at that shadow root.
+    pub tree_root: Option<NodeId>,
+    /// The shadow host when matching in the context of its shadow tree. The
+    /// host is featureless in its own shadow trees (CSS Shadow 1 §3.2.2):
+    /// only the `:host` family and `:scope` (when it is the scoping root) may
+    /// match it, and selector ancestry crosses the shadow root to reach it.
+    pub shadow_host: Option<NodeId>,
+    /// The light-DOM element currently being styled through `::slotted()`,
+    /// when a slotted rule from a shadow tree is being matched. The selector
+    /// subject on the DOM side is the slot the element is assigned to, which
+    /// is why matching runs against the slot and not against this element.
+    pub slotted_element: Option<NodeId>,
     pub quirks_mode: bool,
     pub pseudo_element: Option<String>,
     pub focused: Option<NodeId>,
@@ -955,6 +998,48 @@ fn parse_list(input: &str, forgiving: bool) -> Result<SelectorList, SelectorPars
     Ok(SelectorList { selectors })
 }
 
+/// Parse a single `<compound-selector>` argument, as `:host()`,
+/// `:host-context()` and `::slotted()` require (CSS Shadow 1 §3.2.3-§3.2.4).
+///
+/// The grammar is singular: a comma here is an error rather than a list, and a
+/// combinator is an error rather than part of the argument. Returning a
+/// [`SelectorList`] keeps specificity and nested `:is()`/`:not()` handling on
+/// the same code path as every other selector argument.
+fn parse_compound_selector_argument(
+    input: &str,
+    function: &str,
+) -> Result<SelectorList, SelectorParseError> {
+    let fragments = split_top_level(input, ',')?;
+    if fragments.len() != 1 {
+        return Err(SelectorParseError::new(
+            0,
+            format!("{function} requires exactly one compound selector"),
+        ));
+    }
+    let (offset, fragment) = fragments[0];
+    let leading = fragment.len() - fragment.trim_start().len();
+    let fragment = fragment.trim();
+    if fragment.is_empty() {
+        return Err(SelectorParseError::new(
+            offset,
+            format!("{function} requires a compound selector"),
+        ));
+    }
+    let mut parser = Parser::new(fragment, offset + leading);
+    parser.skip_whitespace_and_comments()?;
+    let compound = parser.parse_compound()?;
+    parser.skip_whitespace_and_comments()?;
+    if !parser.is_eof() {
+        return Err(parser.error(format!("{function} requires a compound selector")));
+    }
+    Ok(SelectorList {
+        selectors: vec![ComplexSelector {
+            compounds: vec![compound],
+            combinators: Vec::new(),
+        }],
+    })
+}
+
 fn parse_relative_list(input: &str) -> Result<Vec<RelativeSelector>, SelectorParseError> {
     let mut selectors = Vec::new();
     for (offset, fragment) in split_top_level(input, ',')? {
@@ -1104,6 +1189,7 @@ impl<'a> Parser<'a> {
                             pseudo_element = Some(PseudoElementSelector {
                                 name: legacy_name,
                                 argument: None,
+                                slotted: None,
                             });
                         } else {
                             self.offset = saved;
@@ -1136,7 +1222,20 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(PseudoElementSelector { name, argument })
+        // CSS Shadow 1 §3.2.4: `::slotted()` takes a `<compound-selector>`.
+        // Parse it now so an invalid argument drops the rule instead of
+        // becoming a selector that silently matches nothing.
+        let slotted = match (name.as_str(), argument.as_deref()) {
+            ("slotted", Some(contents)) => {
+                Some(parse_compound_selector_argument(contents, "::slotted")?)
+            }
+            _ => None,
+        };
+        Ok(PseudoElementSelector {
+            name,
+            argument,
+            slotted,
+        })
     }
 
     fn parse_attribute(&mut self) -> Result<AttributeSelector, SelectorParseError> {
@@ -1235,6 +1334,16 @@ impl<'a> Parser<'a> {
             ("active", None) => Ok(PseudoClass::Active),
             ("target", None) => Ok(PseudoClass::Target),
             ("lang", Some(value)) => Ok(PseudoClass::Lang(parse_lang_ranges(value)?)),
+            ("host", None) => Ok(PseudoClass::Host(None)),
+            ("host", Some(value)) => Ok(PseudoClass::Host(Some(parse_compound_selector_argument(
+                value, ":host",
+            )?))),
+            ("host-context", Some(value)) => Ok(PseudoClass::HostContext(
+                parse_compound_selector_argument(value, ":host-context")?,
+            )),
+            ("host-context", None) => {
+                Err(self.error(":host-context requires a compound selector argument"))
+            }
             _ => Ok(PseudoClass::Unsupported),
         }
     }
@@ -1730,15 +1839,15 @@ fn matches_complex_at(
         return true;
     }
     match selector.combinators[index - 1] {
-        Combinator::Child => element_parent(dom, element)
+        Combinator::Child => selector_parent(dom, element, context)
             .is_some_and(|parent| matches_complex_at(dom, parent, selector, index - 1, context)),
         Combinator::Descendant => {
-            let mut ancestor = element_parent(dom, element);
+            let mut ancestor = selector_parent(dom, element, context);
             while let Some(candidate) = ancestor {
                 if matches_complex_at(dom, candidate, selector, index - 1, context) {
                     return true;
                 }
-                ancestor = element_parent(dom, candidate);
+                ancestor = selector_parent(dom, candidate, context);
             }
             false
         }
@@ -1767,30 +1876,45 @@ fn matches_compound(
     let Some(data) = element_data(dom, element) else {
         return false;
     };
-    if let Some(type_selector) = &selector.type_selector
-        && let Some(expected) = &type_selector.name
-    {
-        let matches = if data.namespace == Namespace::Html {
-            data.local_name.eq_ignore_ascii_case(expected)
-        } else {
-            data.local_name == *expected
-        };
-        if !matches {
+    if context.shadow_host == Some(element) {
+        // CSS Shadow 1 §3.2.2: within its own shadow tree the host is
+        // featureless, and only `:host`, `:host()`, `:host-context()` (plus
+        // `:scope` when it is the scoping root) may match it.
+        if !matches_featureless_host(dom, element, data, selector, context) {
             return false;
         }
-    }
-    if selector
-        .simple
-        .iter()
-        .any(|simple| !matches_simple(dom, element, data, simple, context))
-    {
-        return false;
+    } else {
+        if let Some(type_selector) = &selector.type_selector
+            && let Some(expected) = &type_selector.name
+        {
+            let matches = if data.namespace == Namespace::Html {
+                data.local_name.eq_ignore_ascii_case(expected)
+            } else {
+                data.local_name == *expected
+            };
+            if !matches {
+                return false;
+            }
+        }
+        if selector
+            .simple
+            .iter()
+            .any(|simple| !matches_simple(dom, element, data, simple, context))
+        {
+            return false;
+        }
     }
     // Only the subject compound (the rightmost one) may carry a
     // pseudo-element; the ancestor compounds of `#host .item::after` match
     // ordinary elements even while the subject is being matched for `::after`.
     if !subject {
         return true;
+    }
+    if context.slotted_element.is_some() {
+        // While a shadow tree's `::slotted()` rule is being evaluated, the
+        // selector subject is the *slot*. Only the slotted pseudo-element may
+        // match; ordinary shadow rules must not reach the assigned element.
+        return matches_slotted_subject(dom, selector, context);
     }
     match (&selector.pseudo_element, &context.pseudo_element) {
         (None, None) => true,
@@ -1801,6 +1925,57 @@ fn matches_compound(
         }
         _ => false,
     }
+}
+
+/// Whether `selector` may match a featureless shadow host (CSS Shadow 1
+/// §3.2.2). The host is matched by the `:host` family only; `:is()`/`:where()`
+/// are unwrapped because the engine generates `:where(:scope)` for implicit
+/// `@scope` preludes, and `:scope` is allowed when it is the scoping root
+/// (CSS Cascade 6 §3.5.1).
+fn matches_featureless_host(
+    dom: &Dom,
+    element: NodeId,
+    data: &ElementData,
+    selector: &CompoundSelector,
+    context: &MatchContext,
+) -> bool {
+    if selector.type_selector.is_some() || selector.simple.is_empty() {
+        return false;
+    }
+    selector.simple.iter().all(|simple| match simple {
+        SimpleSelector::Pseudo(
+            pseudo @ (PseudoClass::Host(_)
+            | PseudoClass::HostContext(_)
+            | PseudoClass::Scope
+            | PseudoClass::Is(_)
+            | PseudoClass::Where(_)),
+        ) => matches_pseudo(dom, element, data, pseudo, context),
+        _ => false,
+    })
+}
+
+/// Match the subject of a `::slotted(<compound-selector>)` rule.
+///
+/// `element` is the originating slot (the selector before the pseudo-element
+/// matched it), and the argument is evaluated against the light-DOM element
+/// the slot is currently styling.
+fn matches_slotted_subject(dom: &Dom, selector: &CompoundSelector, context: &MatchContext) -> bool {
+    if context.pseudo_element.is_some() {
+        return false;
+    }
+    let Some(expected) = &selector.pseudo_element else {
+        return false;
+    };
+    if !expected.name.eq_ignore_ascii_case("slotted") {
+        return false;
+    }
+    let (Some(slotted_argument), Some(slotted_element)) =
+        (&expected.slotted, context.slotted_element)
+    else {
+        return false;
+    };
+    let outer = outer_selector_context(context);
+    matches_selector_list(dom, slotted_element, slotted_argument, &outer)
 }
 
 fn matches_simple(
@@ -1900,12 +2075,38 @@ fn matches_attribute(data: &ElementData, selector: &AttributeSelector) -> bool {
 /// pseudo-element context is what made `:is(.host) p::before` unable to see the
 /// `p`: the `:is()` argument has no pseudo-element of its own.
 fn element_match_context(context: &MatchContext) -> Cow<'_, MatchContext> {
-    if context.pseudo_element.is_none() {
+    if context.pseudo_element.is_none() && context.slotted_element.is_none() {
         Cow::Borrowed(context)
     } else {
         let mut element = context.clone();
         element.pseudo_element = None;
+        // A nested selector list selects an ordinary element: in a
+        // `::slotted()` rule that is the originating slot, never the slotted
+        // element whose alias is currently being matched.
+        element.slotted_element = None;
         Cow::Owned(element)
+    }
+}
+
+/// The context a selector argument is evaluated in when the spec says it is
+/// evaluated "in its normal context": outside the shadow tree whose host is
+/// being tested. `:host(.foo)` tests `.foo` against the host's own tree, and
+/// `:host-context(.theme)` tests each shadow-including ancestor in that
+/// ancestor's own tree.
+fn outer_selector_context(context: &MatchContext) -> Cow<'_, MatchContext> {
+    if context.tree_root.is_none()
+        && context.shadow_host.is_none()
+        && context.slotted_element.is_none()
+        && context.pseudo_element.is_none()
+    {
+        Cow::Borrowed(context)
+    } else {
+        let mut outer = context.clone();
+        outer.tree_root = None;
+        outer.shadow_host = None;
+        outer.slotted_element = None;
+        outer.pseudo_element = None;
+        Cow::Owned(outer)
     }
 }
 
@@ -2016,6 +2217,33 @@ fn matches_pseudo(
                         && language.as_bytes().get(range.len()) == Some(&b'-')
             })
         }),
+        // CSS Shadow 1 §3.2.3: these match only in the context of a shadow
+        // tree, and only the tree's own host.
+        PseudoClass::Host(argument) => {
+            if context.shadow_host != Some(element) {
+                return false;
+            }
+            let outer = outer_selector_context(context);
+            argument
+                .as_ref()
+                .is_none_or(|selectors| matches_selector_list(dom, element, selectors, &outer))
+        }
+        PseudoClass::HostContext(selectors) => {
+            if context.shadow_host != Some(element) {
+                return false;
+            }
+            // The argument tests the host and every shadow-including ancestor,
+            // which deliberately crosses shadow boundaries upward.
+            let outer = outer_selector_context(context);
+            let mut current = Some(element);
+            while let Some(candidate) = current {
+                if matches_selector_list(dom, candidate, selectors, &outer) {
+                    return true;
+                }
+                current = shadow_including_parent_element(dom, candidate);
+            }
+            false
+        }
         PseudoClass::Unsupported => false,
     }
 }
@@ -2199,6 +2427,40 @@ fn document_element(dom: &Dom) -> Option<NodeId> {
 
 fn element_parent(dom: &Dom, node: NodeId) -> Option<NodeId> {
     dom.parent(node).filter(|parent| is_element(dom, *parent))
+}
+
+/// The parent used by combinator matching.
+///
+/// CSS Shadow 1 §3.2.2 makes the shadow host appear in its own shadow tree
+/// with the tree's contents as children, so the root elements of the tree have
+/// the host as their ancestor. The host is featureless there, which
+/// [`matches_compound`] enforces: only `:host` compounds can match it, so
+/// ordinary shadow selectors still cannot see outside the tree.
+fn selector_parent(dom: &Dom, node: NodeId, context: &MatchContext) -> Option<NodeId> {
+    // The host is the top of its shadow tree's match list. Its own ancestors
+    // belong to the outer tree and a shadow-tree selector may not see them.
+    if context.shadow_host == Some(node) {
+        return None;
+    }
+    let parent = dom.parent(node)?;
+    if is_element(dom, parent) {
+        return Some(parent);
+    }
+    if context.tree_root == Some(parent) {
+        return context.shadow_host;
+    }
+    None
+}
+
+/// The next element on the shadow-including ancestor chain (DOM §4.4): the
+/// parent, or the host when the parent is a shadow root. Used only by
+/// `:host-context()`, whose argument is specified to pierce shadow boundaries.
+fn shadow_including_parent_element(dom: &Dom, node: NodeId) -> Option<NodeId> {
+    let parent = dom.parent(node)?;
+    if is_element(dom, parent) {
+        return Some(parent);
+    }
+    dom.shadow_host(parent)
 }
 
 fn previous_element_sibling(dom: &Dom, node: NodeId) -> Option<NodeId> {
@@ -2971,7 +3233,6 @@ mod tests {
         for selector in [
             ":host",
             ":host(.a)",
-            ":host(.a, .b)",
             ":host-context(.a)",
             ":host-context(.a) .b",
             "::part(button)",
@@ -2994,5 +3255,173 @@ mod tests {
                 "{selector} must not match a light-DOM element"
             );
         }
+        // CSS Shadow 1 §3.2.3-§3.2.4: the arguments are `<compound-selector>`
+        // singular, so a comma list or a combinator is invalid.
+        for invalid in [
+            ":host(.a, .b)",
+            ":host(.a .b)",
+            ":host(.a > .b)",
+            ":host()",
+            ":host-context()",
+            ":host-context(.a, .b)",
+            "::slotted(.a, .b)",
+            "::slotted(.a .b)",
+        ] {
+            assert!(
+                parse_selector_list(invalid).is_err(),
+                "{invalid} must not parse"
+            );
+        }
+    }
+
+    /// CSS Shadow 1 §3.2.2-§3.2.4: within a shadow tree the host is
+    /// featureless and only `:host`/`:host-context()` match it; a shadow
+    /// selector can cross the root only through those pseudo-classes, and
+    /// `::slotted()` aliases an assigned light-DOM element.
+    #[test]
+    fn host_and_slotted_selectors_match_in_a_shadow_tree_context() {
+        use render_dom::{ShadowRootMode, SlotAssignmentMode};
+
+        let output = parse_document(
+            "<!doctype html><section class=theme>\
+             <div id=h class='card'><span id=light class=x>light</span></div>\
+             </section>",
+        );
+        let mut dom = output.dom;
+        let query = |dom: &render_dom::Dom, selector: &str| {
+            select_all(
+                dom,
+                dom.document(),
+                &parse_selector_list(selector).unwrap(),
+                &MatchContext::default(),
+            )[0]
+        };
+        let host = query(&dom, "#h");
+        let light = query(&dom, "#light");
+        let root = dom
+            .attach_shadow(host, ShadowRootMode::Open, false, SlotAssignmentMode::Named)
+            .unwrap();
+        let inner = dom.create_element("span");
+        dom.set_attribute(inner, "class", "inner").unwrap();
+        dom.append_child(root, inner).unwrap();
+        let slot = dom.create_element("slot");
+        dom.append_child(root, slot).unwrap();
+
+        let shadow = MatchContext {
+            tree_root: Some(root),
+            shadow_host: Some(host),
+            ..MatchContext::default()
+        };
+        let matches = |element, selector: &str, context: &MatchContext| {
+            matches_selector_list(
+                &dom,
+                element,
+                &parse_selector_list(selector).unwrap(),
+                context,
+            )
+        };
+
+        // Outside a shadow-tree context `:host` matches nothing.
+        assert!(!matches(host, ":host", &MatchContext::default()));
+        // Inside it, `:host` and `:host(<compound>)` match the host.
+        assert!(matches(host, ":host", &shadow));
+        assert!(matches(host, ":host(.card)", &shadow));
+        assert!(!matches(host, ":host(.missing)", &shadow));
+        // The host is featureless: a type or class selector in the shadow
+        // context cannot reach it, and `.card:host` is therefore no match.
+        assert!(!matches(host, "div", &shadow));
+        assert!(!matches(host, ".card", &shadow));
+        assert!(!matches(host, ".card:host", &shadow));
+        // `:host() ` also composes with a descendant combinator.
+        assert!(matches(inner, ":host(.card) .inner", &shadow));
+        // An ordinary shadow selector does not pick up the host's class as an
+        // ancestor match, since the host is only reachable through :host.
+        assert!(!matches(inner, ".card .inner", &shadow));
+        // Nor can it see an ancestor outside the shadow tree, even though
+        // `:host-context(.theme)` may look at that same element.
+        assert!(!matches(inner, ".theme .inner", &shadow));
+        // `:host-context()` sees shadow-including ancestors.
+        assert!(matches(host, ":host-context(.theme)", &shadow));
+        assert!(!matches(host, ":host-context(.missing)", &shadow));
+
+        // `::slotted()` matches the assigned light-DOM element through its
+        // originating slot, and not an element that is not assigned.
+        let slotted = MatchContext {
+            tree_root: Some(root),
+            shadow_host: Some(host),
+            slotted_element: Some(light),
+            ..MatchContext::default()
+        };
+        assert!(matches(slot, "::slotted(.x)", &slotted));
+        assert!(matches(slot, "slot::slotted(.x)", &slotted));
+        assert!(!matches(slot, "::slotted(.missing)", &slotted));
+        // While evaluating a slotted rule, ordinary shadow selectors must not
+        // match the slot.
+        assert!(!matches(slot, "slot", &slotted));
+        // Without a slotted element the pseudo-element matches nothing.
+        assert!(!matches(slot, "::slotted(.x)", &shadow));
+        // In the slot's own context it is an ordinary slot element.
+        assert!(matches(slot, "slot", &shadow));
+
+        // Specificity: a pseudo-class plus its argument for the host family,
+        // and a pseudo-element plus its argument for ::slotted.
+        assert_eq!(
+            parse_selector_list(":host").unwrap().max_specificity(),
+            Specificity {
+                ids: 0,
+                classes: 1,
+                types: 0
+            }
+        );
+        assert_eq!(
+            parse_selector_list(":host(.card)")
+                .unwrap()
+                .max_specificity(),
+            Specificity {
+                ids: 0,
+                classes: 2,
+                types: 0
+            }
+        );
+        assert_eq!(
+            parse_selector_list(":host(#card)")
+                .unwrap()
+                .max_specificity(),
+            Specificity {
+                ids: 1,
+                classes: 1,
+                types: 0
+            }
+        );
+        assert_eq!(
+            parse_selector_list(":host-context(.theme)")
+                .unwrap()
+                .max_specificity(),
+            Specificity {
+                ids: 0,
+                classes: 2,
+                types: 0
+            }
+        );
+        assert_eq!(
+            parse_selector_list("::slotted(.x)")
+                .unwrap()
+                .max_specificity(),
+            Specificity {
+                ids: 0,
+                classes: 1,
+                types: 1
+            }
+        );
+        assert_eq!(
+            parse_selector_list("::slotted(#x)")
+                .unwrap()
+                .max_specificity(),
+            Specificity {
+                ids: 1,
+                classes: 0,
+                types: 1
+            }
+        );
     }
 }

@@ -242,6 +242,9 @@ enum GlobalLayerKey {
 struct Priority {
     important: bool,
     origin: u8,
+    /// CSS Cascade 5 §6.1 "Context". Larger beats smaller; the outer-tree-wins
+    /// reversal for normal declarations is applied when the rank is built.
+    context: u8,
     layer: usize,
     specificity: Specificity,
     /// CSS Cascade 6 §3.1's scope proximity step. It is compared after
@@ -381,19 +384,15 @@ fn resolve_rule_scope(
     );
     match proximity {
         Some(proximity) => {
-            // `resolve_scope_level` finds the innermost root; recover it from
-            // the same reachability that produced the distance.
-            let mut node = element;
-            for _ in 0..proximity {
-                match dom.parent(node) {
-                    Some(parent) => node = parent,
-                    None => return RuleScope::OutOfScope,
-                }
-            }
-            RuleScope::InScope {
-                root: node,
-                proximity,
-            }
+            // `resolve_scope_level` finds the innermost root and its distance
+            // from the subject. Recover it from the same chain rather than
+            // walking `parent` again: at a shadow boundary the parent is the
+            // shadow root, while the chain's next entry is the shadow host
+            // that serves as the implicit scoping root.
+            let Some(root) = chain.get(proximity as usize).copied() else {
+                return RuleScope::OutOfScope;
+            };
+            RuleScope::InScope { root, proximity }
         }
         None => RuleScope::OutOfScope,
     }
@@ -502,15 +501,20 @@ fn matches_with_scope(
     context: &MatchContext,
     scope: Option<NodeId>,
 ) -> bool {
-    if context.scope == scope && context.pseudo_element.is_none() {
+    if context.scope == scope
+        && context.pseudo_element.is_none()
+        && context.slotted_element.is_none()
+    {
         return super::selector::matches_selector_list(dom, node, selectors, context);
     }
     // Scope boundaries name elements, never generated content, so the
     // pseudo-element context of the declaration being resolved must not leak
-    // into them.
+    // into them. Nor may a boundary be matched through a `::slotted()` alias:
+    // it names the slot's own tree context.
     let mut scoped = context.clone();
     scoped.scope = scope;
     scoped.pseudo_element = None;
+    scoped.slotted_element = None;
     super::selector::matches_selector_list(dom, node, selectors, &scoped)
 }
 
@@ -531,11 +535,34 @@ fn implicit_scope_root(dom: &Dom, owner: Option<NodeId>) -> NodeId {
 }
 
 fn ancestor_chain(dom: &Dom, element: NodeId) -> Vec<NodeId> {
+    // CSS Shadow 1 §3.2.2 makes the host the top of the match list in its own
+    // shadow tree. Including it here is what lets an implicit `@scope` rooted
+    // at the host (CSS Cascade 6 §3.5.4) contain the tree's elements. The
+    // chain stops at that host: a selector in a shadow tree may not see any
+    // further outside.
+    let tree_root = dom.root_node(element, false);
+    let host = dom.shadow_host(tree_root);
     let mut chain = Vec::new();
     let mut node = Some(element);
     while let Some(current) = node {
         chain.push(current);
-        node = dom.parent(current);
+        if Some(current) == host {
+            break;
+        }
+        node = match dom.parent(current) {
+            Some(parent) if is_element(dom, parent) => Some(parent),
+            Some(parent) if Some(parent) == Some(tree_root) => {
+                if host.is_some() {
+                    host
+                } else {
+                    // The document node is the root of the document tree and
+                    // an implicit `@scope` with no owner roots there.
+                    chain.push(parent);
+                    break;
+                }
+            }
+            _ => None,
+        };
     }
     chain
 }
@@ -544,15 +571,55 @@ fn is_element(dom: &Dom, node: NodeId) -> bool {
     matches!(dom.node(node).map(Node::kind), Some(NodeKind::Element(_)))
 }
 
+/// Whether `ancestor` is an inclusive ancestor of `node` in the selector tree,
+/// which includes the shadow host above a shadow root's top-level elements.
 fn is_inclusive_ancestor(dom: &Dom, ancestor: NodeId, node: NodeId) -> bool {
-    let mut current = Some(node);
-    while let Some(candidate) = current {
-        if candidate == ancestor {
-            return true;
+    ancestor_chain(dom, node).contains(&ancestor)
+}
+
+/// The shadow-including depth of a tree root: zero for the document, one for a
+/// shadow root hosted in the document, and so on.
+fn tree_depth(dom: &Dom, root: NodeId) -> u8 {
+    let mut depth = 0_u8;
+    let mut current = root;
+    while let Some(host) = dom.shadow_host(current) {
+        depth = depth.saturating_add(1);
+        current = dom.root_node(host, false);
+        if depth == u8::MAX {
+            break;
         }
-        current = dom.parent(candidate);
     }
-    false
+    depth
+}
+
+/// CSS Cascade 5 §6.1 "Context": for normal declarations the outer context
+/// wins, for important declarations the inner context wins.
+const fn context_rank(tree_depth: u8, important: bool) -> u8 {
+    if important {
+        tree_depth
+    } else {
+        u8::MAX - tree_depth
+    }
+}
+
+/// The slot in `tree` that `element` is assigned to, after flattening.
+///
+/// A light-DOM element can reach a slot indirectly when its own slot is itself
+/// assigned to a slot in a further shadow tree, so follow the assignment chain.
+fn slotted_slot_in_tree(dom: &Dom, element: NodeId, tree: NodeId) -> Option<NodeId> {
+    let mut candidate = element;
+    let mut seen = Vec::new();
+    loop {
+        if seen.contains(&candidate) {
+            return None;
+        }
+        seen.push(candidate);
+        let slot = dom.assigned_slot(candidate)?;
+        if dom.root_node(slot, false) == tree {
+            return Some(slot);
+        }
+        candidate = slot;
+    }
 }
 
 fn cascade_element_with_origins_impl(
@@ -568,11 +635,16 @@ fn cascade_element_with_origins_impl(
     let mut candidates: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
     let mut source_order = 0_u64;
 
-    // An author stylesheet is scoped to the tree it belongs to, so the
-    // document's sheets never reach an element inside a shadow tree. The
-    // user-agent and user origins still apply there. Shadow-tree sheets are not
-    // collected yet, so no author rule applies inside a shadow tree.
-    let in_shadow_tree = dom.shadow_host(dom.root_node(element, false)).is_some();
+    // CSS Shadow 1 §3.2.1 and CSS Cascade 5 §6.1 "Context": a stylesheet is
+    // scoped to the node tree it belongs to. An author sheet from the document
+    // never reaches into a shadow tree, and a sheet from a shadow tree never
+    // reaches out of it except through `:host` (the host itself) and
+    // `::slotted()` (light-DOM elements assigned to a slot in that tree). The
+    // user-agent and user origins still apply in every tree.
+    let element_tree = dom.root_node(element, false);
+    let element_tree_is_shadow = dom.shadow_host(element_tree).is_some();
+    let element_tree_depth = tree_depth(dom, element_tree);
+    let element_host_root = dom.shadow_root(element);
     let subject_keys = lookup
         .rule_index
         .map(|_| element_subject_keys(dom, element));
@@ -582,11 +654,67 @@ fn cascade_element_with_origins_impl(
         index.elements.fetch_add(1, Ordering::Relaxed);
     }
     for (source_index, source) in sources.iter().enumerate() {
-        if in_shadow_tree && source.origin == CascadeOrigin::Author {
+        let sheet_tree = source.sheet.tree_root.unwrap_or_else(|| dom.document());
+        // A light-DOM element can be styled by `::slotted()` rules of a tree
+        // above it. Resolve that first: it decides both the match subject (the
+        // slot) and the candidate keys.
+        let slot = if source.origin == CascadeOrigin::Author
+            && context.pseudo_element.is_none()
+            && sheet_tree != element_tree
+            && element_host_root != Some(sheet_tree)
+        {
+            slotted_slot_in_tree(dom, element, sheet_tree)
+        } else {
+            None
+        };
+        if source.origin == CascadeOrigin::Author
+            && sheet_tree != element_tree
+            && element_host_root != Some(sheet_tree)
+            && slot.is_none()
+        {
             continue;
         }
+        // Built only for the source currently being considered; a document-
+        // tree element matched against document sheets does not pay for a
+        // clone.
+        let owned_context = match source.origin {
+            CascadeOrigin::Author if sheet_tree == element_tree => {
+                element_tree_is_shadow.then(|| MatchContext {
+                    tree_root: Some(element_tree),
+                    shadow_host: dom.shadow_host(element_tree),
+                    slotted_element: None,
+                    ..context.clone()
+                })
+            }
+            // The element is this shadow tree's host. Only selectors whose
+            // subject is the featureless host (`:host` and friends) can match
+            // here; everything else fails in `matches_compound`.
+            CascadeOrigin::Author if element_host_root == Some(sheet_tree) => Some(MatchContext {
+                tree_root: Some(sheet_tree),
+                shadow_host: Some(element),
+                slotted_element: None,
+                ..context.clone()
+            }),
+            // Match `::slotted()` against the originating slot, while the
+            // argument is tested against the light-DOM element being styled.
+            CascadeOrigin::Author => Some(MatchContext {
+                tree_root: Some(sheet_tree),
+                shadow_host: dom.shadow_host(sheet_tree),
+                slotted_element: Some(element),
+                ..context.clone()
+            }),
+            CascadeOrigin::UserAgent | CascadeOrigin::User => None,
+        };
+        let source_context = owned_context.as_ref().unwrap_or(context);
+        let match_element = slot.unwrap_or(element);
+        let slot_keys = slot.and_then(|_| {
+            lookup
+                .rule_index
+                .map(|_| element_subject_keys(dom, match_element))
+        });
+        let source_keys = slot_keys.as_ref().or(subject_keys.as_ref());
         let mut candidate_rules = Vec::new();
-        if let (Some(index), Some(keys)) = (lookup.rule_index, subject_keys.as_ref()) {
+        if let (Some(index), Some(keys)) = (lookup.rule_index, source_keys) {
             index.candidates(
                 source_index,
                 context.pseudo_element.as_deref().unwrap_or(""),
@@ -595,9 +723,7 @@ fn cascade_element_with_origins_impl(
             );
             candidate_rules.sort_unstable();
             candidate_rules.dedup();
-            if let Some(index) = lookup.rule_index
-                && index.debug
-            {
+            if index.debug {
                 index.candidate_rules.fetch_add(
                     u64::try_from(candidate_rules.len()).unwrap_or(u64::MAX),
                     Ordering::Relaxed,
@@ -606,6 +732,7 @@ fn cascade_element_with_origins_impl(
         } else {
             candidate_rules.extend(0..source.sheet.rules.len());
         }
+        let source_tree_depth = tree_depth(dom, sheet_tree);
         for candidate_rule in candidate_rules {
             let rule = &source.sheet.rules[candidate_rule];
             if !rule
@@ -653,24 +780,29 @@ fn cascade_element_with_origins_impl(
             }
             // CSS Cascade 6 §3.5.3: a scoped rule's subject has to be in scope,
             // and its `:scope`/`&` selectors are relative to that scope's root.
-            let (specificity, proximity) =
-                match resolve_rule_scope(dom, element, rule, source.sheet.scope_owner, context) {
-                    RuleScope::OutOfScope => continue,
-                    RuleScope::Unscoped => (
-                        matching_specificity(dom, element, &rule.selectors, context),
-                        u32::MAX,
-                    ),
-                    RuleScope::InScope { root, proximity } => {
-                        let specificity = if context.scope == Some(root) {
-                            matching_specificity(dom, element, &rule.selectors, context)
-                        } else {
-                            let mut scoped = context.clone();
-                            scoped.scope = Some(root);
-                            matching_specificity(dom, element, &rule.selectors, &scoped)
-                        };
-                        (specificity, proximity)
-                    }
-                };
+            let (specificity, proximity) = match resolve_rule_scope(
+                dom,
+                match_element,
+                rule,
+                source.sheet.scope_owner,
+                source_context,
+            ) {
+                RuleScope::OutOfScope => continue,
+                RuleScope::Unscoped => (
+                    matching_specificity(dom, match_element, &rule.selectors, source_context),
+                    u32::MAX,
+                ),
+                RuleScope::InScope { root, proximity } => {
+                    let specificity = if source_context.scope == Some(root) {
+                        matching_specificity(dom, match_element, &rule.selectors, source_context)
+                    } else {
+                        let mut scoped = source_context.clone();
+                        scoped.scope = Some(root);
+                        matching_specificity(dom, match_element, &rule.selectors, &scoped)
+                    };
+                    (specificity, proximity)
+                }
+            };
             let Some(specificity) = specificity else {
                 continue;
             };
@@ -684,6 +816,10 @@ fn cascade_element_with_origins_impl(
                 let priority = Priority {
                     important: declaration.important,
                     origin: origin_rank(source.origin, declaration.important),
+                    // CSS Cascade 5 §6.1 "Context": normal declarations from
+                    // an outer tree beat inner ones, important declarations do
+                    // the reverse. Tree depth is the shadow-including depth.
+                    context: context_rank(source_tree_depth, declaration.important),
                     layer: layer_rank(
                         &layer_orders,
                         source.origin,
@@ -737,6 +873,9 @@ fn cascade_element_with_origins_impl(
         let priority = Priority {
             important: false,
             origin: origin_rank(CascadeOrigin::UserAgent, false),
+            // A presentational hint is document-tree content, and the UA origin
+            // is compared before context anyway.
+            context: context_rank(0, false),
             layer: layer_rank(
                 &layer_orders,
                 CascadeOrigin::UserAgent,
@@ -781,6 +920,8 @@ fn cascade_element_with_origins_impl(
         let priority = Priority {
             important: declaration.important,
             origin: origin_rank(CascadeOrigin::Author, declaration.important),
+            // A `style` attribute belongs to the element's own tree context.
+            context: context_rank(element_tree_depth, declaration.important),
             layer: layer_rank(
                 &layer_orders,
                 CascadeOrigin::Author,

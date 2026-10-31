@@ -191,6 +191,16 @@ pub struct StyleSheet {
     /// element the scoping root of an `@scope` rule with no `<scope-start>`;
     /// when there is no owner, the root of the containing node tree is used.
     pub scope_owner: Option<NodeId>,
+    /// The root of the node tree this sheet belongs to (CSS Shadow 1 §3.2.1):
+    /// the document node for a sheet in the document tree, or the shadow root
+    /// for a sheet inside a shadow tree. Ordinary selectors in this sheet apply
+    /// only to elements whose tree root is this node; `:host` reaches the tree's
+    /// host and `::slotted()` reaches light-DOM elements assigned to its slots.
+    ///
+    /// `None` means "the document tree". It is the default because a sheet
+    /// built without a DOM attached (a UA sheet, or a unit test) is document
+    /// scoped, and it makes the field additive for every existing constructor.
+    pub tree_root: Option<NodeId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

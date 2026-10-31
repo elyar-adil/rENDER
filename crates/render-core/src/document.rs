@@ -896,6 +896,9 @@ pub enum AuthorStyleSource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorStyleSlot {
     pub owner: NodeId,
+    /// The root of the node tree containing the slot: the document node, or
+    /// the shadow root when the element lives in a shadow tree.
+    pub tree_root: NodeId,
     pub source_order: usize,
     pub source: AuthorStyleSource,
     pub eligibility: AuthorStyleEligibility,
@@ -1104,6 +1107,10 @@ impl Document {
 
     /// Discovers embedded and external author stylesheet slots for the current
     /// DOM revision. This is a pure discovery step and performs no I/O.
+    ///
+    /// Discovery follows shadow-including tree order, so a `<style>` or
+    /// stylesheet `<link>` inside a shadow root is reported with that shadow
+    /// root as its [`AuthorStyleSlot::tree_root`].
     ///
     /// Media evaluation runs with no viewport, so a viewport-dependent media
     /// feature cannot match here. Use
@@ -1917,8 +1924,11 @@ fn collect_author_style_sheets(
                     // CSS Cascade 6 §3.5.4: an implicit @scope root comes from
                     // the parent of the stylesheet's owner element, and the
                     // owner of an external sheet is the <link> that loaded it.
+                    // The tree context comes from the slot, so a sheet linked
+                    // inside a shadow tree stays in that tree.
                     let mut sheet = sheet.clone();
                     sheet.scope_owner = Some(slot.owner);
+                    sheet.tree_root = Some(slot.tree_root);
                     sheets.push((slot.owner, sheet));
                 } else {
                     diagnostics.push(DocumentDiagnostic {
@@ -1971,10 +1981,17 @@ fn discover_author_style_slots(
             continue;
         };
         if let NodeKind::Element(element) = node.kind() {
-            discovery.inspect_element(node_id, element, base_url, limits);
+            discovery.inspect_element(dom, node_id, element, base_url, limits);
         }
         if !matches!(node.kind(), NodeKind::Element(element) if element.local_name == "template") {
+            // DOM §4.4 shadow-including tree order visits a host's shadow root
+            // immediately after the host, before its light children. A shadow
+            // root is not one of the host's children, so the ordinary child
+            // walk never reaches it; push it last so it pops first.
             stack.extend(node.children().iter().rev().copied());
+            if let Some(root) = dom.shadow_root(node_id) {
+                stack.extend(dom.children(root).unwrap_or_default().iter().rev().copied());
+            }
         }
     }
     discovery.finish(dom.revision())
@@ -2014,16 +2031,19 @@ impl<'a> StyleDiscoveryState<'a> {
 
     fn inspect_element(
         &mut self,
+        dom: &Dom,
         node: NodeId,
         element: &ElementData,
         base_url: Option<&Url>,
         limits: DocumentLimits,
     ) {
+        let tree_root = dom.root_node(node, false);
         if element.local_name == "style" {
             let eligibility = style_eligibility(node, element, &mut self.diagnostics, self.context);
             self.push_slot(
                 AuthorStyleSlot {
                     owner: node,
+                    tree_root,
                     source_order: self.source_order,
                     source: AuthorStyleSource::Embedded,
                     eligibility,
@@ -2035,13 +2055,14 @@ impl<'a> StyleDiscoveryState<'a> {
             && is_stylesheet_link(element)
             && let Some(href) = attribute(element, "href")
         {
-            self.discover_external(node, element, href, base_url, limits);
+            self.discover_external(node, tree_root, element, href, base_url, limits);
         }
     }
 
     fn discover_external(
         &mut self,
         node: NodeId,
+        tree_root: NodeId,
         element: &ElementData,
         href: &str,
         base_url: Option<&Url>,
@@ -2076,6 +2097,7 @@ impl<'a> StyleDiscoveryState<'a> {
         self.push_slot(
             AuthorStyleSlot {
                 owner: node,
+                tree_root,
                 source_order,
                 source: AuthorStyleSource::External {
                     href: href.to_owned(),
@@ -2213,8 +2235,11 @@ fn collect_style_element(
     let mut sheet = parse_stylesheet(&css);
     // CSS Cascade 6 §3.5.4: an `@scope` with no `<scope-start>` is rooted at
     // the parent element of the stylesheet's owner node, which is this
-    // `<style>` element.
+    // `<style>` element. CSS Shadow 1 §3.2.1: the sheet belongs to the node
+    // tree that contains it, recorded here so the cascade can keep document
+    // and shadow-tree author sheets apart.
     sheet.scope_owner = Some(node_id);
+    sheet.tree_root = Some(dom.root_node(node_id, false));
     sheets.push((node_id, sheet));
 }
 
@@ -2296,7 +2321,7 @@ mod tests {
     use crate::css::computed::ComputedValue;
     use crate::css::selector::{InteractionState, MatchContext, parse_selector_list, select_all};
     use crate::css::transition::TransitionState;
-    use crate::dom::{Dom, NodeId, NodeKind};
+    use crate::dom::{Dom, NodeId, NodeKind, ShadowRootMode, SlotAssignmentMode};
     use crate::image::{DecodedImage, ImageLimits, ImageResources, discover_images};
     use crate::layout::{FragmentKind, PhysicalPoint, PhysicalSize};
     use crate::paint::{Color, DisplayCommand};
@@ -2314,6 +2339,20 @@ mod tests {
         property: &str,
     ) -> String {
         let node = target_id(document.dom(), selector);
+        render.styles[&node]
+            .typed(property)
+            .unwrap_or_else(|| panic!("{property} must have a typed computed value"))
+            .to_css()
+    }
+
+    /// The computed value for a node held directly, which is how tests assert
+    /// on shadow-tree elements: `target_id` walks the document tree and a
+    /// shadow root is deliberately not one of its host's children.
+    fn node_typed_css(
+        render: &super::DocumentRenderOutput,
+        node: NodeId,
+        property: &str,
+    ) -> String {
         render.styles[&node]
             .typed(property)
             .unwrap_or_else(|| panic!("{property} must have a typed computed value"))
@@ -2394,6 +2433,311 @@ mod tests {
         assert_ne!(
             typed_css(&document, &render, "#outside", "color"),
             "rgb(1, 1, 1)"
+        );
+    }
+
+    /// CSS Shadow 1 §3.2.1: a `<style>` inside a shadow tree belongs to that
+    /// tree. Its rules style the tree's own elements and never the document,
+    /// while the document's author rules never reach into the tree.
+    #[test]
+    fn a_shadow_tree_style_sheet_applies_only_inside_its_tree() {
+        let mut document = Document::parse(
+            "<!doctype html><style>\
+             html, body { display:block; margin:0 }\
+             span { background-color: rgb(255, 0, 0) !important; color: rgb(9, 9, 9) }\
+             </style><div id=host><span id=light>light</span></div>\
+             <span id=outside>outside</span>",
+        );
+        let host = target_id(document.dom(), "#host");
+        let light = target_id(document.dom(), "#light");
+        let outside = target_id(document.dom(), "#outside");
+        let dom = document.dom_mut();
+        let root = dom
+            .attach_shadow(host, ShadowRootMode::Open, false, SlotAssignmentMode::Named)
+            .expect("a div can host a shadow root");
+        let shadow_span = dom.create_element("span");
+        dom.append_child(root, shadow_span)
+            .expect("append the shadow span");
+        let slot = dom.create_element("slot");
+        dom.append_child(root, slot).expect("append the slot");
+        let style = dom.create_element("style");
+        dom.append_child(root, style)
+            .expect("append the shadow style");
+        let text = dom.create_text(
+            "span { background-color: rgb(0, 128, 0) }\
+                 #light { background-color: rgb(255, 0, 255); color: rgb(255, 0, 255) }",
+        );
+        dom.append_child(style, text)
+            .expect("append the style text");
+
+        let render = document.render_reference(DocumentRenderOptions::default());
+        // The shadow sheet styles the shadow span.
+        assert_eq!(
+            node_typed_css(&render, shadow_span, "background-color"),
+            "rgb(0, 128, 0)"
+        );
+        // The document sheet does not reach into the shadow tree.
+        assert_eq!(
+            node_typed_css(&render, outside, "background-color"),
+            "rgb(255, 0, 0)"
+        );
+        // The shadow sheet's `#light` rule does not leak out to the light-DOM
+        // element of the same id. Its selector is more specific than the
+        // document's `span` rule, so a leak would win on colour.
+        assert_eq!(
+            node_typed_css(&render, light, "background-color"),
+            "rgb(255, 0, 0)"
+        );
+        assert_eq!(node_typed_css(&render, light, "color"), "rgb(9, 9, 9)");
+    }
+
+    /// CSS Shadow 1 §3.2.1: nested shadow trees are separate trees. A sheet
+    /// discovered inside an inner shadow root applies there and not to the
+    /// outer tree's sheet's elements, and the outer sheet does not reach in.
+    #[test]
+    fn nested_shadow_tree_style_sheets_stay_in_their_own_trees() {
+        let mut document = Document::parse(
+            "<!doctype html><style>\
+             html, body { display:block; margin:0 }\
+             span { color: rgb(9, 9, 9) }\
+             </style><div id=outer></div><span id=outside>outside</span>",
+        );
+        let outer = target_id(document.dom(), "#outer");
+        let outside = target_id(document.dom(), "#outside");
+        let dom = document.dom_mut();
+        let outer_root = dom
+            .attach_shadow(
+                outer,
+                ShadowRootMode::Open,
+                false,
+                SlotAssignmentMode::Named,
+            )
+            .expect("a div can host a shadow root");
+        let inner_host = dom.create_element("div");
+        dom.append_child(outer_root, inner_host).unwrap();
+        let outer_span = dom.create_element("span");
+        dom.append_child(outer_root, outer_span).unwrap();
+        let outer_style = dom.create_element("style");
+        dom.append_child(outer_root, outer_style).unwrap();
+        let outer_text = dom.create_text("span { color: rgb(1, 1, 1) }");
+        dom.append_child(outer_style, outer_text).unwrap();
+
+        let inner_root = dom
+            .attach_shadow(
+                inner_host,
+                ShadowRootMode::Open,
+                false,
+                SlotAssignmentMode::Named,
+            )
+            .expect("a div inside a shadow tree can host a shadow root too");
+        let deep_span = dom.create_element("span");
+        dom.append_child(inner_root, deep_span).unwrap();
+        let inner_style = dom.create_element("style");
+        dom.append_child(inner_root, inner_style).unwrap();
+        let inner_text = dom.create_text("span { color: rgb(2, 2, 2) }");
+        dom.append_child(inner_style, inner_text).unwrap();
+
+        let render = document.render_reference(DocumentRenderOptions::default());
+        assert_eq!(node_typed_css(&render, deep_span, "color"), "rgb(2, 2, 2)");
+        assert_eq!(node_typed_css(&render, outer_span, "color"), "rgb(1, 1, 1)");
+        assert_eq!(node_typed_css(&render, outside, "color"), "rgb(9, 9, 9)");
+    }
+
+    /// CSS Shadow 1 §3.2.3: `:host` and `:host(<compound-selector>)` match the
+    /// host when evaluated in its shadow tree, `:host-context()` looks up the
+    /// shadow-including ancestor chain, and a document sheet's `:host` matches
+    /// nothing.
+    #[test]
+    fn host_selectors_style_the_shadow_host() {
+        let mut document = Document::parse(
+            "<!doctype html><style>\
+             html, body { display:block; margin:0 }\
+             :host { background-color: rgb(255, 0, 0) }\
+             </style><section class=theme><div id=host class=card></div></section>",
+        );
+        let host = target_id(document.dom(), "#host");
+        let dom = document.dom_mut();
+        let root = dom
+            .attach_shadow(host, ShadowRootMode::Open, false, SlotAssignmentMode::Named)
+            .expect("a div can host a shadow root");
+        let inner = dom.create_element("span");
+        dom.set_attribute(inner, "class", "inner").unwrap();
+        dom.append_child(root, inner).unwrap();
+        let style = dom.create_element("style");
+        dom.append_child(root, style).unwrap();
+        let text = dom.create_text(
+            ":host { background-color: rgb(10, 20, 30); color: rgb(20, 30, 40) }\
+                 :host(.card) { border-top-color: rgb(1, 2, 3) }\
+                 :host(.missing) { border-bottom-color: rgb(4, 5, 6) }\
+                 :host-context(.theme) { border-left-color: rgb(7, 8, 9) }\
+                 :host(.card) .inner { border-right-color: rgb(11, 12, 13) }",
+        );
+        dom.append_child(style, text).unwrap();
+
+        let render = document.render_reference(DocumentRenderOptions::default());
+        // The shadow tree's `:host` applies, and the document's `:host` did not
+        // match the same element.
+        assert_eq!(
+            node_typed_css(&render, host, "background-color"),
+            "rgb(10, 20, 30)"
+        );
+        assert_eq!(node_typed_css(&render, host, "color"), "rgb(20, 30, 40)");
+        assert_eq!(
+            node_typed_css(&render, host, "border-top-color"),
+            "rgb(1, 2, 3)"
+        );
+        assert_ne!(
+            node_typed_css(&render, host, "border-bottom-color"),
+            "rgb(4, 5, 6)"
+        );
+        assert_eq!(
+            node_typed_css(&render, host, "border-left-color"),
+            "rgb(7, 8, 9)"
+        );
+        // `:host(.card) .inner` reaches an element inside the tree.
+        assert_eq!(
+            node_typed_css(&render, inner, "border-right-color"),
+            "rgb(11, 12, 13)"
+        );
+    }
+
+    /// CSS Shadow 1 §3.2.4: `::slotted()` styles the light-DOM elements
+    /// assigned to a slot in that shadow tree, and only those. CSS Cascade 5
+    /// §6.1 context ordering makes a normal document declaration beat the
+    /// shadow declaration, while an important shadow declaration wins.
+    #[test]
+    fn slotted_selectors_style_assigned_light_children_only() {
+        let mut document = Document::parse(
+            "<!doctype html><style>\
+             html, body { display:block; margin:0 }\
+             span { color: rgb(9, 9, 9); background-color: rgb(8, 8, 8) }\
+             </style><div id=host>\
+             <span id=light class=x>light</span>\
+             <span id=other class=y>other</span>\
+             </div><span id=outside class=x>outside</span>",
+        );
+        let host = target_id(document.dom(), "#host");
+        let light = target_id(document.dom(), "#light");
+        let other = target_id(document.dom(), "#other");
+        let outside = target_id(document.dom(), "#outside");
+        let dom = document.dom_mut();
+        let root = dom
+            .attach_shadow(host, ShadowRootMode::Open, false, SlotAssignmentMode::Named)
+            .expect("a div can host a shadow root");
+        let slot = dom.create_element("slot");
+        dom.append_child(root, slot).unwrap();
+        let fallback_slot = dom.create_element("slot");
+        dom.set_attribute(fallback_slot, "name", "fallback")
+            .unwrap();
+        let fallback = dom.create_element("span");
+        dom.set_attribute(fallback, "class", "x").unwrap();
+        dom.append_child(fallback_slot, fallback).unwrap();
+        dom.append_child(root, fallback_slot).unwrap();
+        let style = dom.create_element("style");
+        dom.append_child(root, style).unwrap();
+        let text = dom.create_text(
+            "::slotted(.x) { color: rgb(1, 2, 3); background-color: rgb(4, 5, 6) !important }\
+                 ::slotted(.missing) { color: rgb(7, 8, 9) }\
+                 slot span { color: rgb(3, 3, 3) }",
+        );
+        dom.append_child(style, text).unwrap();
+
+        let render = document.render_reference(DocumentRenderOptions::default());
+        // Normal context ordering: the document's `span` rule is in the outer
+        // tree and wins over the more specific `::slotted(.x)` even though the
+        // slotted selector has higher specificity.
+        assert_eq!(node_typed_css(&render, light, "color"), "rgb(9, 9, 9)");
+        // Important context ordering reverses: the shadow declaration wins.
+        assert_eq!(
+            node_typed_css(&render, light, "background-color"),
+            "rgb(4, 5, 6)"
+        );
+        // A light child with another class is assigned to the same slot but
+        // does not match the compound selector.
+        assert_eq!(node_typed_css(&render, other, "color"), "rgb(9, 9, 9)");
+        // An element outside the host is not assigned to a slot at all.
+        assert_eq!(node_typed_css(&render, outside, "color"), "rgb(9, 9, 9)");
+        // Fallback content is not "assigned", so ::slotted() must not match it;
+        // the ordinary `slot span` rule in the shadow tree does.
+        assert_eq!(node_typed_css(&render, fallback, "color"), "rgb(3, 3, 3)");
+    }
+
+    /// CSS Cascade 6 §3.5.4: a `<style>` inside a shadow tree has the shadow
+    /// root as its parent, so an implicit `@scope` roots at the shadow host and
+    /// contains the tree's elements without leaking into the document.
+    #[test]
+    fn an_implicit_scope_in_a_shadow_tree_roots_at_the_host() {
+        let mut document = Document::parse(
+            "<!doctype html><style>\
+             html, body { display:block; margin:0 }\
+             p { color: rgb(9, 9, 9) }\
+             </style><div id=host><p id=outside>outside</p></div>",
+        );
+        let host = target_id(document.dom(), "#host");
+        let outside = target_id(document.dom(), "#outside");
+        let dom = document.dom_mut();
+        let root = dom
+            .attach_shadow(host, ShadowRootMode::Open, false, SlotAssignmentMode::Named)
+            .expect("a div can host a shadow root");
+        let slot = dom.create_element("slot");
+        dom.append_child(root, slot).unwrap();
+        let shadow_p = dom.create_element("p");
+        dom.append_child(root, shadow_p).unwrap();
+        let style = dom.create_element("style");
+        dom.append_child(root, style).unwrap();
+        let text = dom.create_text("@scope { p { color: rgb(1, 2, 3) } }");
+        dom.append_child(style, text).unwrap();
+
+        let render = document.render_reference(DocumentRenderOptions::default());
+        assert_eq!(node_typed_css(&render, shadow_p, "color"), "rgb(1, 2, 3)");
+        // The scoped shadow rule does not reach the document's own paragraph.
+        assert_eq!(node_typed_css(&render, outside, "color"), "rgb(9, 9, 9)");
+    }
+
+    /// A `<link rel=stylesheet>` inside a shadow tree is discovered with that
+    /// tree's root and its supplied bytes style only that tree.
+    #[test]
+    fn an_external_shadow_tree_stylesheet_keeps_its_tree_context() {
+        let mut document = Document::parse(
+            "<!doctype html><style>\
+             html, body { display:block; margin:0 }\
+             span { background-color: rgb(255, 0, 0) }\
+             </style><div id=host></div>",
+        );
+        let host = target_id(document.dom(), "#host");
+        let dom = document.dom_mut();
+        let root = dom
+            .attach_shadow(host, ShadowRootMode::Open, false, SlotAssignmentMode::Named)
+            .expect("a div can host a shadow root");
+        let shadow_span = dom.create_element("span");
+        dom.append_child(root, shadow_span).unwrap();
+        let link = dom.create_element("link");
+        dom.set_attribute(link, "rel", "stylesheet").unwrap();
+        dom.set_attribute(link, "href", "shadow.css").unwrap();
+        dom.append_child(root, link).unwrap();
+
+        let base = Url::parse("https://example.test/pages/index.html").expect("base URL");
+        let discovery = document.discover_author_style_slots(&base, DocumentLimits::default());
+        let slot = discovery
+            .slots
+            .iter()
+            .find(|slot| slot.owner == link)
+            .expect("the shadow link must be discovered");
+        assert_eq!(slot.tree_root, root);
+
+        let mut external = ExternalStyleSheets::default();
+        external.insert_css(
+            external_key(slot),
+            "span { background-color: rgb(0, 128, 0) }",
+        );
+        let render = document.render_reference_with_external_style_sheets(
+            DocumentRenderOptions::default(),
+            &base,
+            &external,
+        );
+        assert_eq!(
+            node_typed_css(&render, shadow_span, "background-color"),
+            "rgb(0, 128, 0)"
         );
     }
 
