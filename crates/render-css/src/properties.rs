@@ -694,7 +694,7 @@ fn format_function_list(name: &str, values: &[CalcNode]) -> String {
     format!("{name}({values})")
 }
 
-fn format_number(value: f32) -> String {
+pub(crate) fn format_number(value: f32) -> String {
     if value == 0.0 {
         "0".to_owned()
     } else {
@@ -1255,7 +1255,7 @@ pub enum GridTrackBreadth {
     Fraction(f32),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CssColor {
     Srgb {
         red: u8,
@@ -1266,11 +1266,14 @@ pub enum CssColor {
     CurrentColor,
     Canvas,
     CanvasText,
+    /// A `color-mix()` whose operands depend on context (`currentcolor` or a
+    /// system color). Absolute mixes resolve to `Srgb` while parsing.
+    Mix(Box<super::color::ColorMix>),
 }
 
 impl CssColor {
     #[must_use]
-    pub fn to_css(self) -> String {
+    pub fn to_css(&self) -> String {
         match self {
             Self::Srgb {
                 red,
@@ -1283,10 +1286,11 @@ impl CssColor {
                 green,
                 blue,
                 alpha,
-            } => format!("rgba({red}, {green}, {blue}, {})", format_number(alpha)),
+            } => format!("rgba({red}, {green}, {blue}, {})", format_number(*alpha)),
             Self::CurrentColor => "currentcolor".to_owned(),
             Self::Canvas => "canvas".to_owned(),
             Self::CanvasText => "canvastext".to_owned(),
+            Self::Mix(mix) => mix.to_css(),
         }
     }
 }
@@ -2205,6 +2209,27 @@ fn parse_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
         Token::Function(name) if name.eq_ignore_ascii_case("color") => {
             input.parse_nested_block(parse_color_function)
         }
+        // CSS Color 4 §4.4 `hwb()`, §4.4.1 `lab()`/`lch()`, and §4.4.2
+        // `oklab()`/`oklch()`.
+        Token::Function(name) if name.eq_ignore_ascii_case("hwb") => {
+            input.parse_nested_block(parse_hwb_color)
+        }
+        Token::Function(name) if name.eq_ignore_ascii_case("lab") => {
+            input.parse_nested_block(parse_lab_color)
+        }
+        Token::Function(name) if name.eq_ignore_ascii_case("lch") => {
+            input.parse_nested_block(parse_lch_color)
+        }
+        Token::Function(name) if name.eq_ignore_ascii_case("oklab") => {
+            input.parse_nested_block(parse_oklab_color)
+        }
+        Token::Function(name) if name.eq_ignore_ascii_case("oklch") => {
+            input.parse_nested_block(parse_oklch_color)
+        }
+        // CSS Color 5 §3 `color-mix()`.
+        Token::Function(name) if name.eq_ignore_ascii_case("color-mix") => {
+            input.parse_nested_block(parse_color_mix)
+        }
         _ => Err(location.new_custom_error(())),
     }
 }
@@ -2243,27 +2268,20 @@ fn parse_color_function<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColo
     if !(red.is_finite() && green.is_finite() && blue.is_finite() && alpha.is_finite()) {
         return Err(location.new_custom_error(()));
     }
-
-    let srgb = match space.as_str() {
-        // §10.2/§10.3: the components are already sRGB, gamma-encoded for
-        // `srgb` and linear-light for `srgb-linear`.
-        "srgb" => [red, green, blue],
-        "srgb-linear" => [red, green, blue].map(gamma_encode_srgb),
-        // §10.4 and §10.12.
-        "display-p3" => display_p3_to_srgb([red, green, blue]),
-        _ => {
-            return Err(location.new_custom_error(ValueError::detail(format!(
-                "the '{space}' color space is not implemented; only srgb, \
-                 srgb-linear and display-p3 are"
-            ))));
-        }
+    let Some(space) = crate::color::ColorSpace::from_ident(&space) else {
+        return Err(location.new_custom_error(ValueError::detail(format!(
+            "the '{space}' color space is not implemented"
+        ))));
     };
-    Ok(CssColor::Srgb {
-        red: rounded_rgb_channel(srgb[0] * 255.0),
-        green: rounded_rgb_channel(srgb[1] * 255.0),
-        blue: rounded_rgb_channel(srgb[2] * 255.0),
-        alpha: alpha.clamp(0.0, 1.0),
-    })
+    if !space.is_predefined_space() {
+        return Err(location.new_custom_error(ValueError::detail(format!(
+            "the '{}' color space is not a color() space; use its dedicated function",
+            space.name()
+        ))));
+    }
+    let mut srgb = crate::color::space_to_srgb(space, [red, green, blue]);
+    srgb.alpha = alpha.clamp(0.0, 1.0);
+    Ok(crate::color::rgba_to_css(srgb))
 }
 
 /// CSS Color 4 §4.1.1: a `<predefined-rgb>` component is a `<number>` in
@@ -2286,78 +2304,236 @@ fn parse_color_component<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
     }
 }
 
-/// CSS Color 4 §10.12: Display P3 to sRGB.
+/// Parse `hwb()` (CSS Color 4 §4.4) and convert it to sRGB.
+fn parse_hwb_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
+    let location = input.current_source_location();
+    let hue = parse_hue_or_none(input)?;
+    let white = parse_percentage_or_none(input)?;
+    let black = parse_percentage_or_none(input)?;
+    let alpha = parse_modern_alpha(input)?;
+    if !input.is_exhausted() {
+        return Err(location.new_custom_error(()));
+    }
+    let mut color = crate::color::space_to_srgb(crate::color::ColorSpace::Hwb, [hue, white, black]);
+    color.alpha = alpha;
+    Ok(crate::color::rgba_to_css(color))
+}
+
+/// Parse `lab()` (CSS Color 4 §4.4.1) and convert it to sRGB.
+fn parse_lab_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
+    let location = input.current_source_location();
+    let lightness = parse_number_or_percentage(input, 100.0)?.clamp(0.0, 100.0);
+    let a = parse_number_or_percentage(input, 125.0)?;
+    let b = parse_number_or_percentage(input, 125.0)?;
+    let alpha = parse_modern_alpha(input)?;
+    if !input.is_exhausted() {
+        return Err(location.new_custom_error(()));
+    }
+    let mut color = crate::color::space_to_srgb(crate::color::ColorSpace::Lab, [lightness, a, b]);
+    color.alpha = alpha;
+    Ok(crate::color::rgba_to_css(color))
+}
+
+/// Parse `lch()` (CSS Color 4 §4.4.1) and convert it to sRGB.
+fn parse_lch_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
+    let location = input.current_source_location();
+    let lightness = parse_number_or_percentage(input, 100.0)?.clamp(0.0, 100.0);
+    let chroma = parse_number_or_percentage(input, 150.0)?.max(0.0);
+    let hue = parse_hue_or_none(input)?;
+    let alpha = parse_modern_alpha(input)?;
+    if !input.is_exhausted() {
+        return Err(location.new_custom_error(()));
+    }
+    let mut color =
+        crate::color::space_to_srgb(crate::color::ColorSpace::Lch, [lightness, chroma, hue]);
+    color.alpha = alpha;
+    Ok(crate::color::rgba_to_css(color))
+}
+
+/// Parse `oklab()` (CSS Color 4 §4.4.2) and convert it to sRGB.
+fn parse_oklab_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
+    let location = input.current_source_location();
+    let lightness = parse_number_or_percentage(input, 1.0)?.clamp(0.0, 1.0);
+    let a = parse_number_or_percentage(input, 0.4)?;
+    let b = parse_number_or_percentage(input, 0.4)?;
+    let alpha = parse_modern_alpha(input)?;
+    if !input.is_exhausted() {
+        return Err(location.new_custom_error(()));
+    }
+    let mut color = crate::color::space_to_srgb(crate::color::ColorSpace::Oklab, [lightness, a, b]);
+    color.alpha = alpha;
+    Ok(crate::color::rgba_to_css(color))
+}
+
+/// Parse `oklch()` (CSS Color 4 §4.4.2) and convert it to sRGB.
+fn parse_oklch_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
+    let location = input.current_source_location();
+    let lightness = parse_number_or_percentage(input, 1.0)?.clamp(0.0, 1.0);
+    let chroma = parse_number_or_percentage(input, 0.4)?.max(0.0);
+    let hue = parse_hue_or_none(input)?;
+    let alpha = parse_modern_alpha(input)?;
+    if !input.is_exhausted() {
+        return Err(location.new_custom_error(()));
+    }
+    let mut color =
+        crate::color::space_to_srgb(crate::color::ColorSpace::Oklch, [lightness, chroma, hue]);
+    color.alpha = alpha;
+    Ok(crate::color::rgba_to_css(color))
+}
+
+/// Parse `color-mix()` (CSS Color 5 §3).
 ///
-/// §14.1.1 names clipping the component values to the displayable range as the
-/// simplest way to bring an out-of-gamut color into an RGB destination, and
-/// clipping on gamma-encoded values is what it describes. Display P3 is wider
-/// than sRGB, so a saturated P3 color really can land outside sRGB here, and
-/// the hue shift that clipping causes is the cost §14.1.2 exists to avoid.
-fn display_p3_to_srgb(rgb: [f32; 3]) -> [f32; 3] {
-    // §19: `lin_P3_to_XYZ`, on linear-light values.
-    const LIN_P3_TO_XYZ: [[f32; 3]; 3] = [
-        [
-            608_311.0 / 1_250_200.0,
-            189_793.0 / 714_400.0,
-            198_249.0 / 1_000_160.0,
-        ],
-        [
-            35_783.0 / 156_275.0,
-            247_089.0 / 357_200.0,
-            198_249.0 / 2_500_400.0,
-        ],
-        [0.0, 32_229.0 / 714_400.0, 5_220_557.0 / 5_000_800.0],
-    ];
-    // §19: `XYZ_to_lin_sRGB`.
-    const XYZ_TO_LIN_SRGB: [[f32; 3]; 3] = [
-        [12_831.0 / 3_959.0, -329.0 / 214.0, -1_974.0 / 3_959.0],
-        [
-            -851_781.0 / 878_810.0,
-            1_648_619.0 / 878_810.0,
-            36_519.0 / 878_810.0,
-        ],
-        [705.0 / 12_673.0, -2_585.0 / 12_673.0, 705.0 / 667.0],
-    ];
-    // `lin_P3` is `lin_sRGB`: Display P3 uses the sRGB transfer function
-    // (§10.4), it is the primaries and the white point that differ.
-    let linear = rgb.map(gamma_decode_srgb);
-    let xyz = multiply_matrix(LIN_P3_TO_XYZ, linear);
-    multiply_matrix(XYZ_TO_LIN_SRGB, xyz).map(|value| gamma_encode_srgb(value).clamp(0.0, 1.0))
-}
-
-fn multiply_matrix(matrix: [[f32; 3]; 3], vector: [f32; 3]) -> [f32; 3] {
-    [
-        dot(matrix[0], vector),
-        dot(matrix[1], vector),
-        dot(matrix[2], vector),
-    ]
-}
-
-fn dot(left: [f32; 3], right: [f32; 3]) -> f32 {
-    left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
-}
-
-/// CSS Color 4 §19's `lin_sRGB`: gamma-encoded value to linear light, extended
-/// to negative values by reflection so an out-of-gamut conversion does not fold
-/// the sign away before the matrices see it.
-fn gamma_decode_srgb(value: f32) -> f32 {
-    let sign = if value < 0.0 { -1.0 } else { 1.0 };
-    let magnitude = value.abs();
-    if magnitude <= 0.040_45 {
-        value / 12.92
+/// The grammar is
+/// `color-mix( <color-interpolation-method> , <color> [ <percentage> ]? , <color> [ <percentage> ]? )`.
+/// A mix of two absolute colors resolves at parse time; one naming
+/// `currentcolor` or a system color stays a [`CssColor::Mix`] until paint.
+fn parse_color_mix<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
+    let location = input.current_source_location();
+    let keyword = input.expect_ident_cloned()?;
+    if !keyword.eq_ignore_ascii_case("in") {
+        return Err(location.new_custom_error(ValueError::detail(
+            "color-mix() requires an `in <color-space>` interpolation method",
+        )));
+    }
+    let space_name = input.expect_ident_cloned()?;
+    let Some(space) = crate::color::ColorSpace::from_ident(&space_name) else {
+        return Err(location.new_custom_error(ValueError::detail(format!(
+            "'{space_name}' is not a color space"
+        ))));
+    };
+    let hue = if space.is_polar() {
+        match input.try_parse(|candidate| candidate.expect_ident_cloned()) {
+            Ok(name) => crate::color::HueMethod::from_ident(&name).ok_or_else(|| {
+                location.new_custom_error(ValueError::detail(format!(
+                    "'{name}' is not a hue interpolation method"
+                )))
+            })?,
+            Err(_) => crate::color::HueMethod::Shorter,
+        }
     } else {
-        sign * ((magnitude + 0.055) / 1.055).powf(2.4)
+        crate::color::HueMethod::Shorter
+    };
+    input.expect_comma()?;
+    let (left, left_percent) = parse_color_mix_operand(input)?;
+    input.expect_comma()?;
+    let (right, right_percent) = parse_color_mix_operand(input)?;
+    if !input.is_exhausted() {
+        return Err(location.new_custom_error(()));
+    }
+    let (left_weight, right_weight, alpha_multiplier) =
+        color_mix_weights(left_percent, right_percent);
+    let mix = CssColor::Mix(Box::new(crate::color::ColorMix {
+        space,
+        hue,
+        left,
+        right,
+        left_percent,
+        right_percent,
+        left_weight,
+        right_weight,
+        alpha_multiplier,
+    }));
+    if let Some(color) = crate::color::resolve_absolute(&mix) {
+        Ok(crate::color::rgba_to_css(color))
+    } else {
+        Ok(mix)
     }
 }
 
-/// CSS Color 4 §19's `gam_sRGB`: the inverse transfer function.
-fn gamma_encode_srgb(value: f32) -> f32 {
-    let sign = if value < 0.0 { -1.0 } else { 1.0 };
-    let magnitude = value.abs();
-    if magnitude > 0.003_130_8 {
-        sign * (1.055 * magnitude.powf(1.0 / 2.4) - 0.055)
+fn parse_color_mix_operand<'i>(
+    input: &mut Parser<'i, '_>,
+) -> CssResult<'i, (CssColor, Option<f32>)> {
+    let color = parse_color(input)?;
+    let percent = input.try_parse(parse_color_mix_percentage).ok();
+    Ok((color, percent))
+}
+
+fn parse_color_mix_percentage<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
+    let location = input.current_source_location();
+    match input.next()?.clone() {
+        Token::Percentage { unit_value, .. } if (0.0..=1.0).contains(&unit_value) => {
+            Ok(unit_value * 100.0)
+        }
+        _ => Err(location.new_custom_error(())),
+    }
+}
+
+/// CSS Color 5 §3.3: turn the declared percentages into normalized weights.
+///
+/// When both percentages are present and sum below 100%, the two colors keep
+/// their relative ratio and the result's alpha is multiplied by the sum. When
+/// they sum above 100%, the weights are normalized.
+fn color_mix_weights(left: Option<f32>, right: Option<f32>) -> (f32, f32, f32) {
+    match (left, right) {
+        (None, None) => (0.5, 0.5, 1.0),
+        (Some(left), None) => (left / 100.0, 1.0 - left / 100.0, 1.0),
+        (None, Some(right)) => (1.0 - right / 100.0, right / 100.0, 1.0),
+        (Some(left), Some(right)) => {
+            let sum = left + right;
+            if sum <= 0.0 {
+                (0.0, 0.0, 0.0)
+            } else if sum > 100.0 {
+                (left / sum, right / sum, 1.0)
+            } else {
+                (left / sum, right / sum, sum / 100.0)
+            }
+        }
+    }
+}
+
+/// A `<percentage>` component that accepts `none` as zero.
+fn parse_percentage_or_none<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
+    let location = input.current_source_location();
+    match input.next()?.clone() {
+        Token::Percentage { unit_value, .. } => Ok(unit_value),
+        Token::Ident(value) if value.eq_ignore_ascii_case("none") => Ok(0.0),
+        _ => Err(location.new_custom_error(())),
+    }
+}
+
+/// A `<number>` or `<percentage>` component where `100%` scales to `percentage_scale`.
+fn parse_number_or_percentage<'i>(
+    input: &mut Parser<'i, '_>,
+    percentage_scale: f32,
+) -> CssResult<'i, f32> {
+    let location = input.current_source_location();
+    let value = match input.next()?.clone() {
+        Token::Number { value, .. } => value,
+        Token::Percentage { unit_value, .. } => unit_value * percentage_scale,
+        Token::Ident(value) if value.eq_ignore_ascii_case("none") => 0.0,
+        _ => return Err(location.new_custom_error(())),
+    };
+    if value.is_finite() {
+        Ok(value)
     } else {
-        12.92 * value
+        Err(location.new_custom_error(()))
+    }
+}
+
+fn parse_hue_or_none<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
+    if let Ok(hue) = input.try_parse(parse_hue) {
+        return Ok(hue);
+    }
+    let location = input.current_source_location();
+    match input.next()?.clone() {
+        Token::Ident(value) if value.eq_ignore_ascii_case("none") => Ok(0.0),
+        _ => Err(location.new_custom_error(())),
+    }
+}
+
+fn parse_modern_alpha<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
+    if input
+        .try_parse(|candidate| candidate.expect_delim('/'))
+        .is_err()
+    {
+        return Ok(1.0);
+    }
+    let location = input.current_source_location();
+    match input.next()?.clone() {
+        Token::Number { value, .. } => Ok(value.clamp(0.0, 1.0)),
+        Token::Percentage { unit_value, .. } => Ok(unit_value.clamp(0.0, 1.0)),
+        Token::Ident(value) if value.eq_ignore_ascii_case("none") => Ok(0.0),
+        _ => Err(location.new_custom_error(())),
     }
 }
 
@@ -4982,27 +5158,149 @@ mod tests {
         assert_eq!(srgb("color(display-p3 1 1 0)"), (255, 255, 0, 1.0));
     }
 
-    /// A color space this engine cannot represent is rejected with a diagnostic
-    /// that names it, never approximated into a different color.
+    /// Every predefined `color()` space the engine can convert is accepted,
+    /// and an unknown space is rejected with a diagnostic that names it.
     #[test]
-    fn rejects_color_spaces_the_engine_cannot_represent() {
+    fn accepts_every_predefined_color_space_and_rejects_unknown_ones() {
+        for css in [
+            "color(rec2020 1 0 0)",
+            "color(a98-rgb 1 0 0)",
+            "color(prophoto-rgb 1 0 0)",
+            "color(xyz 0.1 0.2 0.3)",
+            "color(xyz-d50 0.1 0.2 0.3)",
+            "color(xyz-d65 0.1 0.2 0.3)",
+        ] {
+            parse_typed_property("color", css)
+                .expect("supported property")
+                .unwrap_or_else(|error| panic!("{css} must parse: {error:?}"));
+        }
         for (css, space) in [
-            ("color(rec2020 1 0 0)", "rec2020"),
-            ("color(a98-rgb 1 0 0)", "a98-rgb"),
-            ("color(prophoto-rgb 1 0 0)", "prophoto-rgb"),
             ("color(display-p3-linear 1 0 0)", "display-p3-linear"),
-            ("color(xyz 0.1 0.2 0.3)", "xyz"),
-            ("color(xyz-d50 0.1 0.2 0.3)", "xyz-d50"),
-            ("color(rec2020 1 0 0)", "not-a-space"),
+            ("color(not-a-space 1 0 0)", "not-a-space"),
+            ("color(oklab 1 0 0)", "oklab"),
         ] {
             let error = parse_typed_property("color", css)
                 .expect("supported property")
                 .expect_err("must be rejected");
             assert_eq!(error.property(), "color");
             let detail = error.detail().unwrap_or_default();
+            assert!(detail.contains(space), "{css}: {detail}");
+        }
+    }
+
+    /// CSS Color 4 §4.4: `hwb()`, `lab()`/`lch()` and `oklab()`/`oklch()`
+    /// compute to the equivalent sRGB color.
+    #[test]
+    fn resolves_hwb_lab_lch_oklab_and_oklch_to_srgb() {
+        assert_eq!(srgb("hwb(0 0% 0%)"), (255, 0, 0, 1.0));
+        assert_eq!(srgb("hwb(120 0% 0%)"), (0, 255, 0, 1.0));
+        assert_eq!(srgb("hwb(0 100% 0%)"), (255, 255, 255, 1.0));
+        assert_eq!(srgb("hwb(0 0% 100%)"), (0, 0, 0, 1.0));
+        assert_eq!(srgb("hwb(0 50% 50%)"), (128, 128, 128, 1.0));
+        assert_eq!(srgb("lab(100 0 0)"), (255, 255, 255, 1.0));
+        assert_eq!(srgb("lab(0 0 0)"), (0, 0, 0, 1.0));
+        assert_eq!(srgb("lch(100 0 0)"), (255, 255, 255, 1.0));
+        assert_eq!(srgb("lch(0 0 0)"), (0, 0, 0, 1.0));
+        assert_eq!(srgb("oklab(1 0 0)"), (255, 255, 255, 1.0));
+        assert_eq!(srgb("oklab(0 0 0)"), (0, 0, 0, 1.0));
+        assert_eq!(srgb("oklch(1 0 0)"), (255, 255, 255, 1.0));
+        assert_eq!(srgb("oklch(0 0 0)"), (0, 0, 0, 1.0));
+        assert_eq!(srgb("oklch(0.7 0.1 120)"), (150, 168, 94, 1.0));
+        assert_eq!(srgb("oklch(70% 25% 120deg)"), (150, 168, 94, 1.0));
+        assert_eq!(srgb("color(rec2020 1 1 1)"), (255, 255, 255, 1.0));
+        assert_eq!(srgb("color(a98-rgb 0 0 0)"), (0, 0, 0, 1.0));
+        assert_eq!(srgb("color(prophoto-rgb 1 1 1)"), (255, 255, 255, 1.0));
+        assert_eq!(srgb("color(xyz-d65 0 0 0)"), (0, 0, 0, 1.0));
+        // `/ <alpha-value>` applies to every modern color function.
+        assert_eq!(srgb("lab(50 0 0 / 50%)").3, 0.5);
+        assert_eq!(srgb("oklch(50% 0.1 240 / 25%)").3, 0.25);
+    }
+
+    /// CSS Color 5 §3: `color-mix()` interpolates in the named space and
+    /// resolves to sRGB when both operands are absolute.
+    #[test]
+    fn parses_color_mix_and_resolves_absolute_mixes() {
+        assert_eq!(srgb("color-mix(in srgb, red, blue)"), (128, 0, 128, 1.0));
+        assert_eq!(
+            srgb("color-mix(in srgb, #ff0000 25%, #0000ff)"),
+            (64, 0, 191, 1.0)
+        );
+        // Premultiplied alpha: a transparent operand halves the result's
+        // alpha but keeps the opaque operand's hue.
+        assert_eq!(
+            srgb("color-mix(in srgb, red, transparent)"),
+            (255, 0, 0, 0.5)
+        );
+        // Both percentages below 100% multiply the alpha by their sum.
+        assert_eq!(
+            srgb("color-mix(in srgb, red 25%, blue 25%)"),
+            (128, 0, 128, 0.5)
+        );
+        // Above 100% the weights normalize and alpha stays opaque.
+        assert_eq!(
+            srgb("color-mix(in srgb, red 75%, blue 75%)"),
+            (128, 0, 128, 1.0)
+        );
+        // Linear-light interpolation is not the same as gamma-space mixing.
+        assert_eq!(
+            srgb("color-mix(in srgb-linear, red, blue)"),
+            (188, 0, 188, 1.0)
+        );
+        // The CSS Color 5 default space is oklab; check the actual result.
+        assert_eq!(srgb("color-mix(in oklab, red, blue)"), (140, 83, 162, 1.0));
+        // Shorter hue path goes through magenta, the longer path through green.
+        assert_eq!(srgb("color-mix(in hsl, red, blue)"), (255, 0, 255, 1.0));
+        assert_eq!(
+            srgb("color-mix(in hsl longer, red, blue)"),
+            (0, 255, 0, 1.0)
+        );
+        // Nested mixes resolve recursively.
+        assert_eq!(
+            srgb("color-mix(in srgb, color-mix(in srgb, red, blue), transparent)"),
+            (128, 0, 128, 0.5)
+        );
+    }
+
+    #[test]
+    fn color_mix_with_currentcolor_stays_unresolved_until_paint() {
+        match parse(
+            "background-color",
+            "color-mix(in srgb, currentcolor 20%, transparent)",
+        ) {
+            TypedPropertyValue::Color(CssColor::Mix(mix)) => {
+                assert_eq!(mix.left_weight, 0.2);
+                assert_eq!(mix.right_weight, 0.8);
+                assert_eq!(mix.alpha_multiplier, 1.0);
+                assert!(mix.to_css().contains("currentcolor 20%"));
+            }
+            other => panic!("expected an unresolved color mix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_modern_color_functions_and_color_mix() {
+        for invalid in [
+            "hwb(0 0 0)",
+            "hwb(0 0%)",
+            "lab(100 0)",
+            "lch(50 20)",
+            "oklab(1 0)",
+            "oklch(1 0.1)",
+            "color-mix(red, blue)",
+            "color-mix(in srgb red, blue)",
+            "color-mix(in srgb, red blue)",
+            "color-mix(in srgb, red 101%, blue)",
+            "color-mix(in srgb, red -1%, blue)",
+            "color-mix(in unknown, red, blue)",
+            "color-mix(in srgb longer, red, blue)",
+            "color-mix(in oklch unknown, red, blue)",
+            "color-mix(in srgb, red, blue, green)",
+        ] {
             assert!(
-                detail.contains(space) || detail.contains("not implemented"),
-                "{css}: {detail}"
+                parse_typed_property("color", invalid)
+                    .expect("supported property")
+                    .is_err(),
+                "{invalid:?} must not parse"
             );
         }
     }

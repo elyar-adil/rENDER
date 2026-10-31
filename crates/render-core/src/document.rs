@@ -1746,7 +1746,7 @@ fn render_dom(
 fn computed_text_color(styles: &BTreeMap<NodeId, ComputedStyle>, node: NodeId) -> Color {
     match styles.get(&node).and_then(|style| style.typed("color")) {
         Some(TypedPropertyValue::Color(value)) => {
-            SystemPalette::default().resolve(*value, Color::BLACK)
+            SystemPalette::default().resolve(value.clone(), Color::BLACK)
         }
         _ => Color::BLACK,
     }

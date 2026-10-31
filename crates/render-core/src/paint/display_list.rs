@@ -4182,7 +4182,7 @@ fn style_font_size(style: &ComputedStyle) -> f32 {
 
 fn typed_color(style: &ComputedStyle, property: &str) -> Option<CssColor> {
     match style.typed(property) {
-        Some(TypedPropertyValue::Color(color)) => Some(*color),
+        Some(TypedPropertyValue::Color(color)) => Some(color.clone()),
         _ => None,
     }
 }

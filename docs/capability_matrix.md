@@ -15,10 +15,9 @@ says so. `docs/visual_fidelity_gaps.md` is the working register; this file is th
 | what | number | when |
 | --- | --- | --- |
 | `render-js` unit tests | 1,116 passed, 0 failed | 2026-10-22 |
-| `render-css` unit tests | 245 passed, 0 failed | 2026-10-31 |
-| `render-core` unit tests | 432 passed, 0 failed (temporary local build without `avif-native`; AVIF decoder test excluded) | 2026-10-31 |
-| `render-layout` unit tests | 306 passed, 0 failed, 1 ignored | 2026-10-22 |
-| `render-css` unit tests | 245 passed, 0 failed | 2026-10-31 |
+| `render-css` unit tests | 266 passed, 0 failed | 2026-10-31 |
+| `render-core` unit tests | 441 passed, 1 failed (temporary local build without `avif-native`; failure is the AVIF decoder test) | 2026-10-31 |
+| `render-layout` unit tests | 322 passed, 1 ignored | 2026-10-31 |
 | `render-browser` unit tests | 198 passed, 0 failed | 2026-10-23 |
 | `render-browser` app tests (binary) | 99 passed, 0 failed | 2026-10-23 |
 | `render-html` unit tests | 149 passed, 0 failed | 2026-10-22 |
@@ -55,8 +54,13 @@ is *derived on every read* rather than stored, so the entire class of staleness 
 The last correction here was the sixth agent to overturn a spec claim I wrote into a work order.
 
 **CSS cascade and selectors.** Specificity, inheritance, the cascade origins, presentational hints
-at the correct origin, CSS Nesting, `@supports` evaluated against a three-state oracle, the
-`hsl()`/`hsla()` family, `color()` in sRGB, sRGB-linear and display-p3. Shorthand expansion is now
+at the correct origin, CSS Nesting, `@supports` evaluated against a three-state oracle. CSS Color 4
+is implemented through a single conversion layer: `hsl()`/`hsla()`/`hwb()`, `lab()`/`lch()`,
+`oklab()`/`oklch()`, `color()` in every predefined space (sRGB, linear sRGB, Display P3, A98 RGB,
+ProPhoto RGB, Rec. 2020, XYZ D50/D65), and `color-mix()` in those spaces with premultiplied alpha
+and all four hue paths. Absolute mixes resolve at parse time; mixes naming `currentcolor` or a
+system color resolve at paint time. Out-of-gamut colors are clipped per channel (perceptual gamut
+mapping is not implemented), and `none` components are currently treated as zero. Shorthand expansion is now
 spec-correct for `text-decoration`, which is what fixed the most-reported visual symptom in the
 project's history. `@property` registrations validate their syntax and initial value, stop
 `inherits: false` properties from inheriting, and replace invalid computed values with the

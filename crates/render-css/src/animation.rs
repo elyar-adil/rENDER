@@ -574,7 +574,7 @@ fn interpolate_color(from: CssColor, to: CssColor, progress: f32) -> CssColor {
             blue: to_blue,
             alpha: to_alpha,
         },
-    ) = (from, to)
+    ) = (&from, &to)
     else {
         return to;
     };
@@ -584,10 +584,10 @@ fn interpolate_color(from: CssColor, to: CssColor, progress: f32) -> CssColor {
             .clamp(0.0, 255.0) as u8
     };
     CssColor::Srgb {
-        red: channel(from_red, to_red),
-        green: channel(from_green, to_green),
-        blue: channel(from_blue, to_blue),
-        alpha: from_alpha + (to_alpha - from_alpha) * progress,
+        red: channel(*from_red, *to_red),
+        green: channel(*from_green, *to_green),
+        blue: channel(*from_blue, *to_blue),
+        alpha: *from_alpha + (*to_alpha - *from_alpha) * progress,
     }
 }
 

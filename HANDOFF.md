@@ -1,3 +1,72 @@
+# 交接文档 (2026-10-31, 续五十二) — 现代颜色函数、全部预定义色彩空间与 `color-mix()`
+
+这一轮补齐 CSS Color 4 的现代颜色函数与 CSS Color 5 的 `color-mix()`：所有预定义
+`color()` 空间、`hwb()`、`lab()`/`lch()`、`oklab()`/`oklch()` 都能解析并换算到设备
+sRGB，`color-mix()` 在任意支持的空间中插值（含极坐标色调路径与预乘 alpha），依赖
+`currentcolor`/系统色的混合保留到绘制期解析。没有站点特判。
+
+## 语义与接入
+
+- `render-css::color` 是唯一的颜色换算层：`ColorSpace` 覆盖 `srgb`、`srgb-linear`、
+  `display-p3`、`a98-rgb`、`prophoto-rgb`、`rec2020`、`xyz`/`xyz-d65`、`xyz-d50`、
+  `lab`、`oklab`、`lch`、`oklch`、`hsl`、`hwb`；矩阵与传递函数按 CSS Color 4 §19 的
+  样例代码实现，`f32` 计算，设备边界才量化到 8 位。
+- 解析（`properties.rs`）：
+  - `hwb()` 按 §4.4 归一化白/黑比例；`lab()`/`lch()`/`oklab()`/`oklch()` 接受数字或
+    百分比（`100%` 分别对应 L=100、C=150、L=1、C=0.4 等），并支持 `/ <alpha-value>`。
+  - `color()` 接受全部预定义空间；未知空间与专用函数空间（如 `color(oklab ...)`）
+    仍被拒绝并给出诊断，不静默近似。
+  - `color-mix()` 的语法为
+    `in <color-space> [<hue-method>]? , <color> [<percentage>]? , <color> [<percentage>]?`；
+    百分比缺失时按 CSS Color 5 §3.3 补足/归一，和低于 100% 时结果 alpha 乘以和。
+  - 插值在目标空间进行；极坐标空间支持 `shorter`/`longer`/`increasing`/`decreasing`，
+    并对 powerless 色相做 carry-forward。非色相分量按预乘 alpha 插值。
+  - 两个操作数都是绝对色时在解析期直接得到 `CssColor::Srgb`；只有含
+    `currentcolor`/`canvas`/`canvastext` 时才保留 `CssColor::Mix`。
+- `CssColor` 因 `Mix(Box<ColorMix>)` 不再 `Copy`；绘制层 `SystemPalette::resolve`
+  递归解析未决混合，`currentcolor` 与系统色在同一元素上下文内求值。
+
+## 测试
+
+- 颜色空间：每个预定义空间的往返与边界值（白/黑/原色）、`hwb()` 白黑混合、
+  `lab/lch/oklab/oklch` 的已知 sRGB 结果、现代 alpha 语法。
+- `color-mix()`：srgb/srgb-linear/oklab 已知结果、百分比归一与 alpha 缩减、透明色预乘、
+  四种色调路径、嵌套混合；含 `currentcolor` 的混合在绘制期解析且不被透明色拉黑。
+- 非法值：缺分量、未知空间、未知色调方法、超范围百分比、缺少逗号或插值空间均拒绝。
+
+## 验证
+
+```
+cargo test -p render-css --lib                     266 passed, 0 failed
+cargo test -p render-layout --lib                  322 passed, 1 ignored
+cargo test -p render-core --lib                    441 passed, 1 failed
+                                                   （临时关闭 avif-native；失败仅为 AVIF 解码测试）
+cargo fmt --all --check                            clean
+cargo clippy -p render-css -p render-layout -p render-core --all-targets -D warnings  clean
+python tools/check_site_neutrality.py              0 blocking, 26 advisory
+```
+
+本机全工作区门禁仍被 `dav1d-sys v0.8.3` 的 `pkg-config` 缺失阻塞，与本轮代码无关。
+
+## 已知缺口
+
+- `none` 颜色分量当前按 0 参与换算与插值，尚未实现 CSS Color 4 §4.4 的缺失分量
+  carry-forward 与序列化保真。
+- 色域映射仍是 §14.1.1 的逐通道裁剪，尚未实现 OKLCH 感知映射（§14.1.2）。
+- 相对颜色语法（`rgb(from ...)` 等）、`light-dark()`、`device-cmyk()`、
+  `contrast-color()` 尚未实现。
+- 颜色动画仍按 sRGB 分量插值，尚未接入 `color-mix()` 的空间与预乘规则。
+
+## 下一步
+
+- `contain: style` 的计数器/quotes 隔离。
+- `scroll-state()` 容器查询。
+- `@scope`、`@starting-style`、`@font-face` 描述符。
+- `none` 分量 carry-forward、感知色域映射与相对颜色语法。
+- fixed 包含块与滚动容器偏移联动。
+
+---
+
 # 交接文档 (2026-10-31, 续五十一) — 独立的 `contain` 属性与包含块语义
 
 这一轮实现 CSS Containment 2 §2 的 `contain` 属性，并据规格修正 `container-type` 的

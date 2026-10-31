@@ -1439,6 +1439,31 @@ comma-separated `<bg-image>#` list per CSS Backgrounds 3 §3.2.
 mapping; the agent deliberately kept `CssColor` to the single sRGB variant rather than
 half-implement a second space.
 
+### S12 follow-up - 2026-10-31: modern colour functions and `color-mix()`
+
+The single-sRGB limitation is gone. `render-css::color` now converts every CSS Color 4
+predefined space (`srgb`, `srgb-linear`, `display-p3`, `a98-rgb`, `prophoto-rgb`, `rec2020`,
+`xyz`/`xyz-d50`/`xyz-d65`) plus `hsl`, `hwb`, `lab`, `lch`, `oklab` and `oklch` into the
+device sRGB contract, using the §19 sample matrices and transfer functions. `hwb()`,
+`lab()`/`lch()`, `oklab()`/`oklch()` and the full `color()` grammar parse with modern
+`/ <alpha-value>` syntax. `color-mix()` interpolates in any of those spaces, honors the
+four hue methods and powerless-hue carry-forward, premultiplies non-hue components by
+alpha, and applies the CSS Color 5 percentage rules, including the alpha reduction when
+the declared percentages sum below 100%. Absolute mixes become sRGB at parse time; mixes
+that name `currentcolor` or a system colour stay unresolved until `SystemPalette::resolve`
+at paint time, so they pick up the element's actual colour.
+
+Verified against known values: `color-mix(in oklab, red, blue)` = `rgb(140, 83, 162)`,
+`oklch(0.7 0.1 120)` = `rgb(150, 168, 94)`, `color-mix(in srgb-linear, red, blue)` =
+`rgb(188, 0, 188)`, and `color-mix(in srgb, red, transparent)` = `rgba(255, 0, 0, 0.5)`.
+
+**Remaining colour gaps:** `none` components are parsed as zero instead of carrying missing
+components through interpolation and serialization; gamut mapping is still per-channel
+clipping rather than perceptual OKLCH mapping; relative colour syntax (`rgb(from ...)`),
+`light-dark()`, `device-cmyk()` and `contrast-color()` are not implemented; colour
+animations still interpolate sRGB channels rather than using the specified interpolation
+space and premultiplication.
+
 ## S17 - Closed, see "S17 - Closed: two media-query evaluators" below
 
 Superseded, and **the severity recorded here was wrong**. This entry described the cost as a

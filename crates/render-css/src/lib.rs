@@ -1,6 +1,7 @@
 pub mod animation;
 pub mod at_rules;
 pub mod cascade;
+pub mod color;
 pub mod computed;
 pub mod container;
 pub mod length;
