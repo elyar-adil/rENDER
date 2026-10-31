@@ -10,11 +10,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use render_dom::{Dom, Node, NodeId, NodeKind};
 
+use super::length::{LengthContext, resolve_length_expr};
 use super::properties::{
     expand_columns_shorthand, expand_flex_shorthand, expand_gap_shorthand,
     expand_grid_axis_shorthand, parse_typed_property,
 };
-use super::selector::{MatchContext, Specificity, SubjectKey, SubjectPseudo, matching_specificity};
+use super::selector::{
+    ColorGamut, ColorScheme, ContrastPreference, DisplayMode, DynamicRange, Hover, MatchContext,
+    OverflowBlock, OverflowInline, Pointer, ReducedPreference, Scripting, Specificity, SubjectKey,
+    SubjectPseudo, UpdateFrequency, matching_specificity,
+};
 use super::stylesheet::{CssWideKeyword, Declaration, LayerName, StyleSheet, css_wide_keyword};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -376,6 +381,17 @@ fn cascade_element_with_origins_impl(
             {
                 continue;
             }
+            // CSS Containment 3 §4.1: a container condition is evaluated
+            // against the element's nearest eligible ancestor container. The
+            // geometry arrives from the previous layout pass; an empty context
+            // answers false for every size query, never "maybe".
+            if !rule
+                .container
+                .iter()
+                .all(|condition| context.containers.matches(dom, element, condition))
+            {
+                continue;
+            }
             if let Some(index) = rule_index
                 && index.debug
             {
@@ -541,10 +557,10 @@ pub fn media_query_list_matches(query: &str, context: &MatchContext) -> bool {
 /// evaluator can answer on its own.
 ///
 /// This is deliberately *not* a second parse with weaker rules: it is derived
-/// from the same [`media_condition_matches`] the cascade uses, so the two
-/// cannot disagree. A query reporting `true` here is one whose result came
-/// from a real evaluation rather than from the "unknown means false" fallback
-/// of Media Queries 4 §2.1.1.
+/// from the same evaluation the cascade uses, so the two cannot disagree. A
+/// query reporting `true` here is one whose result came from a real evaluation
+/// rather than from the "unknown means false" fallback of Media Queries 4
+/// §2.1.1.
 ///
 /// A consumer that reports a media query as unsupported must use this, or the
 /// engine ends up claiming to lack support for something it evaluates on every
@@ -559,24 +575,7 @@ pub fn media_query_list_matches(query: &str, context: &MatchContext) -> bool {
 pub fn media_query_list_is_supported(query: &str) -> bool {
     split_media_list(query)
         .into_iter()
-        .all(media_query_is_supported)
-}
-
-fn media_query_is_supported(query: &str) -> bool {
-    let query = strip_media_modifiers(query);
-    split_media_conjunctions(&query)
-        .into_iter()
-        .all(|condition| {
-            media_condition_evaluate(condition, &MatchContext::default()).is_supported()
-        })
-}
-
-/// The `not`/`only` prefix stripped, shared by evaluation and the support
-/// check so the two cannot drift.
-fn strip_media_modifiers(query: &str) -> String {
-    let query = query.trim().to_ascii_lowercase();
-    let query = query.strip_prefix("not ").unwrap_or(&query);
-    query.strip_prefix("only ").unwrap_or(query).to_owned()
+        .all(|query| evaluate_media_query(query, &MatchContext::default()).supported)
 }
 
 /// The outcome of evaluating one media condition.
@@ -595,16 +594,89 @@ enum MediaCondition {
 }
 
 impl MediaCondition {
-    /// Whether this engine can answer the condition by itself, as opposed to
-    /// falling back to the "unknown means false" rule.
-    const fn is_supported(self) -> bool {
-        !matches!(self, Self::Unsupported)
-    }
-
     const fn matches(self) -> bool {
         match self {
             Self::Evaluated(value) => value,
             Self::Unsupported | Self::Unknown => false,
+        }
+    }
+
+    /// Three-valued negation: an unknown condition stays unknown, so a
+    /// `not (general-enclosed)` query is false rather than accidentally true.
+    const fn negate(self) -> Self {
+        match self {
+            Self::Evaluated(value) => Self::Evaluated(!value),
+            Self::Unsupported | Self::Unknown => Self::Unknown,
+        }
+    }
+
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Evaluated(false), _) | (_, Self::Evaluated(false)) => Self::Evaluated(false),
+            (Self::Evaluated(true), Self::Evaluated(true)) => Self::Evaluated(true),
+            _ => Self::Unknown,
+        }
+    }
+
+    fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Evaluated(true), _) | (_, Self::Evaluated(true)) => Self::Evaluated(true),
+            (Self::Evaluated(false), Self::Evaluated(false)) => Self::Evaluated(false),
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// A condition's value together with whether every construct in it was one the
+/// evaluator understood. Keeping support separate from the three-valued result
+/// is what lets `or` stay short-circuit-correct without hiding an unsupported
+/// feature from [`media_query_list_is_supported`].
+#[derive(Clone, Copy, Debug)]
+struct ConditionResult {
+    value: MediaCondition,
+    supported: bool,
+}
+
+impl ConditionResult {
+    const fn evaluated(value: bool) -> Self {
+        Self {
+            value: MediaCondition::Evaluated(value),
+            supported: true,
+        }
+    }
+
+    const fn unknown() -> Self {
+        Self {
+            value: MediaCondition::Unknown,
+            supported: true,
+        }
+    }
+
+    const fn unsupported() -> Self {
+        Self {
+            value: MediaCondition::Unsupported,
+            supported: false,
+        }
+    }
+
+    const fn negate(self) -> Self {
+        Self {
+            value: self.value.negate(),
+            supported: self.supported,
+        }
+    }
+
+    fn and(self, other: Self) -> Self {
+        Self {
+            value: self.value.and(other.value),
+            supported: self.supported && other.supported,
+        }
+    }
+
+    fn or(self, other: Self) -> Self {
+        Self {
+            value: self.value.or(other.value),
+            supported: self.supported && other.supported,
         }
     }
 }
@@ -629,45 +701,119 @@ fn split_media_list(query: &str) -> Vec<&str> {
 }
 
 fn media_query_matches(query: &str, context: &MatchContext) -> bool {
-    let query = query.trim().to_ascii_lowercase();
-    let (negated, query) = query
-        .strip_prefix("not ")
-        .map_or((false, query.as_str()), |query| (true, query));
-    let query = query.strip_prefix("only ").unwrap_or(query);
-    let matches = split_media_conjunctions(query)
-        .into_iter()
-        .all(|condition| media_condition_evaluate(condition, context).matches());
-    if negated { !matches } else { matches }
+    evaluate_media_query(query, context).value.matches()
 }
 
-/// Split a media query on its `and` conjunctions. Real-world stylesheets
-/// routinely write `(min-width:1560px)and (max-width:2059.9px)` with no
-/// surrounding whitespace, so the identifier must be matched with paren
-/// depth instead of a literal `" and "` split.
-fn split_media_conjunctions(query: &str) -> Vec<&str> {
-    let lowered = query.to_ascii_lowercase();
+/// Evaluate one `<media-query>` (Media Queries 4 §3).
+fn evaluate_media_query(query: &str, context: &MatchContext) -> ConditionResult {
+    let lowered = query.trim().to_ascii_lowercase();
+    let query = lowered.trim();
+    if query.is_empty() {
+        return ConditionResult::evaluated(true);
+    }
+    // A leading `not` followed by parentheses is the condition-level operator;
+    // a leading `not` followed by a media type negates the whole query.
+    if let Some(rest) = strip_keyword(query, "not") {
+        if rest.starts_with('(') {
+            return evaluate_media_condition(query, context);
+        }
+        return evaluate_media_query_body(rest, context).negate();
+    }
+    let query = strip_keyword(query, "only").unwrap_or(query);
+    evaluate_media_query_body(query, context)
+}
+
+fn evaluate_media_query_body(query: &str, context: &MatchContext) -> ConditionResult {
+    if query.starts_with('(') {
+        return evaluate_media_condition(query, context);
+    }
+    let (media_type, rest) =
+        match query.find(|character: char| character.is_ascii_whitespace() || character == '(') {
+            Some(index) => (&query[..index], query[index..].trim()),
+            None => (query, ""),
+        };
+    // A media type is valid syntax even when it is not one this engine
+    // produces: `print` and any future type simply do not match.
+    let result = ConditionResult::evaluated(matches!(media_type, "all" | "screen"));
+    if rest.is_empty() {
+        return result;
+    }
+    let Some(condition) = strip_keyword(rest, "and") else {
+        return ConditionResult::unsupported();
+    };
+    result.and(evaluate_media_condition(condition, context))
+}
+
+/// Strip a leading keyword when it is followed by a token boundary. Media
+/// query keywords are ASCII case-insensitive, and minified sheets write
+/// `)and(` with no whitespace, so the boundary check accepts `)` and `(` as
+/// well as whitespace.
+fn strip_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
+    let input = input.trim_start();
+    let prefix = input.get(..keyword.len())?;
+    if !prefix.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    let rest = &input[keyword.len()..];
+    if let Some(next) = rest.chars().next()
+        && (next.is_ascii_alphanumeric() || next == '-' || next == '_')
+    {
+        return None;
+    }
+    Some(rest.trim_start())
+}
+
+fn evaluate_media_condition(condition: &str, context: &MatchContext) -> ConditionResult {
+    let condition = condition.trim();
+    if condition.is_empty() {
+        return ConditionResult::unsupported();
+    }
+    if let Some(rest) = strip_keyword(condition, "not") {
+        if !rest.starts_with('(') {
+            return ConditionResult::unsupported();
+        }
+        return evaluate_media_in_parens(rest, context).negate();
+    }
+    if let Some(parts) = split_top_level_keyword(condition, "or") {
+        let mut result = evaluate_media_in_parens(parts[0], context);
+        for part in &parts[1..] {
+            result = result.or(evaluate_media_in_parens(part, context));
+        }
+        return result;
+    }
+    if let Some(parts) = split_top_level_keyword(condition, "and") {
+        let mut result = evaluate_media_in_parens(parts[0], context);
+        for part in &parts[1..] {
+            result = result.and(evaluate_media_in_parens(part, context));
+        }
+        return result;
+    }
+    evaluate_media_in_parens(condition, context)
+}
+
+/// Split on a top-level keyword (`and`/`or`) at parenthesis depth zero.
+fn split_top_level_keyword<'a>(input: &'a str, keyword: &str) -> Option<Vec<&'a str>> {
+    let lowered = input.to_ascii_lowercase();
     let bytes = lowered.as_bytes();
-    let mut result = Vec::new();
+    let mut parts = Vec::new();
     let mut depth = 0_u32;
-    let mut start = 0;
-    let mut index = 0;
+    let mut start = 0_usize;
+    let mut index = 0_usize;
     while index < bytes.len() {
         match bytes[index] {
             b'(' => depth = depth.saturating_add(1),
             b')' => depth = depth.saturating_sub(1),
-            b'a' | b'A' if depth == 0 && lowered[index..].starts_with("and") => {
-                let before = bytes.get(index.wrapping_sub(1));
-                let after = bytes.get(index + 3);
-                // Minified sheets write `)and (` with no whitespace at all;
-                // a preceding `)` or following `(` still reads as a
-                // conjunction.
-                let boundary_before = index == 0
-                    || before.is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b')');
-                let boundary_after =
-                    after.is_none_or(|byte| byte.is_ascii_whitespace() || *byte == b'(');
-                if boundary_before && boundary_after {
-                    result.push(query[start..index].trim());
-                    index += 3;
+            _ if depth == 0 && lowered[index..].starts_with(keyword) => {
+                let before = index == 0
+                    || bytes
+                        .get(index.wrapping_sub(1))
+                        .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b')');
+                let after = bytes
+                    .get(index + keyword.len())
+                    .is_none_or(|byte| byte.is_ascii_whitespace() || *byte == b'(');
+                if before && after {
+                    parts.push(input[start..index].trim());
+                    index += keyword.len();
                     start = index;
                     continue;
                 }
@@ -676,89 +822,539 @@ fn split_media_conjunctions(query: &str) -> Vec<&str> {
         }
         index += 1;
     }
-    result.push(query[start..].trim());
-    result
+    if parts.is_empty() {
+        None
+    } else {
+        parts.push(input[start..].trim());
+        Some(parts)
+    }
 }
 
-/// The one place a media condition is interpreted. Both the cascade's
-/// [`media_query_list_matches`] and the [`media_query_list_is_supported`]
-/// diagnostic read their answer from here, so a query cannot be evaluated one
-/// way and described another.
-fn media_condition_evaluate(condition: &str, context: &MatchContext) -> MediaCondition {
-    match condition {
-        "" | "all" | "screen" => return MediaCondition::Evaluated(true),
-        // Known media types this engine does not produce. The engine answers
-        // these correctly, so they are not a capability gap.
-        "print" | "speech" => return MediaCondition::Evaluated(false),
-        _ => {}
-    }
-    let Some(feature) = condition
+fn evaluate_media_in_parens(value: &str, context: &MatchContext) -> ConditionResult {
+    let value = value.trim();
+    let Some(inner) = value
         .strip_prefix('(')
         .and_then(|value| value.strip_suffix(')'))
     else {
-        return MediaCondition::Unsupported;
+        return ConditionResult::unsupported();
     };
-    // A range context such as `(400px <= width <= 700px)` has no colon, and
-    // evaluating one would need the full Media Queries 4 §2.4 grammar.
-    let Some((name, value)) = feature.split_once(':') else {
-        return MediaCondition::Unsupported;
-    };
-    let name = name.trim();
-    let value = value.trim();
-    let is_horizontal = match name {
-        "width" | "min-width" | "max-width" => true,
-        "height" | "min-height" | "max-height" => false,
-        "orientation" => {
-            let Some((width, height)) = context.viewport_width.zip(context.viewport_height) else {
-                return MediaCondition::Unknown;
-            };
-            return match value {
-                "landscape" => MediaCondition::Evaluated(width >= height),
-                "portrait" => MediaCondition::Evaluated(height > width),
-                // A known feature asked a question this engine cannot answer.
-                _ => MediaCondition::Unsupported,
-            };
+    let inner = inner.trim();
+    if inner.is_empty() {
+        return ConditionResult::unsupported();
+    }
+    if inner.starts_with('(') || strip_keyword(inner, "not").is_some() {
+        return evaluate_media_condition(inner, context);
+    }
+    evaluate_media_feature(inner, context)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Comparison {
+    Equal,
+    Less,
+    LessOrEqual,
+    Greater,
+    GreaterOrEqual,
+}
+
+impl Comparison {
+    const fn reverse(self) -> Self {
+        match self {
+            Self::Equal => Self::Equal,
+            Self::Less => Self::Greater,
+            Self::LessOrEqual => Self::GreaterOrEqual,
+            Self::Greater => Self::Less,
+            Self::GreaterOrEqual => Self::LessOrEqual,
         }
-        _ => return MediaCondition::Unsupported,
-    };
-    // The value's grammar is checked before the environment, so a length this
-    // engine cannot express is reported as unsupported whether or not a
-    // viewport happens to be available. Otherwise the support predicate would
-    // answer "supported" for any length feature simply because no viewport had
-    // been supplied yet.
-    let Some(expected) = parse_media_length(value) else {
-        return MediaCondition::Unsupported;
-    };
-    let actual = if is_horizontal {
-        context.viewport_width
-    } else {
-        context.viewport_height
-    };
-    let Some(actual) = actual else {
-        return MediaCondition::Unknown;
-    };
-    MediaCondition::Evaluated(match name {
-        "min-width" | "min-height" => actual >= expected,
-        "max-width" | "max-height" => actual <= expected,
-        _ => (actual - expected).abs() < f32::EPSILON,
+    }
+
+    const fn same_direction(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (
+                Self::Less | Self::LessOrEqual,
+                Self::Less | Self::LessOrEqual
+            ) | (
+                Self::Greater | Self::GreaterOrEqual,
+                Self::Greater | Self::GreaterOrEqual
+            )
+        )
+    }
+}
+
+fn evaluate_media_feature(feature: &str, context: &MatchContext) -> ConditionResult {
+    let feature = feature.trim();
+    if let Some((name, value)) = feature.split_once(':') {
+        let name = name.trim();
+        let value = value.trim();
+        if name.is_empty() || value.is_empty() {
+            return ConditionResult::unsupported();
+        }
+        return evaluate_legacy_media_feature(name, value, context);
+    }
+    let operators = split_comparisons(feature);
+    match operators.as_slice() {
+        [] => evaluate_boolean_media_feature(feature, context),
+        [(position, length, comparison)] => {
+            let left = feature[..*position].trim();
+            let right = feature[position + length..].trim();
+            if left.is_empty() || right.is_empty() {
+                return ConditionResult::unsupported();
+            }
+            if is_feature_name(left) && !is_feature_name(right) {
+                evaluate_media_feature_value(left, right, *comparison, context)
+            } else if is_feature_name(right) && !is_feature_name(left) {
+                evaluate_media_feature_value(right, left, comparison.reverse(), context)
+            } else {
+                ConditionResult::unsupported()
+            }
+        }
+        [
+            (first_position, first_length, first_comparison),
+            (second_position, second_length, second_comparison),
+        ] => {
+            let left = feature[..*first_position].trim();
+            let name = feature[first_position + first_length..*second_position].trim();
+            let right = feature[second_position + second_length..].trim();
+            if left.is_empty() || right.is_empty() || !is_feature_name(name) {
+                return ConditionResult::unsupported();
+            }
+            if !first_comparison.same_direction(*second_comparison) {
+                return ConditionResult::unsupported();
+            }
+            evaluate_media_feature_value(name, left, first_comparison.reverse(), context).and(
+                evaluate_media_feature_value(name, right, *second_comparison, context),
+            )
+        }
+        _ => ConditionResult::unsupported(),
+    }
+}
+
+/// The comparison operators in a range context, at parenthesis depth zero.
+fn split_comparisons(input: &str) -> Vec<(usize, usize, Comparison)> {
+    let bytes = input.as_bytes();
+    let mut result = Vec::new();
+    let mut depth = 0_u32;
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => depth = depth.saturating_add(1),
+            b')' => depth = depth.saturating_sub(1),
+            b'<' | b'>' | b'=' if depth == 0 => {
+                let comparison = match bytes[index] {
+                    b'<' => {
+                        if bytes.get(index + 1) == Some(&b'=') {
+                            Comparison::LessOrEqual
+                        } else {
+                            Comparison::Less
+                        }
+                    }
+                    b'>' => {
+                        if bytes.get(index + 1) == Some(&b'=') {
+                            Comparison::GreaterOrEqual
+                        } else {
+                            Comparison::Greater
+                        }
+                    }
+                    _ => Comparison::Equal,
+                };
+                let length = if matches!(
+                    comparison,
+                    Comparison::LessOrEqual | Comparison::GreaterOrEqual
+                ) {
+                    2
+                } else {
+                    1
+                };
+                result.push((index, length, comparison));
+                index += length;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    result
+}
+
+fn is_feature_name(value: &str) -> bool {
+    let mut characters = value.chars();
+    if value.starts_with('-') {
+        characters.next();
+    }
+    characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic())
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContinuousFeature {
+    Width,
+    Height,
+    AspectRatio,
+    Resolution,
+    Color,
+    Monochrome,
+    ColorIndex,
+}
+
+fn continuous_feature(name: &str) -> Option<ContinuousFeature> {
+    Some(match name {
+        "width" => ContinuousFeature::Width,
+        "height" => ContinuousFeature::Height,
+        "aspect-ratio" => ContinuousFeature::AspectRatio,
+        "resolution" | "-webkit-device-pixel-ratio" => ContinuousFeature::Resolution,
+        "color" => ContinuousFeature::Color,
+        "monochrome" => ContinuousFeature::Monochrome,
+        "color-index" => ContinuousFeature::ColorIndex,
+        _ => return None,
     })
 }
 
-fn parse_media_length(value: &str) -> Option<f32> {
+fn media_feature_actual(feature: ContinuousFeature, context: &MatchContext) -> Option<f32> {
+    match feature {
+        ContinuousFeature::Width => context.viewport_width,
+        ContinuousFeature::Height => context.viewport_height,
+        ContinuousFeature::AspectRatio => {
+            let width = context.viewport_width?;
+            let height = context.viewport_height?;
+            (height > 0.0).then_some(width / height)
+        }
+        ContinuousFeature::Resolution => context.resolution,
+        ContinuousFeature::Color => Some(f32::from(context.color_bits)),
+        ContinuousFeature::Monochrome => Some(f32::from(context.monochrome_bits)),
+        ContinuousFeature::ColorIndex => Some(context.color_index as f32),
+    }
+}
+
+fn parse_media_feature_number(
+    feature: ContinuousFeature,
+    value: &str,
+    context: &MatchContext,
+) -> Option<f32> {
+    match feature {
+        ContinuousFeature::Width | ContinuousFeature::Height => parse_media_length(value, context),
+        ContinuousFeature::AspectRatio => parse_media_ratio(value),
+        ContinuousFeature::Resolution => parse_media_resolution(value),
+        ContinuousFeature::Color
+        | ContinuousFeature::Monochrome
+        | ContinuousFeature::ColorIndex => {
+            value.trim().parse::<u32>().ok().map(|number| number as f32)
+        }
+    }
+}
+
+fn evaluate_legacy_media_feature(
+    name: &str,
+    value: &str,
+    context: &MatchContext,
+) -> ConditionResult {
+    for (prefix, comparison) in [
+        ("min-", Comparison::GreaterOrEqual),
+        ("max-", Comparison::LessOrEqual),
+    ] {
+        if let Some(base) = name.strip_prefix(prefix)
+            && continuous_feature(base).is_some()
+        {
+            return evaluate_media_feature_value(base, value, comparison, context);
+        }
+    }
+    evaluate_media_feature_value(name, value, Comparison::Equal, context)
+}
+
+fn evaluate_media_feature_value(
+    name: &str,
+    value: &str,
+    comparison: Comparison,
+    context: &MatchContext,
+) -> ConditionResult {
+    if let Some(feature) = continuous_feature(name) {
+        let Some(expected) = parse_media_feature_number(feature, value, context) else {
+            return ConditionResult::unsupported();
+        };
+        let Some(actual) = media_feature_actual(feature, context) else {
+            return ConditionResult::unknown();
+        };
+        return ConditionResult::evaluated(compare(actual, comparison, expected));
+    }
+    if comparison != Comparison::Equal {
+        return ConditionResult::unsupported();
+    }
+    evaluate_discrete_media_feature(name, value, context)
+}
+
+fn compare(left: f32, comparison: Comparison, right: f32) -> bool {
+    match comparison {
+        Comparison::Equal => (left - right).abs() <= f32::EPSILON,
+        Comparison::Less => left < right,
+        Comparison::LessOrEqual => left <= right,
+        Comparison::Greater => left > right,
+        Comparison::GreaterOrEqual => left >= right,
+    }
+}
+
+fn evaluate_boolean_media_feature(name: &str, context: &MatchContext) -> ConditionResult {
+    if let Some(feature) = continuous_feature(name) {
+        let Some(actual) = media_feature_actual(feature, context) else {
+            return ConditionResult::unknown();
+        };
+        return ConditionResult::evaluated(actual > 0.0);
+    }
+    match name {
+        "pointer" => ConditionResult::evaluated(context.pointer != Pointer::None),
+        "any-pointer" => ConditionResult::evaluated(context.any_pointer != Pointer::None),
+        "hover" => ConditionResult::evaluated(context.hover == Hover::Hover),
+        "any-hover" => ConditionResult::evaluated(context.any_hover == Hover::Hover),
+        "forced-colors" => ConditionResult::evaluated(context.forced_colors),
+        "inverted-colors" => ConditionResult::evaluated(context.inverted_colors),
+        "update" => ConditionResult::evaluated(context.update != UpdateFrequency::None),
+        "overflow-block" => {
+            ConditionResult::evaluated(context.overflow_block != OverflowBlock::None)
+        }
+        "overflow-inline" => {
+            ConditionResult::evaluated(context.overflow_inline != OverflowInline::None)
+        }
+        "orientation"
+        | "prefers-color-scheme"
+        | "prefers-reduced-motion"
+        | "prefers-reduced-transparency"
+        | "prefers-reduced-data"
+        | "prefers-contrast"
+        | "scripting"
+        | "display-mode"
+        | "color-gamut"
+        | "dynamic-range"
+        | "video-dynamic-range" => ConditionResult::evaluated(true),
+        _ => ConditionResult::unsupported(),
+    }
+}
+
+fn evaluate_discrete_media_feature(
+    name: &str,
+    value: &str,
+    context: &MatchContext,
+) -> ConditionResult {
+    match name {
+        "orientation" => {
+            let Some((width, height)) = context.viewport_width.zip(context.viewport_height) else {
+                return ConditionResult::unknown();
+            };
+            match value {
+                "landscape" => ConditionResult::evaluated(width >= height),
+                "portrait" => ConditionResult::evaluated(height > width),
+                _ => ConditionResult::unsupported(),
+            }
+        }
+        "prefers-color-scheme" => match value {
+            "light" => {
+                ConditionResult::evaluated(context.prefers_color_scheme == ColorScheme::Light)
+            }
+            "dark" => ConditionResult::evaluated(context.prefers_color_scheme == ColorScheme::Dark),
+            _ => ConditionResult::unsupported(),
+        },
+        "prefers-reduced-motion" => {
+            evaluate_reduced_preference(value, context.prefers_reduced_motion)
+        }
+        "prefers-reduced-transparency" => {
+            evaluate_reduced_preference(value, context.prefers_reduced_transparency)
+        }
+        "prefers-reduced-data" => evaluate_reduced_preference(value, context.prefers_reduced_data),
+        "prefers-contrast" => match value {
+            "no-preference" => ConditionResult::evaluated(
+                context.prefers_contrast == ContrastPreference::NoPreference,
+            ),
+            "more" => {
+                ConditionResult::evaluated(context.prefers_contrast == ContrastPreference::More)
+            }
+            "less" => {
+                ConditionResult::evaluated(context.prefers_contrast == ContrastPreference::Less)
+            }
+            "custom" => {
+                ConditionResult::evaluated(context.prefers_contrast == ContrastPreference::Custom)
+            }
+            _ => ConditionResult::unsupported(),
+        },
+        "forced-colors" => match value {
+            "none" => ConditionResult::evaluated(!context.forced_colors),
+            "active" => ConditionResult::evaluated(context.forced_colors),
+            _ => ConditionResult::unsupported(),
+        },
+        "inverted-colors" => match value {
+            "none" => ConditionResult::evaluated(!context.inverted_colors),
+            "inverted" => ConditionResult::evaluated(context.inverted_colors),
+            _ => ConditionResult::unsupported(),
+        },
+        "pointer" => evaluate_pointer(value, context.pointer),
+        "any-pointer" => evaluate_pointer(value, context.any_pointer),
+        "hover" => evaluate_hover(value, context.hover),
+        "any-hover" => evaluate_hover(value, context.any_hover),
+        "scripting" => match value {
+            "none" => ConditionResult::evaluated(context.scripting == Scripting::None),
+            "initial-only" => {
+                ConditionResult::evaluated(context.scripting == Scripting::InitialOnly)
+            }
+            "enabled" => ConditionResult::evaluated(context.scripting == Scripting::Enabled),
+            _ => ConditionResult::unsupported(),
+        },
+        "display-mode" => match value {
+            "browser" => ConditionResult::evaluated(context.display_mode == DisplayMode::Browser),
+            "fullscreen" => {
+                ConditionResult::evaluated(context.display_mode == DisplayMode::Fullscreen)
+            }
+            "standalone" => {
+                ConditionResult::evaluated(context.display_mode == DisplayMode::Standalone)
+            }
+            "minimal-ui" => {
+                ConditionResult::evaluated(context.display_mode == DisplayMode::MinimalUi)
+            }
+            "window-controls-overlay" => ConditionResult::evaluated(
+                context.display_mode == DisplayMode::WindowControlsOverlay,
+            ),
+            "picture-in-picture" => {
+                ConditionResult::evaluated(context.display_mode == DisplayMode::PictureInPicture)
+            }
+            _ => ConditionResult::unsupported(),
+        },
+        "color-gamut" => match value {
+            "srgb" => ConditionResult::evaluated(true),
+            "p3" => ConditionResult::evaluated(matches!(
+                context.color_gamut,
+                ColorGamut::P3 | ColorGamut::Rec2020
+            )),
+            "rec2020" => ConditionResult::evaluated(context.color_gamut == ColorGamut::Rec2020),
+            _ => ConditionResult::unsupported(),
+        },
+        "dynamic-range" => evaluate_dynamic_range(value, context.dynamic_range),
+        "video-dynamic-range" => evaluate_dynamic_range(value, context.video_dynamic_range),
+        "update" => match value {
+            "none" => ConditionResult::evaluated(context.update == UpdateFrequency::None),
+            "slow" => ConditionResult::evaluated(context.update == UpdateFrequency::Slow),
+            "fast" => ConditionResult::evaluated(context.update == UpdateFrequency::Fast),
+            _ => ConditionResult::unsupported(),
+        },
+        "overflow-block" => match value {
+            "none" => ConditionResult::evaluated(context.overflow_block == OverflowBlock::None),
+            "scroll" => ConditionResult::evaluated(context.overflow_block == OverflowBlock::Scroll),
+            "paged" => ConditionResult::evaluated(context.overflow_block == OverflowBlock::Paged),
+            _ => ConditionResult::unsupported(),
+        },
+        "overflow-inline" => match value {
+            "none" => ConditionResult::evaluated(context.overflow_inline == OverflowInline::None),
+            "scroll" => {
+                ConditionResult::evaluated(context.overflow_inline == OverflowInline::Scroll)
+            }
+            _ => ConditionResult::unsupported(),
+        },
+        _ => ConditionResult::unsupported(),
+    }
+}
+
+fn evaluate_reduced_preference(value: &str, actual: ReducedPreference) -> ConditionResult {
+    match value {
+        "no-preference" => ConditionResult::evaluated(actual == ReducedPreference::NoPreference),
+        "reduce" => ConditionResult::evaluated(actual == ReducedPreference::Reduce),
+        _ => ConditionResult::unsupported(),
+    }
+}
+
+fn evaluate_pointer(value: &str, actual: Pointer) -> ConditionResult {
+    match value {
+        "none" => ConditionResult::evaluated(actual == Pointer::None),
+        "coarse" => ConditionResult::evaluated(actual == Pointer::Coarse),
+        "fine" => ConditionResult::evaluated(actual == Pointer::Fine),
+        _ => ConditionResult::unsupported(),
+    }
+}
+
+fn evaluate_hover(value: &str, actual: Hover) -> ConditionResult {
+    match value {
+        "none" => ConditionResult::evaluated(actual == Hover::None),
+        "hover" => ConditionResult::evaluated(actual == Hover::Hover),
+        _ => ConditionResult::unsupported(),
+    }
+}
+
+fn evaluate_dynamic_range(value: &str, actual: DynamicRange) -> ConditionResult {
+    match value {
+        "standard" => ConditionResult::evaluated(true),
+        "high" => ConditionResult::evaluated(actual == DynamicRange::High),
+        _ => ConditionResult::unsupported(),
+    }
+}
+
+/// Resolve a media-query length to CSS pixels.
+///
+/// Media Queries 4 makes `em`/`rem` relative to the initial font size, not the
+/// element's, so the context is deliberately viewport-and-initial-font only.
+fn parse_media_length(value: &str, context: &MatchContext) -> Option<f32> {
     let value = value.trim();
     if value == "0" {
         return Some(0.0);
     }
-    for (unit, factor) in [("px", 1.0), ("em", 16.0), ("rem", 16.0)] {
-        if let Some(number) = value.strip_suffix(unit) {
-            return number
-                .trim()
-                .parse::<f32>()
-                .ok()
-                .map(|value| value * factor);
+    let length_context = LengthContext {
+        percentage_base: None,
+        em_base: 16.0,
+        rem_base: 16.0,
+        viewport_width: f64::from(context.viewport_width.unwrap_or(1.0)),
+        viewport_height: f64::from(context.viewport_height.unwrap_or(1.0)),
+        ..LengthContext::default()
+    };
+    let pixels = resolve_length_expr(value, &length_context).ok()?;
+    if pixels.is_finite() && pixels >= 0.0 {
+        Some(pixels as f32)
+    } else {
+        None
+    }
+}
+
+fn parse_media_ratio(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if let Some((numerator, denominator)) = value.split_once('/') {
+        let numerator = numerator.trim().parse::<f32>().ok()?;
+        let denominator = denominator.trim().parse::<f32>().ok()?;
+        if !numerator.is_finite() || !denominator.is_finite() || denominator == 0.0 {
+            return None;
+        }
+        if numerator < 0.0 || denominator < 0.0 {
+            return None;
+        }
+        Some(numerator / denominator)
+    } else {
+        let value = value.parse::<f32>().ok()?;
+        if value.is_finite() && value >= 0.0 {
+            Some(value)
+        } else {
+            None
         }
     }
-    None
+}
+
+fn parse_media_resolution(value: &str) -> Option<f32> {
+    let value = value.trim();
+    for (unit, factor) in [
+        ("dppx", 1.0_f32),
+        ("x", 1.0),
+        ("dpi", 1.0 / 96.0),
+        ("dpcm", 2.54 / 96.0),
+    ] {
+        if let Some(number) = value.strip_suffix(unit) {
+            let number = number.trim().parse::<f32>().ok()?;
+            if number.is_finite() && number >= 0.0 {
+                return Some(number * factor);
+            }
+            return None;
+        }
+    }
+    // A bare number is the legacy `-webkit-device-pixel-ratio` spelling.
+    let number = value.parse::<f32>().ok()?;
+    if number.is_finite() && number >= 0.0 {
+        Some(number)
+    } else {
+        None
+    }
 }
 
 /// The longhand declarations one authored declaration resolves to.
@@ -776,6 +1372,9 @@ pub fn expand_shorthand(name: &str, value: &str) -> Vec<(String, String)> {
 }
 
 fn expanded_declaration(name: &str, value: &str) -> Vec<(String, String)> {
+    if name.eq_ignore_ascii_case("container") {
+        return expand_container_shorthand(value);
+    }
     if name.eq_ignore_ascii_case("background") {
         return expand_background_shorthand(value);
     }
@@ -797,6 +1396,57 @@ fn expanded_declaration(name: &str, value: &str) -> Vec<(String, String)> {
         // still ship; they expand exactly like their modern counterparts.
         _ => expand_legacy_longhands(name, value),
     }
+}
+
+/// Expand the `container` shorthand (CSS Containment 3 §3.3).
+///
+/// `container: card / inline-size` sets both longhands; omitting the type
+/// resets it to `normal`, and `none` names nothing. A value the shorthand
+/// grammar rejects is left unexpanded at its original name, so the declaration
+/// simply does not apply and no invented longhand value reaches the cascade.
+fn expand_container_shorthand(value: &str) -> Vec<(String, String)> {
+    let unexpanded = || vec![("container".to_owned(), value.to_owned())];
+    if css_wide_keyword(value).is_some() {
+        return vec![
+            ("container-name".to_owned(), value.to_owned()),
+            ("container-type".to_owned(), value.to_owned()),
+        ];
+    }
+    let mut parts = value.split('/');
+    let name_part = parts.next().unwrap_or_default().trim();
+    let type_part = parts.next().map(str::trim);
+    if parts.next().is_some() {
+        return unexpanded();
+    }
+    let container_type = match type_part {
+        None => "normal".to_owned(),
+        Some(part) => {
+            let lower = part.to_ascii_lowercase();
+            if part.is_empty() || !matches!(lower.as_str(), "normal" | "size" | "inline-size") {
+                return unexpanded();
+            }
+            lower
+        }
+    };
+    if name_part.is_empty() {
+        return unexpanded();
+    }
+    let names = if name_part.eq_ignore_ascii_case("none") {
+        "none".to_owned()
+    } else {
+        let mut names = Vec::new();
+        for name in name_part.split_ascii_whitespace() {
+            if !super::container::is_container_name(name) {
+                return unexpanded();
+            }
+            names.push(name.to_owned());
+        }
+        names.join(" ")
+    };
+    vec![
+        ("container-name".to_owned(), names),
+        ("container-type".to_owned(), container_type),
+    ]
 }
 
 fn expand_legacy_longhands(name: &str, value: &str) -> Vec<(String, String)> {
@@ -2083,6 +2733,33 @@ mod tests {
             "(min-width:1560px)and (max-width:2059.9px)",
             "screen, print",
             "not screen and (min-width: 400px)",
+            "(width >= 768px)",
+            "(768px <= width)",
+            "(400px <= width <= 700px)",
+            "(400px < width <= 700px)",
+            "(width >= 40em)",
+            "(min-width: 10vw)",
+            "(calc(100px + 5vw) < width)",
+            "(aspect-ratio: 16/9)",
+            "(aspect-ratio > 1)",
+            "(min-resolution: 2dppx)",
+            "(resolution >= 192dpi)",
+            "(-webkit-device-pixel-ratio: 2)",
+            "(prefers-color-scheme: dark)",
+            "(prefers-reduced-motion: reduce)",
+            "(prefers-contrast: more)",
+            "(forced-colors: active)",
+            "(hover: hover)",
+            "(any-pointer: coarse)",
+            "(scripting: enabled)",
+            "(display-mode: standalone)",
+            "(color-gamut: p3)",
+            "(dynamic-range: high)",
+            "(update: fast)",
+            "(overflow-block: scroll)",
+            "(width > 600px) or (height > 400px)",
+            "not (hover: none)",
+            "((width > 600px) and (height > 400px))",
         ] {
             assert!(
                 media_query_list_is_supported(query),
@@ -2092,30 +2769,132 @@ mod tests {
     }
 
     /// A feature the engine genuinely does not evaluate is reported as
-    /// unsupported, which is what makes the diagnostic worth reading. These
-    /// are the features the corpus gates rules out on.
+    /// unsupported, which is what makes the diagnostic worth reading.
     #[test]
     fn media_features_the_engine_cannot_evaluate_report_as_unsupported() {
         for query in [
-            "(prefers-reduced-motion: reduce)",
-            "(prefers-color-scheme: dark)",
-            "(min-resolution: 2dppx)",
             "(device-min-pixel-ratio: 2)",
-            "(color-gamut: p3)",
-            "(min-width: 10vw)",
-            "(400px <= width <= 700px)",
             "(unknown-feature: 1)",
-            "screen and (hover: hover)",
+            "(min-width: 10furlong)",
+            "(aspect-ratio: wide)",
+            "(hover: sometimes)",
+            "(resolution: fast)",
         ] {
             assert!(
                 !media_query_list_is_supported(query),
                 "{query:?} names something the engine does not evaluate"
             );
         }
-        // One unsupported conjunct makes the whole list unsupported.
+        // One unsupported conjunct makes the whole list unsupported even when
+        // the other conjunct alone would match.
         assert!(!media_query_list_is_supported(
-            "screen and (min-width: 700px) and (hover: hover)"
+            "screen and (min-width: 700px) and (unknown-feature: 1)"
         ));
+    }
+
+    /// Media Queries 4 §2.4 range syntax, including the value-first and
+    /// two-sided forms, compares against the same viewport the colon form does.
+    #[test]
+    fn media_range_syntax_compares_the_viewport() {
+        let context = MatchContext {
+            viewport_width: Some(800.0),
+            viewport_height: Some(600.0),
+            resolution: Some(2.0),
+            ..MatchContext::default()
+        };
+        for (query, expected) in [
+            ("(width >= 800px)", true),
+            ("(width > 800px)", false),
+            ("(width <= 800px)", true),
+            ("(width < 800px)", false),
+            ("(800px <= width)", true),
+            ("(900px <= width)", false),
+            ("(400px <= width <= 900px)", true),
+            ("(400px <= width <= 700px)", false),
+            ("(900px >= width >= 400px)", true),
+            ("(700px >= width >= 900px)", false),
+            ("(width >= 600px) and (height <= 600px)", true),
+            ("(width < 400px) or (height >= 600px)", true),
+            ("not (width > 900px)", true),
+            ("(aspect-ratio > 1)", true),
+            ("(16/9 > aspect-ratio)", true),
+            ("(min-resolution: 2dppx)", true),
+            ("(resolution >= 192dpi)", true),
+            ("(resolution = 2x)", true),
+            ("(width >= 40em)", true),
+        ] {
+            assert_eq!(
+                media_query_list_matches(query, &context),
+                expected,
+                "{query:?}"
+            );
+        }
+    }
+
+    /// Preference and capability features read the environment carried by the
+    /// match context instead of assuming a desktop browser.
+    #[test]
+    fn media_environment_features_read_the_match_context() {
+        use crate::selector::{
+            ColorScheme, ContrastPreference, DisplayMode, Hover, Pointer, ReducedPreference,
+            Scripting,
+        };
+
+        let context = MatchContext {
+            prefers_color_scheme: ColorScheme::Dark,
+            prefers_reduced_motion: ReducedPreference::Reduce,
+            prefers_contrast: ContrastPreference::More,
+            forced_colors: true,
+            pointer: Pointer::Coarse,
+            any_pointer: Pointer::Fine,
+            hover: Hover::None,
+            any_hover: Hover::Hover,
+            scripting: Scripting::None,
+            display_mode: DisplayMode::Standalone,
+            ..MatchContext::default()
+        };
+        for (query, expected) in [
+            ("(prefers-color-scheme: dark)", true),
+            ("(prefers-color-scheme: light)", false),
+            ("(prefers-reduced-motion: reduce)", true),
+            ("(prefers-reduced-motion: no-preference)", false),
+            ("(prefers-contrast: more)", true),
+            ("(forced-colors: active)", true),
+            ("(forced-colors: none)", false),
+            ("(pointer: coarse)", true),
+            ("(pointer: fine)", false),
+            ("(any-pointer: fine)", true),
+            ("(hover: none)", true),
+            ("(any-hover: hover)", true),
+            ("(scripting: none)", true),
+            ("(scripting: enabled)", false),
+            ("(display-mode: standalone)", true),
+            ("(display-mode: browser)", false),
+        ] {
+            assert_eq!(
+                media_query_list_matches(query, &context),
+                expected,
+                "{query:?}"
+            );
+        }
+    }
+
+    /// Range syntax is supported even when the host has not supplied a
+    /// viewport yet; it simply cannot match until one exists.
+    #[test]
+    fn media_range_syntax_is_supported_before_the_viewport_is_known() {
+        for query in [
+            "(width >= 768px)",
+            "(400px <= width <= 700px)",
+            "(aspect-ratio > 1)",
+            "(resolution >= 2dppx)",
+        ] {
+            assert!(media_query_list_is_supported(query), "{query:?}");
+            assert!(
+                !media_query_list_matches(query, &MatchContext::default()),
+                "{query:?} must not match without the environment it compares against"
+            );
+        }
     }
 
     /// A viewport-dependent feature asked before the viewport is known is not a

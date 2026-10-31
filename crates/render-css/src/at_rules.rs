@@ -58,7 +58,14 @@ const RECOGNISED_AT_RULES: &[(&str, &str)] = &[
 
 /// The recognised at-rules whose contents reach the cascade. Everything else in
 /// [`RECOGNISED_AT_RULES`] parses and is then dropped.
-const EVALUATED_AT_RULES: &[&str] = &["keyframes", "layer", "media", "supports"];
+const EVALUATED_AT_RULES: &[&str] = &[
+    "container",
+    "keyframes",
+    "layer",
+    "media",
+    "property",
+    "supports",
+];
 
 /// The recognised at-rules whose block is a `<declaration-list>` rather than a
 /// `<rule-list>`, with the section that defines each block's contents.
@@ -85,7 +92,6 @@ pub const DECLARATION_LIST_AT_RULES: &[(&str, &str)] = &[
     ("font-palette-values", "CSS Fonts 4 §10"),
     ("page", "CSS Paged Media 3 §3"),
     ("position-try", "CSS Anchor Positioning 1 §2"),
-    ("property", "CSS Properties and Values 1 §2"),
     ("view-transition", "CSS View Transitions 2 §2"),
     ("viewport", "CSS Device Adaptation 1 §3"),
 ];
@@ -281,7 +287,17 @@ mod tests {
             .map(|(name, _)| *name)
             .filter(|name| at_rule_support(name) == AtRuleSupport::Evaluated)
             .collect();
-        assert_eq!(evaluated, ["keyframes", "layer", "media", "supports"]);
+        assert_eq!(
+            evaluated,
+            [
+                "container",
+                "keyframes",
+                "layer",
+                "media",
+                "property",
+                "supports"
+            ]
+        );
     }
 
     /// Every at-rule whose block is read as a declaration list has to be an

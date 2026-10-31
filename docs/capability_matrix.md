@@ -15,9 +15,10 @@ says so. `docs/visual_fidelity_gaps.md` is the working register; this file is th
 | what | number | when |
 | --- | --- | --- |
 | `render-js` unit tests | 1,116 passed, 0 failed | 2026-10-22 |
-| `render-core` unit tests | 298 passed, 0 failed | 2026-10-23 |
+| `render-css` unit tests | 245 passed, 0 failed | 2026-10-31 |
+| `render-core` unit tests | 432 passed, 0 failed (temporary local build without `avif-native`; AVIF decoder test excluded) | 2026-10-31 |
 | `render-layout` unit tests | 306 passed, 0 failed, 1 ignored | 2026-10-22 |
-| `render-css` unit tests | 191 passed, 0 failed | 2026-10-22 |
+| `render-css` unit tests | 245 passed, 0 failed | 2026-10-31 |
 | `render-browser` unit tests | 198 passed, 0 failed | 2026-10-23 |
 | `render-browser` app tests (binary) | 99 passed, 0 failed | 2026-10-23 |
 | `render-html` unit tests | 149 passed, 0 failed | 2026-10-22 |
@@ -57,7 +58,12 @@ The last correction here was the sixth agent to overturn a spec claim I wrote in
 at the correct origin, CSS Nesting, `@supports` evaluated against a three-state oracle, the
 `hsl()`/`hsla()` family, `color()` in sRGB, sRGB-linear and display-p3. Shorthand expansion is now
 spec-correct for `text-decoration`, which is what fixed the most-reported visual symptom in the
-project's history.
+project's history. `@property` registrations validate their syntax and initial value, stop
+`inherits: false` properties from inheriting, and replace invalid computed values with the
+registered unset value before `var()` substitution. Media Queries 4/5 conditions support
+`not`/`and`/`or`, nested parentheses and range syntax, plus the common environment features.
+`@container` size queries parse at stylesheet time and evaluate against measured ancestor content
+boxes, with a bounded three-pass style/layout feedback loop.
 
 **Table layout.** 47 tests. CSS 2.1 §17 including border-collapse conflict resolution, row groups,
 `colspan`/`rowspan`, `caption-side`, fixed layout, intrinsic widths. This is the single most-used
@@ -105,7 +111,7 @@ Verified by grep, not inferred. Full discussion in the register's S30.
 | **Web Workers** | zero occurrences of `Worker` |
 | **History API** | `pushState`/`replaceState` change the URL and `history.state` without a load. Back/forward/go within the document fire `popstate` without a load; entries of another document reload. `history.length` reflects the list at each turn's start |
 | **Iframe painting** | a nested document runs scripts in its own realm, but it is not laid out or painted, so a page embedding one loses that content visually |
-| **Animations and transitions** | `@keyframes` is parsed, diagnosed and discarded - 249 blocks in the corpus. No clock, so nothing can be time-driven |
+| **Animations and transitions** | *Closed for the CSS surface.* `@keyframes`, `animation-*`, and CSS transitions are sampled by a browser-driven 16 ms timeline clock; keyframes inside `@media` are gated, while keyframes inside `@container` are global per CSS Conditional 5 §5.4. Multi-animation lists, reversing shortening and WAAPI edge cases remain partial. |
 | **Selection / Range** | Range is implemented (DOM §5): `Range`, `StaticRange`, `createRange`, the boundary-point and content algorithms, and live updates on every tree mutation. There is no `getSelection` selection state, so `getSelection()` reports an empty selection, and no caret position APIs |
 | **Shadow-scoped styling** | shadow trees, `attachShadow` and autonomous `customElements` exist; shadow-tree stylesheets are not collected, `:host`/`::slotted` match nothing, and `slotchange` is not dispatched |
 | **Compositing** | there is no compositor. Every frame is one raster of the whole document, which is why scrolling cannot be cheap and why `position: fixed` cannot be a layer |

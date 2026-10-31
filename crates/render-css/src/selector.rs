@@ -398,6 +398,139 @@ pub struct MatchContext {
     pub visited_links: HashSet<NodeId>,
     pub viewport_width: Option<f32>,
     pub viewport_height: Option<f32>,
+    /// Device pixel ratio in `dppx`. `None` means the host has not supplied
+    /// one, which makes resolution features unknown rather than false.
+    pub resolution: Option<f32>,
+    pub prefers_color_scheme: ColorScheme,
+    pub prefers_reduced_motion: ReducedPreference,
+    pub prefers_reduced_transparency: ReducedPreference,
+    pub prefers_reduced_data: ReducedPreference,
+    pub prefers_contrast: ContrastPreference,
+    /// `forced-colors: active`.
+    pub forced_colors: bool,
+    /// `inverted-colors: inverted`.
+    pub inverted_colors: bool,
+    pub pointer: Pointer,
+    pub any_pointer: Pointer,
+    pub hover: Hover,
+    pub any_hover: Hover,
+    pub scripting: Scripting,
+    pub display_mode: DisplayMode,
+    pub color_gamut: ColorGamut,
+    pub dynamic_range: DynamicRange,
+    pub video_dynamic_range: DynamicRange,
+    pub update: UpdateFrequency,
+    pub overflow_block: OverflowBlock,
+    pub overflow_inline: OverflowInline,
+    /// Bits per color channel available to the page.
+    pub color_bits: u8,
+    /// Bits per pixel of a monochrome device; zero for color devices.
+    pub monochrome_bits: u8,
+    /// Entries in the color palette; zero for direct-color devices.
+    pub color_index: u32,
+    /// Measured query containers from the previous layout pass, keyed by the
+    /// element that establishes each one. Empty on the first pass, which makes
+    /// every size query false until geometry exists.
+    pub containers: std::sync::Arc<crate::container::ContainerContext>,
+}
+
+/// The user's preferred color scheme (`prefers-color-scheme`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColorScheme {
+    #[default]
+    Light,
+    Dark,
+}
+
+/// A binary user preference such as reduced motion or reduced transparency.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReducedPreference {
+    #[default]
+    NoPreference,
+    Reduce,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContrastPreference {
+    #[default]
+    NoPreference,
+    More,
+    Less,
+    Custom,
+}
+
+/// The primary pointing device's accuracy (`pointer`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pointer {
+    None,
+    Coarse,
+    #[default]
+    Fine,
+}
+
+/// The primary pointing device's hover ability (`hover`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Hover {
+    None,
+    #[default]
+    Hover,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Scripting {
+    None,
+    InitialOnly,
+    #[default]
+    Enabled,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DisplayMode {
+    #[default]
+    Browser,
+    Fullscreen,
+    Standalone,
+    MinimalUi,
+    WindowControlsOverlay,
+    PictureInPicture,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColorGamut {
+    #[default]
+    Srgb,
+    P3,
+    Rec2020,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DynamicRange {
+    #[default]
+    Standard,
+    High,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UpdateFrequency {
+    None,
+    Slow,
+    #[default]
+    Fast,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverflowBlock {
+    None,
+    #[default]
+    Scroll,
+    Paged,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverflowInline {
+    None,
+    #[default]
+    Scroll,
 }
 
 /// The host's user-interaction state for dynamic pseudo-classes.

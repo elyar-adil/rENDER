@@ -1854,8 +1854,8 @@ impl BrowserApp {
         }
         // The default referrer policy is strict-origin-when-cross-origin:
         // same-origin requests send the full URL, cross-origin ones only the
-        // origin. Anti-bot APIs (JD's api.m.jd.com among them) reject requests
-        // without it.
+        // origin. Cross-origin APIs behind bot protection commonly reject
+        // requests without it.
         fetch_request = fetch_request.with_header("Referer", cors::referer(&page_url, &url));
         // A cross-origin request sends cookies only when the page asked for
         // credentials (XHR `withCredentials`, fetch `credentials: "include"`).
@@ -1867,7 +1867,10 @@ impl BrowserApp {
                 "render-browser page fetch {url} credentials={:?} cookie={:?} headers={:?}",
                 request.credentials, fetch_request.cookie, fetch_request.headers
             );
-            if fetch_request.cookie.is_none() && url.as_str().contains("api.m.jd.com") {
+            // A credentialed cross-origin request with no matching cookie is
+            // the shape that silently fails against cookie-gated APIs, so dump
+            // the jar to show whether the problem is the request or the store.
+            if include_credentials && fetch_request.cookie.is_none() {
                 eprintln!("render-browser cookie jar: {}", self.cookies.debug_dump());
             }
         }
@@ -2998,15 +3001,16 @@ impl BrowserApp {
     /// cookie jar, as a navigation's does. A cross-origin response is refused
     /// unless CORS allows the page to read it, and then exposes only the headers
     /// CORS allows.
-    /// Logs one completed page fetch under `RENDER_DEBUG_FRAME`, including
-    /// the response body, for exchanges whose rejection explains a page.
+    /// Logs one completed page fetch, including the response body. Failures are
+    /// always logged while frame debugging is on because they explain the page;
+    /// successful exchanges are opt-in through `RENDER_DEBUG_FETCH` so a normal
+    /// frame log stays readable.
     fn debug_log_fetch_exchange(
         request: &FetchRequest,
         result: &Result<FetchResponse, FetchError>,
     ) {
-        let is_jd = request.url.as_str().contains("api.m.jd.com");
         let all = env::var_os("RENDER_DEBUG_FETCH").is_some();
-        if !is_jd && !all {
+        if !all && result.is_ok() {
             return;
         }
         match result {

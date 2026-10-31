@@ -15,9 +15,11 @@ use render_dom::{Dom, Node, NodeId, NodeKind};
 
 use super::cascade::{
     CascadeInput, CascadeRuleIndex, CascadedStyle, cascade_element_with_origins_indexed,
+    media_query_list_matches,
 };
 use super::properties::{TypedPropertyValue, parse_typed_property};
 use super::pseudo::{self, PseudoElement};
+use super::registered::{PropertyRegistration, RegisteredSyntax};
 use super::selector::MatchContext;
 use super::stylesheet::{CssWideKeyword, Declaration, css_wide_keyword, parse_declaration_list};
 
@@ -238,6 +240,12 @@ impl PropertyRegistry {
             ("text-decoration-style", "solid"),
             ("text-decoration-color", "currentcolor"),
             ("text-decoration-thickness", "auto"),
+            // CSS Containment 3 §3.1 and §3.2: `container-type` and
+            // `container-name` do not inherit. Registering them gives every
+            // element the initial `normal`/`none` that keeps it out of the
+            // query container chain until it says otherwise.
+            ("container-type", "normal"),
+            ("container-name", "none"),
         ] {
             registry.define(name, false, initial);
         }
@@ -937,6 +945,12 @@ struct CustomResolver<'a> {
     /// instead of cloning the whole inherited map into `sources`.
     inherited: Option<&'a BTreeMap<String, ComputedValue>>,
     inherited_invalid: Option<&'a BTreeSet<String>>,
+    /// The document's registrations, so a substituted value is checked against
+    /// its syntax before another property can use it.
+    registered: Option<&'a RegisteredProperties>,
+    /// The unset value for each registered property, precomputed once per
+    /// element. An invalid value falls back to this before substitution.
+    registered_fallbacks: &'a BTreeMap<String, Option<TokenStream>>,
     memo: BTreeMap<String, Option<TokenStream>>,
     limits: &'a ComputationLimits,
     diagnostics: &'a mut Vec<ComputationDiagnostic>,
@@ -949,6 +963,13 @@ impl CustomResolver<'_> {
             return value.clone();
         }
         if self.invalid.contains(name) || depth >= self.limits.max_dependency_depth {
+            // A registered property whose own value is invalid at computed-value
+            // time computes to its unset value, so references to it still have
+            // something to substitute.
+            if let Some(Some(fallback)) = self.registered_fallbacks.get(name) {
+                self.memo.insert(name.to_owned(), Some(fallback.clone()));
+                return Some(fallback.clone());
+            }
             if depth >= self.limits.max_dependency_depth && self.diagnosed.insert(name.to_owned()) {
                 self.diagnostics.push(ComputationDiagnostic {
                     property: Some(name.to_owned()),
@@ -973,11 +994,11 @@ impl CustomResolver<'_> {
             return resolved;
         }
         let source = self.sources.get(name)?.clone();
-        let resolved = match source {
+        let mut resolved = match source {
             CustomSource::Resolved(value) => Some(value),
             CustomSource::Specified(value) => self.substitute(&value, depth.saturating_add(1)),
         };
-        let resolved = resolved.filter(|value| {
+        resolved = resolved.filter(|value| {
             if !value.serialized_len_exceeds(self.limits.max_value_bytes)
                 && !value.component_count_exceeds(self.limits.max_component_values)
             {
@@ -992,6 +1013,25 @@ impl CustomResolver<'_> {
                 false
             }
         });
+        if let Some(value) = resolved.as_ref()
+            && let Some(registration) = self
+                .registered
+                .and_then(|registered| registered.definition(name))
+        {
+            let css = ComputedValue::new(value.clone()).parseable_css();
+            if !registration.syntax.matches(&css) {
+                if self.diagnosed.insert(name.to_owned()) {
+                    self.diagnostics.push(ComputationDiagnostic {
+                        property: Some(name.to_owned()),
+                        message: format!(
+                            "value does not match the registered syntax for {name}; \
+                             using the unset fallback"
+                        ),
+                    });
+                }
+                resolved = self.registered_fallbacks.get(name).cloned().flatten();
+            }
+        }
         self.memo.insert(name.to_owned(), resolved.clone());
         resolved
     }
@@ -1131,6 +1171,46 @@ impl InitialValues {
     }
 }
 
+/// The document's `@property` registrations, with their initial values
+/// tokenized once.
+///
+/// A registration is document-wide rather than per-element, so building this
+/// table once keeps `@property --x { syntax: "<length>"; ... }` from
+/// re-tokenizing `0px` for every element that does not declare `--x`.
+#[derive(Debug, Default)]
+struct RegisteredProperties {
+    definitions: BTreeMap<String, PropertyRegistration>,
+    initials: BTreeMap<String, ComputedValue>,
+}
+
+impl RegisteredProperties {
+    fn new(
+        definitions: BTreeMap<String, PropertyRegistration>,
+        limits: &ComputationLimits,
+    ) -> Self {
+        let initials = definitions
+            .iter()
+            .filter_map(|(name, registration)| {
+                let source = registration.initial_value.as_deref()?;
+                let tokens = tokenize(source, limits).ok()?;
+                Some((name.clone(), ComputedValue::within_limits(tokens, limits)?))
+            })
+            .collect();
+        Self {
+            definitions,
+            initials,
+        }
+    }
+
+    fn initial(&self, name: &str) -> Option<&ComputedValue> {
+        self.initials.get(name)
+    }
+
+    fn definition(&self, name: &str) -> Option<&PropertyRegistration> {
+        self.definitions.get(name)
+    }
+}
+
 /// Resolve token-level computed values for one element.
 #[must_use]
 pub fn compute_style(
@@ -1145,6 +1225,7 @@ pub fn compute_style(
         registry,
         limits,
         &Arc::new(InitialValues::new(registry, limits)),
+        &RegisteredProperties::default(),
     )
 }
 
@@ -1155,6 +1236,7 @@ fn compute_style_with_initials(
     registry: &PropertyRegistry,
     limits: &ComputationLimits,
     initials: &Arc<InitialValues>,
+    registered: &RegisteredProperties,
 ) -> ComputedStyle {
     let mut diagnostics = Vec::new();
     let cascaded_custom = cascaded
@@ -1166,7 +1248,12 @@ fn compute_style_with_initials(
     // resolved map unchanged. Sharing it avoids copying and re-resolving every
     // inherited variable for every element; the resolver falls back to the
     // parent map for `var()` references in this element's declarations.
-    let inherits_custom = cascaded_custom.is_empty() && parent.is_some();
+    //
+    // A document with `@property` registrations cannot take that shortcut,
+    // because a registered `inherits: false` property must stop inheriting even
+    // when the element declares nothing at all.
+    let inherits_custom =
+        cascaded_custom.is_empty() && parent.is_some() && registered.definitions.is_empty();
     let mut invalid = if inherits_custom {
         BTreeSet::new()
     } else {
@@ -1182,6 +1269,11 @@ fn compute_style_with_initials(
                 style
                     .custom_properties
                     .iter()
+                    .filter(|(name, _)| {
+                        registered
+                            .definition(name)
+                            .is_none_or(|registration| registration.inherits)
+                    })
                     .map(|(name, value)| {
                         (name.clone(), CustomSource::Resolved(value.tokens.clone()))
                     })
@@ -1189,6 +1281,14 @@ fn compute_style_with_initials(
             })
             .unwrap_or_default()
     };
+    // Registered properties exist on every element, so an element that says
+    // nothing about one starts from its registered initial value. For an
+    // inherited registration the parent's value, already in `sources`, wins.
+    for (name, value) in &registered.initials {
+        sources
+            .entry(name.clone())
+            .or_insert_with(|| CustomSource::Resolved(value.tokens.clone()));
+    }
     if cascaded_custom.len() > limits.max_custom_properties {
         diagnostics.push(ComputationDiagnostic {
             property: None,
@@ -1199,25 +1299,54 @@ fn compute_style_with_initials(
         .into_iter()
         .take(limits.max_custom_properties)
     {
-        match css_wide_keyword(&value.value) {
-            Some(CssWideKeyword::Inherit | CssWideKeyword::Unset) => {
-                if let Some(parent_value) =
-                    parent.and_then(|style| style.custom_properties.get(name))
-                {
-                    sources.insert(
-                        name.clone(),
-                        CustomSource::Resolved(parent_value.tokens.clone()),
-                    );
-                    invalid.remove(name);
+        let keyword = css_wide_keyword(&value.value);
+        let registration = registered.definition(name);
+        let parent_value = parent.and_then(|style| style.custom_properties.get(name));
+        let initial_value = registered.initial(name);
+        match keyword {
+            Some(CssWideKeyword::Inherit) => {
+                let inherited = parent_value.or(initial_value);
+                match inherited {
+                    Some(inherited) => {
+                        sources.insert(
+                            name.clone(),
+                            CustomSource::Resolved(inherited.tokens.clone()),
+                        );
+                        invalid.remove(name);
+                    }
+                    None => {
+                        sources.remove(name);
+                        invalid.insert(name.clone());
+                    }
+                }
+            }
+            Some(CssWideKeyword::Unset) => {
+                let unset = if registration.is_none_or(|registration| registration.inherits) {
+                    parent_value.or(initial_value)
                 } else {
+                    initial_value
+                };
+                match unset {
+                    Some(unset) => {
+                        sources.insert(name.clone(), CustomSource::Resolved(unset.tokens.clone()));
+                        invalid.remove(name);
+                    }
+                    None => {
+                        sources.remove(name);
+                        invalid.insert(name.clone());
+                    }
+                }
+            }
+            Some(CssWideKeyword::Initial) => match initial_value {
+                Some(initial) => {
+                    sources.insert(name.clone(), CustomSource::Resolved(initial.tokens.clone()));
+                    invalid.remove(name);
+                }
+                None => {
                     sources.remove(name);
                     invalid.insert(name.clone());
                 }
-            }
-            Some(CssWideKeyword::Initial) => {
-                sources.remove(name);
-                invalid.insert(name.clone());
-            }
+            },
             Some(CssWideKeyword::Revert | CssWideKeyword::RevertLayer) => {
                 sources.remove(name);
                 invalid.insert(name.clone());
@@ -1287,6 +1416,30 @@ fn compute_style_with_initials(
         invalid.extend(depth_limited);
     }
 
+    // The unset value of each registered property, precomputed once per
+    // element. A value that fails its registered syntax computes to this, and
+    // every later `var()` reference must see it rather than the rejected value.
+    let registered_fallbacks = registered
+        .definitions
+        .iter()
+        .map(|(name, registration)| {
+            let fallback = if matches!(registration.syntax, RegisteredSyntax::Universal) {
+                // The universal syntax keeps the unregistered behavior: the
+                // substituted value is used as-is, and a cycle is the
+                // guaranteed-invalid value rather than the initial value.
+                None
+            } else if registration.inherits {
+                parent
+                    .and_then(|style| style.custom_properties.get(name))
+                    .map(|value| value.tokens.clone())
+                    .or_else(|| registered.initial(name).map(|value| value.tokens.clone()))
+            } else {
+                registered.initial(name).map(|value| value.tokens.clone())
+            };
+            (name.clone(), fallback)
+        })
+        .collect::<BTreeMap<_, _>>();
+
     let mut resolver = CustomResolver {
         sources: &sources,
         invalid: &invalid,
@@ -1296,6 +1449,8 @@ fn compute_style_with_initials(
                 .expect("inherits_custom implies a parent")
         }),
         inherited_invalid: parent.map(|style| &*style.invalid_custom_properties),
+        registered: Some(registered),
+        registered_fallbacks: &registered_fallbacks,
         memo: BTreeMap::new(),
         limits,
         diagnostics: &mut diagnostics,
@@ -1304,14 +1459,21 @@ fn compute_style_with_initials(
     if !inherits_custom {
         let source_names = sources.keys().cloned().collect::<Vec<_>>();
         for name in source_names {
-            if let Some(value) = resolver
+            let resolved = resolver
                 .resolve(&name, 0)
-                .and_then(|tokens| ComputedValue::within_limits(tokens, limits))
-            {
+                .and_then(|tokens| ComputedValue::within_limits(tokens, limits));
+            if let Some(value) = resolved {
                 custom_properties.insert(name, value);
             } else {
                 resolution_invalid.insert(name);
             }
+        }
+    }
+    // A registered universal property with no initial value has no source at
+    // all until it is declared; it is the guaranteed-invalid value.
+    for name in registered.definitions.keys() {
+        if !sources.contains_key(name) {
+            resolution_invalid.insert(name.clone());
         }
     }
 
@@ -1531,6 +1693,31 @@ fn compute_registered_property(
     }
 }
 
+/// Collect the `@property` registrations that apply in this environment.
+///
+/// Document order decides between two registrations of the same name: the
+/// later rule wins, as it does for a normal declaration. A registration inside
+/// a false `@media` query is absent for the same reason a style rule inside it
+/// is absent.
+fn collect_registered_properties(
+    sources: &[CascadeInput<'_>],
+    context: &MatchContext,
+) -> BTreeMap<String, PropertyRegistration> {
+    let mut registrations = BTreeMap::new();
+    for source in sources {
+        for registration in &source.sheet.property_registrations {
+            if registration
+                .media
+                .iter()
+                .all(|query| media_query_list_matches(query, context))
+            {
+                registrations.insert(registration.name.clone(), registration.clone());
+            }
+        }
+    }
+    registrations
+}
+
 /// Cascade and compute every element in parent-before-child order.
 #[must_use]
 pub fn compute_document_styles(
@@ -1557,6 +1744,8 @@ pub fn compute_document_styles_with_hints(
 ) -> BTreeMap<NodeId, ComputedStyle> {
     let mut styles = BTreeMap::new();
     let initials = Arc::new(InitialValues::new(registry, limits));
+    let registered =
+        RegisteredProperties::new(collect_registered_properties(sources, context), limits);
     let registry_size = registry.iter().count();
     let initial_count = initials.values.len();
     let debug_index = std::env::var_os("RENDER_DEBUG_CSS_INDEX").is_some();
@@ -1617,6 +1806,7 @@ pub fn compute_document_styles_with_hints(
                 registry,
                 limits,
                 &initials,
+                &registered,
             );
             if let Some(started) = compute_started {
                 compute_time += started.elapsed();
@@ -1657,6 +1847,7 @@ pub fn compute_document_styles_with_hints(
                     registry,
                     limits,
                     &initials,
+                    &registered,
                 );
                 if let Some(started) = pseudo_compute_started {
                     pseudo_compute_time += started.elapsed();
@@ -1694,6 +1885,7 @@ mod tests {
         compute_document_styles_with_hints, compute_style,
     };
     use crate::cascade::{CascadeInput, CascadeOrigin, cascade_element};
+    use crate::container::{ContainerContext, ContainerGeometry, ContainerType};
     use crate::properties::{
         BorderSpacing, Length, LengthPercentage, LengthUnit, TypedPropertyValue,
     };
@@ -1894,6 +2086,140 @@ mod tests {
                 "{property}"
             );
         }
+    }
+
+    #[test]
+    fn property_registrations_control_inheritance_and_initial_values() {
+        let output =
+            parse_document("<!doctype html><div id='parent'><span id='child'></span></div>");
+        let sheet = parse_stylesheet(
+            "@property --accent { syntax: \"<color>\"; inherits: false; initial-value: red; } \
+             @property --size { syntax: \"<length>\"; inherits: true; initial-value: 4px; } \
+             #parent { --accent: blue; --size: 10px } \
+             #child { color: var(--accent); margin-left: var(--size) }",
+        );
+        let mut registry = PropertyRegistry::new();
+        registry.define("color", true, "canvastext");
+        registry.define("margin-left", false, "0px");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &registry,
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let parent = &styles[&target_id(&output.dom, "#parent")];
+        let child = &styles[&target_id(&output.dom, "#child")];
+
+        assert_eq!(
+            parent.get("--accent").map(super::ComputedValue::css_text),
+            Some("blue")
+        );
+        assert_eq!(
+            parent.get("--size").map(super::ComputedValue::css_text),
+            Some("10px")
+        );
+        // `--accent` does not inherit, so the child starts from its registered
+        // initial value rather than the parent's blue.
+        assert_eq!(
+            child.get("--accent").map(super::ComputedValue::css_text),
+            Some("red")
+        );
+        // `--size` does inherit, so the child sees the parent's computed value.
+        assert_eq!(
+            child.get("--size").map(super::ComputedValue::css_text),
+            Some("10px")
+        );
+        assert_eq!(
+            child.get("color").map(super::ComputedValue::css_text),
+            Some("red")
+        );
+        assert_eq!(
+            child.get("margin-left").map(super::ComputedValue::css_text),
+            Some("10px")
+        );
+    }
+
+    #[test]
+    fn a_value_outside_the_registered_syntax_falls_back_before_substitution() {
+        let output = parse_document("<!doctype html><div id='target'></div>");
+        let sheet = parse_stylesheet(
+            "@property --gap { syntax: \"<length>\"; inherits: false; initial-value: 8px; } \
+             #target { --gap: 1px 2px; --mirror: var(--gap); margin-left: var(--gap) }",
+        );
+        let mut registry = PropertyRegistry::new();
+        registry.define("margin-left", false, "0px");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &registry,
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let target = &styles[&target_id(&output.dom, "#target")];
+
+        // The rejected `1px 2px` computes to the registered initial value, and
+        // references to it see that value, not the rejected token stream.
+        assert_eq!(
+            target.get("--gap").map(super::ComputedValue::css_text),
+            Some("8px")
+        );
+        assert_eq!(
+            target.get("--mirror").map(super::ComputedValue::css_text),
+            Some("8px")
+        );
+        assert_eq!(
+            target
+                .get("margin-left")
+                .map(super::ComputedValue::css_text),
+            Some("8px")
+        );
+        assert!(!target.invalid_custom_properties().contains("--gap"));
+        assert!(target.diagnostics().iter().any(|diagnostic| {
+            diagnostic.property.as_deref() == Some("--gap")
+                && diagnostic.message.contains("registered syntax")
+        }));
+    }
+
+    #[test]
+    fn the_last_applicable_registration_wins_and_false_media_ones_do_not_apply() {
+        let output = parse_document("<!doctype html><div id='target'></div>");
+        let sheet = parse_stylesheet(
+            "@property --accent { syntax: \"<color>\"; inherits: false; initial-value: red; } \
+             @media (max-width: 0px) { \
+                 @property --accent { syntax: \"<color>\"; inherits: false; initial-value: blue; } \
+             } \
+             @media (min-width: 1px) { \
+                 @property --accent { syntax: \"<color>\"; inherits: false; initial-value: lime; } \
+             }",
+        );
+        let context = MatchContext {
+            viewport_width: Some(1_280.0),
+            viewport_height: Some(720.0),
+            ..MatchContext::default()
+        };
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::new(),
+            &ComputationLimits::default(),
+            &context,
+        );
+        let target = &styles[&target_id(&output.dom, "#target")];
+
+        assert_eq!(
+            target.get("--accent").map(super::ComputedValue::css_text),
+            Some("lime")
+        );
     }
 
     #[test]
@@ -2615,5 +2941,242 @@ mod tests {
                 "{property} must report why it was dropped"
             );
         }
+    }
+
+    /// Feed one measured container into the match context a style pass sees.
+    fn context_with_container(
+        node: render_dom::NodeId,
+        container_type: ContainerType,
+        names: &[&str],
+        width: f32,
+        height: f32,
+    ) -> MatchContext {
+        let mut context = ContainerContext {
+            viewport_width: 1000.0,
+            viewport_height: 800.0,
+            root_font_size: 16.0,
+            ..ContainerContext::default()
+        };
+        context.containers.insert(
+            node,
+            ContainerGeometry {
+                container_type,
+                names: names.iter().map(|name| (*name).to_owned()).collect(),
+                width,
+                height,
+                font_size: 16.0,
+            },
+        );
+        MatchContext {
+            containers: std::sync::Arc::new(context),
+            ..MatchContext::default()
+        }
+    }
+
+    /// A size query reads the content box of the nearest eligible ancestor
+    /// container, and an `inline-size` container cannot answer a block-axis
+    /// query: the query is false, not answered from the viewport.
+    #[test]
+    fn container_queries_read_the_named_ancestor_and_respect_their_axis() {
+        let output = parse_document("<!doctype html><div id='card'><p id='target'>text</p></div>");
+        let sheet = parse_stylesheet(
+            "#card { container-type: inline-size; container-name: card } \
+             @container card (min-width: 400px) { #target { color: red } } \
+             @container card (min-height: 100px) { #target { background-color: blue } }",
+        );
+        let card = target_id(&output.dom, "#card");
+        let target = target_id(&output.dom, "#target");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &context_with_container(card, ContainerType::InlineSize, &["card"], 500.0, 300.0),
+        );
+        let style = &styles[&target];
+        assert_eq!(
+            style.get("color").map(super::ComputedValue::css_text),
+            Some("red")
+        );
+        assert_eq!(
+            style
+                .get("background-color")
+                .map(super::ComputedValue::css_text),
+            Some("transparent"),
+            "an inline-size container does not answer a height query"
+        );
+
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &context_with_container(card, ContainerType::Size, &["card"], 500.0, 300.0),
+        );
+        assert_eq!(
+            styles[&target]
+                .get("background-color")
+                .map(super::ComputedValue::css_text),
+            Some("blue"),
+            "a size container answers both axes"
+        );
+    }
+
+    /// The queried container is chosen per name and per axis, so a nearer
+    /// unnamed or ineligible container does not hide the outer one the author
+    /// asked for.
+    #[test]
+    fn container_lookup_skips_containers_that_do_not_match_the_query() {
+        let output = parse_document(
+            "<!doctype html><div id='outer'><div id='inner'><p id='target'></p></div></div>",
+        );
+        let sheet = parse_stylesheet(
+            "#outer { container-type: size; container-name: page } \
+             #inner { container-type: inline-size } \
+             @container page (min-height: 500px) { #target { color: green } }",
+        );
+        let outer = target_id(&output.dom, "#outer");
+        let inner = target_id(&output.dom, "#inner");
+        let target = target_id(&output.dom, "#target");
+        let mut context = ContainerContext {
+            viewport_width: 1000.0,
+            viewport_height: 800.0,
+            root_font_size: 16.0,
+            ..ContainerContext::default()
+        };
+        context.containers.insert(
+            inner,
+            ContainerGeometry {
+                container_type: ContainerType::InlineSize,
+                names: Vec::new(),
+                width: 400.0,
+                height: 700.0,
+                font_size: 16.0,
+            },
+        );
+        context.containers.insert(
+            outer,
+            ContainerGeometry {
+                container_type: ContainerType::Size,
+                names: vec!["page".to_owned()],
+                width: 900.0,
+                height: 600.0,
+                font_size: 16.0,
+            },
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext {
+                containers: std::sync::Arc::new(context),
+                ..MatchContext::default()
+            },
+        );
+        assert_eq!(
+            styles[&target]
+                .get("color")
+                .map(super::ComputedValue::css_text),
+            Some("green"),
+            "the named eligible outer container answers the query"
+        );
+    }
+
+    /// Without a measurement the query is false; it must not fall back to the
+    /// viewport or to the initial value.
+    #[test]
+    fn a_container_query_without_geometry_does_not_match() {
+        let output = parse_document("<!doctype html><div id='card'><p id='target'></p></div>");
+        let sheet = parse_stylesheet(
+            "#card { container-type: size } \
+             @container (min-width: 1px) { #target { color: red } }",
+        );
+        let target = target_id(&output.dom, "#target");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        assert_ne!(
+            styles[&target]
+                .get("color")
+                .map(super::ComputedValue::css_text),
+            Some("red")
+        );
+    }
+
+    /// The `container` shorthand reaches both longhands, and the longhands are
+    /// what the geometry builder reads.
+    #[test]
+    fn the_container_shorthand_sets_name_and_type() {
+        let output = parse_document("<!doctype html><div id='card'></div>");
+        let sheet = parse_stylesheet("#card { container: card / inline-size }");
+        let card = target_id(&output.dom, "#card");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let style = &styles[&card];
+        assert_eq!(
+            style
+                .get("container-type")
+                .map(super::ComputedValue::css_text),
+            Some("inline-size")
+        );
+    }
+
+    /// A `@property` registration inside a container query still registers:
+    /// CSS Conditional 5 §5.4 exempts global name-defining at-rules from the
+    /// condition, so the initial value participates in computation even when
+    /// the query does not match.
+    #[test]
+    fn a_property_registered_inside_a_container_query_still_registers() {
+        let output = parse_document("<!doctype html><div id='target'></div>");
+        let sheet = parse_stylesheet(
+            "@container (width: 200px) { \
+                 @property --accent { syntax: \"<color>\"; inherits: false; initial-value: red } \
+             } \
+             #target { color: var(--accent) }",
+        );
+        assert_eq!(sheet.property_registrations.len(), 1);
+        let target = target_id(&output.dom, "#target");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        assert_eq!(
+            styles[&target]
+                .get("color")
+                .map(super::ComputedValue::css_text),
+            Some("red"),
+            "the unconditional registration supplies its initial value"
+        );
     }
 }

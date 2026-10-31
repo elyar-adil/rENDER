@@ -11,6 +11,8 @@ use cssparser::{
 };
 
 use super::at_rules::{at_rule_block_is_declaration_list, at_rule_diagnostic};
+use super::container::ContainerCondition;
+use super::registered::{PropertyRegistration, parse_registration};
 use super::selector::{
     NestedSelectors, SelectorList, parse_nested_selector_list, parse_selector_list,
 };
@@ -85,6 +87,14 @@ pub struct StyleRule {
     pub layer: Option<LayerName>,
     /// Every enclosing `@media` query, from outermost to innermost.
     pub media: Vec<String>,
+    /// Every enclosing `@container` condition, from outermost to innermost.
+    ///
+    /// A rule matches only when every condition holds for the element's
+    /// nearest eligible ancestor container. The geometry that answers them is
+    /// fed back by a layout pass (see `render_css::container`), so an empty
+    /// context during the first pass makes size queries false rather than
+    /// guessed.
+    pub container: Vec<ContainerCondition>,
     pub source_order: u64,
 }
 
@@ -153,6 +163,10 @@ pub struct StyleSheet {
     pub rules: Vec<StyleRule>,
     pub layer_order: Vec<LayerName>,
     pub keyframes: Vec<KeyframesRule>,
+    /// `@property` registrations in source order. A later registration of the
+    /// same name wins, which is why this is a list rather than a map: the
+    /// consumer can apply document order without losing the source position.
+    pub property_registrations: Vec<PropertyRegistration>,
     pub diagnostics: Vec<StyleSheetDiagnostic>,
 }
 
@@ -244,9 +258,28 @@ enum ParsedRule {
         body: RuleBody,
         diagnostics: Vec<StyleSheetDiagnostic>,
     },
+    /// A `@container` block. The prelude is parsed once here into the
+    /// condition every rule in the block carries; a malformed prelude is kept
+    /// as an error so the block is dropped with a diagnostic that names the
+    /// author's mistake instead of silently contributing nothing.
+    ContainerBlock {
+        condition: Result<ContainerCondition, String>,
+        body: RuleBody,
+        diagnostics: Vec<StyleSheetDiagnostic>,
+        location: SourceLocation,
+    },
     SupportsBlock {
         query: String,
         body: RuleBody,
+        diagnostics: Vec<StyleSheetDiagnostic>,
+        location: SourceLocation,
+    },
+    /// A `@property` registration. The declaration list is not a discarded
+    /// descriptor block: a valid registration reaches the custom-property
+    /// computation stage, and an invalid one is reported with the reason CSS
+    /// Properties and Values 1 §2.2 gives for rejecting it.
+    PropertyBlock {
+        registration: Result<PropertyRegistration, String>,
         diagnostics: Vec<StyleSheetDiagnostic>,
         location: SourceLocation,
     },
@@ -487,6 +520,16 @@ fn parse_at_rule_block<'i, 't>(
         });
     }
 
+    if prelude.name == "container" {
+        let (body, diagnostics) = parse_group_body(input, next_anonymous_layer, parent);
+        return Ok(ParsedRule::ContainerBlock {
+            condition: ContainerCondition::parse(&prelude.value),
+            body,
+            diagnostics,
+            location,
+        });
+    }
+
     if prelude.name.ends_with("keyframes") {
         let (keyframes, diagnostics) = parse_keyframes_body(input);
         return Ok(ParsedRule::KeyframesBlock {
@@ -503,6 +546,25 @@ fn parse_at_rule_block<'i, 't>(
         return Ok(ParsedRule::SupportsBlock {
             query: prelude.value,
             body,
+            diagnostics,
+            location,
+        });
+    }
+
+    // `@property` is a registration, not a conditional group rule: its block
+    // is a descriptor list and a valid rule changes custom-property
+    // computation for the whole document. It is handled before the generic
+    // declaration-list at-rule branch so its descriptors are not thrown away
+    // with the rest of the unimplemented blocks.
+    if prelude.name == "property" {
+        let (declarations, _, diagnostics) = parse_declarations(input).into_parts();
+        let registration = if parent.is_some() {
+            Err("@property is not valid inside a style rule".to_owned())
+        } else {
+            parse_registration(&prelude.value, &declarations)
+        };
+        return Ok(ParsedRule::PropertyBlock {
+            registration,
             diagnostics,
             location,
         });
@@ -1181,7 +1243,7 @@ pub fn parse_stylesheet(source: &str) -> StyleSheet {
         diagnostics,
         ..StyleSheet::default()
     };
-    flatten_rules(rules, None, &[], &mut sheet);
+    flatten_rules(rules, None, &[], &[], &mut sheet);
     sheet
 }
 
@@ -1594,6 +1656,7 @@ fn flatten_rules(
     rules: Vec<ParsedRule>,
     layer: Option<&LayerName>,
     media: &[String],
+    containers: &[ContainerCondition],
     sheet: &mut StyleSheet,
 ) {
     for rule in rules {
@@ -1619,9 +1682,10 @@ fn flatten_rules(
                     declaration_locations,
                     layer: layer.cloned(),
                     media: media.to_vec(),
+                    container: containers.to_vec(),
                     source_order: u64::try_from(sheet.rules.len()).unwrap_or(u64::MAX),
                 });
-                flatten_rules(nested, layer, media, sheet);
+                flatten_rules(nested, layer, media, containers, sheet);
             }
             ParsedRule::NestedDeclarations {
                 selectors,
@@ -1639,6 +1703,7 @@ fn flatten_rules(
                     declaration_locations,
                     layer: layer.cloned(),
                     media: media.to_vec(),
+                    container: containers.to_vec(),
                     source_order: u64::try_from(sheet.rules.len()).unwrap_or(u64::MAX),
                 });
             }
@@ -1668,7 +1733,7 @@ fn flatten_rules(
                     ));
                 } else {
                     register_layer(sheet, &nested_layer);
-                    flatten_rules(rules, Some(&nested_layer), media, sheet);
+                    flatten_rules(rules, Some(&nested_layer), media, containers, sheet);
                 }
             }
             ParsedRule::MediaBlock {
@@ -1679,7 +1744,43 @@ fn flatten_rules(
                 sheet.diagnostics.extend(diagnostics);
                 let mut nested_media = media.to_vec();
                 nested_media.push(query);
-                flatten_group_body(body, layer, &nested_media, sheet);
+                flatten_group_body(body, layer, &nested_media, containers, sheet);
+            }
+            ParsedRule::ContainerBlock {
+                condition,
+                body,
+                diagnostics,
+                location,
+            } => {
+                // The condition's own diagnostics belong to the author whether
+                // or not it holds, exactly like `@media` and `@supports`.
+                sheet.diagnostics.extend(diagnostics);
+                match condition {
+                    Ok(condition) => {
+                        if let Some(reason) = condition.query.unsupported() {
+                            // A style() or scroll-state() query is real syntax
+                            // this engine cannot answer; applying the block
+                            // unconditionally would be a lie, and dropping it
+                            // silently is the defect this project forbids.
+                            sheet.diagnostics.push(capability_diagnostic(
+                                location,
+                                format!("@container is not evaluated: {reason}"),
+                            ));
+                        }
+                        let mut nested = containers.to_vec();
+                        nested.push(condition);
+                        flatten_group_body(body, layer, media, &nested, sheet);
+                    }
+                    Err(reason) => {
+                        sheet.diagnostics.push(capability_diagnostic(
+                            location,
+                            format!(
+                                "@container condition is not valid, so the rule and its \
+                                 contents are dropped: {reason}"
+                            ),
+                        ));
+                    }
+                }
             }
             ParsedRule::SupportsBlock {
                 query,
@@ -1700,7 +1801,7 @@ fn flatten_rules(
                     // though they were at the group rule's location, and when
                     // it is false none of them apply.
                     SupportsCondition::Evaluated(true) => {
-                        flatten_group_body(body, layer, media, sheet);
+                        flatten_group_body(body, layer, media, containers, sheet);
                     }
                     // A false condition is a complete answer, not a gap: the
                     // author wrote the query to find out whether the engine
@@ -1735,6 +1836,25 @@ fn flatten_rules(
                     }
                 }
             }
+            ParsedRule::PropertyBlock {
+                registration,
+                diagnostics,
+                location,
+            } => {
+                sheet.diagnostics.extend(diagnostics);
+                match registration {
+                    Ok(mut registration) => {
+                        registration.media = media.to_vec();
+                        sheet.property_registrations.push(registration);
+                    }
+                    Err(reason) => {
+                        sheet.diagnostics.push(capability_diagnostic(
+                            location,
+                            format!("@property is invalid: {reason}"),
+                        ));
+                    }
+                }
+            }
             ParsedRule::KeyframesBlock {
                 name,
                 at_keyword,
@@ -1749,6 +1869,9 @@ fn flatten_rules(
                         format!("@{at_keyword} needs a name and at least one keyframe"),
                     ));
                 } else {
+                    // CSS Conditional 5 §5.4: global name-defining at-rules
+                    // such as `@keyframes` are not constrained by an enclosing
+                    // `@container` condition. Only `@media` can gate them.
                     sheet.keyframes.push(KeyframesRule {
                         name,
                         keyframes,
@@ -1804,12 +1927,13 @@ fn flatten_group_body(
     body: RuleBody,
     layer: Option<&LayerName>,
     media: &[String],
+    containers: &[ContainerCondition],
     sheet: &mut StyleSheet,
 ) {
     let rules = match body {
         RuleBody::Rules(rules) | RuleBody::Block(rules) => rules,
     };
-    flatten_rules(rules, layer, media, sheet);
+    flatten_rules(rules, layer, media, containers, sheet);
 }
 
 #[cfg(test)]
@@ -2656,6 +2780,82 @@ mod tests {
         );
     }
 
+    /// `@property` is a registration, not a style rule: a valid rule lands in
+    /// the sheet's registration table, a media-gated one keeps its condition,
+    /// and an invalid one is reported rather than silently dropped.
+    #[test]
+    fn property_rules_register_descriptors_and_report_invalid_ones() {
+        let sheet = parse_stylesheet(
+            "@property --accent { syntax: \"<color>\"; inherits: false; initial-value: red } \
+             @media (min-width: 1px) { \
+                 @property --size { syntax: \"<length>\"; inherits: true; initial-value: 1rem } \
+             } \
+             @property --bad-value { syntax: \"<length>\"; inherits: false; initial-value: red } \
+             @property --incomplete { syntax: \"<length>\"; inherits: false } \
+             @property nope { syntax: \"*\"; inherits: false }",
+        );
+
+        assert_eq!(sheet.property_registrations.len(), 2);
+        let accent = &sheet.property_registrations[0];
+        assert_eq!(accent.name, "--accent");
+        assert_eq!(accent.initial_value.as_deref(), Some("red"));
+        assert!(!accent.inherits);
+        assert!(accent.media.is_empty());
+        let size = &sheet.property_registrations[1];
+        assert_eq!(size.name, "--size");
+        assert_eq!(size.initial_value.as_deref(), Some("1rem"));
+        assert!(size.inherits);
+        assert_eq!(size.media, ["(min-width: 1px)"]);
+
+        let messages = messages(&sheet);
+        assert!(messages.iter().any(|message| {
+            message.contains("@property is invalid")
+                && message.contains("`initial-value` `red` does not match")
+        }));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("`initial-value` is required")),
+            "{messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("not a custom property name"))
+        );
+    }
+
+    /// CSS Conditional 5 §5.4: global, name-defining at-rules such as
+    /// `@property` and `@keyframes` inside a container query are not
+    /// constrained by it. Both are hoisted into the sheet exactly as if they
+    /// were written at the top level.
+    #[test]
+    fn global_at_rules_inside_a_container_query_are_not_conditioned() {
+        let sheet = parse_stylesheet(
+            "@container (width: 200px) { \
+                 @property --accent { syntax: \"<color>\"; inherits: false; initial-value: red } \
+                 @keyframes pulse { from { opacity: 0 } to { opacity: 1 } } \
+                 #inside { color: red } \
+             }",
+        );
+
+        assert_eq!(sheet.property_registrations.len(), 1);
+        assert_eq!(sheet.property_registrations[0].name, "--accent");
+        assert!(
+            sheet.property_registrations[0].media.is_empty(),
+            "a container condition is not a media condition"
+        );
+        assert_eq!(sheet.keyframes.len(), 1);
+        assert_eq!(sheet.keyframes[0].name, "pulse");
+        assert!(sheet.keyframes[0].media.is_empty());
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(
+            sheet.rules[0].container.len(),
+            1,
+            "the style rule itself stays container-gated"
+        );
+    }
+
     /// Every recognised at-rule this engine does not evaluate is reported, once
     /// per occurrence, naming itself. This is the defect `css.font-face` and
     /// `css.animations` in the capability registry are about: 223 `@font-face`
@@ -2667,11 +2867,9 @@ mod tests {
         for name in [
             "font-face",
             "page",
-            "property",
             "counter-style",
             "namespace",
             "color-profile",
-            "container",
             "starting-style",
             "position-try",
             "view-transition",
@@ -2715,11 +2913,9 @@ mod tests {
         for name in [
             "font-face",
             "page",
-            "property",
             "counter-style",
             "namespace",
             "color-profile",
-            "container",
             "starting-style",
             "position-try",
             "view-transition",

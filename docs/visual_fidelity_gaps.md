@@ -2528,7 +2528,12 @@ report it had been given wrong in its mechanism while right about its consequenc
   `crates/render-core/tests/wpt_reftests.rs:432` lists `print` only as a media type to
   skip.
 - Not implemented, and not yet audited for real-page impact: `scroll-snap`,
-  `content-visibility`, `subgrid`, `@container`, `::marker`, `forced-colors`.
+  `content-visibility`, `subgrid`, `::marker`, `forced-colors`.
+  `@container` size queries have since landed (see HANDOFF 续四十六): named/unnamed ancestors,
+  inline/block axis eligibility, range syntax, orientation/aspect-ratio, and bounded
+  style/layout feedback. `style()` and `scroll-state()` queries are diagnosed as unsupported.
+  Media Queries 4/5 condition syntax and environment features have also landed; print media and
+  `@page` remain absent.
 
 Note that media *features* are not wholly absent: `@media (prefers-reduced-motion)` and
 `@media (prefers-color-scheme)` are used by the built-in new-tab page at

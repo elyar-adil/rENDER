@@ -1,3 +1,75 @@
+# 交接文档 (2026-10-31, 续四十六) — 现代 CSS：`@property`、媒体查询重写、`@container`
+
+这一轮补齐三类现代 CSS 能力，全部按规范正向实现，没有站点特判、没有静默丢弃。
+
+## `@property`
+
+- 新文件 `crates/render-css/src/registered.rs`：`PropertyRegistration` / `RegisteredSyntax`
+  数据模型。解析 `syntax`/`inherits`/`initial-value`，校验语法字符串、`initial-value` 是否匹配
+  以及计算独立性；`<transform-list>` 按规范等于 `<transform-function>+`，`<image>` 不把
+  `none` 当图像。
+- 样式表解析把注册收集到 `StyleSheet.property_registrations`。同一属性后注册覆盖先注册；
+  位于 `@media` 内的注册只在媒体条件成立时生效。
+- 计算层在 `var()` 替换前按注册语法校验自定义属性值；非法值回退到 unset 值
+  （`inherits: false` 用 initial-value，`inherits: true` 用父值再退到 initial-value），
+  并产生诊断。注册属性的初始值只 tokenize 一次。
+- `@property` 位于 `@container` 内仍然注册：CSS Conditional 5 §5.4 规定全局命名 at-rule
+  不受容器条件约束（WPT `container-inner-at-rules.html` 同义）。
+
+## 媒体查询
+
+`cascade.rs` 的媒体查询求值改为 Media Queries 4/5 条件语法：
+
+- `not`、`and`、`or`、任意嵌套括号与三值逻辑（true/false/unknown）。
+- 范围语法：`(width >= 600px)`、`(400px < width < 800px)`、双向比较。
+- 连续特性 `width`/`height`/`aspect-ratio`/`resolution`/`color`/`monochrome`/`color-index`，
+  支持 `calc()`、`em`/`rem`、视口单位与常见分辨率单位。
+- 环境特性：颜色方案、reduced-motion/transparency/data、contrast、pointer/hover、
+  forced-colors、inverted-colors、scripting、display-mode、color-gamut、dynamic-range、
+  update、overflow-block/inline 等。
+- `media_query_list_is_supported` 与求值共用同一实现，避免“能求值却报告不支持”的旧缺陷。
+- 内置 `window.matchMedia`/样式表诊断随新求值器一起工作。
+
+## `@container`
+
+- 新文件 `crates/render-css/src/container.rs`：`ContainerType`、`ContainerCondition`/
+  `ContainerQuery`、尺寸特性解析（plain / min-max / 双向范围 / 三段范围）、
+  `orientation`/`aspect-ratio`、命名容器、轴资格与 `ContainerContext` 祖先查询。
+- 样式表解析期把 `@container` 条件解析为 AST，附加到每条 `StyleRule`；级联按元素祖先链
+  求值。`style()`/`scroll-state()` 被识别为真实语法但暂不能回答，产生诊断而不是静默应用
+  或静默丢弃。
+- `container`/`container-name`/`container-type` 属性与简写进入注册表和计算层。
+- 容器几何由布局回馈：`render_dom` 在存在容器规则时最多迭代 3 次样式/布局直到尺寸稳定；
+  没有容器规则时不增加布局。尺寸取内容盒；`inline-size` 只回答 inline 轴，block 轴查询
+  继续向上找合格容器；没有几何时查询为 false，不猜视口。
+- `@keyframes` 位于 `@container` 内不受条件约束（CSS Conditional 5 §5.4），本轮修正了此前
+  按元素门控 keyframes 的错误；只有 `@media` 能门控 keyframes。
+
+## 验证
+
+```
+cargo test -p render-css --lib                     245 passed, 0 failed
+cargo test -p render-core --lib                    432 passed, 0 failed
+                                                   （临时关闭 avif-native；仅 AVIF 解码测试因特性关闭失败）
+cargo fmt --all --check                            clean
+cargo clippy -p render-css --all-targets -D warnings  clean
+python tools/check_site_neutrality.py              clean
+```
+
+本机全工作区门禁仍被 `dav1d-sys v0.8.3` 阻塞：构建脚本找不到 `pkg-config`
+（`The pkg-config command could not be found.`）。这与本轮代码无关；在具备
+`pkg-config` + `libdav1d` 的环境需重跑 `cargo test --workspace` 与全工作区 clippy。
+
+## 下一步
+
+- 容器单位 `cqw`/`cqh`/`cqi`/`cqb`/`cqmin`/`cqmax` 的计算路径（属性解析已识别，需把
+  查询容器尺寸接入 `LengthContext`）。
+- `container-type` 的尺寸包含语义（`size`/`inline-size` 建立独立格式化上下文与包含）。
+- `style()`/`scroll-state()` 容器查询。
+- `@font-face`、`@layer` 在容器/条件规则中的全局语义审查。
+
+---
+
 # 交接文档 (2026-10-31, 续四十五) — 设置页 HTTP 代理 + GitHub 样式性能
 
 ## 设置页 HTTP 代理

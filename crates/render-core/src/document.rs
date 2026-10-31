@@ -18,6 +18,8 @@ use crate::css::computed::{
     ComputationDiagnostic, ComputationLimits, ComputedStyle, PropertyRegistry,
     compute_document_styles_with_hints,
 };
+use crate::css::container::{ContainerContext, container_geometry_for_style};
+use crate::css::length::{LengthContext, resolve_length_expr};
 use crate::css::properties::TypedPropertyValue;
 use crate::css::selector::{InteractionState, MatchContext};
 use crate::css::stylesheet::{Declaration, StyleSheet, StyleSheetDiagnostic, parse_stylesheet};
@@ -29,8 +31,8 @@ use crate::image::inline_svg::{
 };
 use crate::image::{ImageLimits, ImageResources};
 use crate::layout::{
-    FormattingDiagnostic, FormattingLimits, FormattingTree, LayoutDiagnostic, LayoutOptions,
-    LayoutOutput, PhysicalPoint, PhysicalRect, TextMeasurer, build_formatting_tree,
+    FormattingDiagnostic, FormattingLimits, FormattingTree, FragmentKind, LayoutDiagnostic,
+    LayoutOptions, LayoutOutput, PhysicalPoint, PhysicalRect, TextMeasurer, build_formatting_tree,
     layout_formatting_tree_with_images,
 };
 use crate::paint::{
@@ -1365,6 +1367,82 @@ fn dump_fragment_tree(
     walk(dom, styles, fragments, fragments.root(), 0, &mut printed);
 }
 
+/// Whether any stylesheet in `sources` has a rule or keyframes definition
+/// gated by `@container`.
+///
+/// The feedback pass costs an extra layout, so it only runs when a container
+/// condition could change a style. A page with `@container` but no matching
+/// block is therefore not charged for it.
+fn sheets_use_container_queries(sources: &[CascadeInput<'_>]) -> bool {
+    sources.iter().any(|source| {
+        source
+            .sheet
+            .rules
+            .iter()
+            .any(|rule| !rule.container.is_empty())
+    })
+}
+
+/// Measure every `container-type` element from the layout that just ran.
+///
+/// The content box is what CSS Containment 3 §4 queries: padding and borders
+/// are not part of the size a query sees. Only the first fragment of a split
+/// box is recorded; a fragmented container is not a case this layout creates
+/// yet, and choosing one fragment is at least deterministic.
+fn build_container_context(
+    dom: &Dom,
+    styles: &BTreeMap<NodeId, ComputedStyle>,
+    layout: &LayoutOutput,
+) -> ContainerContext {
+    let mut containers = BTreeMap::new();
+    for fragment in layout.fragments.iter() {
+        let Some(source) = fragment.source else {
+            continue;
+        };
+        let FragmentKind::Box(geometry) = &fragment.kind else {
+            continue;
+        };
+        if containers.contains_key(&source) {
+            continue;
+        }
+        let Some(style) = styles.get(&source) else {
+            continue;
+        };
+        let width = geometry.content_rect.size.width;
+        let height = geometry.content_rect.size.height;
+        if !width.is_finite() || !height.is_finite() || width < 0.0 || height < 0.0 {
+            continue;
+        }
+        if let Some(container) = container_geometry_for_style(style, width, height) {
+            containers.insert(source, container);
+        }
+    }
+    ContainerContext {
+        containers,
+        viewport_width: layout.fragments.viewport.width,
+        viewport_height: layout.fragments.viewport.height,
+        root_font_size: root_font_size(dom, styles),
+    }
+}
+
+/// The root element's used font size, which is the `rem` base for a container
+/// query's lengths.
+// A computed font size is a small finite length; the f32 style pipeline stores
+// it in f32 deliberately, so the narrow cast is the representation boundary.
+#[allow(clippy::cast_possible_truncation)]
+fn root_font_size(dom: &Dom, styles: &BTreeMap<NodeId, ComputedStyle>) -> f32 {
+    let root = dom.children(dom.document()).and_then(|children| {
+        children
+            .iter()
+            .copied()
+            .find(|node| matches!(dom.node(*node).map(Node::kind), Some(NodeKind::Element(_))))
+    });
+    root.and_then(|node| styles.get(&node))
+        .and_then(|style| style.get("font-size"))
+        .and_then(|value| resolve_length_expr(value.css_text(), &LengthContext::default()).ok())
+        .map_or(16.0, |value| value as f32)
+}
+
 fn render_dom(
     dom: &Dom,
     quirks_mode: QuirksMode,
@@ -1394,7 +1472,7 @@ fn render_dom(
     // §4.3 ("in quirks mode, class and ID selectors match ASCII
     // case-insensitively"), and the user-agent sheet below is built
     // differently for a quirks document.
-    let match_context = MatchContext {
+    let mut match_context = MatchContext {
         viewport_width: Some(options.layout.viewport.width),
         viewport_height: Some(options.layout.viewport.height),
         quirks_mode: is_quirks_mode(quirks_mode),
@@ -1434,6 +1512,45 @@ fn render_dom(
     );
     if stage_timing {
         eprintln!("stage cascade-match: {:?}", cascade_match_started.elapsed());
+    }
+    // Container queries need geometry that only layout can produce, and the
+    // styles that geometry then changes can move the containers. Feed the
+    // measured content boxes back until they stop changing, bounded so a page
+    // whose containers chase each other cannot spin. No `@container` rule means
+    // no extra layout at all.
+    if sheets_use_container_queries(&cascade_inputs) {
+        let container_started = std::time::Instant::now();
+        for _ in 0..3 {
+            let formatting = build_formatting_tree(dom, &styles, &options.formatting_limits);
+            let layout = layout_formatting_tree_with_images(
+                dom,
+                &formatting,
+                &styles,
+                options.layout,
+                backends.text_measurer,
+                environment.images,
+            );
+            let measured = build_container_context(dom, &styles, &layout);
+            let measured = std::sync::Arc::new(measured);
+            if measured == match_context.containers {
+                break;
+            }
+            match_context.containers = measured;
+            styles = compute_document_styles_with_hints(
+                dom,
+                &cascade_inputs,
+                &PropertyRegistry::standard_baseline(),
+                &options.computation_limits,
+                &match_context,
+                &|node| presentational_hint_declarations(dom, node, quirks_mode),
+            );
+        }
+        if stage_timing {
+            eprintln!(
+                "stage container-feedback: {:?}",
+                container_started.elapsed()
+            );
+        }
     }
     let transitions_started = std::time::Instant::now();
     let transition_events = sample_transitions(&mut styles, transitions, options.animation_time);
@@ -1657,7 +1774,7 @@ fn apply_animations(
     context: &MatchContext,
     time: f32,
 ) {
-    let mut keyframes = BTreeMap::new();
+    let mut rules = Vec::new();
     for input in sheets {
         for rule in &input.sheet.keyframes {
             if rule
@@ -1665,13 +1782,19 @@ fn apply_animations(
                 .iter()
                 .all(|query| media_query_list_matches(query, context))
             {
-                keyframes.insert(rule.name.clone(), rule.clone());
+                rules.push(rule.clone());
             }
         }
     }
-    if keyframes.is_empty() {
+    if rules.is_empty() {
         return;
     }
+    // CSS Conditional 5 §5.4: `@keyframes` is a global, name-defining at-rule,
+    // so a container query around it does not gate its visibility.
+    let keyframes: BTreeMap<_, _> = rules
+        .into_iter()
+        .map(|rule| (rule.name.clone(), rule))
+        .collect();
     for style in styles.values_mut() {
         for (property, value) in sample_animations(&keyframes, style, time) {
             style.set_animated_property(&property, &value);
@@ -2394,7 +2517,7 @@ mod tests {
         let document = Document::parse(
             "<!doctype html><link rel=stylesheet href=theme.css>\
              <link rel=stylesheet>\
-             <style media='screen and (hover: hover)'>body { color:red }</style>\
+             <style media='screen and (device-posture: folded)'>body { color:red }</style>\
              <body style='color:blue'></body>",
         );
         let render = document.render_reference(DocumentRenderOptions::default());
@@ -2566,7 +2689,7 @@ mod tests {
              <style media=print>#print { color: red }</style>\
              <style media='not print'>#not-print { color: red }</style>\
              <style media=speech>#speech { color: red }</style>\
-             <style media='screen and (hover: hover)'>#query { color: red }</style>\
+             <style media='screen and (device-posture: folded)'>#query { color: red }</style>\
              <style type=text/plain>#wrong-type { color: red }</style>\
              <p id=screen></p><p id=print></p><p id=not-print></p><p id=speech></p>\
              <p id=query></p><p id=wrong-type></p>",
@@ -2712,7 +2835,7 @@ mod tests {
             "<!doctype html><head>\
              <link rel=stylesheet href=print.css media=print>\
              <link rel=stylesheet href=plain.css type=text/plain>\
-             <link rel=stylesheet href=query.css media='screen and (hover: hover)'>\
+             <link rel=stylesheet href=query.css media='screen and (device-posture: folded)'>\
              <link rel=stylesheet href=screen.css media='only screen'>\
              <link rel=stylesheet href='http://['>\
              <link rel=stylesheet href=wide.css media='(min-width: 100000px)'>\
@@ -3647,6 +3770,36 @@ mod tests {
         assert_eq!(
             at(1.0).raster.surface.pixel(10, 10),
             Some(Color::rgb(255, 0, 0))
+        );
+    }
+
+    /// CSS Conditional 5 §5.4: a `@keyframes` rule written inside a container
+    /// query is a global, name-defining at-rule and is not constrained by the
+    /// condition, so it animates even when no container matches it.
+    #[test]
+    fn keyframes_inside_a_container_query_are_not_gated_by_it() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0; background: white }
+               #box { width: 20px; height: 20px; background: red;
+                      animation: fade 1s linear forwards }
+               @container (width > 100000px) {
+                 @keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+               }
+               </style><div id="box"></div>"#,
+        );
+        let half = document
+            .render_reference(DocumentRenderOptions {
+                animation_time: 0.5,
+                ..DocumentRenderOptions::default()
+            })
+            .raster
+            .surface
+            .pixel(10, 10)
+            .expect("mid-animation pixel");
+        assert!(
+            half.red == 255 && (120..=135).contains(&half.green),
+            "the hoisted keyframes animate regardless of the container query: {half:?}"
         );
     }
 
