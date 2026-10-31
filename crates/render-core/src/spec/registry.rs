@@ -448,8 +448,14 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 modern function, carry forward to analogous components during \
                 interpolation, and behave as zero elsewhere. Out-of-gamut results use \
                 the §14.2.2 Binary Search + Local MINDE mapping at the sRGB device \
-                boundary rather than per-channel clipping. Relative color syntax, \
-                `light-dark()`, `device-cmyk()` and `contrast-color()` remain absent.",
+                boundary rather than per-channel clipping. Relative color syntax is \
+                implemented for rgb(), hsl(), hwb(), lab(), lch(), oklab(), oklch() \
+                and color(), including channel keywords, `none`, alpha inheritance \
+                and basic `calc()` arithmetic. `light-dark()` selects its arm from \
+                the used paint color scheme; the scheme is currently supplied by \
+                `SystemPalette.dark` because there is no `color-scheme` property \
+                yet. `alpha()`, `device-cmyk()` and `contrast-color()` remain \
+                absent.",
         dependencies: &[CSS_TYPED_VALUES],
         tests: TYPED_VALUE_TESTS,
     },

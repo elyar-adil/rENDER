@@ -1460,8 +1460,11 @@ Verified against known values: `color-mix(in oklab, red, blue)` = `rgb(140, 83, 
 `oklch(0.7 0.1 120)` = `rgb(150, 168, 94)`, `color-mix(in srgb-linear, red, blue)` =
 `rgb(188, 0, 188)`, and `color-mix(in srgb, red, transparent)` = `rgba(255, 0, 0, 0.5)`.
 
-**Remaining colour gaps:** relative colour syntax (`rgb(from ...)`), `light-dark()`,
-`device-cmyk()` and `contrast-color()` are not implemented; colour animations still
+**Remaining colour gaps:** relative color syntax and `light-dark()` are implemented,
+including channel keywords, missing components, alpha inheritance and basic `calc()`
+arithmetic; `alpha()`, `device-cmyk()` and `contrast-color()` are not. `light-dark()`
+currently takes its used scheme from `SystemPalette.dark` because the engine has no
+`color-scheme` property or used-scheme propagation yet. Colour animations still
 interpolate sRGB channels rather than using the specified interpolation space and
 premultiplication; and the engine flattens every computed colour to its 8-bit sRGB paint
 contract, so the §14.2.2 gamut mapping happens at the sRGB boundary rather than in a

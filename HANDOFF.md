@@ -1,3 +1,74 @@
+# 交接文档 (2026-11-01, 续五十五) — CSS Color 5 相对颜色语法与 `light-dark()`
+
+这一轮补齐 CSS Color 5 §4 的相对颜色语法（`rgb(from ...)`、`hsl(from ...)`、
+`hwb(from ...)`、`lab/lch/oklab/oklch(from ...)`、`color(from ...)`）以及 §7 的
+`light-dark()`。没有站点特判。
+
+## 相对颜色
+
+- `render-css/src/color.rs` 新增：
+  - `RelativeFunction`（Rgb/Hsl/Hwb/Lab/Lch/Oklab/Oklch/Color(space)）；
+  - `RelativeChannel`（`none`、number、percentage、channel keyword、`calc()`）；
+  - `CalcExpr`（数字、百分比、关键字、`+ - * /`、括号、一元负号）；
+  - `RelativeColor` 与 `RelativeAlpha::Inherit`（省略 alpha 时继承 origin alpha）；
+  - `LightDarkColor`。
+- 解析：
+  - 各颜色函数在参数开头识别 `from <color>`；legacy comma 语法不能与相对语法混用。
+  - `rgb()` 的 channel number 按 0..255，`hsl/hwb` 的 s/l/w/b 按 0..100，
+    `lab` L 0..100、a/b 100%=125，`lch` C 100%=150，`oklab` L 0..1、a/b 100%=0.4，
+    `oklch` C 100%=0.4，`color()` 各分量按 0..1。内部统一折算到 `SpaceColor` 单位。
+  - 支持 `alpha` 关键字、`none`、直接 number/percentage，以及 `calc()`；
+    hue 位置拒绝 percentage（包括 `calc(50%)`）。
+  - origin 为绝对色时在解析期求值；含 `currentcolor`/系统色/`light-dark()` 时保留
+    `CssColor::Relative`，绘制期由 `SystemPalette::resolve_space` 递归求值。
+  - origin 与目标空间不同时按 §13.3 做 missing carry-forward，并对转换后的
+    powerless 分量置 missing。
+- 数值测试覆盖：恒等相对色、直接通道、`calc(r + 10)`、规范中的 grayscale 公式
+  `r*.3+g*.59+b*.11`、HSL 补色、oklch 恒等、`color()` 跨空间、alpha、missing hue。
+
+## `light-dark()`
+
+- `CssColor::LightDark` 保留两支；绘制期 `SystemPalette.dark` 选择 light/dark。
+- 默认 light；当前没有 `color-scheme` 属性/used-scheme 传播，嵌入方可在
+  `DisplayListBuilderOptions.palette.dark` 上设置。
+- 单测：properties 解析两支；paint 层分别以 light/dark palette 解析出
+  `rgb(1,2,3)` / `rgb(4,5,6)`，并验证 `rgb(from currentcolor ...)`。
+
+## 验证
+
+```
+cargo test -p render-css --lib                    300 passed, 0 failed
+cargo test -p render-core --lib                   454 passed, 0 failed
+cargo test -p render-browser -- --test-threads=1  206 + 114 + 2 passed, 0 failed
+cargo test -p render-layout --lib                 322 passed, 1 ignored
+cargo test -p render-dom --lib                    78 passed, 0 failed
+cargo test --workspace                            all crates passed, 0 failed
+cargo fmt --all --check                           clean
+cargo clippy -p render-css -p render-core -p render-browser -p render-dom -p render-layout \
+  --all-targets -- -D warnings                    clean
+python tools/check_site_neutrality.py             0 blocking, 26 advisory
+```
+
+## 已知缺口
+
+- `alpha()` 独立相对 alpha 函数、`device-cmyk()`、`contrast-color()` 未实现。
+- `light-dark()` 尚未接入 `color-scheme` 属性；当前只有 `SystemPalette.dark` 入口。
+- `calc()` 仅实现基础四则、括号、number/percentage/关键字；`min()`/`max()`/
+  `clamp()` 等数学函数尚未接入相对颜色。
+- Canvas `fillStyle` 仍通过 `resolve_absolute`，因此 `light-dark()` 和上下文相关
+  相对色在 canvas 上会被拒绝；CSS transition 也尚未沿相对色插值。
+- 颜色动画仍按 sRGB 通道插值；绘制仍统一落到 8-bit sRGB。
+
+## 下一步
+
+- `alpha()` 与 `light-dark()` 的 `color-scheme` 接线。
+- `device-cmyk()` / `contrast-color()`。
+- `calc()` 中的 `min/max/clamp` 与百分比语义。
+- 相对色在 canvas、transition、gradient 中的完整解析。
+- 继续处理 `contain: style`、`scroll-state()`、`@starting-style`、`@font-face` 描述符。
+
+---
+
 # 交接文档 (2026-11-01, 续五十四) — Shadow DOM 样式/slotchange、Color `none` 与感知色域映射、截图唤醒
 
 这一轮并行推进四块现代浏览器能力：shadow-tree 样式与 `slotchange`、CSS Color 4 的
