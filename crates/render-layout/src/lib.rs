@@ -36,7 +36,8 @@ pub use scrollport::{ClipMode, ScrollportGeometry};
 pub use solver::{
     ImageResourceProvider, LayoutDiagnostic, LayoutDiagnosticCode, LayoutLimits, LayoutOptions,
     LayoutOutput, SimpleTextMeasurer, TextMeasure, TextMeasurer, TextSpacing, TextStyle,
-    is_word_separator, layout_formatting_tree, layout_formatting_tree_with_images,
+    is_word_separator, layout_formatting_tree, layout_formatting_tree_with_containers,
+    layout_formatting_tree_with_images, layout_formatting_tree_with_images_and_containers,
 };
 pub use sticky::{StickyConstraint, StickyInsets, sticky_offset, sticky_view_rect};
 pub use tree::{

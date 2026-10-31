@@ -63,7 +63,9 @@ project's history. `@property` registrations validate their syntax and initial v
 registered unset value before `var()` substitution. Media Queries 4/5 conditions support
 `not`/`and`/`or`, nested parentheses and range syntax, plus the common environment features.
 `@container` size queries parse at stylesheet time and evaluate against measured ancestor content
-boxes, with a bounded three-pass style/layout feedback loop.
+boxes, with a bounded three-pass style/layout feedback loop. Container-relative units
+(`cqw`/`cqh`/`cqi`/`cqb`/`cqmin`/`cqmax`) resolve per axis against the nearest eligible ancestor,
+falling back to the small viewport size when none exists.
 
 **Table layout.** 47 tests. CSS 2.1 §17 including border-collapse conflict resolution, row groups,
 `colspan`/`rowspan`, `caption-side`, fixed layout, intrinsic widths. This is the single most-used

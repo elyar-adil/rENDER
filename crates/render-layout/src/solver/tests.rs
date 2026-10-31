@@ -6,6 +6,7 @@ use crate::geometry::EdgeSizes;
 use crate::tree::{FormattingLimits, build_formatting_tree};
 use render_css::cascade::{CascadeInput, CascadeOrigin};
 use render_css::computed::{ComputationLimits, PropertyRegistry, compute_document_styles};
+use render_css::container::{ContainerContext, ContainerGeometry, ContainerType};
 use render_css::selector::{MatchContext, parse_selector_list, select_all};
 use render_css::stylesheet::parse_stylesheet;
 use render_dom::NodeId;
@@ -13,7 +14,8 @@ use render_html::parse_document;
 
 use crate::solver::{
     ImageResourceProvider, LayoutDiagnosticCode, LayoutLimits, LayoutOptions, SimpleTextMeasurer,
-    layout_formatting_tree, layout_formatting_tree_with_images,
+    layout_formatting_tree, layout_formatting_tree_with_containers,
+    layout_formatting_tree_with_images,
 };
 
 pub(super) fn pipeline(
@@ -2341,5 +2343,102 @@ fn an_in_flow_wrapper_does_not_float_above_later_siblings_because_of_a_fixed_des
     assert!(
         first < second,
         "in-flow siblings stay in source order; only their positioned descendants join a later layer"
+    );
+}
+
+#[test]
+fn container_units_use_their_own_axis_container_and_the_viewport_fallback() {
+    let output = parse_document(
+        "<!doctype html><body>\
+           <div id='outer'><div id='inner'><div id='child'></div></div></div>\
+           <div id='orphan'></div>\
+         </body>",
+    );
+    let sheet = parse_stylesheet(
+        "html, body, div { display: block; margin: 0; padding: 0 }\
+         #outer { width: 400px; height: 300px }\
+         #inner { width: 200px; height: 100px }\
+         #child { width: 10cqmin; height: 10cqmax }\
+         #orphan { width: 10cqw; height: 10cqh }",
+    );
+    let styles = compute_document_styles(
+        &output.dom,
+        &[CascadeInput {
+            sheet: &sheet,
+            origin: CascadeOrigin::Author,
+        }],
+        &PropertyRegistry::standard_baseline(),
+        &ComputationLimits::default(),
+        &MatchContext::default(),
+    );
+    let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+    let outer = find(&output.dom, "#outer");
+    let inner = find(&output.dom, "#inner");
+    let child = find(&output.dom, "#child");
+    let orphan = find(&output.dom, "#orphan");
+    let containers = ContainerContext {
+        containers: [
+            (
+                outer,
+                ContainerGeometry {
+                    container_type: ContainerType::Size,
+                    names: Vec::new(),
+                    width: 400.0,
+                    height: 300.0,
+                    font_size: 16.0,
+                },
+            ),
+            (
+                inner,
+                ContainerGeometry {
+                    container_type: ContainerType::InlineSize,
+                    names: Vec::new(),
+                    width: 200.0,
+                    height: 100.0,
+                    font_size: 16.0,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        viewport_width: 800.0,
+        viewport_height: 600.0,
+        root_font_size: 16.0,
+    };
+    let layout = layout_formatting_tree_with_containers(
+        &output.dom,
+        &formatting,
+        &styles,
+        LayoutOptions {
+            viewport: crate::PhysicalSize {
+                width: 800.0,
+                height: 600.0,
+            },
+            ..LayoutOptions::default()
+        },
+        &SimpleTextMeasurer,
+        Some(&containers),
+    );
+
+    let size = |node| match &fragment(&layout, node).kind {
+        FragmentKind::Box(geometry) => geometry.content_rect.size,
+        FragmentKind::Text(_) => panic!("expected a box for the queried element"),
+    };
+    // `cqmin` reads the inline-size container (200px) and `cqmax` the outer
+    // size container (300px): the two axes may come from different ancestors.
+    assert_eq!(
+        size(child),
+        crate::PhysicalSize {
+            width: 20.0,
+            height: 30.0
+        }
+    );
+    // With no eligible ancestor, §5.1 falls back to the small viewport size.
+    assert_eq!(
+        size(orphan),
+        crate::PhysicalSize {
+            width: 80.0,
+            height: 60.0
+        }
     );
 }

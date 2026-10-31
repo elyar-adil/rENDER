@@ -20,6 +20,7 @@ use render_dom::{Dom, NodeId};
 
 use crate::computed::ComputedStyle;
 use crate::length::{LengthContext, resolve_length_expr};
+use crate::properties::LengthResolutionContext;
 
 /// What a `container-type` declaration establishes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -347,6 +348,23 @@ pub struct ContainerGeometry {
     pub font_size: f32,
 }
 
+/// The four container-relative lengths the `cq*` units resolve against
+/// (CSS Containment 3 §5.1).
+///
+/// Each axis selects its own query container: `cqi` reads the nearest ancestor
+/// that accepts inline-axis size queries and `cqb` the nearest ancestor that
+/// accepts block-axis size queries. Those can be different elements, which is
+/// why `cqmin`/`cqmax` cannot be written as a single lookup. A `None` side is
+/// answered by the corresponding small viewport dimension, exactly as
+/// [`LengthResolutionContext`] already treats an absent container size.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ContainerSizes {
+    pub width: Option<f32>,
+    pub height: Option<f32>,
+    pub inline_size: Option<f32>,
+    pub block_size: Option<f32>,
+}
+
 /// Every query container the current layout produced, plus the environment a
 /// query's `vw`/`rem` units resolve against.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -394,6 +412,104 @@ impl ContainerContext {
     pub fn matches(&self, dom: &Dom, element: NodeId, condition: &ContainerCondition) -> bool {
         self.query_container(dom, element, condition)
             .is_some_and(|geometry| condition.query.matches(geometry, self))
+    }
+
+    /// The nearest ancestor that accepts size queries on one axis.
+    ///
+    /// The element itself is never its own query container (CSS Containment 3
+    /// §4.1): `container-type` on a box establishes containment for its
+    /// descendants, and a `cqw` in that box's own `width` would otherwise
+    /// depend on itself.
+    fn nearest_for_axis(
+        &self,
+        dom: &Dom,
+        element: NodeId,
+        inline: bool,
+    ) -> Option<&ContainerGeometry> {
+        let mut current = dom.parent(element);
+        while let Some(node) = current {
+            if let Some(geometry) = self.containers.get(&node) {
+                let eligible = if inline {
+                    geometry.container_type.supports_inline_axis()
+                } else {
+                    geometry.container_type.supports_block_axis()
+                };
+                if eligible {
+                    return Some(geometry);
+                }
+            }
+            current = dom.parent(node);
+        }
+        None
+    }
+
+    /// The `cqw`/`cqh`/`cqi`/`cqb` bases for `element`.
+    ///
+    /// CSS Containment 3 §5.1 gives each axis its own nearest eligible
+    /// container. `width` and `height` are the physical axes, so which logical
+    /// axis answers them depends on the writing mode: in a vertical writing
+    /// mode a `cqw` reads the block-axis container's width. `cqmin`/`cqmax`
+    /// combine `inline_size` and `block_size`, which may therefore come from
+    /// two different containers.
+    #[must_use]
+    pub fn sizes_for_element(
+        &self,
+        dom: &Dom,
+        element: NodeId,
+        inline_axis_is_horizontal: bool,
+    ) -> ContainerSizes {
+        let inline = self.nearest_for_axis(dom, element, true);
+        let block = self.nearest_for_axis(dom, element, false);
+        let inline_size = inline.map(|geometry| {
+            if inline_axis_is_horizontal {
+                geometry.width
+            } else {
+                geometry.height
+            }
+        });
+        let block_size = block.map(|geometry| {
+            if inline_axis_is_horizontal {
+                geometry.height
+            } else {
+                geometry.width
+            }
+        });
+        let (width, height) = if inline_axis_is_horizontal {
+            (
+                inline.map(|geometry| geometry.width),
+                block.map(|geometry| geometry.height),
+            )
+        } else {
+            (
+                block.map(|geometry| geometry.width),
+                inline.map(|geometry| geometry.height),
+            )
+        };
+        ContainerSizes {
+            width,
+            height,
+            inline_size,
+            block_size,
+        }
+    }
+
+    /// Fill the container-relative fields of a length resolution context.
+    ///
+    /// Leaves fields `None` when no eligible ancestor exists, so the resolver
+    /// falls back to the small viewport size as §5.1 requires.
+    pub fn apply_container_sizes(
+        &self,
+        dom: &Dom,
+        element: NodeId,
+        inline_axis_is_horizontal: bool,
+        context: &mut LengthResolutionContext,
+    ) {
+        let sizes = self.sizes_for_element(dom, element, inline_axis_is_horizontal);
+        context.container_width = sizes.width;
+        context.container_height = sizes.height;
+        context.container_inline_size = sizes.inline_size;
+        context.container_block_size = sizes.block_size;
+        context.inline_axis_is_horizontal = inline_axis_is_horizontal;
     }
 }
 
@@ -1178,5 +1294,159 @@ mod tests {
             Some((SizeFeatureName::Width, Some(Comparison::Ge)))
         );
         assert_eq!(Orientation::Landscape, Orientation::Landscape);
+    }
+
+    fn unit_tree() -> (render_dom::Dom, render_dom::NodeId, render_dom::NodeId) {
+        let mut dom = render_dom::Dom::new();
+        let outer = dom.create_element("div");
+        let inner = dom.create_element("div");
+        let target = dom.create_element("div");
+        dom.append_child(dom.document(), outer)
+            .expect("outer attaches to the document");
+        dom.append_child(outer, inner)
+            .expect("inner attaches to outer");
+        dom.append_child(inner, target)
+            .expect("target attaches to inner");
+        (dom, outer, target)
+    }
+
+    fn size_container(width: f32, height: f32) -> ContainerGeometry {
+        ContainerGeometry {
+            container_type: ContainerType::Size,
+            names: Vec::new(),
+            width,
+            height,
+            font_size: 16.0,
+        }
+    }
+
+    fn inline_container(width: f32, height: f32) -> ContainerGeometry {
+        ContainerGeometry {
+            container_type: ContainerType::InlineSize,
+            names: Vec::new(),
+            width,
+            height,
+            font_size: 16.0,
+        }
+    }
+
+    #[test]
+    fn container_units_pick_each_axis_nearest_eligible_ancestor() {
+        let (dom, outer, target) = unit_tree();
+        let inner = dom.parent(target).expect("target has a parent");
+        let context = super::ContainerContext {
+            containers: [
+                (outer, size_container(600.0, 400.0)),
+                (inner, inline_container(500.0, 200.0)),
+            ]
+            .into_iter()
+            .collect(),
+            viewport_width: 1_000.0,
+            viewport_height: 800.0,
+            root_font_size: 16.0,
+        };
+
+        // The inner inline-size container answers the inline axis; the outer
+        // size container is the nearest one that accepts the block axis.
+        assert_eq!(
+            context.sizes_for_element(&dom, target, true),
+            super::ContainerSizes {
+                width: Some(500.0),
+                height: Some(400.0),
+                inline_size: Some(500.0),
+                block_size: Some(400.0),
+            }
+        );
+
+        // A container's own `cq*` units read its ancestors, never itself.
+        assert_eq!(
+            context.sizes_for_element(&dom, inner, true),
+            super::ContainerSizes {
+                width: Some(600.0),
+                height: Some(400.0),
+                inline_size: Some(600.0),
+                block_size: Some(400.0),
+            }
+        );
+
+        // The outermost container has no eligible ancestor; the resolver's
+        // small-viewport fallback applies.
+        assert_eq!(
+            context.sizes_for_element(&dom, outer, true),
+            super::ContainerSizes::default()
+        );
+    }
+
+    #[test]
+    fn physical_container_units_follow_the_writing_mode() {
+        let (dom, outer, target) = unit_tree();
+        let inner = dom.parent(target).expect("target has a parent");
+        let context = super::ContainerContext {
+            containers: [
+                (outer, size_container(600.0, 400.0)),
+                (inner, inline_container(500.0, 200.0)),
+            ]
+            .into_iter()
+            .collect(),
+            viewport_width: 1_000.0,
+            viewport_height: 800.0,
+            root_font_size: 16.0,
+        };
+
+        // In a vertical writing mode inline is the physical height, so `cqw`
+        // reads the block-axis container's width and `cqh` the inline
+        // container's height.
+        assert_eq!(
+            context.sizes_for_element(&dom, target, false),
+            super::ContainerSizes {
+                width: Some(600.0),
+                height: Some(200.0),
+                inline_size: Some(200.0),
+                block_size: Some(600.0),
+            }
+        );
+    }
+
+    #[test]
+    fn container_sizes_fill_the_length_resolution_context() {
+        use crate::properties::{Length, LengthPercentage, LengthResolutionContext, LengthUnit};
+
+        let (dom, outer, target) = unit_tree();
+        let inner = dom.parent(target).expect("target has a parent");
+        let context = super::ContainerContext {
+            containers: [
+                (outer, size_container(600.0, 400.0)),
+                (inner, inline_container(500.0, 200.0)),
+            ]
+            .into_iter()
+            .collect(),
+            ..super::ContainerContext::default()
+        };
+        let mut resolution = LengthResolutionContext {
+            // The fallback when no eligible container exists is the small
+            // viewport size, so make it distinguishable from both containers.
+            small_viewport_width: Some(1_000.0),
+            small_viewport_height: Some(800.0),
+            ..LengthResolutionContext::default()
+        };
+        context.apply_container_sizes(&dom, target, true, &mut resolution);
+
+        let resolve = |resolution: &LengthResolutionContext, unit| {
+            LengthPercentage::Length(Length { value: 10.0, unit })
+                .resolve(resolution)
+                .expect("container lengths resolve")
+        };
+        assert_eq!(resolve(&resolution, LengthUnit::Cqw), 50.0);
+        assert_eq!(resolve(&resolution, LengthUnit::Cqh), 40.0);
+        assert_eq!(resolve(&resolution, LengthUnit::Cqi), 50.0);
+        assert_eq!(resolve(&resolution, LengthUnit::Cqb), 40.0);
+        assert_eq!(resolve(&resolution, LengthUnit::Cqmin), 40.0);
+        assert_eq!(resolve(&resolution, LengthUnit::Cqmax), 50.0);
+
+        // No eligible ancestor: every axis falls back to the small viewport.
+        context.apply_container_sizes(&dom, outer, true, &mut resolution);
+        assert_eq!(resolution.container_width, None);
+        assert_eq!(resolve(&resolution, LengthUnit::Cqw), 100.0);
+        assert_eq!(resolve(&resolution, LengthUnit::Cqh), 80.0);
     }
 }

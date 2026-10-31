@@ -434,7 +434,7 @@ impl Solver<'_> {
             .and_then(|style| style.get("font-size"))
             .and_then(|value| parse_font_size(value.css_text(), self.options.root_font_size))
             .unwrap_or(self.options.root_font_size);
-        let context = LengthResolutionContext {
+        let mut context = LengthResolutionContext {
             percentage_basis: Some(basis),
             font_size,
             root_font_size: self.options.root_font_size,
@@ -444,6 +444,9 @@ impl Solver<'_> {
             viewport_height: self.options.viewport.height,
             ..LengthResolutionContext::default()
         };
+        if let (Some(containers), Some(node)) = (self.containers, node) {
+            containers.apply_container_sizes(self.dom, node, true, &mut context);
+        }
         match value.resolve(&context) {
             Ok(value) => value,
             Err(error) => {

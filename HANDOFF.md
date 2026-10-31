@@ -1,3 +1,66 @@
+# 交接文档 (2026-10-31, 续四十七) — 容器查询单位 `cqw`/`cqh`/`cqi`/`cqb`/`cqmin`/`cqmax`
+
+这一轮把 CSS Containment 3 §5.1 的容器相对单位接到真实布局与绘制路径，没有站点特判。
+
+## 轴选择
+
+- `render-css::container` 新增 `ContainerSizes` 与 `ContainerContext::sizes_for_element`：
+  每个轴各自找最近的、在该轴接受尺寸查询的祖先。`cqw`/`cqi` 走 inline 轴，
+  `cqh`/`cqb` 走 block 轴；`cqmin`/`cqmax` 因此可以组合两个不同容器的尺寸。
+- 元素自身永远不是自己的查询容器；查找从 `dom.parent(element)` 开始。
+- 物理轴随书写模式映射：水平书写 `cqw` 取 inline 容器的 width、`cqh` 取 block 容器的
+  height；垂直书写反过来。当前引擎只产生水平书写模式，但接口已按两轴建模。
+- 没有合格祖先时字段保持 `None`，既有 `LengthResolutionContext` 回退到 small viewport
+  尺寸，与 §5.1 一致。
+
+## 接入点
+
+- `render-layout`：新增
+  `layout_formatting_tree_with_containers` 与
+  `layout_formatting_tree_with_images_and_containers`；`Solver` 持有可选
+  `&ContainerContext`，`resolve_length` 在构造 `LengthResolutionContext` 后按元素填充四个
+  容器尺寸字段。`None` 上下文保持旧行为（视口回退）。
+- `render-core` 绘制：新增
+  `build_display_list_with_images_clip_paths_and_containers`，`Builder` 持有 DOM 与容器
+  上下文；`transform`/`transform-origin` 的 `translate()`、`cq*` 长度在绘制期与布局期用同
+  一套轴选择逻辑解析。旧函数签名保持不变并委托到新函数（容器参数为 `None`）。
+- `render_dom` 反馈条件从“存在 `@container` 规则”扩展为“存在容器规则或任何声明使用
+  `cq*` 单位”，并扫描内联 `style` 属性；检测按“数字/小数点之后 + 标识符边界”匹配，
+  避免把 `--cqw-theme`、URL 等误判为使用容器单位。
+- 容器反馈循环与最终布局都传入上一轮测量的 `ContainerContext`；绘制使用同一份上下文，
+  因此布局宽度与 transform 位移不会各算一套。
+
+## 测试
+
+- `render-css`：轴选择、不同祖先组合 `cqmin`/`cqmax`、自身排除、垂直书写映射、
+  `LengthResolutionContext` 填充与 small viewport 回退。
+- `render-layout`：`cqmin`/`cqmax` 跨两个容器解析，以及无容器元素回退视口。
+- `render-core`：完整样式→布局→容器测量→再布局链路，以及 `transform: translate(10cqw,
+  10cqh)` 在绘制列表中的数值；单位检测的正反例。
+
+## 验证
+
+```
+cargo test -p render-css --lib                     248 passed, 0 failed
+cargo test -p render-layout --lib                  313 passed, 1 ignored
+cargo test -p render-core --lib                    435 passed, 0 failed
+                                                   （临时关闭 avif-native；仅 AVIF 解码测试因特性关闭失败）
+cargo fmt --all --check                            clean
+cargo clippy -p render-css -p render-layout -p render-core --all-targets -D warnings  clean
+python tools/check_site_neutrality.py              0 blocking, 26 advisory
+```
+
+本机全工作区门禁仍被 `dav1d-sys v0.8.3` 的 `pkg-config` 缺失阻塞，与本轮代码无关。
+
+## 下一步
+
+- `container-type` 的尺寸包含语义：`size`/`inline-size` 建立独立格式化上下文并对相应轴
+  施加 size containment（内容不参与容器自身尺寸）。
+- `style()` / `scroll-state()` 容器查询。
+- 继续现代 CSS：`@scope`、`@starting-style`、`@font-face` 描述符、`color-mix()` 等。
+
+---
+
 # 交接文档 (2026-10-31, 续四十六) — 现代 CSS：`@property`、媒体查询重写、`@container`
 
 这一轮补齐三类现代 CSS 能力，全部按规范正向实现，没有站点特判、没有静默丢弃。

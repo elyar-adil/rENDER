@@ -18,6 +18,7 @@ pub use display_list::{
     ReferenceTextShaper, StackingContext, TextDecoration, TextDecorationLine, TextDecorationStyle,
     TextShadowPaint, TextShaper, Transform2D, build_display_list, build_display_list_with_images,
     build_display_list_with_images_and_clip_paths,
+    build_display_list_with_images_clip_paths_and_containers,
 };
 pub use raster::{
     CpuRasterOutput, CpuRasterizer, GlyphMask, GlyphMaskProvider, NoGlyphMasks,

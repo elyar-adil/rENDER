@@ -2531,7 +2531,9 @@ report it had been given wrong in its mechanism while right about its consequenc
   `content-visibility`, `subgrid`, `::marker`, `forced-colors`.
   `@container` size queries have since landed (see HANDOFF 续四十六): named/unnamed ancestors,
   inline/block axis eligibility, range syntax, orientation/aspect-ratio, and bounded
-  style/layout feedback. `style()` and `scroll-state()` queries are diagnosed as unsupported.
+  style/layout feedback. Container-relative units (`cqw`/`cqh`/`cqi`/`cqb`/`cqmin`/`cqmax`)
+  resolve per axis against the nearest eligible ancestor and fall back to the small viewport.
+  `style()` and `scroll-state()` queries are diagnosed as unsupported.
   Media Queries 4/5 condition syntax and environment features have also landed; print media and
   `@page` remain absent.
 

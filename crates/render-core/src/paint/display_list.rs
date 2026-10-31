@@ -3,13 +3,14 @@
 use std::collections::BTreeMap;
 
 use crate::css::computed::{ComputedStyle, ComputedValue};
+use crate::css::container::ContainerContext;
 use crate::css::length::{LengthContext, resolve_length_expr};
 use crate::css::properties::{
     BorderStyle, CssColor, Display, LengthPercentage, LengthResolutionContext, ObjectFit, Overflow,
     Position, Size, TransformFunction, TransformList, TransformOrigin, TypedPropertyValue,
     Visibility, parse_typed_property,
 };
-use crate::dom::{DomRevision, NodeId};
+use crate::dom::{Dom, DomRevision, NodeId};
 use crate::image::ImageResources;
 use crate::image::svg::parse_css_path_contours;
 use crate::layout::{
@@ -758,6 +759,39 @@ pub fn build_display_list_with_images_and_clip_paths(
     images: Option<&ImageResources>,
     clip_path_resolver: Option<&dyn ClipPathResolver>,
 ) -> DisplayListBuildOutput {
+    build_display_list_with_images_clip_paths_and_containers(
+        None,
+        fragments,
+        formatting,
+        styles,
+        options,
+        shaper,
+        images,
+        clip_path_resolver,
+        None,
+    )
+}
+
+/// Build a display list with the DOM and query-container geometry available.
+///
+/// The DOM and container context are only needed by container-relative units
+/// in `transform`/`transform-origin`; every other length on the display list
+/// was resolved by layout. Keeping them optional preserves the embedder API:
+/// a caller with no container units passes `None` and gets the small-viewport
+/// fallback CSS Containment 3 §5.1 defines.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn build_display_list_with_images_clip_paths_and_containers(
+    dom: Option<&Dom>,
+    fragments: &FragmentTree,
+    formatting: &FormattingTree,
+    styles: &BTreeMap<NodeId, ComputedStyle>,
+    options: DisplayListBuilderOptions,
+    shaper: &dyn TextShaper,
+    images: Option<&ImageResources>,
+    clip_path_resolver: Option<&dyn ClipPathResolver>,
+    containers: Option<&ContainerContext>,
+) -> DisplayListBuildOutput {
     let parents = if images.is_some() {
         let mut parents = BTreeMap::<FragmentId, FragmentId>::new();
         for fragment in fragments.iter() {
@@ -781,6 +815,7 @@ pub fn build_display_list_with_images_and_clip_paths(
         }
     }
     let mut builder = Builder {
+        dom,
         fragments,
         formatting,
         styles,
@@ -788,6 +823,7 @@ pub fn build_display_list_with_images_and_clip_paths(
         shaper,
         images,
         clip_path_resolver,
+        containers,
         parents,
         formatting_parents,
         items: Vec::new(),
@@ -811,6 +847,7 @@ pub fn build_display_list_with_images_and_clip_paths(
 }
 
 struct Builder<'a> {
+    dom: Option<&'a Dom>,
     fragments: &'a FragmentTree,
     formatting: &'a FormattingTree,
     styles: &'a BTreeMap<NodeId, ComputedStyle>,
@@ -818,6 +855,9 @@ struct Builder<'a> {
     shaper: &'a dyn TextShaper,
     images: Option<&'a ImageResources>,
     clip_path_resolver: Option<&'a dyn ClipPathResolver>,
+    /// Query-container geometry from the layout that produced `fragments`,
+    /// used only for container-relative transform lengths.
+    containers: Option<&'a ContainerContext>,
     parents: BTreeMap<FragmentId, FragmentId>,
     formatting_parents: Vec<Option<FormattingNodeId>>,
     items: Vec<DisplayItem>,
@@ -867,7 +907,7 @@ impl<'a> Builder<'a> {
             FragmentKind::Box(geometry) => geometry.border_rect(),
             FragmentKind::Text(_) => fragment.rect,
         };
-        let transform = self.fragment_transform(style, border_rect);
+        let transform = self.fragment_transform(style, border_rect, fragment.source);
         let hidden = matches!(
             style.and_then(|style| style.typed("visibility")),
             Some(TypedPropertyValue::Visibility(
@@ -1078,6 +1118,7 @@ impl<'a> Builder<'a> {
         &self,
         style: Option<&ComputedStyle>,
         border_rect: PhysicalRect,
+        node: Option<NodeId>,
     ) -> Option<Transform2D> {
         let style = style?;
         let Some(TypedPropertyValue::Transform(TransformList(functions))) =
@@ -1090,7 +1131,7 @@ impl<'a> Builder<'a> {
         }
         let font_size = style_font_size(style);
         let viewport = self.fragments.viewport;
-        // The first function is the outermost mapping: M = F1 �?F2 �?�?�?Fn.
+        // The first function is the outermost mapping: M = F1 × F2 × … × Fn.
         let mut matrix = Transform2D::default();
         for function in functions {
             matrix = matrix.then(&transform_function_matrix(
@@ -1098,10 +1139,13 @@ impl<'a> Builder<'a> {
                 border_rect,
                 font_size,
                 viewport,
+                node,
+                self.dom,
+                self.containers,
             ));
         }
         // transform-origin re-bases the list around a fixed point:
-        // T(origin) �?M �?T(−origin). It defaults to 50% 50% of the box.
+        // T(origin) × M × T(−origin). It defaults to 50% 50% of the box.
         let origin = style
             .typed("transform-origin")
             .and_then(|value| match value {
@@ -1112,10 +1156,24 @@ impl<'a> Builder<'a> {
                 LengthPercentage::Percentage(0.5),
                 LengthPercentage::Percentage(0.5),
             ));
-        let origin_x =
-            resolve_transform_length(&origin.0, border_rect.size.width, font_size, viewport);
-        let origin_y =
-            resolve_transform_length(&origin.1, border_rect.size.height, font_size, viewport);
+        let origin_x = resolve_transform_length(
+            &origin.0,
+            border_rect.size.width,
+            font_size,
+            viewport,
+            node,
+            self.dom,
+            self.containers,
+        );
+        let origin_y = resolve_transform_length(
+            &origin.1,
+            border_rect.size.height,
+            font_size,
+            viewport,
+            node,
+            self.dom,
+            self.containers,
+        );
         let to_origin = Transform2D {
             translate_x: origin_x,
             translate_y: origin_y,
@@ -3937,6 +3995,9 @@ fn transform_function_matrix(
     border_rect: PhysicalRect,
     font_size: f32,
     viewport: PhysicalSize,
+    node: Option<NodeId>,
+    dom: Option<&Dom>,
+    containers: Option<&ContainerContext>,
 ) -> Transform2D {
     match function {
         TransformFunction::Matrix([a, b, c, d, e, f]) => Transform2D {
@@ -3948,8 +4009,24 @@ fn transform_function_matrix(
             translate_y: *f,
         },
         TransformFunction::Translate(x, y) => Transform2D {
-            translate_x: resolve_transform_length(x, border_rect.size.width, font_size, viewport),
-            translate_y: resolve_transform_length(y, border_rect.size.height, font_size, viewport),
+            translate_x: resolve_transform_length(
+                x,
+                border_rect.size.width,
+                font_size,
+                viewport,
+                node,
+                dom,
+                containers,
+            ),
+            translate_y: resolve_transform_length(
+                y,
+                border_rect.size.height,
+                font_size,
+                viewport,
+                node,
+                dom,
+                containers,
+            ),
             ..Transform2D::default()
         },
         TransformFunction::Scale(x, y) => Transform2D {
@@ -3984,14 +4061,20 @@ fn resolve_transform_length(
     basis: f32,
     font_size: f32,
     viewport: PhysicalSize,
+    node: Option<NodeId>,
+    dom: Option<&Dom>,
+    containers: Option<&ContainerContext>,
 ) -> f32 {
-    let context = LengthResolutionContext {
+    let mut context = LengthResolutionContext {
         percentage_basis: Some(basis),
         font_size,
         viewport_width: viewport.width,
         viewport_height: viewport.height,
         ..LengthResolutionContext::default()
     };
+    if let (Some(containers), Some(dom), Some(node)) = (containers, dom, node) {
+        containers.apply_container_sizes(dom, node, true, &mut context);
+    }
     value.resolve(&context).unwrap_or(0.0)
 }
 

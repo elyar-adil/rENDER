@@ -17,6 +17,7 @@ use crate::tree::FormattingNodeId;
 use crate::tree::FormattingNodeKind;
 use crate::tree::FormattingTree;
 use render_css::computed::ComputedStyle;
+use render_css::container::ContainerContext;
 use render_css::properties::Float;
 use render_css::properties::Overflow;
 use render_css::properties::Position;
@@ -309,7 +310,7 @@ pub fn layout_formatting_tree(
     options: LayoutOptions,
     text_measurer: &dyn TextMeasurer,
 ) -> LayoutOutput {
-    run_reference_layout(dom, formatting, styles, options, text_measurer, None)
+    run_reference_layout(dom, formatting, styles, options, text_measurer, None, None)
 }
 
 /// Layout with decoded replaced-element resources available for intrinsic sizing.
@@ -325,6 +326,58 @@ pub fn layout_formatting_tree_with_images<I: ImageResourceProvider>(
     text_measurer: &dyn TextMeasurer,
     images: Option<&I>,
 ) -> LayoutOutput {
+    layout_formatting_tree_with_images_and_containers(
+        dom,
+        formatting,
+        styles,
+        options,
+        text_measurer,
+        images,
+        None,
+    )
+}
+
+/// Layout with the query-container geometry measured by a previous pass.
+///
+/// This is the image-free form of
+/// [`layout_formatting_tree_with_images_and_containers`].
+#[must_use]
+pub fn layout_formatting_tree_with_containers(
+    dom: &Dom,
+    formatting: &FormattingTree,
+    styles: &BTreeMap<NodeId, ComputedStyle>,
+    options: LayoutOptions,
+    text_measurer: &dyn TextMeasurer,
+    containers: Option<&ContainerContext>,
+) -> LayoutOutput {
+    run_reference_layout(
+        dom,
+        formatting,
+        styles,
+        options,
+        text_measurer,
+        None,
+        containers,
+    )
+}
+
+/// Layout with decoded replaced-element resources and the query-container
+/// geometry measured by a previous pass.
+///
+/// `containers` is what container-relative units (`cqw`, `cqh`, `cqi`, `cqb`,
+/// `cqmin`, `cqmax`) resolve against. A `None` context resolves them against
+/// the small viewport, which is CSS Containment 3 §5.1's fallback when no
+/// eligible ancestor container exists.
+#[must_use]
+pub fn layout_formatting_tree_with_images_and_containers<I: ImageResourceProvider>(
+    dom: &Dom,
+    formatting: &FormattingTree,
+    styles: &BTreeMap<NodeId, ComputedStyle>,
+    options: LayoutOptions,
+    text_measurer: &dyn TextMeasurer,
+    images: Option<&I>,
+    containers: Option<&ContainerContext>,
+) -> LayoutOutput {
     run_reference_layout(
         dom,
         formatting,
@@ -332,6 +385,7 @@ pub fn layout_formatting_tree_with_images<I: ImageResourceProvider>(
         options,
         text_measurer,
         images.map(|provider| provider as &dyn ImageResourceProvider),
+        containers,
     )
 }
 
@@ -342,6 +396,7 @@ fn run_reference_layout(
     options: LayoutOptions,
     text_measurer: &dyn TextMeasurer,
     images: Option<&dyn ImageResourceProvider>,
+    containers: Option<&ContainerContext>,
 ) -> LayoutOutput {
     let mut solver = Solver {
         dom,
@@ -350,6 +405,7 @@ fn run_reference_layout(
         options,
         text_measurer,
         images,
+        containers,
         fragments: Vec::new(),
         diagnostics: Vec::new(),
         inline_characters: 0,
@@ -428,6 +484,10 @@ struct Solver<'a> {
     options: LayoutOptions,
     text_measurer: &'a dyn TextMeasurer,
     images: Option<&'a dyn ImageResourceProvider>,
+    /// Query containers measured by a previous style/layout pass. Container
+    /// units resolve against these; `None` is the first pass, where §5.1's
+    /// small-viewport fallback applies.
+    containers: Option<&'a ContainerContext>,
     fragments: Vec<Fragment>,
     diagnostics: Vec<LayoutDiagnostic>,
     inline_characters: usize,

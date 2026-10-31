@@ -33,12 +33,13 @@ use crate::image::{ImageLimits, ImageResources};
 use crate::layout::{
     FormattingDiagnostic, FormattingLimits, FormattingTree, FragmentKind, LayoutDiagnostic,
     LayoutOptions, LayoutOutput, PhysicalPoint, PhysicalRect, TextMeasurer, build_formatting_tree,
-    layout_formatting_tree_with_images,
+    layout_formatting_tree_with_images_and_containers,
 };
 use crate::paint::{
     ClipFillRule, ClipPathResolver, ClipShape, Color, CpuRasterOutput, CpuRasterizer,
     DisplayListBuildOutput, DisplayListBuilderOptions, DisplayListDiagnostic, GlyphMaskProvider,
-    RasterDiagnostic, SystemPalette, TextShaper, build_display_list_with_images_and_clip_paths,
+    RasterDiagnostic, SystemPalette, TextShaper,
+    build_display_list_with_images_clip_paths_and_containers,
 };
 
 /// The HTML user-agent style sheet.
@@ -1367,20 +1368,75 @@ fn dump_fragment_tree(
     walk(dom, styles, fragments, fragments.root(), 0, &mut printed);
 }
 
-/// Whether any stylesheet in `sources` has a rule or keyframes definition
-/// gated by `@container`.
+/// Whether any stylesheet in `sources` has a rule gated by `@container`, or a
+/// declaration that uses a container-relative unit.
 ///
-/// The feedback pass costs an extra layout, so it only runs when a container
-/// condition could change a style. A page with `@container` but no matching
-/// block is therefore not charged for it.
-fn sheets_use_container_queries(sources: &[CascadeInput<'_>]) -> bool {
-    sources.iter().any(|source| {
-        source
-            .sheet
-            .rules
-            .iter()
-            .any(|rule| !rule.container.is_empty())
-    })
+/// Both features need geometry that only layout can produce. The feedback pass
+/// costs an extra layout, so it only runs when a container condition or a
+/// `cq*` unit could change the result. A page with `@container` but no
+/// matching block, or a mention inside a comment-like string, is merely
+/// charged one extra pass; missing a real use would be incorrect.
+fn sheets_use_container_features(sources: &[CascadeInput<'_>], dom: &Dom) -> bool {
+    let uses_in_sheet = |sheet: &StyleSheet| {
+        sheet.rules.iter().any(|rule| {
+            !rule.container.is_empty()
+                || rule
+                    .declarations
+                    .iter()
+                    .any(|declaration| text_mentions_container_unit(&declaration.value))
+        }) || sheet.keyframes.iter().any(|keyframes| {
+            keyframes.keyframes.iter().any(|frame| {
+                frame
+                    .declarations
+                    .iter()
+                    .any(|declaration| text_mentions_container_unit(&declaration.value))
+            })
+        })
+    };
+    sources.iter().any(|source| uses_in_sheet(source.sheet))
+        || dom
+            .nodes()
+            // An inline `style` attribute is not part of any stylesheet the
+            // cascade inputs carry, but it can use a `cq*` unit just as well.
+            .any(|(node, _)| {
+                matches!(dom.node(node).map(Node::kind), Some(NodeKind::Element(_)))
+                    && dom
+                        .attribute(node, "style")
+                        .ok()
+                        .flatten()
+                        .is_some_and(text_mentions_container_unit)
+            })
+}
+
+/// Whether `text` contains a `<length>` with one of the container-relative
+/// units of CSS Containment 3 §5.1.
+///
+/// The token is matched only where a dimension can start (after a digit or a
+/// decimal point) and only when its final character is not another identifier
+/// character. That keeps `--cqw-theme` or the letters inside a URL from
+/// forcing an extra layout while still finding the unit in `calc(50cqw + 1px)`
+/// and `-10CQMAX`.
+fn text_mentions_container_unit(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    ["cqw", "cqh", "cqi", "cqb", "cqmin", "cqmax"]
+        .into_iter()
+        .any(|unit| {
+            let mut searched = 0;
+            while let Some(offset) = lower[searched..].find(unit) {
+                let start = searched + offset;
+                let end = start + unit.len();
+                let before = lower[..start].chars().next_back();
+                let after = lower[end..].chars().next();
+                let starts_dimension = before.is_some_and(|c| c.is_ascii_digit() || c == '.');
+                let continues_identifier =
+                    after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+                if starts_dimension && !continues_identifier {
+                    return true;
+                }
+                searched = end;
+            }
+            false
+        })
 }
 
 /// Measure every `container-type` element from the layout that just ran.
@@ -1513,22 +1569,23 @@ fn render_dom(
     if stage_timing {
         eprintln!("stage cascade-match: {:?}", cascade_match_started.elapsed());
     }
-    // Container queries need geometry that only layout can produce, and the
-    // styles that geometry then changes can move the containers. Feed the
-    // measured content boxes back until they stop changing, bounded so a page
-    // whose containers chase each other cannot spin. No `@container` rule means
-    // no extra layout at all.
-    if sheets_use_container_queries(&cascade_inputs) {
+    // Container queries and container-relative units need geometry that only
+    // layout can produce, and the styles that geometry then changes can move
+    // the containers. Feed the measured content boxes back until they stop
+    // changing, bounded so a page whose containers chase each other cannot
+    // spin. No container feature means no extra layout at all.
+    if sheets_use_container_features(&cascade_inputs, dom) {
         let container_started = std::time::Instant::now();
         for _ in 0..3 {
             let formatting = build_formatting_tree(dom, &styles, &options.formatting_limits);
-            let layout = layout_formatting_tree_with_images(
+            let layout = layout_formatting_tree_with_images_and_containers(
                 dom,
                 &formatting,
                 &styles,
                 options.layout,
                 backends.text_measurer,
                 environment.images,
+                Some(match_context.containers.as_ref()),
             );
             let measured = build_container_context(dom, &styles, &layout);
             let measured = std::sync::Arc::new(measured);
@@ -1581,13 +1638,14 @@ fn render_dom(
     stage_elapsed("inline-svg", &mut stage_mark);
     let formatting = build_formatting_tree(dom, &styles, &options.formatting_limits);
     stage_elapsed("formatting", &mut stage_mark);
-    let layout = layout_formatting_tree_with_images(
+    let layout = layout_formatting_tree_with_images_and_containers(
         dom,
         &formatting,
         &styles,
         options.layout,
         backends.text_measurer,
         images,
+        Some(match_context.containers.as_ref()),
     );
     stage_elapsed("layout", &mut stage_mark);
     if std::env::var_os("RENDER_DEBUG_FRAGMENT").is_some() && layout.fragments.iter().count() > 20 {
@@ -1598,7 +1656,8 @@ fn render_dom(
         dump_fragment_tree(dom, &styles, &layout.fragments);
     }
     let clip_path_resolver = DomClipPathResolver::new(dom);
-    let display = build_display_list_with_images_and_clip_paths(
+    let display = build_display_list_with_images_clip_paths_and_containers(
+        Some(dom),
         &layout.fragments,
         &formatting,
         &styles,
@@ -1606,6 +1665,7 @@ fn render_dom(
         backends.text_shaper,
         images,
         Some(&clip_path_resolver),
+        Some(match_context.containers.as_ref()),
     );
     stage_elapsed("display", &mut stage_mark);
     let paint_viewport_origin = layout.fragments.clamp_scroll_offset(options.scroll_offset);
@@ -3801,6 +3861,105 @@ mod tests {
             half.red == 255 && (120..=135).contains(&half.green),
             "the hoisted keyframes animate regardless of the container query: {half:?}"
         );
+    }
+
+    /// CSS Containment 3 §5.1: container-relative units resolve against the
+    /// nearest ancestor that accepts queries on their axis. `cqmin` and
+    /// `cqmax` may therefore combine two different containers, and an element
+    /// with no eligible ancestor falls back to the small viewport size.
+    #[test]
+    fn container_units_resolve_after_the_container_feedback_pass() {
+        let document = Document::parse(
+            r"<!doctype html><style>
+               html, body { margin: 0 }
+               #outer { container-type: size; width: 400px; height: 300px }
+               #inner { container-type: inline-size; width: 200px; height: 100px }
+               #child { width: 10cqmin; height: 10cqmax }
+               #orphan { width: 10cqw; height: 10cqh }
+               </style>
+               <div id=outer><div id=inner><div id=child></div></div></div>
+               <div id=orphan></div>",
+        );
+        let render = document.render_reference(DocumentRenderOptions::default());
+        let size = |selector| {
+            let node = target_id(document.dom(), selector);
+            render
+                .layout
+                .fragments
+                .iter()
+                .find_map(
+                    |fragment| match (&fragment.kind, fragment.source == Some(node)) {
+                        (FragmentKind::Box(geometry), true) => Some(geometry.content_rect.size),
+                        _ => None,
+                    },
+                )
+                .expect("a box fragment for the queried element")
+        };
+
+        // The inline axis comes from `#inner` (200px) and the block axis from
+        // `#outer` (300px), so the two units disagree by design.
+        assert_eq!(
+            size("#child"),
+            PhysicalSize {
+                width: 20.0,
+                height: 30.0
+            }
+        );
+        let viewport = render.layout.fragments.viewport;
+        assert_eq!(
+            size("#orphan"),
+            PhysicalSize {
+                width: viewport.width / 10.0,
+                height: viewport.height / 10.0
+            },
+            "no eligible ancestor falls back to the small viewport size"
+        );
+    }
+
+    /// Paint re-resolves `transform` and `transform-origin` lengths from the
+    /// computed style, so it must receive the same measured containers layout
+    /// used. `10cqw` is 40px of the 400px container; `10cqh` has no
+    /// block-axis-eligible ancestor and falls back to the viewport.
+    #[test]
+    fn container_units_resolve_in_painted_transforms() {
+        let document = Document::parse(
+            r"<!doctype html><style>
+               html, body { margin: 0 }
+               #outer { container-type: inline-size; width: 400px; height: 100px }
+               #moved { width: 10px; height: 10px; transform: translate(10cqw, 10cqh) }
+               </style><div id=outer><div id=moved></div></div>",
+        );
+        let render = document.render_reference(DocumentRenderOptions::default());
+        let moved = target_id(document.dom(), "#moved");
+        let transform = render
+            .display
+            .list
+            .items()
+            .iter()
+            .find_map(|item| match (&item.command, item.source == Some(moved)) {
+                (DisplayCommand::PushStackingContext(context), true)
+                    if context.reason == crate::paint::CompositingReason::Transform =>
+                {
+                    Some(context.transform)
+                }
+                _ => None,
+            })
+            .expect("the transformed box opens a stacking context");
+        assert!((transform.translate_x - 40.0).abs() < f32::EPSILON);
+        assert!(
+            (transform.translate_y - render.layout.fragments.viewport.height / 10.0).abs()
+                < f32::EPSILON
+        );
+    }
+
+    #[test]
+    fn container_unit_detection_reads_dimensions_not_identifiers() {
+        assert!(super::text_mentions_container_unit("width: 50cqw"));
+        assert!(super::text_mentions_container_unit("calc(50cqw + 1px)"));
+        assert!(super::text_mentions_container_unit("-10CQMAX"));
+        assert!(!super::text_mentions_container_unit("--cqw-theme: red"));
+        assert!(!super::text_mentions_container_unit("cqw"));
+        assert!(!super::text_mentions_container_unit("url(cqw.png)"));
     }
 
     /// Animated layout and transform values reach the typed computed style, so
