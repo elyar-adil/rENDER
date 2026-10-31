@@ -634,7 +634,9 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
         notes: "Block, inline, inline-block, list-item and flex formatting, floats, \
                 absolute, relative and sticky positioning, multi-column layout with \
                 `column-count`, `column-width`, `column-gap`, `column-fill` and \
-                `column-span: all`, margin collapsing, the intrinsic and min/max sizing \
+                `column-span: all`, CSS 2.1 §8.3 vertical margin collapsing \
+                (adjoining siblings, parent-first/last, empty-block \
+                collapse-through, positive and negative margins), the intrinsic and min/max sizing \
                 passes and text shaping through a measurer seam are implemented. A sticky \
                 box is displaced when it is painted and hit tested, against the page's \
                 scroll offset; a sticky box inside a nested scroll container uses that \

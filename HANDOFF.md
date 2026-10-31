@@ -1,3 +1,85 @@
+# 交接文档 (2026-11-01, 续五十七) — CSS 2.1 §8.3 垂直 margin collapsing
+
+这一轮补齐 block formatting context 的垂直 margin collapsing：相邻兄弟、父/首子、
+父/末子，以及空块的 collapse-through。没有站点特判。
+
+## 模型
+
+- `BlockResult` 从“margin box 高度”改为显式的四项：
+  - `margin_top`：与首个子盒折叠后的有效上 margin；
+  - `border_height`：border box 高度；
+  - `margin_bottom`：与最后一个子盒折叠后的有效下 margin；
+  - `collapses_through`：空盒的整条 strut 穿透。
+- `MarginStrut` 保存 `{ positive, negative }`，合并规则为
+  `max(positive) + min(negative)`，因此正负 margin 混合时仍满足结合律，
+  与 CSS 2.1 §8.3.1 的算法一致。
+- 父级布局用 `cursor_y`（上一个 border box 底边）加 `pending` strut 定位下一个
+  border 顶边；不再把两个 margin 直接相加。
+- `layout_block_with_containing_height` 新增 `collapse_children` 参数。以下传
+  `false`，即不与其子盒折叠：
+  - flex item（Flexbox §4）、grid item（Grid §6）、table cell；
+  - float、absolutely/fixed positioned box；
+  - 多列容器、`flow-root`、`overflow` 非 visible、containment/`container-type`
+    形成的 BFC。
+- 父/首子折叠：父无上 border/padding 且不是 BFC 时，父 border 顶边移到
+  `collapse(parent margin-top, first-child effective top margin)`；首子的上 margin
+  不再在父 content 内重复。父/末子规则对应检查 height auto、min-height 0、
+  无下 border/padding。
+- 空块穿透：无垂直 border/padding、height auto 或 0、min-height 0、无 in-flow
+  内容（或所有子块都穿透）时，自己的上下 margin 与前后兄弟、后代的 strut 合并成
+  一条，只出现一次。
+- 清除（clearance）会重置 pending group，并使父/首子折叠失效。
+- 修正了一个随之暴露的定位问题：父/首子折叠会移动 in-flow 子树，但绝对定位后代
+  若其 containing block 在被移动子树之外，就必须保持文档位置。
+  `translate_fragment_subtree_for_margin` 会跳过这类 out-of-flow 后代；包含块在
+  子树内时仍然一起移动。
+
+## 测试
+
+新增 `crates/render-layout/src/solver/collapse_tests.rs`，13 个精确 border-box
+几何断言：
+
+- 正 margin 相邻兄弟取最大值；
+- 正负混合 `max(+) + min(-)`，含两个负 margin；
+- 父/首子折叠、border 阻断；
+- 父/末子折叠、padding 阻断；
+- 空块穿透、border 阻断、嵌套空块；
+- 父上 margin 跨过空的第一个子盒；
+- BFC root 不与子盒折叠；
+- 负的父/末子 margin 缩短后续间距；
+- 父/首子折叠后绝对定位后代跟随 containing block。
+
+已有 `sticky_tests` 的滚动容器用例也验证了 body 首子 margin 折叠后的 20px 偏移。
+
+## 验证
+
+```
+cargo test -p render-layout --lib                 335 passed, 1 ignored
+cargo test -p render-core --lib                   455 passed, 0 failed
+cargo test --workspace                            all crates passed, 0 failed
+cargo fmt --all --check                           clean
+cargo clippy -p render-layout -p render-core \
+  --all-targets -- -D warnings                    clean
+python tools/check_site_neutrality.py             0 blocking, 26 advisory
+```
+
+## 已知缺口
+
+- `content-visibility` 的布局包含与 margin 折叠边界尚未实现。
+- RTL / 垂直书写模式的 margin collapsing 未实现（当前只覆盖水平书写模式）。
+- `@page` 的 margin 折叠与分页未实现。
+- clearance 与浮动组合只覆盖到“清除后不折叠”的常规路径；更细的
+  `clear` + 负 margin 交互仍可补测试。
+- flex/grid item 之间按规范不折叠，这部分是明确排除而非缺口。
+
+## 下一步
+
+- `content-visibility` 与 `contain: style` 的隔离。
+- RTL / `direction` 的布局消费。
+- 继续补 bidi、compositor、宽色域合成等大缺口。
+
+---
+
 # 交接文档 (2026-11-01, 续五十六) — CSS Color 5 `alpha()` 与 used color scheme 接线
 
 这一轮补齐 CSS Color 5 §4.10 的 `alpha()`，并把 `light-dark()` 从“只有一个

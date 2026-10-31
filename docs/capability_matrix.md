@@ -17,7 +17,7 @@ says so. `docs/visual_fidelity_gaps.md` is the working register; this file is th
 | `render-js` unit tests | 1,116 passed, 0 failed | 2026-10-22 |
 | `render-css` unit tests | 302 passed, 0 failed | 2026-11-01 |
 | `render-core` unit tests | 455 passed, 0 failed | 2026-11-01 |
-| `render-layout` unit tests | 322 passed, 1 ignored | 2026-11-01 |
+| `render-layout` unit tests | 335 passed, 1 ignored | 2026-11-01 |
 | `render-browser` unit tests | 206 passed, 0 failed | 2026-11-01 |
 | `render-browser` app tests (binary) | 114 passed, 0 failed | 2026-11-01 |
 | `render-html` unit tests | 149 passed, 0 failed | 2026-10-22 |
@@ -97,6 +97,17 @@ descendants, and a stacking context; `paint` also clips to the padding box. `str
 expand at parse time and serialization follows grammar order. `style` containment is parsed but its
 counter/quote isolation is not yet observable. `scroll-state()` queries and `style()` shorthand
 features remain gaps.
+
+**Block flow and vertical margin collapsing.** CSS 2.1 §8.3 is implemented for the block
+formatting context: adjoining sibling margins, a parent's first/last child margins, and an
+empty block's own top/bottom margins all collapse through a `MarginStrut` that keeps the
+largest positive and most negative components (`max(+) + min(-)`). Parent-first and
+parent-last collapsing move the parent's border edge and remove the escaped margin from its
+content height; an empty block passes its whole strut to the next sibling. Floats, absolutely
+positioned boxes, flex and grid items, table cells, BFC roots (`overflow`, containment,
+`container-type`, `flow-root`, multi-column) and clearance are excluded from the collapse,
+and positioned descendants whose containing block lies outside a shifted subtree keep their
+document position. Evidence: 13 exact-geometry tests in `solver/collapse_tests.rs`.
 
 **Table layout.** 47 tests. CSS 2.1 §17 including border-collapse conflict resolution, row groups,
 `colspan`/`rowspan`, `caption-side`, fixed layout, intrinsic widths. This is the single most-used

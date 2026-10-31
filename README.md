@@ -20,7 +20,7 @@ capabilities that are parsed but never consumed, or computed and then dropped.
 | HTML parsing and encoding | 55% | Tokenization, tree construction, recovery, and common Chinese encodings work; full HTML5 edge cases remain. |
 | DOM, events, and forms | 40% | Tree mutation, selectors, common events, inputs, and GET submission work; broad Web APIs and event options remain. |
 | CSS syntax, selectors, and cascade | 45% | Common selectors, specificity, inheritance, custom properties, and major value grammars work; full CSS syntax and cascade coverage remain. |
-| Layout | 48% | Block/inline, floats, positioned boxes, flex, grid, table, overflow, and common sizing work; intrinsic and multi-axis edge cases remain. |
+| Layout | 48% | Block/inline, floats, positioned boxes, flex, grid, table, overflow, common sizing, and CSS 2.1 §8.3 vertical margin collapsing work; intrinsic and multi-axis edge cases remain. |
 | Painting and images | 42% | CPU display lists, backgrounds, borders, clipping, opacity, transforms, and common raster images work; stacking, replaced-element, and SVG coverage remain. |
 | JavaScript runtime | 15% | Common script execution, DOM mutation, promises, timers, and events work; the latest full test262 run passed 90,765/103,199 variants (88.0%), recorded 2026-10-22 in release. |
 | Network and resources | 50% | TLS HTTP(S), redirects, cookies, gzip/Brotli, CSS, scripts, images, and common lazy-image sources work; bounded workers and a conservative private HTTP cache are active; CORS covers simple and preflighted requests without credentials, while credentialed CORS and service workers remain. |
