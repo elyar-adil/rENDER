@@ -1,3 +1,87 @@
+# 交接文档 (2026-10-31, 续五十三) — CSS Cascade 6 `@scope`
+
+这一轮实现 CSS Cascade 6 §3.5 的 `@scope`：作用域根/限制、相对选择器、
+`:scope` 与 `&`、嵌套作用域、作用域内直接声明，以及级联中的 scope proximity。
+没有站点特判。
+
+## 语义与接入
+
+- `StyleSheet::scope_owner` 记录样式表 owner（`<style>`/`<link>` 元素）。
+  `render-core::document` 在收集内嵌与外部样式表时设置它；`@scope` 无
+  `<scope-start>` 时的根是 owner 的父元素。若父节点不是元素，则依次回退到
+  shadow host 与包含节点树的根。
+- `StyleRule::scopes: Vec<Scope>` 从外到内保存全部 `@scope` 边界。`Scope` 的
+  `start`/`end` 是已解析的 `SelectorList`；`start: None` 表示隐式作用域。
+- 作用域内样式规则（§3.5.3）：
+  - 不以组合符开头且不含 `:scope`/`&` 的选择器加隐式 `:where(:scope)` 后代前缀，
+    因此作用域 prelude 不贡献特异性。
+  - 以组合符开头的相对选择器同样锚定在 `:where(:scope)`。
+  - 显式 `:scope` 保持 `(0,1,0)`；`&` 等价于 `:where(:scope)`，特异性为零。
+  - 嵌套 `@scope` 的 `<scope-start>` 相对外层作用域根；`<scope-end>` 与作用域内
+    规则相对自己的根（§3.5.5）。
+- 嵌套作用域：内层根的候选必须落在外层作用域的祖先链内，并同时满足外层的
+  scoping limit；scope proximity 只按最内层根到 subject 的世代距离计算。
+- `@scope` 的块是 `<block-contents>`（§3.5.6）：连续的直接声明各自成为一条
+  `:where(:scope)` 规则，匹配作用域根且特异性为零；声明与子规则可交错。
+- 级联（§3.1）：`Priority` 在 specificity 之后、order of appearance 之前加入
+  `proximity`。距离越近优先级越高；未作用域规则视为无限距离。
+- `<scope-start>`/`<scope-end>` 不支持伪元素（§3.5.2），且选择器列表是
+  unforgiving 的；非法 prelude 丢弃整个块并报告原因。
+- `at_rules` 将 `scope` 移入 `EVALUATED_AT_RULES`，`@supports at-rule(@scope)`
+  与解析器/级联不再互相矛盾。
+- 顺带修正选择器匹配：`:is()`/`:where()`/`:not()`/`:has()` 与
+  `:nth-child(… of …)` 的参数列表按元素匹配，不再继承外层伪元素上下文；
+  这修复了 `:is(.host) p::before` 一类此前无法匹配的选择器。
+
+## 测试
+
+- 解析：相对选择器前缀、`:scope`/`&` 特异性、限制选择器、嵌套作用域、隐式
+  prelude、直接声明分段与顺序、非法/伪元素 prelude 诊断、`@scope` 内
+  `@keyframes` 不受作用域影响。
+- 级联：根自身在作用域内、limit 子树被排除、proximity 打破特异性平局、
+  特异性优先于 proximity、已作用域规则胜过同特异性未作用域规则、隐式 owner
+  根、嵌套作用域互相约束、spec §3.5.5 的 `:scope` prelude 示例、生成内容
+  伪元素在作用域内可命中、直接声明零特异性。
+- 文档层：`<style>` 的 owner 被写入 `scope_owner`，隐式 `@scope` 在
+  `render_reference` 的实际 computed color 上生效。
+
+## 验证
+
+```
+cargo test -p render-css --lib                     285 passed, 0 failed
+cargo test -p render-layout --lib                  322 passed, 1 ignored
+cargo test -p render-core --lib                    442 passed, 1 failed
+                                                   （临时关闭 avif-native；失败仅为 AVIF 解码测试）
+cargo fmt --all --check                            clean
+cargo clippy -p render-css -p render-layout -p render-core --all-targets -D warnings  clean
+python tools/check_site_neutrality.py              0 blocking, 26 advisory
+```
+
+本机全工作区门禁仍被 `dav1d-sys v0.8.3` 的 `pkg-config` 缺失阻塞，与本轮代码无关。
+
+## 已知缺口
+
+- `@import ... scope(...)` 尚未接入；目前只支持规则块形式的 `@scope`。
+- shadow root 内的样式表仍未收集（既有缺口）；收集后 `scope_owner` 已能表达
+  shadow 树的隐式根回退。
+- `<scope-start>`/`<scope-end>` 按 §3.5.2 拒绝伪元素，因此 `::part()`/`::slotted()`
+  不能作为作用域根或限制；这是规范行为，不是未实现项。
+- 语句形式 `@scope ...;`（无块）走通用语句 at-rule 路径，诊断沿用既有的
+  “已求值”措辞（与 `@media;` 相同），不是本轮新增的静默丢弃。
+- 作用域解析为每个候选规则构建祖先链并可能克隆 `MatchContext`；功能正确，
+  但大规模 `@scope` 文档仍有优化空间（缓存根/限制或按根索引规则）。
+
+## 下一步
+
+- `contain: style` 的计数器/quotes 隔离。
+- `scroll-state()` 容器查询。
+- `@starting-style`、`@font-face` 描述符。
+- `none` 颜色分量 carry-forward、感知色域映射与相对颜色语法。
+- fixed 包含块与滚动容器偏移联动。
+- shadow-tree 样式表收集，使 `@scope` 的隐式 shadow host 根与 `:host` 一起可观测。
+
+---
+
 # 交接文档 (2026-10-31, 续五十二) — 现代颜色函数、全部预定义色彩空间与 `color-mix()`
 
 这一轮补齐 CSS Color 4 的现代颜色函数与 CSS Color 5 的 `color-mix()`：所有预定义

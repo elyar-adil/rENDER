@@ -54,7 +54,10 @@ is *derived on every read* rather than stored, so the entire class of staleness 
 The last correction here was the sixth agent to overturn a spec claim I wrote into a work order.
 
 **CSS cascade and selectors.** Specificity, inheritance, the cascade origins, presentational hints
-at the correct origin, CSS Nesting, `@supports` evaluated against a three-state oracle. CSS Color 4
+at the correct origin, CSS Nesting, `@supports` evaluated against a three-state oracle. CSS Cascade 6
+`@scope` is evaluated: explicit and implicit scoping roots, scoping limits, relative preludes with
+zero-specificity `:where(:scope)` anchoring, `:scope` and `&`, nested scopes, declarations directly
+in `@scope`, and scope proximity between specificity and order of appearance. CSS Color 4
 is implemented through a single conversion layer: `hsl()`/`hsla()`/`hwb()`, `lab()`/`lch()`,
 `oklab()`/`oklch()`, `color()` in every predefined space (sRGB, linear sRGB, Display P3, A98 RGB,
 ProPhoto RGB, Rec. 2020, XYZ D50/D65), and `color-mix()` in those spaces with premultiplied alpha

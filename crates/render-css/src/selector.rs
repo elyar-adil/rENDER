@@ -1,5 +1,6 @@
 //! Selectors Level 3/4 parsing, specificity, and DOM matching.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
@@ -92,6 +93,19 @@ impl SelectorList {
             .max()
             .unwrap_or_default()
     }
+
+    /// Whether any selector in the list names a pseudo-element, including one
+    /// nested inside a functional pseudo-class such as `:is()`.
+    ///
+    /// CSS Cascade 6 §3.5.2 makes a pseudo-element invalid in `<scope-start>`
+    /// and `<scope-end>`: a pseudo-element is not a node, so it cannot be a
+    /// scoping root or a scoping limit.
+    #[must_use]
+    pub fn has_any_pseudo_element(&self) -> bool {
+        self.selectors
+            .iter()
+            .any(ComplexSelector::has_any_pseudo_element)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,6 +125,14 @@ impl ComplexSelector {
                 element.argument.is_none() && element.name.eq_ignore_ascii_case(pseudo)
             })
         })
+    }
+
+    /// Whether this selector names a pseudo-element anywhere in its compounds,
+    /// including inside a functional pseudo-class.
+    fn has_any_pseudo_element(&self) -> bool {
+        self.compounds
+            .iter()
+            .any(CompoundSelector::has_any_pseudo_element)
     }
 
     #[must_use]
@@ -240,6 +262,14 @@ struct PseudoElementSelector {
 }
 
 impl CompoundSelector {
+    fn has_any_pseudo_element(&self) -> bool {
+        self.pseudo_element.is_some()
+            || self.simple.iter().any(|simple| match simple {
+                SimpleSelector::Pseudo(pseudo) => pseudo.has_any_pseudo_element(),
+                _ => false,
+            })
+    }
+
     fn specificity(&self) -> Specificity {
         let mut result = if self
             .type_selector
@@ -349,6 +379,20 @@ enum PseudoClass {
 }
 
 impl PseudoClass {
+    fn has_any_pseudo_element(&self) -> bool {
+        match self {
+            Self::Is(list) | Self::Where(list) | Self::Not(list) => list.has_any_pseudo_element(),
+            Self::Has(relative) => relative
+                .iter()
+                .any(|selector| selector.selector.has_any_pseudo_element()),
+            Self::NthChild(expression) | Self::NthLastChild(expression) => expression
+                .of
+                .as_ref()
+                .is_some_and(SelectorList::has_any_pseudo_element),
+            _ => false,
+        }
+    }
+
     fn specificity(&self) -> Specificity {
         match self {
             Self::Where(_) => Specificity::default(),
@@ -613,6 +657,110 @@ pub fn parse_nested_selector_list(
         selectors: parse_selector_list(&css)?,
         css,
     })
+}
+
+/// Parse the prelude of a style rule inside an `@scope` block.
+///
+/// CSS Cascade 6 §3.5.3 makes those selectors relative to the scoping root by
+/// default. A selector that does not begin with a combinator and does not name
+/// `:scope` or `&` gets an implicit `:where(:scope)` descendant prefix; the
+/// `:where()` keeps the scoping root at zero specificity, which is what makes
+/// `@scope (#hero) { img {} }` as specific as `:where(#hero) img`. A relative
+/// selector beginning with a combinator gets the same zero-specificity anchor,
+/// and `&` is the scoping root exactly as §3.5.3 defines it.
+pub fn parse_scoped_selector_list(input: &str) -> Result<NestedSelectors, SelectorParseError> {
+    let anchored = ":where(:scope)";
+    if !contains_scope_pseudo(input) || starts_with_combinator(input) {
+        return parse_nested_selector_list(input, anchored);
+    }
+    let mut resolved = String::with_capacity(input.len() + anchored.len());
+    let mut named_nesting = false;
+    let mut source = ParserInput::new(input);
+    let mut parser = CssParser::new(&mut source);
+    substitute_nesting(&mut parser, anchored, &mut resolved, &mut named_nesting)?;
+    Ok(NestedSelectors {
+        selectors: parse_selector_list(&resolved)?,
+        css: resolved,
+    })
+}
+
+/// Parse a `<scope-start>` for an `@scope` rule nested inside a style rule.
+///
+/// CSS Cascade 6 §3.5.5 makes the nested rule's prelude relative to its nesting
+/// context, so the enclosing style rule's selector is the implied anchor. A
+/// selector that names `:scope` suppresses the implied anchor and keeps
+/// `:scope` for the enclosing `@scope` rule, exactly as §3.5.3 treats
+/// `:scope` in a scoped style rule.
+pub fn parse_scope_start_in_style(
+    input: &str,
+    parent: &str,
+) -> Result<SelectorList, SelectorParseError> {
+    if !contains_scope_pseudo(input) || starts_with_combinator(input) {
+        return parse_nested_selector_list(input, parent).map(|nested| nested.selectors);
+    }
+    let nesting = format!(":where({parent})");
+    let mut resolved = String::with_capacity(input.len() + nesting.len());
+    let mut named_nesting = false;
+    let mut source = ParserInput::new(input);
+    let mut parser = CssParser::new(&mut source);
+    substitute_nesting(&mut parser, &nesting, &mut resolved, &mut named_nesting)?;
+    parse_selector_list(&resolved)
+}
+
+/// Whether a selector names `:scope` outside a string or an attribute selector.
+///
+/// A `:scope` inside `[data-x=":scope"]` is an attribute value, not a selector,
+/// so treating it as one would suppress the implicit scoping prefix for a rule
+/// that never asked for it.
+fn contains_scope_pseudo(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    let mut quote = None;
+    let mut bracket_depth = 0_u32;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' {
+                index = index.saturating_add(2);
+                continue;
+            }
+            if byte == delimiter {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'"' | b'\'' => quote = Some(byte),
+            b'[' => bracket_depth = bracket_depth.saturating_add(1),
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                // A comment is not a selector, and `/* :scope */` must not
+                // suppress the implicit scoping prefix.
+                let rest = &bytes[index + 2..];
+                let end = rest
+                    .windows(2)
+                    .position(|window| window == b"*/")
+                    .map_or(bytes.len(), |offset| index + 2 + offset + 2);
+                index = end;
+                continue;
+            }
+            b':' if bracket_depth == 0 => {
+                let rest = &input[index..];
+                let lower = rest.get(..6).unwrap_or(rest);
+                if lower.eq_ignore_ascii_case(":scope") {
+                    let next = rest.as_bytes().get(6).copied();
+                    if next.is_none_or(|byte| !is_name_character(char::from(byte))) {
+                        return true;
+                    }
+                }
+            }
+            b'\\' => index = index.saturating_add(1),
+            _ => {}
+        }
+        index += 1;
+    }
+    false
 }
 
 /// One substitution step, holding no borrow of the parser so the block forms can
@@ -1744,6 +1892,33 @@ fn matches_attribute(data: &ElementData, selector: &AttributeSelector) -> bool {
     }
 }
 
+/// The matching context for a selector list nested inside a functional
+/// pseudo-class such as `:is()`, `:where()`, `:not()`, `:has()` or `:nth-child(… of …)`.
+///
+/// Those lists select ordinary elements, and only the outermost selector's
+/// subject may carry the generated pseudo-element. Inheriting the outer
+/// pseudo-element context is what made `:is(.host) p::before` unable to see the
+/// `p`: the `:is()` argument has no pseudo-element of its own.
+fn element_match_context(context: &MatchContext) -> Cow<'_, MatchContext> {
+    if context.pseudo_element.is_none() {
+        Cow::Borrowed(context)
+    } else {
+        let mut element = context.clone();
+        element.pseudo_element = None;
+        Cow::Owned(element)
+    }
+}
+
+fn matches_nested_selector_list(
+    dom: &Dom,
+    element: NodeId,
+    selectors: &SelectorList,
+    context: &MatchContext,
+) -> bool {
+    let element_context = element_match_context(context);
+    matches_selector_list(dom, element, selectors, &element_context)
+}
+
 #[allow(clippy::too_many_lines)]
 fn matches_pseudo(
     dom: &Dom,
@@ -1795,12 +1970,15 @@ fn matches_pseudo(
         PseudoClass::NthLastOfType(expression) => type_index(dom, element, false)
             .is_some_and(|(index, count)| matches_an_plus_b(expression, count - index + 1)),
         PseudoClass::Is(list) | PseudoClass::Where(list) => {
-            matches_selector_list(dom, element, list, context)
+            matches_nested_selector_list(dom, element, list, context)
         }
-        PseudoClass::Not(list) => !matches_selector_list(dom, element, list, context),
-        PseudoClass::Has(relative) => relative
-            .iter()
-            .any(|selector| matches_relative(dom, element, selector, context)),
+        PseudoClass::Not(list) => !matches_nested_selector_list(dom, element, list, context),
+        PseudoClass::Has(relative) => {
+            let element_context = element_match_context(context);
+            relative
+                .iter()
+                .any(|selector| matches_relative(dom, element, selector, &element_context))
+        }
         PseudoClass::Link | PseudoClass::AnyLink => {
             matches!(data.local_name.as_str(), "a" | "area" | "link")
                 && attribute_value(data, "href").is_some()
@@ -1949,6 +2127,7 @@ fn element_index(
     context: &MatchContext,
 ) -> Option<(i32, i32)> {
     let parent = dom.parent(element)?;
+    let element_context = element_match_context(context);
     let siblings: Vec<_> = dom
         .children(parent)?
         .iter()
@@ -1956,7 +2135,7 @@ fn element_index(
         .filter(|candidate| {
             is_element(dom, *candidate)
                 && filter.is_none_or(|selectors| {
-                    matches_selector_list(dom, *candidate, selectors, context)
+                    matches_selector_list(dom, *candidate, selectors, &element_context)
                 })
         })
         .collect();
@@ -2453,6 +2632,27 @@ mod tests {
             &parse_selector_list("#host .item::after").unwrap(),
             &MatchContext::default()
         ));
+        // The same holds for a structural pseudo-class in an ancestor
+        // compound: its own argument list selects elements, so the generated
+        // pseudo-element must not leak into `:is()`, `:where()`, `:not()`,
+        // `:has()` or `:nth-child(... of ...)`.
+        for selector in [
+            ":is(#host) .item::after",
+            ":where(#host) .item::after",
+            ":not(.missing) .item::after",
+            ":has(p) .item::after",
+            ":nth-child(1 of .item)::after",
+        ] {
+            assert!(
+                matches_selector_list(
+                    &output.dom,
+                    element,
+                    &parse_selector_list(selector).unwrap(),
+                    &after
+                ),
+                "{selector} must match the element's ::after"
+            );
+        }
     }
 
     #[test]

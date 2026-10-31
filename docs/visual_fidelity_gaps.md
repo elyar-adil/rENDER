@@ -2691,3 +2691,42 @@ added when a mutation lands inside a shadow tree, because the invalidation keys 
 mutation target and a shadow root is not in the flat tree. Closing `slotchange` needs a
 slot-change signal queued from assignment changes and delivered at the microtask
 checkpoint, as DOM Â§4.2.2.5 describes.
+
+## CSS Cascade 6 `@scope` - closed for rule blocks, with named limits
+
+`@scope` is now parsed and evaluated rather than reported as unimplemented. A `Scope`
+carries the `<scope-start>` and `<scope-end>` selector lists, and every `StyleRule`
+recorded inside a block carries the full chain of scopes from outermost to innermost.
+Matching checks that the subject is an inclusive descendant of every scoping root and
+not an inclusive descendant of any scoping limit; only the innermost root contributes
+scope proximity, which sorts after specificity and before order of appearance. An
+`@scope` with no start is rooted at the parent of the stylesheet's owner element, which
+`render-core` supplies for both embedded and external sheets.
+
+Scoped preludes follow ¡ì3.5.3: ordinary selectors receive an implicit
+`:where(:scope)` descendant anchor, a leading combinator is relative to the same root,
+`:scope` keeps its `(0,1,0)` specificity, and `&` is `:where(:scope)`. Nested scopes
+parse their start relative to the enclosing root and their end relative to their own
+root. Declarations written directly inside `@scope` become zero-specificity rules that
+match the root, in contiguous runs and in source order.
+
+Pseudo-elements are rejected in either boundary as ¡ì3.5.2 requires, and an invalid or
+unforgiving prelude drops the block with a diagnostic instead of silently applying it.
+While wiring the scope selectors through `matching_specificity`, one pre-existing
+selector bug surfaced and was fixed: functional pseudo-class arguments (`:is()`,
+`:where()`, `:not()`, `:has()`, `:nth-child(¡­ of ¡­)`) were inheriting the outer
+pseudo-element context, so `:is(.host) p::before` could not match; those lists now
+match elements, as only the outermost subject may carry the generated pseudo-element.
+
+Still open on this row: `@import ... scope(...)` is not parsed; shadow-tree stylesheets
+are still not collected, so an implicit `@scope` inside a shadow tree is unreachable;
+and scope resolution builds an ancestor chain per candidate rule, which is correct but
+leaves a caching/indexing opportunity for documents with many scopes.
+
+Evidence: `crates/render-css/src/stylesheet.rs` (`parse_scope_prelude`,
+`parse_scope_body`, `flatten_rules`), `crates/render-css/src/cascade.rs`
+(`resolve_rule_scope`, `element_in_scope`, `Priority::proximity`),
+`crates/render-css/src/selector.rs` (`parse_scoped_selector_list`,
+`element_match_context`), and `crates/render-core/src/document.rs`
+(`scope_owner`). Tests pin both boundaries, nesting, implicit ownership, zero-specificity
+declarations, proximity ordering, and generated content.

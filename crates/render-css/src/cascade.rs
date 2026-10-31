@@ -21,7 +21,9 @@ use super::selector::{
     OverflowBlock, OverflowInline, Pointer, ReducedPreference, Scripting, Specificity, SubjectKey,
     SubjectPseudo, UpdateFrequency, matching_specificity,
 };
-use super::stylesheet::{CssWideKeyword, Declaration, LayerName, StyleSheet, css_wide_keyword};
+use super::stylesheet::{
+    CssWideKeyword, Declaration, LayerName, Scope, StyleRule, StyleSheet, css_wide_keyword,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CascadeOrigin {
@@ -242,6 +244,11 @@ struct Priority {
     origin: u8,
     layer: usize,
     specificity: Specificity,
+    /// CSS Cascade 6 §3.1's scope proximity step. It is compared after
+    /// specificity and before order of appearance, and the declaration with
+    /// the fewest hops from its scoping root wins. `Reverse` makes a smaller
+    /// distance a larger priority; an unscoped rule has infinite hops.
+    proximity: Reverse<u32>,
     source_order: u64,
 }
 
@@ -334,6 +341,218 @@ pub(crate) fn cascade_element_with_origins_indexed(
         inline_declarations,
         lookup,
     )
+}
+
+/// Where a rule's selector is allowed to match (CSS Cascade 6 §3.5.3) and how
+/// close its scoping root is to the element.
+#[derive(Clone, Copy, Debug)]
+enum RuleScope {
+    /// The rule is not inside an `@scope` block.
+    Unscoped,
+    /// The rule is scoped, and the element is in at least one resulting scope.
+    InScope { root: NodeId, proximity: u32 },
+    /// The element is outside every scope the rule defines.
+    OutOfScope,
+}
+
+fn resolve_rule_scope(
+    dom: &Dom,
+    element: NodeId,
+    rule: &StyleRule,
+    owner: Option<NodeId>,
+    context: &MatchContext,
+) -> RuleScope {
+    if rule.scopes.is_empty() {
+        return RuleScope::Unscoped;
+    }
+    // The scope chain is a chain of ancestors: an inner scoping root has to be
+    // inside the outer scope, so every root is on the element's ancestor chain.
+    let chain = ancestor_chain(dom, element);
+    let proximity = resolve_scope_level(
+        dom,
+        element,
+        &rule.scopes,
+        0,
+        None,
+        None,
+        owner,
+        context,
+        &chain,
+    );
+    match proximity {
+        Some(proximity) => {
+            // `resolve_scope_level` finds the innermost root; recover it from
+            // the same reachability that produced the distance.
+            let mut node = element;
+            for _ in 0..proximity {
+                match dom.parent(node) {
+                    Some(parent) => node = parent,
+                    None => return RuleScope::OutOfScope,
+                }
+            }
+            RuleScope::InScope {
+                root: node,
+                proximity,
+            }
+        }
+        None => RuleScope::OutOfScope,
+    }
+}
+
+/// Try every root that can serve `scopes[index]`, returning the smallest
+/// distance between the element and the innermost scoping root.
+///
+/// `outer_root` is the root chosen for the enclosing scope and `outer_index` is
+/// its position in `chain`, so an inner root is only considered at or below it.
+#[allow(clippy::too_many_arguments)]
+fn resolve_scope_level(
+    dom: &Dom,
+    element: NodeId,
+    scopes: &[Scope],
+    index: usize,
+    outer_root: Option<NodeId>,
+    outer_index: Option<usize>,
+    owner: Option<NodeId>,
+    context: &MatchContext,
+    chain: &[NodeId],
+) -> Option<u32> {
+    let scope = scopes.get(index)?;
+    let last = index + 1 == scopes.len();
+    let limit = outer_index.unwrap_or(chain.len().saturating_sub(1));
+    let mut best: Option<u32> = None;
+    // Every outer root is tried because the inner `<scope-start>` is matched
+    // relative to it, so a farther outer root can still make a closer inner
+    // root reachable.
+    for (depth, root) in chain.iter().enumerate().take(limit + 1) {
+        if let Some(start) = scope.start.as_ref() {
+            if !matches_with_scope(dom, *root, start, context, outer_root) {
+                continue;
+            }
+        } else {
+            let implicit = implicit_scope_root(dom, owner);
+            if *root != implicit {
+                continue;
+            }
+            // An implicit root still has to be inside the enclosing scope.
+            if outer_root.is_some_and(|outer| !is_inclusive_ancestor(dom, outer, *root)) {
+                continue;
+            }
+        }
+        if !element_in_scope(dom, element, *root, scope.end.as_ref(), context) {
+            continue;
+        }
+        let proximity = if last {
+            depth as u32
+        } else {
+            let Some(proximity) = resolve_scope_level(
+                dom,
+                element,
+                scopes,
+                index + 1,
+                Some(*root),
+                Some(depth),
+                owner,
+                context,
+                chain,
+            ) else {
+                continue;
+            };
+            proximity
+        };
+        best = Some(best.map_or(proximity, |current| current.min(proximity)));
+        if best == Some(0) {
+            break;
+        }
+    }
+    best
+}
+
+/// Whether `element` is in the scope rooted at `root`: an inclusive descendant
+/// of the root and not an inclusive descendant of any scoping limit.
+fn element_in_scope(
+    dom: &Dom,
+    element: NodeId,
+    root: NodeId,
+    end: Option<&super::selector::SelectorList>,
+    context: &MatchContext,
+) -> bool {
+    if !is_inclusive_ancestor(dom, root, element) {
+        return false;
+    }
+    let Some(end) = end else {
+        return true;
+    };
+    let mut node = Some(element);
+    while let Some(current) = node {
+        if current == root {
+            break;
+        }
+        if matches_with_scope(dom, current, end, context, Some(root)) {
+            return false;
+        }
+        node = dom.parent(current);
+    }
+    true
+}
+
+fn matches_with_scope(
+    dom: &Dom,
+    node: NodeId,
+    selectors: &super::selector::SelectorList,
+    context: &MatchContext,
+    scope: Option<NodeId>,
+) -> bool {
+    if context.scope == scope && context.pseudo_element.is_none() {
+        return super::selector::matches_selector_list(dom, node, selectors, context);
+    }
+    // Scope boundaries name elements, never generated content, so the
+    // pseudo-element context of the declaration being resolved must not leak
+    // into them.
+    let mut scoped = context.clone();
+    scoped.scope = scope;
+    scoped.pseudo_element = None;
+    super::selector::matches_selector_list(dom, node, selectors, &scoped)
+}
+
+/// CSS Cascade 6 §3.5.4: the implicit scoping root is the parent element of the
+/// stylesheet's owner node; failing that, the shadow host of its tree, and
+/// otherwise the root of the tree.
+fn implicit_scope_root(dom: &Dom, owner: Option<NodeId>) -> NodeId {
+    let Some(owner) = owner else {
+        return dom.document();
+    };
+    if let Some(parent) = dom.parent(owner)
+        && is_element(dom, parent)
+    {
+        return parent;
+    }
+    let tree_root = dom.root_node(owner, false);
+    dom.shadow_host(tree_root).unwrap_or(tree_root)
+}
+
+fn ancestor_chain(dom: &Dom, element: NodeId) -> Vec<NodeId> {
+    let mut chain = Vec::new();
+    let mut node = Some(element);
+    while let Some(current) = node {
+        chain.push(current);
+        node = dom.parent(current);
+    }
+    chain
+}
+
+fn is_element(dom: &Dom, node: NodeId) -> bool {
+    matches!(dom.node(node).map(Node::kind), Some(NodeKind::Element(_)))
+}
+
+fn is_inclusive_ancestor(dom: &Dom, ancestor: NodeId, node: NodeId) -> bool {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if candidate == ancestor {
+            return true;
+        }
+        current = dom.parent(candidate);
+    }
+    false
 }
 
 fn cascade_element_with_origins_impl(
@@ -432,8 +651,27 @@ fn cascade_element_with_origins_impl(
                     Ordering::Relaxed,
                 );
             }
-            let Some(specificity) = matching_specificity(dom, element, &rule.selectors, context)
-            else {
+            // CSS Cascade 6 §3.5.3: a scoped rule's subject has to be in scope,
+            // and its `:scope`/`&` selectors are relative to that scope's root.
+            let (specificity, proximity) =
+                match resolve_rule_scope(dom, element, rule, source.sheet.scope_owner, context) {
+                    RuleScope::OutOfScope => continue,
+                    RuleScope::Unscoped => (
+                        matching_specificity(dom, element, &rule.selectors, context),
+                        u32::MAX,
+                    ),
+                    RuleScope::InScope { root, proximity } => {
+                        let specificity = if context.scope == Some(root) {
+                            matching_specificity(dom, element, &rule.selectors, context)
+                        } else {
+                            let mut scoped = context.clone();
+                            scoped.scope = Some(root);
+                            matching_specificity(dom, element, &rule.selectors, &scoped)
+                        };
+                        (specificity, proximity)
+                    }
+                };
+            let Some(specificity) = specificity else {
                 continue;
             };
             if let Some(index) = lookup.rule_index
@@ -454,6 +692,7 @@ fn cascade_element_with_origins_impl(
                         declaration.important,
                     ),
                     specificity,
+                    proximity: Reverse(proximity),
                     source_order,
                 };
                 for (name, specified_value) in
@@ -506,6 +745,7 @@ fn cascade_element_with_origins_impl(
                 false,
             ),
             specificity: ua_specificity,
+            proximity: Reverse(u32::MAX),
             source_order,
         };
         for (name, specified_value) in expanded_declaration(&declaration.name, &declaration.value) {
@@ -549,6 +789,7 @@ fn cascade_element_with_origins_impl(
                 declaration.important,
             ),
             specificity: inline_specificity,
+            proximity: Reverse(u32::MAX),
             source_order,
         };
         for (name, specified_value) in expanded_declaration(&declaration.name, &declaration.value) {
@@ -2574,6 +2815,285 @@ mod tests {
             &MatchContext::default(),
         );
         style.get("color").map(|value| value.value.clone())
+    }
+
+    fn element_by_id(dom: &render_dom::Dom, id: &str) -> render_dom::NodeId {
+        let selector = parse_selector_list(&format!("#{id}")).expect("valid test selector");
+        select_all(dom, dom.document(), &selector, &MatchContext::default())[0]
+    }
+
+    /// Resolve the winning `color` for the element with `id`, optionally giving
+    /// the stylesheet an owner node so an implicit `@scope` has a root.
+    fn color_of(html: &str, source: &str, id: &str, owner_id: Option<&str>) -> Option<String> {
+        let output = parse_document(html);
+        let mut sheet = parse_stylesheet(source);
+        if let Some(owner_id) = owner_id {
+            sheet.scope_owner = Some(element_by_id(&output.dom, owner_id));
+        }
+        let probe = element_by_id(&output.dom, id);
+        let style = cascade_element(
+            &output.dom,
+            probe,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+        style.get("color").map(|value| value.value.clone())
+    }
+
+    /// CSS Cascade 6 §3.5.4: elements inside a scoping limit and its subtree are
+    /// outside the scope, while the root itself and everything above the limit
+    /// are inside it.
+    #[test]
+    fn scope_limits_exclude_their_subtree() {
+        let html = "<!doctype html><div class='scope'>\
+             <p id='in'>1</p>\
+             <section class='limit'><p id='out'>2</p></section>\
+             <p id='after'>3</p></div>";
+        let source = "@scope (.scope) to (.limit) { p { color: red } }";
+        assert_eq!(color_of(html, source, "in", None).as_deref(), Some("red"));
+        assert_eq!(color_of(html, source, "out", None), None);
+        assert_eq!(
+            color_of(html, source, "after", None).as_deref(),
+            Some("red")
+        );
+    }
+
+    /// CSS Cascade 6 §3.5.3: `:scope` and `&` both match the scoping root. The
+    /// scoping root itself is in scope because the scope is defined by an
+    /// inclusive descendant relationship.
+    #[test]
+    fn the_scoping_root_itself_is_in_scope() {
+        let html = "<!doctype html><div id='root'><p id='child'>x</p></div>";
+        assert_eq!(
+            color_of(
+                html,
+                "@scope (#root) { :scope { color: red } & { color: blue } p { color: green } }",
+                "root",
+                None,
+            )
+            .as_deref(),
+            Some("red"),
+            ":scope is (0,1,0) and `&` is zero specificity"
+        );
+        assert_eq!(
+            color_of(
+                html,
+                "@scope (#root) { :scope { color: red } & { color: blue } p { color: green } }",
+                "child",
+                None,
+            )
+            .as_deref(),
+            Some("green")
+        );
+        // `&` alone names the root and must match it even when no `:scope`
+        // selector is present.
+        assert_eq!(
+            color_of(html, "@scope (#root) { & { color: red } }", "root", None).as_deref(),
+            Some("red")
+        );
+    }
+
+    /// CSS Cascade 6 §3.1 orders scope proximity after specificity: a closer
+    /// scope wins a specificity tie regardless of source order, but a more
+    /// specific outer rule still wins.
+    #[test]
+    fn scope_proximity_comes_after_specificity() {
+        let html = "<!doctype html><div class='outer'><div class='inner'>\
+             <div id='x'><p data-probe>x</p></div></div></div>";
+
+        assert_eq!(
+            winning_color(
+                html,
+                "@scope (.inner) { p { color: blue } } \
+                 @scope (.outer) { p { color: red } }",
+            )
+            .as_deref(),
+            Some("blue"),
+            "the inner scope is closer and both selectors are (0,0,1)"
+        );
+
+        assert_eq!(
+            winning_color(
+                html,
+                "@scope (.outer) { #x p { color: red } } \
+                 @scope (.inner) { p { color: blue } }",
+            )
+            .as_deref(),
+            Some("red"),
+            "specificity is compared before proximity"
+        );
+    }
+
+    /// CSS Cascade 6 §3.1: an unscoped rule has infinite proximity hops, so a
+    /// scoped rule of equal specificity wins even when it appears earlier.
+    #[test]
+    fn a_scoped_rule_beats_an_unscoped_rule_at_equal_specificity() {
+        let html = "<!doctype html><div class='inner'><p data-probe>x</p></div>";
+        assert_eq!(
+            winning_color(
+                html,
+                "p { color: red } @scope (.inner) { p { color: blue } }",
+            )
+            .as_deref(),
+            Some("blue")
+        );
+    }
+
+    /// CSS Cascade 6 §3.5.4: each element matched by `<scope-start>` creates a
+    /// scope, so a selector list produces one scope per matching ancestor.
+    #[test]
+    fn a_scope_start_selector_list_creates_one_scope_per_match() {
+        let html = "<!doctype html><div class='a'><p id='a'>1</p></div>\
+             <div class='b'><p id='b'>2</p></div>\
+             <div class='c'><p id='c'>3</p></div>";
+        let source = "@scope (.a, .b) { p { color: red } }";
+        assert_eq!(color_of(html, source, "a", None).as_deref(), Some("red"));
+        assert_eq!(color_of(html, source, "b", None).as_deref(), Some("red"));
+        assert_eq!(color_of(html, source, "c", None), None);
+    }
+
+    /// CSS Cascade 6 §3.5.4: an `@scope` with no `<scope-start>` is rooted at
+    /// the parent element of the stylesheet's owner node.
+    #[test]
+    fn an_implicit_scope_uses_the_stylesheet_owner() {
+        let html = "<!doctype html><div id='host'>\
+             <style id='owner'></style><p id='in'>1</p></div><p id='out'>2</p>";
+        let source = "@scope { p { color: red } }";
+        assert_eq!(
+            color_of(html, source, "in", Some("owner")).as_deref(),
+            Some("red")
+        );
+        assert_eq!(color_of(html, source, "out", Some("owner")), None);
+    }
+
+    /// CSS Cascade 6 §3.5.5: a nested `@scope` root has to be inside the outer
+    /// scope, and its proximity is measured from the innermost root.
+    #[test]
+    fn nested_scopes_constrain_each_other() {
+        let html = "<!doctype html><div class='outer'>\
+             <div class='inner'><p id='in'>1</p></div>\
+             <p id='out'>2</p></div>\
+             <div class='inner'><p id='elsewhere'>3</p></div>";
+        let source = "@scope (.outer) { @scope (.inner) { p { color: red } } }";
+        assert_eq!(color_of(html, source, "in", None).as_deref(), Some("red"));
+        assert_eq!(color_of(html, source, "out", None), None);
+        assert_eq!(color_of(html, source, "elsewhere", None), None);
+    }
+
+    /// The worked example from CSS Cascade 6 §3.5.5: `:scope` in a nested
+    /// prelude names the enclosing scoping root for `<scope-start>` and the
+    /// nested root for `<scope-end>` and the scoped rule.
+    #[test]
+    fn nested_scope_preludes_use_the_enclosing_and_owning_roots() {
+        let html = "<!doctype html><div class='parent-scope'>\
+             <div class='child-scope'>\
+               <p class='content' id='in'>1</p>\
+               <div class='limit'><p class='content' id='limited'>2</p></div>\
+             </div>\
+             <p class='content' id='outside'>3</p></div>";
+        let source = "@scope (.parent-scope) { \
+             @scope (:scope > .child-scope) to (:scope .limit) { \
+               :scope .content { color: red } } }";
+        assert_eq!(color_of(html, source, "in", None).as_deref(), Some("red"));
+        assert_eq!(color_of(html, source, "limited", None), None);
+        assert_eq!(color_of(html, source, "outside", None), None);
+    }
+
+    /// CSS Cascade 6 §3.5.3: only the subject has to be in scope. An explicit
+    /// `:scope` lets the rest of the selector reach ancestors outside the
+    /// scoping root.
+    #[test]
+    fn selector_parts_outside_the_scope_may_match_unrestricted() {
+        let html = "<!doctype html><main><div class='inner'><p id='in'>x</p></div></main>";
+        assert_eq!(
+            color_of(
+                html,
+                "@scope (.inner) { main :scope p { color: red } }",
+                "in",
+                None,
+            )
+            .as_deref(),
+            Some("red")
+        );
+    }
+
+    /// Scope boundaries select elements, so a rule for generated content inside
+    /// an `@scope` must still find its scoping root while `context` names the
+    /// pseudo-element subject.
+    #[test]
+    fn scoped_rules_apply_to_generated_content_inside_the_scope() {
+        let html = "<!doctype html><div class='outer'><p data-probe>x</p></div>";
+        let output = parse_document(html);
+        let sheet = parse_stylesheet("@scope (.outer) { p::before { color: red } }");
+        let selectors = parse_selector_list("[data-probe]").expect("valid test selector");
+        let probe = select_all(
+            &output.dom,
+            output.dom.document(),
+            &selectors,
+            &MatchContext::default(),
+        )[0];
+        let context = MatchContext {
+            pseudo_element: Some("before".to_owned()),
+            ..MatchContext::default()
+        };
+        let style = cascade_element(
+            &output.dom,
+            probe,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &context,
+        );
+        assert_eq!(
+            style.get("color").map(|value| value.value.as_str()),
+            Some("red"),
+            "the scope boundaries match elements, not the generated subject"
+        );
+    }
+
+    /// CSS Cascade 6 §3.5.6: declarations directly inside `@scope` match the
+    /// root at zero specificity, so even `:scope`'s (0,1,0) beats them.
+    #[test]
+    fn scoped_declarations_have_zero_specificity() {
+        let html = "<!doctype html><div id='outer' class='outer'><p id='child'>x</p></div>";
+        assert_eq!(
+            color_of(
+                html,
+                "@scope (.outer) { color: blue; :scope { color: red } }",
+                "outer",
+                None,
+            )
+            .as_deref(),
+            Some("red"),
+            ":scope outranks a scoped declaration regardless of source order"
+        );
+        assert_eq!(
+            color_of(
+                html,
+                "@scope (.outer) { color: blue; :scope { color: red } }",
+                "child",
+                None,
+            ),
+            None,
+            "scoped declarations match the root, not its descendants"
+        );
+
+        // `&` is `:where(:scope)`, so it also contributes zero specificity and
+        // loses to `:scope` written before it.
+        assert_eq!(
+            color_of(
+                html,
+                "@scope (.outer) { :scope { color: red } & { color: blue } }",
+                "outer",
+                None,
+            )
+            .as_deref(),
+            Some("red")
+        );
     }
 
     /// CSS Nesting §4's worked example: `&` takes the specificity of the

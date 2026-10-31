@@ -361,13 +361,17 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
         id: CSS_CASCADE,
         family: StandardFamily::Css,
         specification: "CSS Cascading and Inheritance Level 6",
-        section: "Cascade sorting order and defaulting",
+        section: "Cascade sorting order, defaulting, and the @scope rule",
         status: SupportStatus::Partial,
         notes: "Origin and importance sorting, specificity, `@layer` with \
                 `revert-layer`, the CSS-wide keywords including `revert`, custom \
                 property substitution and the shorthand expansions `background`, \
                 `margin`/`padding`, `border*`, `font`, `text-decoration` and the \
-                legacy `grid-gap` longhands are implemented. One documented origin \
+                legacy `grid-gap` longhands are implemented. `@scope` is evaluated \
+                with explicit and implicit roots, scoping limits, relative preludes, \
+                nested scopes, scoped declarations and scope proximity between \
+                specificity and order of appearance; `@import ... scope(...)` is the \
+                remaining scope surface. One documented origin \
                 error remains: HTML presentational hints cascade at the user-agent \
                 origin rather than the author origin the standard specifies, so the \
                 user-agent sheet has to declare `td, th` and `table` through `:where` \

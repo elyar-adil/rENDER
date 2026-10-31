@@ -1914,7 +1914,12 @@ fn collect_author_style_sheets(
             } => {
                 let key = ExternalStyleSheetKey::new(slot.owner, requested_url.clone());
                 if let Some(sheet) = external.get(&key) {
-                    sheets.push((slot.owner, sheet.clone()));
+                    // CSS Cascade 6 §3.5.4: an implicit @scope root comes from
+                    // the parent of the stylesheet's owner element, and the
+                    // owner of an external sheet is the <link> that loaded it.
+                    let mut sheet = sheet.clone();
+                    sheet.scope_owner = Some(slot.owner);
+                    sheets.push((slot.owner, sheet));
                 } else {
                     diagnostics.push(DocumentDiagnostic {
                         node: Some(slot.owner),
@@ -2205,7 +2210,12 @@ fn collect_style_element(
     };
     *style_bytes = next_style_bytes;
     *embedded_sheet_count += 1;
-    sheets.push((node_id, parse_stylesheet(&css)));
+    let mut sheet = parse_stylesheet(&css);
+    // CSS Cascade 6 §3.5.4: an `@scope` with no `<scope-start>` is rooted at
+    // the parent element of the stylesheet's owner node, which is this
+    // `<style>` element.
+    sheet.scope_owner = Some(node_id);
+    sheets.push((node_id, sheet));
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2362,6 +2372,29 @@ mod tests {
             )
         }));
         assert!(render.diagnostics.document.is_empty());
+    }
+
+    /// CSS Cascade 6 §3.5.4: an `@scope` with no `<scope-start>` is rooted at
+    /// the parent of the stylesheet's owner node. The document has to supply
+    /// that owner when it collects a `<style>` element or the rule has no root
+    /// and applies nowhere.
+    #[test]
+    fn implicit_scope_uses_the_style_elements_parent() {
+        let document = Document::parse(
+            "<!doctype html><div id=host>\
+             <style>@scope { p { color: rgb(1, 1, 1) } }</style>\
+             <p id=inside>x</p></div>\
+             <p id=outside>y</p>",
+        );
+        let render = document.render_reference(DocumentRenderOptions::default());
+        assert_eq!(
+            typed_css(&document, &render, "#inside", "color"),
+            "rgb(1, 1, 1)"
+        );
+        assert_ne!(
+            typed_css(&document, &render, "#outside", "color"),
+            "rgb(1, 1, 1)"
+        );
     }
 
     /// The selector engine has always read `MatchContext`'s dynamic fields,

@@ -381,10 +381,11 @@ Microdata、`is=""`、`<dialog>` 完整模态语义、Drag & Drop API、可访�
 | `@media` | ✅ `stylesheet.rs:227,529-538`（可嵌套，`nested_media` 累积） |
 | `@layer`（语句 + 块） | ✅ 见 4.2 |
 | `@supports` | 🟡 **偏差。** 块被解析（`stylesheet.rs:244,539-551`），但条件被**丢弃**：`:548` 是 `let _ = query;`，嵌套规则无条件应用。源码注释自述"Property support is intentionally permissive until the computed-value registry grows a complete CSS.supports implementation"。这意味着 `@supports (display: none) { ... }` 也会生效 |
+| `@scope` | ✅ CSS Cascade 6 §3.5：根/限制、相对 prelude、`:scope`/`&`、嵌套作用域、作用域内直接声明与 scope proximity（见 `HANDOFF.md` 续五十三） |
 | `@import` | 🔴 不是"部分实现"：at-rule 分派只处理 `@layer`，其余走 `IgnoredAtRule` 并记一条 `@import is parsed but not evaluated yet` 诊断（`stylesheet.rs:180-191,561-566`） |
 | `@font-face` | 🔴 丢弃，见 4.5 |
 | `@keyframes` | 🔴 丢弃，见 4.7 |
-| `@page` `@property` `@scope` `@counter-style` `@font-feature-values` | 🔴 走 `IgnoredAtRule` + 诊断 |
+| `@page` `@counter-style` `@font-feature-values` | 🔴 走 `IgnoredAtRule` + 诊断 |
 | CSS Nesting | 🔵（是否进入 scope 需在本文登记后再实现，见第 13 节） |
 
 ### 4.10 CSS 总体 ⛔ NON-GOAL 汇总

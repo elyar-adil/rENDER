@@ -9,12 +9,14 @@ use cssparser::{
     AtRuleParser, CowRcStr, DeclarationParser, Delimiter, ParseError, ParseErrorKind, Parser,
     ParserInput, ParserState, QualifiedRuleParser, SourceLocation, StyleSheetParser, Token,
 };
+use render_dom::NodeId;
 
 use super::at_rules::{at_rule_block_is_declaration_list, at_rule_diagnostic};
 use super::container::ContainerCondition;
 use super::registered::{PropertyRegistration, parse_registration};
 use super::selector::{
-    NestedSelectors, SelectorList, parse_nested_selector_list, parse_selector_list,
+    NestedSelectors, SelectorList, parse_nested_selector_list, parse_scope_start_in_style,
+    parse_scoped_selector_list, parse_selector_list,
 };
 use super::supports::{SupportsCondition, evaluate_supports_condition};
 
@@ -31,6 +33,19 @@ pub(crate) enum CssWideKeyword {
 pub enum LayerName {
     Named(Vec<String>),
     Anonymous(u32),
+}
+
+/// The boundaries of one `@scope` block (CSS Cascade 6 §3.5.2).
+///
+/// A rule nested in several `@scope` rules carries one entry per block, from
+/// the outermost to the innermost. `start` is `None` for an implicit scope,
+/// whose root comes from the stylesheet's owner node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Scope {
+    /// `<scope-start>`: the selectors that identify scoping roots.
+    pub start: Option<SelectorList>,
+    /// `<scope-end>`: the selectors that identify scoping limits.
+    pub end: Option<SelectorList>,
 }
 
 /// Where a declaration starts in the stylesheet it was parsed from.
@@ -95,6 +110,9 @@ pub struct StyleRule {
     /// context during the first pass makes size queries false rather than
     /// guessed.
     pub container: Vec<ContainerCondition>,
+    /// Every enclosing `@scope` boundary, from outermost to innermost. Empty
+    /// for an ordinary rule.
+    pub scopes: Vec<Scope>,
     pub source_order: u64,
 }
 
@@ -168,6 +186,11 @@ pub struct StyleSheet {
     /// consumer can apply document order without losing the source position.
     pub property_registrations: Vec<PropertyRegistration>,
     pub diagnostics: Vec<StyleSheetDiagnostic>,
+    /// The element that owns this stylesheet (`<style>` or `<link>`), when the
+    /// document supplied one. CSS Cascade 6 §3.5.4 makes the parent of that
+    /// element the scoping root of an `@scope` rule with no `<scope-start>`;
+    /// when there is no owner, the root of the containing node tree is used.
+    pub scope_owner: Option<NodeId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -242,6 +265,19 @@ enum ParsedRule {
     NestedDeclarations {
         selectors: SelectorList,
         declarations: Vec<SourcedDeclaration>,
+    },
+    /// Declarations written directly inside `@scope` (CSS Cascade 6 §3.5.6).
+    /// They match the scoping root with zero specificity.
+    ScopedDeclarations {
+        declarations: Vec<SourcedDeclaration>,
+    },
+    /// An `@scope` block. The prelude is parsed once into the boundaries every
+    /// style rule in the block carries.
+    ScopeBlock {
+        scope: Result<Scope, String>,
+        body: RuleBody,
+        diagnostics: Vec<StyleSheetDiagnostic>,
+        location: SourceLocation,
     },
     LayerStatement {
         layers: Vec<LayerName>,
@@ -368,6 +404,9 @@ struct RuleParser<'a> {
     next_anonymous_layer: &'a mut u32,
     /// `Some` when this parser is walking a block nested inside a style rule.
     parent: Option<ParentRule>,
+    /// Whether this rule list is the body of an `@scope` block, where style-rule
+    /// preludes are relative to the scoping root (CSS Cascade 6 §3.5.3).
+    scoped: bool,
 }
 
 impl<'i> QualifiedRuleParser<'i> for RuleParser<'_> {
@@ -382,6 +421,7 @@ impl<'i> QualifiedRuleParser<'i> for RuleParser<'_> {
         let selector_text = consume_raw(input);
         let resolved = match self.parent.as_ref() {
             Some(parent) => parse_nested_selector_list(&selector_text, &parent.text),
+            None if self.scoped => parse_scoped_selector_list(&selector_text),
             None => parse_selector_list(&selector_text).map(|selectors| NestedSelectors {
                 css: selector_text,
                 selectors,
@@ -404,8 +444,13 @@ impl<'i> QualifiedRuleParser<'i> for RuleParser<'_> {
             text: resolved.css,
             selectors: resolved.selectors,
         };
-        let (declarations, nested, diagnostics) =
-            parse_block_contents(input, self.next_anonymous_layer, Some(&parent), true);
+        let (declarations, nested, diagnostics) = parse_block_contents(
+            input,
+            self.next_anonymous_layer,
+            Some(&parent),
+            true,
+            self.scoped,
+        );
         Ok(ParsedRule::Style {
             selectors: parent.selectors,
             declarations,
@@ -467,6 +512,7 @@ impl<'i> AtRuleParser<'i> for RuleParser<'_> {
             input,
             self.next_anonymous_layer,
             self.parent.as_ref(),
+            self.scoped,
         )
     }
 }
@@ -481,6 +527,7 @@ fn parse_at_rule_block<'i, 't>(
     input: &mut Parser<'i, 't>,
     next_anonymous_layer: &mut u32,
     parent: Option<&ParentRule>,
+    scoped: bool,
 ) -> Result<ParsedRule, ParseError<'i, RuleParseError>> {
     let location = start.source_location();
     if prelude.name == "layer" {
@@ -502,7 +549,7 @@ fn parse_at_rule_block<'i, 't>(
             }
             layers.remove(0)
         };
-        let (rules, diagnostics) = parse_rule_list(input, next_anonymous_layer);
+        let (rules, diagnostics) = parse_rule_list(input, next_anonymous_layer, scoped);
         return Ok(ParsedRule::LayerBlock {
             layer,
             rules,
@@ -511,8 +558,22 @@ fn parse_at_rule_block<'i, 't>(
         });
     }
 
+    if prelude.name == "scope" {
+        // CSS Cascade 6 §3.5.2: the block is a `<block-contents>`, so it holds
+        // declarations as well as rules, and its style rules are scoped by the
+        // boundaries the prelude names.
+        let scope = parse_scope_prelude(&prelude.value, parent, scoped);
+        let (body, diagnostics) = parse_scope_body(input, next_anonymous_layer);
+        return Ok(ParsedRule::ScopeBlock {
+            scope,
+            body,
+            diagnostics,
+            location,
+        });
+    }
+
     if prelude.name == "media" {
-        let (body, diagnostics) = parse_group_body(input, next_anonymous_layer, parent);
+        let (body, diagnostics) = parse_group_body(input, next_anonymous_layer, parent, scoped);
         return Ok(ParsedRule::MediaBlock {
             query: prelude.value,
             body,
@@ -521,7 +582,7 @@ fn parse_at_rule_block<'i, 't>(
     }
 
     if prelude.name == "container" {
-        let (body, diagnostics) = parse_group_body(input, next_anonymous_layer, parent);
+        let (body, diagnostics) = parse_group_body(input, next_anonymous_layer, parent, scoped);
         return Ok(ParsedRule::ContainerBlock {
             condition: ContainerCondition::parse(&prelude.value),
             body,
@@ -542,7 +603,7 @@ fn parse_at_rule_block<'i, 't>(
     }
 
     if prelude.name == "supports" {
-        let (body, diagnostics) = parse_group_body(input, next_anonymous_layer, parent);
+        let (body, diagnostics) = parse_group_body(input, next_anonymous_layer, parent, scoped);
         return Ok(ParsedRule::SupportsBlock {
             query: prelude.value,
             body,
@@ -601,15 +662,184 @@ fn parse_group_body<'i, 't>(
     input: &mut Parser<'i, 't>,
     next_anonymous_layer: &mut u32,
     parent: Option<&ParentRule>,
+    scoped: bool,
 ) -> (RuleBody, Vec<StyleSheetDiagnostic>) {
     if parent.is_none() {
-        let (rules, diagnostics) = parse_rule_list(input, next_anonymous_layer);
+        let (rules, diagnostics) = parse_rule_list(input, next_anonymous_layer, scoped);
         (RuleBody::Rules(rules), diagnostics)
     } else {
         let (_, nested, diagnostics) =
-            parse_block_contents(input, next_anonymous_layer, parent, false);
+            parse_block_contents(input, next_anonymous_layer, parent, false, scoped);
         (RuleBody::Block(nested), diagnostics)
     }
+}
+
+/// Parse an `@scope` prelude (CSS Cascade 6 §3.5.2).
+///
+/// `<scope-boundaries>` is an optional parenthesized `<scope-start>` followed
+/// by an optional `to ( <scope-end> )`, and at least one of the two must be
+/// present if the prelude is not empty. An empty prelude is the implicit scope
+/// whose root comes from the stylesheet's owner node (§3.5.4).
+///
+/// Scope selectors are unforgiving: any invalid selector invalidates the whole
+/// prelude, and the block is dropped with a diagnostic. A pseudo-element is
+/// invalid in either boundary because it is not a node and cannot be a scoping
+/// root or limit.
+fn parse_scope_prelude(
+    value: &str,
+    parent: Option<&ParentRule>,
+    scoped: bool,
+) -> Result<Scope, String> {
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    parser.skip_whitespace();
+    if parser.is_exhausted() {
+        return Ok(Scope {
+            start: None,
+            end: None,
+        });
+    }
+
+    let initial = parser.state();
+    let has_start = parser
+        .try_parse(|candidate| {
+            candidate.expect_parenthesis_block()?;
+            Ok::<(), ParseError<'_, RuleParseError>>(())
+        })
+        .is_ok();
+    parser.reset(&initial);
+
+    let start = if has_start {
+        let text = scope_parenthesis_text(&mut parser)?;
+        if text.trim().is_empty() {
+            return Err("an empty <scope-start> is not a selector list".to_owned());
+        }
+        let selectors = match parent {
+            // CSS Cascade 6 §3.5.5: a nested @scope's start is relative to its
+            // nesting context, and a selector that names :scope keeps that
+            // pseudo for the enclosing scope.
+            Some(parent) => parse_scope_start_in_style(&text, &parent.text),
+            None if scoped => parse_scoped_selector_list(&text).map(|nested| nested.selectors),
+            None => parse_selector_list(&text),
+        }
+        .map_err(|error| format!("invalid <scope-start>: {error}"))?;
+        reject_scope_pseudo_element(&selectors)?;
+        Some(selectors)
+    } else {
+        None
+    };
+
+    parser.skip_whitespace();
+    let end = if parser.is_exhausted() {
+        None
+    } else {
+        parser
+            .expect_ident_matching("to")
+            .map_err(|_| "expected `to (` or the end of the @scope prelude".to_owned())?;
+        parser.skip_whitespace();
+        let text = scope_parenthesis_text(&mut parser)?;
+        if text.trim().is_empty() {
+            return Err("an empty <scope-end> is not a selector list".to_owned());
+        }
+        // §3.5.4: scoping limits are relative to the scoping root, exactly as
+        // a scoped style rule's prelude is.
+        let selectors = parse_scoped_selector_list(&text)
+            .map(|nested| nested.selectors)
+            .map_err(|error| format!("invalid <scope-end>: {error}"))?;
+        reject_scope_pseudo_element(&selectors)?;
+        Some(selectors)
+    };
+
+    parser
+        .expect_exhausted()
+        .map_err(|_| "trailing tokens after the @scope prelude".to_owned())?;
+    if start.is_none() && end.is_none() {
+        return Err("@scope needs a <scope-start>, a <scope-end>, or both".to_owned());
+    }
+    Ok(Scope { start, end })
+}
+
+fn scope_parenthesis_text(parser: &mut Parser<'_, '_>) -> Result<String, String> {
+    parser
+        .expect_parenthesis_block()
+        .map_err(|_| "expected a parenthesized selector list".to_owned())?;
+    parser
+        .parse_nested_block(|nested| {
+            Ok::<String, ParseError<'_, RuleParseError>>(consume_raw(nested))
+        })
+        .map_err(|error| format!("invalid selector block: {}", from_kind(error.kind)))
+}
+
+fn reject_scope_pseudo_element(selectors: &SelectorList) -> Result<(), String> {
+    if selectors.has_any_pseudo_element() {
+        return Err("a pseudo-element cannot be a scoping root or a scoping limit".to_owned());
+    }
+    Ok(())
+}
+
+/// Parse an `@scope` block's `<block-contents>` (§3.5.2).
+///
+/// Unlike a style rule's block, a run of declarations here does not belong to
+/// an enclosing rule: §3.5.6 wraps each contiguous run in a nested declarations
+/// rule that matches the scoping root with zero specificity. Those runs become
+/// [`ParsedRule::ScopedDeclarations`], and the flattening stage attaches the
+/// scope and the `:where(:scope)` selector.
+///
+/// The body is relative to the scoping root even when the `@scope` itself sits
+/// inside a style rule, so no `ParentRule` is passed down: only the scope's
+/// prelude was relative to the style rule.
+fn parse_scope_body<'i, 't>(
+    input: &mut Parser<'i, 't>,
+    next_anonymous_layer: &mut u32,
+) -> (RuleBody, Vec<StyleSheetDiagnostic>) {
+    let mut rules = Vec::new();
+    let mut pending: Vec<SourcedDeclaration> = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut contents = BlockContents {
+        input,
+        parser: PropertyParser {
+            allow_nesting: true,
+            parent: None,
+            next_anonymous_layer,
+            scoped: true,
+        },
+    };
+    while let Some(item) = contents.next() {
+        match item {
+            Ok(RuleBodyItem::Declaration(declaration)) => {
+                if declaration.is_usable() {
+                    pending.push(declaration);
+                }
+            }
+            Ok(RuleBodyItem::Rule(rule)) => {
+                flush_scoped_declarations(&mut pending, &mut rules);
+                rules.push(rule);
+            }
+            Err((error, location)) => diagnostics.push(at(&error, location)),
+        }
+    }
+    flush_scoped_declarations(&mut pending, &mut rules);
+    (RuleBody::Block(rules), diagnostics)
+}
+
+/// §3.5.6: a contiguous run of declarations directly in an `@scope` block is
+/// one nested declarations rule matching the scoping root with zero
+/// specificity. A run holding only empty ordinary declarations is not a rule.
+fn flush_scoped_declarations(
+    declarations: &mut Vec<SourcedDeclaration>,
+    rules: &mut Vec<ParsedRule>,
+) {
+    if declarations.is_empty() {
+        return;
+    }
+    let run: Vec<SourcedDeclaration> = std::mem::take(declarations)
+        .into_iter()
+        .filter(SourcedDeclaration::is_usable)
+        .collect();
+    if run.is_empty() {
+        return;
+    }
+    rules.push(ParsedRule::ScopedDeclarations { declarations: run });
 }
 
 /// A declaration together with the position it starts at.
@@ -988,6 +1218,9 @@ struct PropertyParser<'a> {
     /// selector refers to.
     parent: Option<ParentRule>,
     next_anonymous_layer: &'a mut u32,
+    /// Whether nested style rules are parsed inside an `@scope` body and are
+    /// therefore relative to the scoping root.
+    scoped: bool,
 }
 
 impl<'a> PropertyParser<'a> {
@@ -998,6 +1231,7 @@ impl<'a> PropertyParser<'a> {
             allow_nesting: false,
             parent: None,
             next_anonymous_layer,
+            scoped: false,
         }
     }
 }
@@ -1130,6 +1364,7 @@ impl<'i> QualifiedRuleParser<'i> for PropertyParser<'_> {
         let selector_text = consume_raw(input);
         let resolved = match self.parent.as_ref() {
             Some(parent) => parse_nested_selector_list(&selector_text, &parent.text),
+            None if self.scoped => parse_scoped_selector_list(&selector_text),
             None => parse_selector_list(&selector_text).map(|selectors| NestedSelectors {
                 css: selector_text,
                 selectors,
@@ -1153,8 +1388,13 @@ impl<'i> QualifiedRuleParser<'i> for PropertyParser<'_> {
             text: resolved.css,
             selectors: resolved.selectors,
         };
-        let (declarations, nested, diagnostics) =
-            parse_block_contents(input, self.next_anonymous_layer, Some(&parent), true);
+        let (declarations, nested, diagnostics) = parse_block_contents(
+            input,
+            self.next_anonymous_layer,
+            Some(&parent),
+            true,
+            self.scoped,
+        );
         Ok(RuleBodyItem::Rule(ParsedRule::Style {
             selectors: parent.selectors,
             declarations,
@@ -1227,6 +1467,7 @@ impl<'i> AtRuleParser<'i> for PropertyParser<'_> {
             input,
             self.next_anonymous_layer,
             self.parent.as_ref(),
+            self.scoped,
         )
         .map(RuleBodyItem::Rule)
     }
@@ -1238,12 +1479,12 @@ pub fn parse_stylesheet(source: &str) -> StyleSheet {
     let mut input = ParserInput::new(source);
     let mut parser = Parser::new(&mut input);
     let mut next_anonymous_layer = 0;
-    let (rules, diagnostics) = parse_rule_list(&mut parser, &mut next_anonymous_layer);
+    let (rules, diagnostics) = parse_rule_list(&mut parser, &mut next_anonymous_layer, false);
     let mut sheet = StyleSheet {
         diagnostics,
         ..StyleSheet::default()
     };
-    flatten_rules(rules, None, &[], &[], &mut sheet);
+    flatten_rules(rules, None, &[], &[], &[], &mut sheet);
     sheet
 }
 
@@ -1291,10 +1532,12 @@ pub(crate) fn css_wide_keyword(source: &str) -> Option<CssWideKeyword> {
 fn parse_rule_list(
     input: &mut Parser<'_, '_>,
     next_anonymous_layer: &mut u32,
+    scoped: bool,
 ) -> (Vec<ParsedRule>, Vec<StyleSheetDiagnostic>) {
     let mut parser = RuleParser {
         next_anonymous_layer,
         parent: None,
+        scoped,
     };
     let mut rules = Vec::new();
     let mut diagnostics = Vec::new();
@@ -1319,6 +1562,7 @@ fn parse_block_contents(
     next_anonymous_layer: &mut u32,
     parent: Option<&ParentRule>,
     own_declarations: bool,
+    scoped: bool,
 ) -> (
     Vec<SourcedDeclaration>,
     Vec<ParsedRule>,
@@ -1340,6 +1584,7 @@ fn parse_block_contents(
             allow_nesting: true,
             parent: parent.cloned(),
             next_anonymous_layer,
+            scoped,
         },
     };
     while let Some(item) = contents.next() {
@@ -1657,6 +1902,7 @@ fn flatten_rules(
     layer: Option<&LayerName>,
     media: &[String],
     containers: &[ContainerCondition],
+    scopes: &[Scope],
     sheet: &mut StyleSheet,
 ) {
     for rule in rules {
@@ -1683,9 +1929,10 @@ fn flatten_rules(
                     layer: layer.cloned(),
                     media: media.to_vec(),
                     container: containers.to_vec(),
+                    scopes: scopes.to_vec(),
                     source_order: u64::try_from(sheet.rules.len()).unwrap_or(u64::MAX),
                 });
-                flatten_rules(nested, layer, media, containers, sheet);
+                flatten_rules(nested, layer, media, containers, scopes, sheet);
             }
             ParsedRule::NestedDeclarations {
                 selectors,
@@ -1704,8 +1951,50 @@ fn flatten_rules(
                     layer: layer.cloned(),
                     media: media.to_vec(),
                     container: containers.to_vec(),
+                    scopes: scopes.to_vec(),
                     source_order: u64::try_from(sheet.rules.len()).unwrap_or(u64::MAX),
                 });
+            }
+            ParsedRule::ScopedDeclarations { declarations } => {
+                // CSS Cascade 6 §3.5.6: declarations directly in an `@scope`
+                // block match the scoping root with zero specificity.
+                // `:where(:scope)` is exactly that selector: the pseudo-class
+                // names the scoping root and `:where()` contributes no
+                // specificity.
+                let selectors = parse_selector_list(":where(:scope)")
+                    .expect(":where(:scope) is a valid selector");
+                let (declarations, declaration_locations) = kept_declarations(&declarations);
+                sheet.rules.push(StyleRule {
+                    selectors,
+                    declarations,
+                    declaration_locations,
+                    layer: layer.cloned(),
+                    media: media.to_vec(),
+                    container: containers.to_vec(),
+                    scopes: scopes.to_vec(),
+                    source_order: u64::try_from(sheet.rules.len()).unwrap_or(u64::MAX),
+                });
+            }
+            ParsedRule::ScopeBlock {
+                scope,
+                body,
+                diagnostics,
+                location,
+            } => {
+                sheet.diagnostics.extend(diagnostics);
+                match scope {
+                    Ok(scope) => {
+                        let mut nested = scopes.to_vec();
+                        nested.push(scope);
+                        flatten_group_body(body, layer, media, containers, &nested, sheet);
+                    }
+                    Err(reason) => {
+                        sheet.diagnostics.push(capability_diagnostic(
+                            location,
+                            format!("@scope is invalid, so the rule and its contents are dropped: {reason}"),
+                        ));
+                    }
+                }
             }
             ParsedRule::LayerStatement { layers, location } => {
                 if layer.is_none() {
@@ -1733,7 +2022,7 @@ fn flatten_rules(
                     ));
                 } else {
                     register_layer(sheet, &nested_layer);
-                    flatten_rules(rules, Some(&nested_layer), media, containers, sheet);
+                    flatten_rules(rules, Some(&nested_layer), media, containers, scopes, sheet);
                 }
             }
             ParsedRule::MediaBlock {
@@ -1744,7 +2033,7 @@ fn flatten_rules(
                 sheet.diagnostics.extend(diagnostics);
                 let mut nested_media = media.to_vec();
                 nested_media.push(query);
-                flatten_group_body(body, layer, &nested_media, containers, sheet);
+                flatten_group_body(body, layer, &nested_media, containers, scopes, sheet);
             }
             ParsedRule::ContainerBlock {
                 condition,
@@ -1769,7 +2058,7 @@ fn flatten_rules(
                         }
                         let mut nested = containers.to_vec();
                         nested.push(condition);
-                        flatten_group_body(body, layer, media, &nested, sheet);
+                        flatten_group_body(body, layer, media, &nested, scopes, sheet);
                     }
                     Err(reason) => {
                         sheet.diagnostics.push(capability_diagnostic(
@@ -1801,7 +2090,7 @@ fn flatten_rules(
                     // though they were at the group rule's location, and when
                     // it is false none of them apply.
                     SupportsCondition::Evaluated(true) => {
-                        flatten_group_body(body, layer, media, containers, sheet);
+                        flatten_group_body(body, layer, media, containers, scopes, sheet);
                     }
                     // A false condition is a complete answer, not a gap: the
                     // author wrote the query to find out whether the engine
@@ -1928,12 +2217,13 @@ fn flatten_group_body(
     layer: Option<&LayerName>,
     media: &[String],
     containers: &[ContainerCondition],
+    scopes: &[Scope],
     sheet: &mut StyleSheet,
 ) {
     let rules = match body {
         RuleBody::Rules(rules) | RuleBody::Block(rules) => rules,
     };
-    flatten_rules(rules, layer, media, containers, sheet);
+    flatten_rules(rules, layer, media, containers, scopes, sheet);
 }
 
 #[cfg(test)]
@@ -2876,7 +3166,6 @@ mod tests {
             "viewport",
             "when",
             "else",
-            "scope",
             "custom-media",
             "font-palette-values",
             "font-feature-values",
@@ -2922,7 +3211,6 @@ mod tests {
             "viewport",
             "when",
             "else",
-            "scope",
             "custom-media",
             "font-palette-values",
             "font-feature-values",
@@ -3248,5 +3536,327 @@ mod tests {
         assert!(messages(&unmet).is_empty(), "{:?}", unmet.diagnostics);
         assert_eq!(unmet.rules.len(), 1);
         assert!(unmet.rules[0].declarations.is_empty());
+    }
+
+    const SCOPED_DOM: &str = "<!doctype html><section id='outer' class='outer'>\
+         <div id='inner' class='inner'><p id='deep'>x</p></div></section>\
+         <p id='outside'>y</p>";
+
+    fn node_by_id(dom: &render_dom::Dom, id: &str) -> render_dom::NodeId {
+        let selector =
+            crate::selector::parse_selector_list(&format!("#{id}")).expect("valid test selector");
+        select_all(dom, dom.document(), &selector, &MatchContext::default())[0]
+    }
+
+    fn scoped_ids(html: &str, source: &str, root_id: &str) -> Vec<Vec<String>> {
+        let output = parse_document(html);
+        let sheet = parse_stylesheet(source);
+        let root = node_by_id(&output.dom, root_id);
+        let context = MatchContext {
+            scope: Some(root),
+            ..MatchContext::default()
+        };
+        sheet
+            .rules
+            .iter()
+            .map(|rule| {
+                select_all(
+                    &output.dom,
+                    output.dom.document(),
+                    &rule.selectors,
+                    &context,
+                )
+                .iter()
+                .map(|node| {
+                    output
+                        .dom
+                        .attribute(*node, "id")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .collect()
+            })
+            .collect()
+    }
+
+    /// CSS Cascade 6 §3.5.3: a scoped style rule's prelude is relative to the
+    /// scoping root. A plain selector gets an implicit `:where(:scope)`
+    /// descendant prefix, a leading combinator is relative to the root, and an
+    /// explicit `:scope`/`&` names the root. None of the three may leak outside
+    /// the scope.
+    #[test]
+    fn scoped_style_rules_are_relative_to_the_scoping_root() {
+        let sheet = parse_stylesheet(
+            "@scope (.inner) { \
+               p { color: red } \
+               > p { color: blue } \
+               :scope > p { color: green } \
+               & p { color: black } }",
+        );
+        assert!(messages(&sheet).is_empty(), "{:?}", sheet.diagnostics);
+        assert_eq!(sheet.rules.len(), 4);
+        assert_eq!(sheet.rules[0].scopes.len(), 1);
+        assert!(sheet.rules[0].scopes[0].start.is_some());
+
+        let matched = scoped_ids(
+            SCOPED_DOM,
+            "@scope (.inner) { p {} > p {} :scope > p {} & p {} }",
+            "inner",
+        );
+        assert_eq!(
+            matched,
+            [
+                vec!["deep".to_owned()],
+                vec!["deep".to_owned()],
+                vec!["deep".to_owned()],
+                vec!["deep".to_owned()],
+            ]
+        );
+
+        // §3.5.1: the prelude contributes no specificity. `p` inside an
+        // `@scope (.inner)` is (0,0,1); `:scope` itself stays (0,1,0), and `&`
+        // behaves as `:where(:scope)`, which is zero.
+        let type_selector = Specificity {
+            ids: 0,
+            classes: 0,
+            types: 1,
+        };
+        let scope_and_type = Specificity {
+            ids: 0,
+            classes: 1,
+            types: 1,
+        };
+        assert_eq!(sheet.rules[0].selectors.max_specificity(), type_selector);
+        assert_eq!(sheet.rules[2].selectors.max_specificity(), scope_and_type);
+        assert_eq!(sheet.rules[3].selectors.max_specificity(), type_selector);
+        let ampersand = parse_stylesheet("@scope (.inner) { & { color: red } }");
+        assert_eq!(
+            ampersand.rules[0].selectors.max_specificity(),
+            Specificity::default(),
+            "`&` is `:where(:scope)`, which is zero specificity"
+        );
+        let output = parse_document(SCOPED_DOM);
+        let inner = node_by_id(&output.dom, "inner");
+        assert!(
+            !crate::selector::matches_selector_list(
+                &output.dom,
+                inner,
+                &sheet.rules[3].selectors,
+                &MatchContext {
+                    scope: Some(inner),
+                    ..MatchContext::default()
+                },
+            ),
+            "`& p` matches descendants, not the root itself"
+        );
+    }
+
+    /// CSS Cascade 6 §3.5.4: `<scope-end>` is relative to the scoping root and
+    /// produces the limits that exclude a subtree from the scope.
+    #[test]
+    fn scope_end_selectors_are_relative_to_the_scoping_root() {
+        let sheet = parse_stylesheet("@scope (.outer) to (.inner) { p { color: red } }");
+        assert!(messages(&sheet).is_empty(), "{:?}", sheet.diagnostics);
+        assert_eq!(sheet.rules.len(), 1);
+        let scope = &sheet.rules[0].scopes[0];
+        let end = scope.end.as_ref().expect("<scope-end> was dropped");
+
+        let output = parse_document(SCOPED_DOM);
+        let selector = crate::selector::parse_selector_list("#outer").expect("valid selector");
+        let outer = select_all(
+            &output.dom,
+            output.dom.document(),
+            &selector,
+            &MatchContext::default(),
+        )[0];
+        let inner = node_by_id(&output.dom, "inner");
+        assert!(
+            crate::selector::matches_selector_list(
+                &output.dom,
+                inner,
+                end,
+                &MatchContext {
+                    scope: Some(outer),
+                    ..MatchContext::default()
+                },
+            ),
+            "`.inner` is a limit only when the scoping root is :scope"
+        );
+        assert!(
+            !crate::selector::matches_selector_list(
+                &output.dom,
+                inner,
+                end,
+                &MatchContext {
+                    scope: Some(inner),
+                    ..MatchContext::default()
+                },
+            ),
+            "with the limit itself as the scoping root, `.inner` has no ancestor to match"
+        );
+    }
+
+    /// CSS Cascade 6 §3.5.6: declarations directly inside `@scope` become
+    /// nested declarations rules matching the scoping root with zero
+    /// specificity, and contiguous runs stay separate in source order.
+    #[test]
+    fn declarations_directly_in_scope_match_the_root_with_zero_specificity() {
+        let sheet = parse_stylesheet("@scope (.outer) { color: red; p { color: blue } border: 0 }");
+        assert!(messages(&sheet).is_empty(), "{:?}", sheet.diagnostics);
+        assert_eq!(sheet.rules.len(), 3);
+        assert_eq!(sheet.rules[0].declarations[0].name, "color");
+        assert_eq!(sheet.rules[0].declarations[0].value, "red");
+        assert_eq!(
+            sheet.rules[0].selectors.max_specificity(),
+            Specificity::default()
+        );
+        assert_eq!(sheet.rules[1].declarations[0].value, "blue");
+        assert_eq!(sheet.rules[2].declarations[0].name, "border");
+
+        let output = parse_document(SCOPED_DOM);
+        let selector = crate::selector::parse_selector_list("#outer").expect("valid selector");
+        let outer = select_all(
+            &output.dom,
+            output.dom.document(),
+            &selector,
+            &MatchContext::default(),
+        )[0];
+        let context = MatchContext {
+            scope: Some(outer),
+            ..MatchContext::default()
+        };
+        assert!(crate::selector::matches_selector_list(
+            &output.dom,
+            outer,
+            &sheet.rules[0].selectors,
+            &context,
+        ));
+    }
+
+    /// CSS Cascade 6 §3.5.5: a nested `@scope` prelude is relative to the
+    /// enclosing scope, and both boundaries are retained from outermost to
+    /// innermost.
+    #[test]
+    fn nested_scope_preludes_are_relative_to_the_enclosing_scope() {
+        let sheet = parse_stylesheet("@scope (.outer) { @scope (.inner) { p { color: red } } }");
+        assert!(messages(&sheet).is_empty(), "{:?}", sheet.diagnostics);
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(sheet.rules[0].scopes.len(), 2);
+        let inner_start = sheet.rules[0].scopes[1]
+            .start
+            .as_ref()
+            .expect("inner <scope-start>");
+
+        let output = parse_document(SCOPED_DOM);
+        let outer = node_by_id(&output.dom, "outer");
+        let inner = node_by_id(&output.dom, "inner");
+        assert!(crate::selector::matches_selector_list(
+            &output.dom,
+            inner,
+            inner_start,
+            &MatchContext {
+                scope: Some(outer),
+                ..MatchContext::default()
+            },
+        ));
+        assert!(
+            !crate::selector::matches_selector_list(
+                &output.dom,
+                inner,
+                inner_start,
+                &MatchContext {
+                    scope: Some(inner),
+                    ..MatchContext::default()
+                },
+            ),
+            "`.inner` is relative to the enclosing scope's root"
+        );
+    }
+
+    /// An empty `@scope` prelude is the implicit scope: the root comes from the
+    /// stylesheet's owner node (`StyleSheet::scope_owner`) at cascade time.
+    #[test]
+    fn an_empty_scope_prelude_is_an_implicit_scope() {
+        let sheet = parse_stylesheet("@scope { p { color: red } }");
+        assert!(messages(&sheet).is_empty(), "{:?}", sheet.diagnostics);
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(sheet.rules[0].scopes.len(), 1);
+        assert!(sheet.rules[0].scopes[0].start.is_none());
+    }
+
+    /// A `@scope` inside a style rule is nested in that selector; its prelude is
+    /// relative to the style rule, while its own body is relative to the scoping
+    /// root.
+    #[test]
+    fn a_scope_inside_a_style_rule_takes_its_start_from_the_parent() {
+        let sheet = parse_stylesheet(".outer { @scope (.inner) { p { color: red } } }");
+        assert!(messages(&sheet).is_empty(), "{:?}", sheet.diagnostics);
+        assert_eq!(sheet.rules.len(), 2);
+        let start = sheet.rules[1].scopes[0]
+            .start
+            .as_ref()
+            .expect("<scope-start>");
+        let output = parse_document(SCOPED_DOM);
+        let inner = node_by_id(&output.dom, "inner");
+        assert!(crate::selector::matches_selector_list(
+            &output.dom,
+            inner,
+            start,
+            &MatchContext::default(),
+        ));
+    }
+
+    /// An `@scope` prelude is unforgiving and pseudo-elements are not nodes, so
+    /// an invalid boundary drops the whole block with a diagnostic rather than
+    /// applying it to the wrong elements.
+    #[test]
+    fn invalid_scope_preludes_drop_the_block_and_are_reported() {
+        for source in [
+            "@scope (p::before) { p { color: red } }",
+            "@scope (.a,) { p { color: red } }",
+            "@scope to { p { color: red } }",
+            "@scope () { p { color: red } }",
+            "@scope (.a) to () { p { color: red } }",
+            "@scope (.a) to (.b) extra { p { color: red } }",
+        ] {
+            let sheet = parse_stylesheet(source);
+            assert!(
+                sheet.rules.is_empty(),
+                "{source:?} must not contribute a rule: {:#?}",
+                sheet.rules
+            );
+            assert!(
+                !messages(&sheet).is_empty(),
+                "{source:?} is dropped without a diagnostic: {:#?}",
+                sheet.diagnostics
+            );
+        }
+
+        let valid = parse_stylesheet("@scope (.a) to (.b) { p { color: red } }");
+        assert!(messages(&valid).is_empty(), "{:?}", valid.diagnostics);
+        assert_eq!(valid.rules.len(), 1);
+        assert!(valid.rules[0].scopes[0].end.is_some());
+
+        let only_end = parse_stylesheet("@scope to (.b) { p { color: red } }");
+        assert!(messages(&only_end).is_empty(), "{:?}", only_end.diagnostics);
+        assert_eq!(only_end.rules.len(), 1);
+        assert!(only_end.rules[0].scopes[0].start.is_none());
+        assert!(only_end.rules[0].scopes[0].end.is_some());
+    }
+
+    /// CSS Cascade 6 §3.5.5: name-defining at-rules inside `@scope` are global,
+    /// not scoped, but style rules contained by group at-rules are scoped.
+    #[test]
+    fn name_defining_at_rules_inside_scope_are_not_scoped() {
+        let sheet = parse_stylesheet(
+            "@scope (.outer) { @keyframes fade { from { opacity: 0 } } p { animation: fade 1s } }",
+        );
+        assert!(messages(&sheet).is_empty(), "{:?}", sheet.diagnostics);
+        assert_eq!(sheet.keyframes.len(), 1);
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(sheet.rules[0].scopes.len(), 1);
+        assert_eq!(sheet.rules[0].declarations[0].name, "animation");
     }
 }

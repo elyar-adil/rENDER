@@ -64,6 +64,7 @@ const EVALUATED_AT_RULES: &[&str] = &[
     "layer",
     "media",
     "property",
+    "scope",
     "supports",
 ];
 
@@ -295,6 +296,7 @@ mod tests {
                 "layer",
                 "media",
                 "property",
+                "scope",
                 "supports"
             ]
         );
