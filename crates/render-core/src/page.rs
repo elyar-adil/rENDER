@@ -299,8 +299,17 @@ pub struct PreparedPageScript {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageJob {
-    Task { id: TaskId, source: TaskSource },
-    Microtask { id: MicrotaskId },
+    Task {
+        id: TaskId,
+        source: TaskSource,
+    },
+    Microtask {
+        id: MicrotaskId,
+    },
+    /// A user-agent `slotchange` event fired after slot assignment changed.
+    SlotChange {
+        slot: NodeId,
+    },
 }
 
 /// A script result remains observable even when execution throws after making
@@ -413,6 +422,10 @@ pub struct Page {
     /// Whether the self-hosted Web Animations core reported a running animation
     /// at the last tick.
     web_animations_active: bool,
+    /// The slot assignment observed after the last turn. DOM §4.2.2.5 has no
+    /// stored list to observe, so a turn compares this snapshot with the
+    /// current tree and fires `slotchange` for every slot that changed.
+    slot_assignments: Vec<(NodeId, Vec<NodeId>)>,
 }
 
 impl Page {
@@ -487,6 +500,7 @@ impl Page {
         runtime.install_canvas_host(Box::new(canvas.clone()));
         let event_loop = EventLoop::with_limits(document.dom(), options.event_loop_limits);
         let invalidation = InvalidationCursor::at_current(document.dom());
+        let slot_assignments = document.dom().slot_assignment_snapshot();
         Self {
             document,
             runtime,
@@ -506,6 +520,7 @@ impl Page {
             video_frames_dirty: false,
             script_title_override: None,
             web_animations_active: false,
+            slot_assignments,
         }
     }
 
@@ -540,6 +555,7 @@ impl Page {
         runtime.install_canvas_host(Box::new(canvas.clone()));
         let event_loop = EventLoop::with_limits(document.dom(), options.event_loop_limits);
         let invalidation = InvalidationCursor::at_current(document.dom());
+        let slot_assignments = document.dom().slot_assignment_snapshot();
         let mut page = Self {
             document,
             canvas,
@@ -559,6 +575,7 @@ impl Page {
             video_frames_dirty: false,
             script_title_override: None,
             web_animations_active: false,
+            slot_assignments,
         };
         page.refresh_geometry_index();
         page
@@ -1456,6 +1473,62 @@ impl Page {
         self.run_one_turn_with_backends(Some(backends))
     }
 
+    /// DOM §4.2.2.5: fire `slotchange` for every slot whose assigned nodes
+    /// changed since the previous turn. The event bubbles but is neither
+    /// cancelable nor composed.
+    ///
+    /// Assignment is derived from the tree, not stored, so the page keeps the
+    /// last snapshot. A listener that changes assignment again is given a
+    /// bounded number of follow-up rounds; without a bound a listener that
+    /// toggles its own slot would keep the turn alive forever.
+    fn dispatch_slot_changes(&mut self, executions: &mut Vec<PageExecution>) {
+        const MAX_ROUNDS: usize = 8;
+        for _ in 0..MAX_ROUNDS {
+            let current = self.document.dom().slot_assignment_snapshot();
+            if current == self.slot_assignments {
+                return;
+            }
+            let previous: BTreeMap<NodeId, Vec<NodeId>> =
+                self.slot_assignments.iter().cloned().collect();
+            let changed: Vec<NodeId> = current
+                .iter()
+                .filter(|(slot, assigned)| {
+                    previous
+                        .get(slot)
+                        // A slot that just appeared assigned nothing has not
+                        // changed anything observable.
+                        .map_or(!assigned.is_empty(), |old| old != assigned)
+                })
+                .map(|(slot, _)| *slot)
+                .collect();
+            self.slot_assignments = current;
+            if changed.is_empty() {
+                return;
+            }
+            for slot in changed {
+                let from_revision = self.document.dom().revision();
+                let result = self.runtime.dispatch_dom_event(
+                    self.document.dom_mut(),
+                    slot,
+                    "slotchange",
+                    true,
+                    false,
+                    false,
+                    &[],
+                );
+                let to_revision = self.document.dom().revision();
+                executions.push(PageExecution {
+                    job: PageJob::SlotChange { slot },
+                    result: result.map(|not_canceled| ScriptOutcome {
+                        value: JsValue::Boolean(not_canceled),
+                        from_revision,
+                        to_revision,
+                    }),
+                });
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn run_one_turn_with_backends(
         &mut self,
@@ -1586,6 +1659,8 @@ impl Page {
         // root set is stale from here on.
         self.runtime
             .set_external_microtask_roots(std::iter::empty());
+        self.sync_script_title();
+        self.dispatch_slot_changes(&mut executions);
         self.sync_script_title();
         let invalidation = self.invalidation.take(self.document.dom())?;
         let canvas_changed = self.canvas.engine().borrow().has_changes();
@@ -1925,7 +2000,7 @@ fn collect_text_content(dom: &Dom, root: NodeId, text: &mut String) {
 mod tests {
     use super::{
         DocumentScriptQueueError, Page, PageDomEvent, PageJob, PageLimits, PageOptions,
-        PageQueueError, PageTask, PreparedPageScript,
+        PageQueueError, PageTask, PreparedPageScript, collect_text_content,
     };
     use crate::dom::{Dom, NodeId, NodeKind};
     use crate::event_loop::{EventLoopLimits, MicrotaskCheckpoint, RenderingDecision};
@@ -1947,6 +2022,12 @@ mod tests {
             pending.extend(dom.children(node).unwrap_or_default().iter().rev());
         }
         panic!("test element #{id} must exist");
+    }
+
+    fn text_of(dom: &Dom, id: &str) -> String {
+        let mut text = String::new();
+        collect_text_content(dom, element_with_id(dom, id), &mut text);
+        text
     }
 
     #[test]
@@ -2459,6 +2540,52 @@ mod tests {
         assert!(!diff.inserted.is_empty() || !diff.changed.is_empty());
         assert!(!diff.dirty_rects.is_empty());
         assert_eq!(page.queued_script_source_bytes(), 0);
+    }
+
+    #[test]
+    fn slotchange_fires_when_a_slots_assigned_nodes_change() {
+        let mut page =
+            Page::new("<!doctype html><div id=host><span id=light>L</span></div><p id=log></p>");
+        page.queue_script(
+            "const host = document.getElementById('host'); \
+             const root = host.attachShadow({ mode: 'open' }); \
+             const slot = document.createElement('slot'); \
+             root.appendChild(slot); \
+             const log = document.getElementById('log'); \
+             let count = 0; \
+             slot.addEventListener('slotchange', () => { \
+               count += 1; \
+               log.textContent = count + ':' + slot.assignedNodes().length; \
+             });",
+        )
+        .expect("slot setup task fits");
+        let turn = page
+            .run_one_turn_reference()
+            .expect("turn runs")
+            .expect("a turn ran");
+        assert!(
+            turn.executions
+                .iter()
+                .any(|execution| matches!(execution.job, PageJob::SlotChange { .. })),
+            "attaching the shadow and slot must signal the initial assignment: {:?}",
+            turn.executions
+        );
+        assert_eq!(text_of(page.document().dom(), "log"), "1:1");
+
+        page.queue_script("document.getElementById('light').remove();")
+            .expect("removal task fits");
+        let turn = page
+            .run_one_turn_reference()
+            .expect("turn runs")
+            .expect("a turn ran");
+        assert!(
+            turn.executions
+                .iter()
+                .any(|execution| matches!(execution.job, PageJob::SlotChange { .. })),
+            "removing the only slottable must signal another change: {:?}",
+            turn.executions
+        );
+        assert_eq!(text_of(page.document().dom(), "log"), "2:0");
     }
 
     #[test]

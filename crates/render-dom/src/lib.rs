@@ -572,6 +572,10 @@ pub struct Dom {
     named: named::NamedIndex,
     /// The loading state of each image element. See [`Dom::image_state`].
     image_states: BTreeMap<NodeId, ImageLoadState>,
+    /// Number of shadow roots in this arena. Shadow roots are only ever
+    /// attached, so this is a cheap guard for consumers that would otherwise
+    /// walk every node looking for one.
+    shadow_roots: usize,
 }
 
 impl Default for Dom {
@@ -602,6 +606,7 @@ impl Dom {
             ranges: Vec::new(),
             named: named::NamedIndex::default(),
             image_states: BTreeMap::new(),
+            shadow_roots: 0,
         }
     }
 
@@ -623,6 +628,7 @@ impl Dom {
     /// changed, and the tree is not rendered by the owning document.
     pub fn graft_document(&mut self, other: Self) -> NodeId {
         let offset = self.nodes.len();
+        let grafted_shadow_roots = other.shadow_roots;
         let shift = |id: NodeId| NodeId::from_index(id.0 as usize + offset);
         for node in other.nodes {
             self.nodes.push(Node {
@@ -636,6 +642,7 @@ impl Dom {
         for index in offset..self.nodes.len() {
             self.index_named(NodeId::from_index(index));
         }
+        self.shadow_roots += grafted_shadow_roots;
         self.document_content_types.extend(
             other
                 .document_content_types

@@ -215,8 +215,16 @@ impl Dom {
         if let Some(data) = self.element_data_mut(host) {
             data.shadow_root = Some(root);
         }
+        self.shadow_roots += 1;
         self.record_mutations([MutationKind::ShadowRootAttached { host }]);
         Ok(root)
+    }
+
+    /// Whether this arena contains at least one shadow root. A `false` answer
+    /// lets consumers skip slot bookkeeping without walking the node arena.
+    #[must_use]
+    pub const fn has_shadow_roots(&self) -> bool {
+        self.shadow_roots != 0
     }
 
     /// The shadow root attached to `host`, whatever its mode. Whether a script
@@ -495,6 +503,37 @@ impl Dom {
                 })
                 .collect(),
         }
+    }
+
+    /// The assigned nodes of every slot in every shadow tree, in a stable
+    /// order, as `(slot, assigned nodes)`.
+    ///
+    /// Assignment is derived from the current tree on every call. A consumer
+    /// that needs to detect a change keeps the previous snapshot and compares;
+    /// the DOM itself has no stored assignment list to observe.
+    #[must_use]
+    pub fn slot_assignment_snapshot(&self) -> Vec<(NodeId, Vec<NodeId>)> {
+        if !self.has_shadow_roots() {
+            return Vec::new();
+        }
+        let mut roots: Vec<NodeId> = self
+            .nodes()
+            .filter_map(|(id, node)| matches!(node.kind(), NodeKind::ShadowRoot(_)).then_some(id))
+            .collect();
+        roots.sort_unstable();
+        let mut snapshot = Vec::new();
+        for root in roots {
+            let assignments = self.slot_assignments(root);
+            for slot in self.slots_in_tree(root) {
+                let assigned = assignments
+                    .iter()
+                    .filter(|(_, assigned_slot)| *assigned_slot == slot)
+                    .map(|(node, _)| *node)
+                    .collect();
+                snapshot.push((slot, assigned));
+            }
+        }
+        snapshot
     }
 
     /// `slottable.assignedSlot` (DOM §4.2.2.2): the slot `slottable` is assigned
@@ -841,6 +880,43 @@ mod tests {
         // Naming another slot sends it away, and the fallback comes back.
         dom.set_attribute(light, "slot", "x").unwrap();
         assert_eq!(dom.flat_children(slot), vec![fallback]);
+    }
+
+    #[test]
+    fn slot_assignment_snapshot_tracks_every_slot() {
+        let mut dom = Dom::new();
+        let (host, root) = host_with_root(&mut dom, ShadowRootMode::Open);
+        let slot = dom.create_element("slot");
+        dom.append_child(root, slot).unwrap();
+        let light = dom.create_element("i");
+        dom.append_child(host, light).unwrap();
+        assert_eq!(
+            dom.slot_assignment_snapshot(),
+            vec![(slot, vec![light])],
+            "the default slot receives the unnamed light child"
+        );
+
+        dom.set_attribute(light, "slot", "x").unwrap();
+        assert_eq!(
+            dom.slot_assignment_snapshot(),
+            vec![(slot, vec![])],
+            "the same slot is still present, now assigned nothing"
+        );
+
+        let other = dom.create_element("slot");
+        dom.append_child(root, other).unwrap();
+        let snapshot = dom.slot_assignment_snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert!(
+            snapshot
+                .iter()
+                .any(|(candidate, assigned)| *candidate == slot && assigned.is_empty())
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|(candidate, assigned)| *candidate == other && assigned.is_empty())
+        );
     }
 
     #[test]
