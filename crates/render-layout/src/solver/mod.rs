@@ -36,6 +36,8 @@ pub(crate) mod resolve;
 mod table;
 
 #[cfg(test)]
+mod collapse_tests;
+#[cfg(test)]
 mod columns_tests;
 #[cfg(test)]
 mod linebreak_tests;
@@ -530,9 +532,68 @@ struct CollapsedEdges {
     padding: Option<EdgeSizes>,
 }
 
+/// A set of adjoining vertical margins, represented so that merging is
+/// associative even when positive and negative margins mix (CSS 2.1 §8.3.1):
+/// the collapsed value of a set is its largest positive margin plus its most
+/// negative one.
+#[derive(Clone, Copy, Debug, Default)]
+struct MarginStrut {
+    positive: f32,
+    negative: f32,
+}
+
+impl MarginStrut {
+    const ZERO: Self = Self {
+        positive: 0.0,
+        negative: 0.0,
+    };
+
+    fn from_margin(margin: f32) -> Self {
+        if margin >= 0.0 {
+            Self {
+                positive: margin,
+                negative: 0.0,
+            }
+        } else {
+            Self {
+                positive: 0.0,
+                negative: margin,
+            }
+        }
+    }
+
+    /// Adjoining margins collapse together: the used margin is the largest
+    /// positive contribution plus the most negative one.
+    fn merge(self, other: Self) -> Self {
+        Self {
+            positive: self.positive.max(other.positive),
+            negative: self.negative.min(other.negative),
+        }
+    }
+
+    fn value(self) -> f32 {
+        self.positive + self.negative
+    }
+}
+
 #[derive(Clone, Copy)]
 struct BlockResult {
     fragment: FragmentId,
+    /// The effective top margin of the box, measured from its margin box top
+    /// to its border box top. This is the collapsed group formed by the box's
+    /// own `margin-top` and its first in-flow child's top margin when they
+    /// collapse (CSS 2.1 §8.3.1).
+    margin_top: f32,
+    /// The box's border-box height, excluding both margins.
+    border_height: f32,
+    /// The effective bottom margin, the collapsed group formed with the last
+    /// in-flow child's bottom margin when they collapse.
+    margin_bottom: f32,
+    /// An empty block whose own top and bottom margins collapsed together:
+    /// its margin strut passes through it into the surrounding group.
+    collapses_through: bool,
+    /// Margin-box height for consumers that never collapse margins (flex
+    /// items, grid items and the viewport's root flow).
     outer_height: f32,
     /// The height the box's in-flow children occupy, before a used `height`
     /// stretches the content box past them. This is what a consumer aligns

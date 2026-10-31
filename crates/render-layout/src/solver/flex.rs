@@ -579,7 +579,11 @@ impl Solver<'_> {
                         // Flex items are in-flow: their percentage heights are
                         // definite only against a definite container height
                         // (CSS 2 §10.5).
+                        // Flex items establish independent formatting
+                        // contexts; their margins do not collapse with their
+                        // children (CSS Flexbox §4).
                         specified_height.is_some(),
+                        false,
                     ),
                 _ => self.layout_anonymous_block(
                     item.node,

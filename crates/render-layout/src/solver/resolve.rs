@@ -114,6 +114,88 @@ impl Solver<'_> {
         }
     }
 
+    /// Move a subtree because a vertical margin collapsed.
+    ///
+    /// An absolutely or fixed positioned descendant whose containing block
+    /// lies outside the moved subtree must keep its document position: its
+    /// coordinates were resolved against that ancestor, and that ancestor is
+    /// not moving. A descendant whose containing block is inside the subtree
+    /// moves with it. This is why `translate_fragment_subtree` cannot be used
+    /// blindly for margin adjustments.
+    pub(super) fn translate_fragment_subtree_for_margin(
+        &mut self,
+        root: FragmentId,
+        dx: f32,
+        dy: f32,
+    ) {
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        let root_source = self
+            .fragments
+            .get(usize::try_from(root.as_u32()).unwrap_or(usize::MAX))
+            .and_then(|fragment| fragment.source);
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            let Some(fragment) = self
+                .fragments
+                .get(usize::try_from(id.as_u32()).unwrap_or(usize::MAX))
+            else {
+                continue;
+            };
+            let out_of_flow = fragment.source.is_some_and(|source| {
+                matches!(
+                    position(self.styles.get(&source)),
+                    Position::Absolute | Position::Fixed
+                )
+            });
+            if id != root
+                && out_of_flow
+                && !self.positioned_containing_block_within(root_source, fragment.source)
+            {
+                continue;
+            }
+            let children = fragment.children.clone();
+            if let Some(fragment) = self.fragment_mut(id) {
+                translate_fragment(fragment, dx, dy);
+            }
+            stack.extend(children);
+        }
+    }
+
+    /// Whether the containing block of `source` is `root` or a descendant of
+    /// `root`. A fixed box with no containing-block-forming ancestor resolves
+    /// against the viewport, which is never inside a shifted subtree.
+    fn positioned_containing_block_within(
+        &self,
+        root: Option<NodeId>,
+        source: Option<NodeId>,
+    ) -> bool {
+        let (Some(root), Some(source)) = (root, source) else {
+            return true;
+        };
+        let mut current = self.dom.parent(source);
+        while let Some(node) = current {
+            let style = self.styles.get(&node);
+            let establishes = matches!(
+                position(style),
+                Position::Relative | Position::Absolute | Position::Fixed | Position::Sticky
+            ) || super::block::establishes_positioning_containing_block(style);
+            if establishes {
+                let mut ancestor = Some(node);
+                while let Some(candidate) = ancestor {
+                    if candidate == root {
+                        return true;
+                    }
+                    ancestor = self.dom.parent(candidate);
+                }
+                return false;
+            }
+            current = self.dom.parent(node);
+        }
+        false
+    }
+
     /// Moves one fragment, and not its children, by `(dx, dy)`.
     pub(super) fn translate_fragment_own(&mut self, id: FragmentId, dx: f32, dy: f32) {
         if let Some(fragment) = self.fragment_mut(id) {

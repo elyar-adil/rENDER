@@ -420,6 +420,9 @@ impl Solver<'_> {
                     // definite row height, which is content-sized here
                     // (CSS 2 §10.5).
                     false,
+                    // A table cell establishes an independent formatting
+                    // context; its margins do not collapse with its content.
+                    false,
                 ) else {
                     continue;
                 };

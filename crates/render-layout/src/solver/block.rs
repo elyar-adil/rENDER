@@ -9,6 +9,7 @@ use crate::solver::BlockResult;
 use crate::solver::FloatArea;
 use crate::solver::LayoutDiagnostic;
 use crate::solver::LayoutDiagnosticCode;
+use crate::solver::MarginStrut;
 use crate::solver::Solver;
 use crate::solver::columns::ColumnFlow;
 use crate::solver::inline::InlineTextContextSource;
@@ -271,6 +272,7 @@ impl Solver<'_> {
                     depth,
                     None,
                     containing_height_definite,
+                    true,
                 )
             }
             FormattingNodeKind::AtomicInline { .. } => self.layout_block_with_containing_height(
@@ -281,6 +283,7 @@ impl Solver<'_> {
                 depth,
                 None,
                 containing_height_definite,
+                true,
             ),
             FormattingNodeKind::Root => None,
         }
@@ -308,6 +311,7 @@ impl Solver<'_> {
             depth,
             forced_content_width,
             false,
+            true,
         )
     }
 
@@ -323,6 +327,11 @@ impl Solver<'_> {
         depth: usize,
         forced_content_width: Option<f32>,
         containing_height_definite: bool,
+        // Whether this box's margins may collapse with its in-flow children.
+        // Flex items, grid items, floats, absolutely positioned boxes and
+        // table cells establish independent formatting contexts and pass
+        // `false` (CSS 2.1 §8.3.1, Flexbox §4, Grid §6).
+        collapse_children: bool,
     ) -> Option<BlockResult> {
         let node = self.formatting.get(node_id)?.clone();
         let style = node
@@ -540,7 +549,7 @@ impl Solver<'_> {
         }
 
         let content_x = containing.origin.x + margin_left.value + border.left + padding.left;
-        let content_y = margin_box_y + margin_top + border.top + padding.top;
+        let mut content_y = margin_box_y + margin_top + border.top + padding.top;
         let provisional_content = PhysicalRect::new(content_x, content_y, content_width, 0.0);
         let fragment = self.allocate_fragment(
             node_id,
@@ -681,6 +690,25 @@ impl Solver<'_> {
             .children
             .into_iter()
             .partition(|child| !self.is_out_of_flow(*child));
+        // Vertical margin collapsing state shared by the block-flow branch.
+        // A box's own top and bottom margins are replaced by the collapsed
+        // groups they form with their first/last in-flow children, and an
+        // empty box's strut passes through to the next sibling.
+        let mut effective_top = margin_top;
+        let mut effective_bottom = margin_bottom;
+        let mut collapses_through = false;
+        let mut establishes_bfc =
+            !collapse_children || out_of_flow || !matches!(context, FormattingContextKind::Block);
+        if matches!(
+            style.and_then(|style| style.typed("display")),
+            Some(TypedPropertyValue::Display(Display::Normal {
+                inside: DisplayInside::FlowRoot,
+                ..
+            }))
+        ) || establishes_block_formatting_context(style)
+        {
+            establishes_bfc = true;
+        }
         let (mut children, auto_height) = match context {
             FormattingContextKind::Flex => {
                 // A `min-height` resolving against a definite containing
@@ -732,6 +760,11 @@ impl Solver<'_> {
                 // one column, and distributed into the columns afterwards.
                 let columns = self.column_geometry(style, content_width, node.source);
                 let flow_width = columns.map_or(content_width, |geometry| geometry.width);
+                if columns.is_some() {
+                    // A multi-column container is an independent formatting
+                    // context (CSS Multi-column §2), like a BFC root.
+                    establishes_bfc = true;
+                }
                 // The column set being filled runs from `set_top`, and its children
                 // are `children[set_start..]`. A spanning child starts a new set.
                 let mut set_start = 0;
@@ -739,9 +772,24 @@ impl Solver<'_> {
                 let remaining = |top: f32| {
                     specified_content_height.map(|height| (height - (top - content_y)).max(0.0))
                 };
+                // `cursor_y` is always the border-box bottom of the last
+                // in-flow box placed. Margins that have not met their next
+                // border edge yet live in `pending`, so a sibling's bottom
+                // margin and the next sibling's top margin can collapse
+                // without either being counted twice.
                 let mut cursor_y = content_y;
+                let mut pending = MarginStrut::ZERO;
                 let mut children = Vec::new();
                 let mut floats = Vec::new();
+                let mut last_in_flow: Option<BlockResult> = None;
+                // The margin group that reaches the first non-empty content
+                // box. Empty boxes that collapse through contribute their
+                // whole strut to this group, so a parent's top margin still
+                // collapses with a later sibling's top margin across them.
+                let mut first_content_strut: Option<MarginStrut> = None;
+                let mut in_flow_count = 0usize;
+                let mut all_in_flow_collapse_through = true;
+                let mut first_in_flow_had_clearance = false;
                 for child in flow_children {
                     // CSS Multi-column §4: a spanning child closes the column set before
                     // it, and is laid out at the full width of the container.
@@ -750,6 +798,10 @@ impl Solver<'_> {
                         && self.spans_all_columns(child);
                     let child_width = if spans { content_width } else { flow_width };
                     if let Some(geometry) = columns.filter(|_| spans) {
+                        // A column set boundary is not a margin edge: the
+                        // pending strut belongs to the flow inside the set.
+                        cursor_y += pending.value();
+                        pending = MarginStrut::ZERO;
                         cursor_y = self.distribute_column_set(
                             &mut children,
                             set_start,
@@ -761,7 +813,17 @@ impl Solver<'_> {
                             },
                         );
                     }
-                    cursor_y = self.cleared_y(child, cursor_y, &floats);
+                    // Clearance is measured from the position the next
+                    // border edge would occupy, including the pending
+                    // collapsed margin. When clearance is introduced it
+                    // suppresses collapsing with the preceding sibling.
+                    let clear_from = cursor_y + pending.value();
+                    let cleared = self.cleared_y(child, clear_from, &floats);
+                    let had_clearance = cleared > clear_from;
+                    if had_clearance {
+                        pending = MarginStrut::ZERO;
+                        cursor_y = cleared;
+                    }
                     let float = self.float_side(child);
                     if float == Float::None {
                         let result = if matches!(
@@ -803,26 +865,61 @@ impl Solver<'_> {
                             )
                         };
                         if let Some(result) = result {
-                            cursor_y += result.outer_height;
+                            // The child was laid out with its own effective
+                            // top margin above its border edge. Reposition it
+                            // to the collapsed group of that margin and the
+                            // pending margins from preceding siblings.
+                            let child_top = MarginStrut::from_margin(result.margin_top);
+                            let collapsed_top = pending.merge(child_top).value();
+                            let shift = collapsed_top - result.margin_top;
+                            if shift != 0.0 {
+                                self.translate_fragment_subtree_for_margin(
+                                    result.fragment,
+                                    0.0,
+                                    shift,
+                                );
+                            }
                             children.push(result.fragment);
+                            if result.collapses_through {
+                                // The empty box's own top and bottom margins
+                                // are one group; it advances no border edge.
+                                pending = pending.merge(child_top);
+                            } else {
+                                cursor_y += collapsed_top + result.border_height;
+                                if first_content_strut.is_none() {
+                                    first_content_strut = Some(pending.merge(child_top));
+                                    first_in_flow_had_clearance = had_clearance;
+                                }
+                                pending = MarginStrut::from_margin(result.margin_bottom);
+                            }
+                            last_in_flow = Some(result);
+                            in_flow_count += 1;
+                            all_in_flow_collapse_through &= result.collapses_through;
                         }
-                    } else if let Some((fragment, area)) = self.layout_float(
-                        child,
-                        float,
-                        PhysicalRect::new(
-                            content_x,
-                            content_y,
-                            child_width,
-                            child_containing_height,
-                        ),
-                        positioned_child_containing,
-                        cursor_y,
-                        &floats,
-                        depth.saturating_add(1),
-                        child_containing_height_definite,
-                    ) {
-                        floats.push(area);
-                        children.push(fragment);
+                    } else {
+                        // A float is out of flow for collapsing purposes: its
+                        // margins neither collapse nor pass through, so any
+                        // pending sibling margin is placed before it.
+                        cursor_y += pending.value();
+                        pending = MarginStrut::ZERO;
+                        if let Some((fragment, area)) = self.layout_float(
+                            child,
+                            float,
+                            PhysicalRect::new(
+                                content_x,
+                                content_y,
+                                child_width,
+                                child_containing_height,
+                            ),
+                            positioned_child_containing,
+                            cursor_y,
+                            &floats,
+                            depth.saturating_add(1),
+                            child_containing_height_definite,
+                        ) {
+                            floats.push(area);
+                            children.push(fragment);
+                        }
                     }
                     if spans {
                         // What follows a spanning child starts a new column set.
@@ -830,7 +927,7 @@ impl Solver<'_> {
                         set_top = cursor_y;
                     }
                 }
-                let flow_height = match columns {
+                let mut flow_height = match columns {
                     Some(geometry) => {
                         let end = self.distribute_column_set(
                             &mut children,
@@ -844,12 +941,12 @@ impl Solver<'_> {
                         );
                         (end - content_y).max(0.0)
                     }
-                    None => (cursor_y - content_y).max(0.0),
+                    None => cursor_y - content_y,
                 };
                 // A non-visible overflow establishes a block formatting
                 // context, so floats inside it contribute to its auto height
                 // instead of escaping into the parent flow.
-                let contains_floats = matches!(node.kind, FormattingNodeKind::AtomicInline { .. })
+                let contains_floats = matches!(&node.kind, FormattingNodeKind::AtomicInline { .. })
                     || matches!(
                         style.and_then(|style| style.typed("display")),
                         Some(TypedPropertyValue::Display(Display::Normal {
@@ -865,14 +962,104 @@ impl Solver<'_> {
                     .iter()
                     .map(|area| area.rect.bottom() - content_y)
                     .fold(0.0_f32, f32::max);
-                (
-                    children,
-                    if contains_floats {
-                        flow_height.max(float_height)
+                // CSS 2 §10.7: a `min-height` of zero is required before an
+                // empty box's top and bottom margins may collapse together.
+                let min_height = self.apply_min_max_height(
+                    style,
+                    0.0,
+                    containing.size.height,
+                    containing_height_definite,
+                    node.source,
+                    padding.vertical() + border.vertical(),
+                    box_sizing,
+                );
+                let zero_vertical_edges = border.top == 0.0
+                    && border.bottom == 0.0
+                    && padding.top == 0.0
+                    && padding.bottom == 0.0;
+                let empty_content = in_flow_count == 0 || all_in_flow_collapse_through;
+                let auto_content_height = specified_content_height.is_none();
+                let through = columns.is_none()
+                    && !establishes_bfc
+                    && zero_vertical_edges
+                    && empty_content
+                    && min_height <= 0.0
+                    && (auto_content_height || specified_content_height == Some(0.0));
+                if through {
+                    // §8.3.1: the top and bottom margins of an empty box
+                    // collapse with each other and with every group that
+                    // reached it, so the whole strut passes through.
+                    let total = MarginStrut::from_margin(margin_top)
+                        .merge(pending)
+                        .merge(MarginStrut::from_margin(margin_bottom));
+                    effective_top = total.value();
+                    effective_bottom = total.value();
+                    collapses_through = true;
+                    flow_height = 0.0;
+                } else {
+                    // Parent and first in-flow child top margins collapse
+                    // when nothing separates them (§8.3.1). The parent's
+                    // border edge moves to the collapsed position and the
+                    // child's margin is then no longer applied inside.
+                    if !establishes_bfc
+                        && border.top == 0.0
+                        && padding.top == 0.0
+                        && !first_in_flow_had_clearance
+                        && let Some(first_strut) = first_content_strut
+                    {
+                        let merged = MarginStrut::from_margin(margin_top).merge(first_strut);
+                        let collapsed_top = merged.value();
+                        let delta = collapsed_top - margin_top;
+                        // The fragment's children are not attached until
+                        // `set_children` at the end of layout, but the border
+                        // edge moves every in-flow descendant now. Attach
+                        // them so the translation reaches each subtree.
+                        self.set_children(fragment, children.clone());
+                        if delta != 0.0 {
+                            self.translate_fragment_subtree_for_margin(fragment, 0.0, delta);
+                            content_y += delta;
+                        }
+                        // The group that reached the first content box was
+                        // part of the parent's outer margin; it is no longer
+                        // applied between the parent's content edge and that
+                        // box. Every in-flow child was already moved by
+                        // `delta`; removing the strut is the remaining shift.
+                        let child_shift = -first_strut.value();
+                        if child_shift != 0.0 {
+                            for child in &children {
+                                self.translate_fragment_subtree_for_margin(
+                                    *child,
+                                    0.0,
+                                    child_shift,
+                                );
+                            }
+                        }
+                        flow_height -= first_strut.value();
+                        effective_top = collapsed_top;
+                    }
+                    // §8.3.1: the bottom margin collapses with the last
+                    // in-flow child's bottom margin when the height is auto,
+                    // `min-height` is zero, and no bottom edge separates
+                    // them. Otherwise the trailing margin is inside.
+                    let collapses_bottom = !establishes_bfc
+                        && border.bottom == 0.0
+                        && padding.bottom == 0.0
+                        && auto_content_height
+                        && min_height <= 0.0
+                        && last_in_flow.is_some();
+                    if collapses_bottom {
+                        effective_bottom = MarginStrut::from_margin(margin_bottom)
+                            .merge(pending)
+                            .value();
                     } else {
-                        flow_height
-                    },
-                )
+                        flow_height += pending.value();
+                    }
+                }
+                let mut flow_height = flow_height.max(0.0);
+                if contains_floats {
+                    flow_height = flow_height.max(float_height);
+                }
+                (children, flow_height)
             }
         };
         // CSS Containment 3 §3: size containment makes the intrinsic block size
@@ -915,12 +1102,16 @@ impl Solver<'_> {
                 // carry that extent into the containing rect: absolute
                 // descendants with `height:100%` must resolve against the
                 // real box (CSS 2 §10.5/§10.6), never a tentative zero.
-                let margin_box_bottom = margin_box_y
-                    + margin_top
-                    + border.vertical()
-                    + padding.vertical()
-                    + content_height
-                    + margin_bottom;
+                let margin_box_bottom = if collapses_through {
+                    margin_box_y + effective_top
+                } else {
+                    margin_box_y
+                        + effective_top
+                        + border.vertical()
+                        + padding.vertical()
+                        + content_height
+                        + effective_bottom
+                };
                 let carried = (margin_box_bottom - positioning_containing.origin.y).max(0.0);
                 PhysicalRect::new(
                     positioning_containing.origin.x,
@@ -1004,12 +1195,19 @@ impl Solver<'_> {
             );
         }
         self.fixed_positioning_containing = saved_fixed_containing;
+        let border_height = border.vertical() + padding.vertical() + content_height;
         Some(BlockResult {
             fragment,
+            margin_top: effective_top,
+            border_height,
+            margin_bottom: effective_bottom,
+            collapses_through,
             outer_height: if out_of_flow {
                 0.0
+            } else if collapses_through {
+                effective_top
             } else {
-                margin_top + border.vertical() + padding.vertical() + content_height + margin_bottom
+                effective_top + border_height + effective_bottom
             },
             flow_height: auto_height,
         })
@@ -1072,6 +1270,7 @@ impl Solver<'_> {
                 depth,
                 None,
                 false,
+                false,
             );
         }
         let fragment = self.allocate_fragment(
@@ -1104,6 +1303,13 @@ impl Solver<'_> {
         self.finish_box(fragment, height, children);
         Some(BlockResult {
             fragment,
+            margin_top: 0.0,
+            border_height: height,
+            margin_bottom: 0.0,
+            // An anonymous wrapper with no line boxes is empty in the margin
+            // sense: its zero top and bottom margins are adjoining, so the
+            // surrounding margins collapse through it (CSS 2.1 §8.3.1).
+            collapses_through: height <= 0.0,
             outer_height: height,
             flow_height: height,
         })
@@ -1191,6 +1397,9 @@ impl Solver<'_> {
                 depth,
                 Some(forced_content_width),
                 containing_height_definite,
+                // A float establishes its own block formatting context, so
+                // its margins never collapse with its children's.
+                false,
             )?;
             let outer = self.fragment_outer_rect(result.fragment)?;
             if outer.size.width <= available || available >= containing.size.width {
