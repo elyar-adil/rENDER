@@ -54,6 +54,9 @@
 - 修复：`next_control_flow()` 把截图 deadline 与帧轮询、页面 timer 取最小值；
   窗口已存在但 frame 为空时明确报错；事件循环在截图未写出就停止时非零退出。
 - 实测生成 122,219 字节 PNG，`@scope` 演示的颜色/限制/嵌套/隐式根全部正确。
+- 同轮的浏览器测试基建：`serve_until_idle` 改为按期望请求数收尾，跨源 PUT 预检
+  测试不再依赖 800ms 空闲窗口，消除了并行 `cargo test --workspace` 下的时序
+  flake。
 
 ## 构建前提
 
@@ -72,6 +75,7 @@ cargo test -p render-core --lib                   453 passed, 0 failed
 cargo test -p render-browser -- --test-threads=1  206 + 114 + 2 passed, 0 failed
 cargo test -p render-layout --lib                 322 passed, 1 ignored
 cargo test -p render-dom --lib                    78 passed, 0 failed
+cargo test --workspace                            all crates passed, 0 failed
 cargo fmt --all --check                           clean
 cargo clippy -p render-css -p render-core -p render-browser -p render-dom -p render-layout \
   --all-targets -- -D warnings                    clean
