@@ -1269,6 +1269,10 @@ pub enum CssColor {
     /// A `color-mix()` whose operands depend on context (`currentcolor` or a
     /// system color). Absolute mixes resolve to `Srgb` while parsing.
     Mix(Box<super::color::ColorMix>),
+    /// A color with one or more missing components (CSS Color 4 §4.4). Its
+    /// authored space is retained so a `color-mix()` can carry `none` forward
+    /// to an analogous component before conversion.
+    Space(Box<super::color::SpaceColor>),
 }
 
 impl CssColor {
@@ -1291,6 +1295,7 @@ impl CssColor {
             Self::Canvas => "canvas".to_owned(),
             Self::CanvasText => "canvastext".to_owned(),
             Self::Mix(mix) => mix.to_css(),
+            Self::Space(color) => color.to_css(),
         }
     }
 }
@@ -2159,6 +2164,20 @@ fn parse_containment<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, Containmen
 }
 
 fn parse_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
+    parse_color_with_space(input, false)
+}
+
+/// Parse a `color-mix()` operand without collapsing an absolute color to
+/// sRGB. Keeping the authored space (and even its explicit components) lets
+/// §13.3 decide analogous components and powerlessness before conversion.
+fn parse_color_preserving_space<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
+    parse_color_with_space(input, true)
+}
+
+fn parse_color_with_space<'i>(
+    input: &mut Parser<'i, '_>,
+    preserve_space: bool,
+) -> CssResult<'i, CssColor> {
     let location = input.current_source_location();
     let token = input.next()?.clone();
     match token {
@@ -2196,39 +2215,39 @@ fn parse_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
         Token::Function(name)
             if name.eq_ignore_ascii_case("rgb") || name.eq_ignore_ascii_case("rgba") =>
         {
-            input.parse_nested_block(parse_rgb_color)
+            input.parse_nested_block(|input| parse_rgb_color(input, preserve_space))
         }
-        // CSS Color 4 §4.3 `hsl()` / §4.4 `hsla()`, including the legacy
+        // CSS Color 4 §7 `hsl()` / `hsla()`, including the legacy
         // comma-separated form of CSS Color 3 §4.2.
         Token::Function(name)
             if name.eq_ignore_ascii_case("hsl") || name.eq_ignore_ascii_case("hsla") =>
         {
-            input.parse_nested_block(parse_hsl_color)
+            input.parse_nested_block(|input| parse_hsl_color(input, preserve_space))
         }
         // CSS Color 4 §10.1 `color()`.
         Token::Function(name) if name.eq_ignore_ascii_case("color") => {
-            input.parse_nested_block(parse_color_function)
+            input.parse_nested_block(|input| parse_color_function(input, preserve_space))
         }
-        // CSS Color 4 §4.4 `hwb()`, §4.4.1 `lab()`/`lch()`, and §4.4.2
+        // CSS Color 4 §8 `hwb()`, §9.3 `lab()`/`lch()`, and §9.4
         // `oklab()`/`oklch()`.
         Token::Function(name) if name.eq_ignore_ascii_case("hwb") => {
-            input.parse_nested_block(parse_hwb_color)
+            input.parse_nested_block(|input| parse_hwb_color(input, preserve_space))
         }
         Token::Function(name) if name.eq_ignore_ascii_case("lab") => {
-            input.parse_nested_block(parse_lab_color)
+            input.parse_nested_block(|input| parse_lab_color(input, preserve_space))
         }
         Token::Function(name) if name.eq_ignore_ascii_case("lch") => {
-            input.parse_nested_block(parse_lch_color)
+            input.parse_nested_block(|input| parse_lch_color(input, preserve_space))
         }
         Token::Function(name) if name.eq_ignore_ascii_case("oklab") => {
-            input.parse_nested_block(parse_oklab_color)
+            input.parse_nested_block(|input| parse_oklab_color(input, preserve_space))
         }
         Token::Function(name) if name.eq_ignore_ascii_case("oklch") => {
-            input.parse_nested_block(parse_oklch_color)
+            input.parse_nested_block(|input| parse_oklch_color(input, preserve_space))
         }
         // CSS Color 5 §3 `color-mix()`.
         Token::Function(name) if name.eq_ignore_ascii_case("color-mix") => {
-            input.parse_nested_block(parse_color_mix)
+            input.parse_nested_block(|input| parse_color_mix(input, preserve_space))
         }
         _ => Err(location.new_custom_error(())),
     }
@@ -2242,31 +2261,25 @@ fn parse_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
 /// point), then apply the destination transfer function. The matrices are the
 /// ones in §19's sample code.
 ///
-/// Only `srgb`, `srgb-linear` and `display-p3` are accepted. A space this
-/// engine cannot represent is **rejected with a diagnostic naming it**, never
-/// approximated: a silently wrong colour is worse than a missing declaration,
-/// because the page still lays out and only the paint is wrong.
-fn parse_color_function<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
+/// Only spaces listed by [`crate::color::ColorSpace::is_predefined_space`] are
+/// accepted. A space this engine cannot represent is **rejected with a
+/// diagnostic naming it**, never approximated: a silently wrong colour is
+/// worse than a missing declaration, because the page still lays out and only
+/// the paint is wrong.
+fn parse_color_function<'i>(
+    input: &mut Parser<'i, '_>,
+    preserve_space: bool,
+) -> CssResult<'i, CssColor> {
     let location = input.current_source_location();
     let space = input.expect_ident_cloned()?.to_ascii_lowercase();
     let red = parse_color_component(input)?;
     let green = parse_color_component(input)?;
     let blue = parse_color_component(input)?;
-    let alpha = if input
-        .try_parse(|candidate| candidate.expect_delim('/'))
-        .is_ok()
-    {
-        parse_alpha_component(input)?
-    } else {
-        1.0
-    };
+    let alpha = parse_modern_alpha(input)?;
     if !input.is_exhausted() {
         return Err(location.new_custom_error(ValueError::detail(
             "trailing tokens after the color() components",
         )));
-    }
-    if !(red.is_finite() && green.is_finite() && blue.is_finite() && alpha.is_finite()) {
-        return Err(location.new_custom_error(()));
     }
     let Some(space) = crate::color::ColorSpace::from_ident(&space) else {
         return Err(location.new_custom_error(ValueError::detail(format!(
@@ -2279,33 +2292,58 @@ fn parse_color_function<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColo
             space.name()
         ))));
     }
-    let mut srgb = crate::color::space_to_srgb(space, [red, green, blue]);
-    srgb.alpha = alpha.clamp(0.0, 1.0);
-    Ok(crate::color::rgba_to_css(srgb))
+    Ok(space_color_or_srgb(
+        space,
+        [red, green, blue],
+        alpha,
+        preserve_space,
+    ))
+}
+
+/// CSS Color 4 §4.4: keep a color that has missing components in its authored
+/// space so interpolation can carry them forward; otherwise compute it to the
+/// engine's sRGB paint value exactly as before.
+fn space_color_or_srgb(
+    space: crate::color::ColorSpace,
+    components: [Option<f32>; 3],
+    alpha: Option<f32>,
+    preserve_space: bool,
+) -> CssColor {
+    if preserve_space || components.iter().any(Option::is_none) || alpha.is_none() {
+        return CssColor::Space(Box::new(crate::color::SpaceColor::new(
+            space, components, alpha,
+        )));
+    }
+    let mut srgb =
+        crate::color::space_to_srgb(space, components.map(|component| component.unwrap_or(0.0)));
+    srgb.alpha = alpha.unwrap_or(1.0).clamp(0.0, 1.0);
+    crate::color::rgba_to_css(srgb)
 }
 
 /// CSS Color 4 §4.1.1: a `<predefined-rgb>` component is a `<number>` in
-/// `0.0..1.0` or a `<percentage>` in `0%..100%`, and `none` is a missing
-/// component, which §4.4 says behaves as a zero value "including converting it
-/// to another color space".
-fn parse_color_component<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
+/// `0.0..1.0` or a `<percentage>` in `0%..100%`; `none` is a missing component
+/// (§4.4) that here retains its missing state for interpolation.
+fn parse_color_component<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, Option<f32>> {
     let location = input.current_source_location();
     let value = match input.next()?.clone() {
-        Token::Number { value, .. } => value,
+        Token::Number { value, .. } => Some(value),
         // `unit_value` is already normalized to `0.0..=1.0`.
-        Token::Percentage { unit_value, .. } => unit_value,
-        Token::Ident(value) if value.eq_ignore_ascii_case("none") => 0.0,
+        Token::Percentage { unit_value, .. } => Some(unit_value),
+        Token::Ident(value) if value.eq_ignore_ascii_case("none") => None,
         _ => return Err(location.new_custom_error(())),
     };
-    if value.is_finite() {
+    if value.is_none_or(f32::is_finite) {
         Ok(value)
     } else {
         Err(location.new_custom_error(()))
     }
 }
 
-/// Parse `hwb()` (CSS Color 4 §4.4) and convert it to sRGB.
-fn parse_hwb_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
+/// Parse `hwb()` (CSS Color 4 §8) and compute it to sRGB.
+fn parse_hwb_color<'i>(
+    input: &mut Parser<'i, '_>,
+    preserve_space: bool,
+) -> CssResult<'i, CssColor> {
     let location = input.current_source_location();
     let hue = parse_hue_or_none(input)?;
     let white = parse_percentage_or_none(input)?;
@@ -2314,71 +2352,101 @@ fn parse_hwb_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
     if !input.is_exhausted() {
         return Err(location.new_custom_error(()));
     }
-    let mut color = crate::color::space_to_srgb(crate::color::ColorSpace::Hwb, [hue, white, black]);
-    color.alpha = alpha;
-    Ok(crate::color::rgba_to_css(color))
+    let components = [
+        hue.map(|value| value.rem_euclid(360.0)),
+        white.map(|value| value.clamp(0.0, 1.0)),
+        black.map(|value| value.clamp(0.0, 1.0)),
+    ];
+    Ok(space_color_or_srgb(
+        crate::color::ColorSpace::Hwb,
+        components,
+        alpha,
+        preserve_space,
+    ))
 }
 
-/// Parse `lab()` (CSS Color 4 §4.4.1) and convert it to sRGB.
-fn parse_lab_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
+/// Parse `lab()` (CSS Color 4 §9.3) and compute it to sRGB.
+fn parse_lab_color<'i>(
+    input: &mut Parser<'i, '_>,
+    preserve_space: bool,
+) -> CssResult<'i, CssColor> {
     let location = input.current_source_location();
-    let lightness = parse_number_or_percentage(input, 100.0)?.clamp(0.0, 100.0);
+    let lightness = parse_number_or_percentage(input, 100.0)?.map(|value| value.clamp(0.0, 100.0));
     let a = parse_number_or_percentage(input, 125.0)?;
     let b = parse_number_or_percentage(input, 125.0)?;
     let alpha = parse_modern_alpha(input)?;
     if !input.is_exhausted() {
         return Err(location.new_custom_error(()));
     }
-    let mut color = crate::color::space_to_srgb(crate::color::ColorSpace::Lab, [lightness, a, b]);
-    color.alpha = alpha;
-    Ok(crate::color::rgba_to_css(color))
+    Ok(space_color_or_srgb(
+        crate::color::ColorSpace::Lab,
+        [lightness, a, b],
+        alpha,
+        preserve_space,
+    ))
 }
 
-/// Parse `lch()` (CSS Color 4 §4.4.1) and convert it to sRGB.
-fn parse_lch_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
+/// Parse `lch()` (CSS Color 4 §9.3) and compute it to sRGB.
+fn parse_lch_color<'i>(
+    input: &mut Parser<'i, '_>,
+    preserve_space: bool,
+) -> CssResult<'i, CssColor> {
     let location = input.current_source_location();
-    let lightness = parse_number_or_percentage(input, 100.0)?.clamp(0.0, 100.0);
-    let chroma = parse_number_or_percentage(input, 150.0)?.max(0.0);
-    let hue = parse_hue_or_none(input)?;
+    let lightness = parse_number_or_percentage(input, 100.0)?.map(|value| value.clamp(0.0, 100.0));
+    let chroma = parse_number_or_percentage(input, 150.0)?.map(|value| value.max(0.0));
+    let hue = parse_hue_or_none(input)?.map(|value| value.rem_euclid(360.0));
     let alpha = parse_modern_alpha(input)?;
     if !input.is_exhausted() {
         return Err(location.new_custom_error(()));
     }
-    let mut color =
-        crate::color::space_to_srgb(crate::color::ColorSpace::Lch, [lightness, chroma, hue]);
-    color.alpha = alpha;
-    Ok(crate::color::rgba_to_css(color))
+    Ok(space_color_or_srgb(
+        crate::color::ColorSpace::Lch,
+        [lightness, chroma, hue],
+        alpha,
+        preserve_space,
+    ))
 }
 
-/// Parse `oklab()` (CSS Color 4 §4.4.2) and convert it to sRGB.
-fn parse_oklab_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
+/// Parse `oklab()` (CSS Color 4 §9.4) and compute it to sRGB.
+fn parse_oklab_color<'i>(
+    input: &mut Parser<'i, '_>,
+    preserve_space: bool,
+) -> CssResult<'i, CssColor> {
     let location = input.current_source_location();
-    let lightness = parse_number_or_percentage(input, 1.0)?.clamp(0.0, 1.0);
+    let lightness = parse_number_or_percentage(input, 1.0)?.map(|value| value.clamp(0.0, 1.0));
     let a = parse_number_or_percentage(input, 0.4)?;
     let b = parse_number_or_percentage(input, 0.4)?;
     let alpha = parse_modern_alpha(input)?;
     if !input.is_exhausted() {
         return Err(location.new_custom_error(()));
     }
-    let mut color = crate::color::space_to_srgb(crate::color::ColorSpace::Oklab, [lightness, a, b]);
-    color.alpha = alpha;
-    Ok(crate::color::rgba_to_css(color))
+    Ok(space_color_or_srgb(
+        crate::color::ColorSpace::Oklab,
+        [lightness, a, b],
+        alpha,
+        preserve_space,
+    ))
 }
 
-/// Parse `oklch()` (CSS Color 4 §4.4.2) and convert it to sRGB.
-fn parse_oklch_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
+/// Parse `oklch()` (CSS Color 4 §9.4) and compute it to sRGB.
+fn parse_oklch_color<'i>(
+    input: &mut Parser<'i, '_>,
+    preserve_space: bool,
+) -> CssResult<'i, CssColor> {
     let location = input.current_source_location();
-    let lightness = parse_number_or_percentage(input, 1.0)?.clamp(0.0, 1.0);
-    let chroma = parse_number_or_percentage(input, 0.4)?.max(0.0);
-    let hue = parse_hue_or_none(input)?;
+    let lightness = parse_number_or_percentage(input, 1.0)?.map(|value| value.clamp(0.0, 1.0));
+    let chroma = parse_number_or_percentage(input, 0.4)?.map(|value| value.max(0.0));
+    let hue = parse_hue_or_none(input)?.map(|value| value.rem_euclid(360.0));
     let alpha = parse_modern_alpha(input)?;
     if !input.is_exhausted() {
         return Err(location.new_custom_error(()));
     }
-    let mut color =
-        crate::color::space_to_srgb(crate::color::ColorSpace::Oklch, [lightness, chroma, hue]);
-    color.alpha = alpha;
-    Ok(crate::color::rgba_to_css(color))
+    Ok(space_color_or_srgb(
+        crate::color::ColorSpace::Oklch,
+        [lightness, chroma, hue],
+        alpha,
+        preserve_space,
+    ))
 }
 
 /// Parse `color-mix()` (CSS Color 5 §3).
@@ -2387,7 +2455,10 @@ fn parse_oklch_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> 
 /// `color-mix( <color-interpolation-method> , <color> [ <percentage> ]? , <color> [ <percentage> ]? )`.
 /// A mix of two absolute colors resolves at parse time; one naming
 /// `currentcolor` or a system color stays a [`CssColor::Mix`] until paint.
-fn parse_color_mix<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
+fn parse_color_mix<'i>(
+    input: &mut Parser<'i, '_>,
+    preserve_space: bool,
+) -> CssResult<'i, CssColor> {
     let location = input.current_source_location();
     let keyword = input.expect_ident_cloned()?;
     if !keyword.eq_ignore_ascii_case("in") {
@@ -2433,8 +2504,12 @@ fn parse_color_mix<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
         right_weight,
         alpha_multiplier,
     }));
-    if let Some(color) = crate::color::resolve_absolute(&mix) {
-        Ok(crate::color::rgba_to_css(color))
+    if let Some(color) = crate::color::resolve_absolute_space(&mix) {
+        if preserve_space || color.has_missing() {
+            Ok(CssColor::Space(Box::new(color)))
+        } else {
+            Ok(crate::color::rgba_to_css(color.to_rgba()))
+        }
     } else {
         Ok(mix)
     }
@@ -2443,7 +2518,7 @@ fn parse_color_mix<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
 fn parse_color_mix_operand<'i>(
     input: &mut Parser<'i, '_>,
 ) -> CssResult<'i, (CssColor, Option<f32>)> {
-    let color = parse_color(input)?;
+    let color = parse_color_preserving_space(input)?;
     let percent = input.try_parse(parse_color_mix_percentage).ok();
     Ok((color, percent))
 }
@@ -2481,59 +2556,72 @@ fn color_mix_weights(left: Option<f32>, right: Option<f32>) -> (f32, f32, f32) {
     }
 }
 
-/// A `<percentage>` component that accepts `none` as zero.
-fn parse_percentage_or_none<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
-    let location = input.current_source_location();
-    match input.next()?.clone() {
-        Token::Percentage { unit_value, .. } => Ok(unit_value),
-        Token::Ident(value) if value.eq_ignore_ascii_case("none") => Ok(0.0),
-        _ => Err(location.new_custom_error(())),
-    }
-}
-
-/// A `<number>` or `<percentage>` component where `100%` scales to `percentage_scale`.
-fn parse_number_or_percentage<'i>(
-    input: &mut Parser<'i, '_>,
-    percentage_scale: f32,
-) -> CssResult<'i, f32> {
+/// A `<percentage>` component that may be the missing-component keyword
+/// `none` (CSS Color 4 §4.4).
+fn parse_percentage_or_none<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, Option<f32>> {
     let location = input.current_source_location();
     let value = match input.next()?.clone() {
-        Token::Number { value, .. } => value,
-        Token::Percentage { unit_value, .. } => unit_value * percentage_scale,
-        Token::Ident(value) if value.eq_ignore_ascii_case("none") => 0.0,
+        Token::Percentage { unit_value, .. } => Some(unit_value),
+        Token::Ident(value) if value.eq_ignore_ascii_case("none") => None,
         _ => return Err(location.new_custom_error(())),
     };
-    if value.is_finite() {
+    if value.is_none_or(f32::is_finite) {
         Ok(value)
     } else {
         Err(location.new_custom_error(()))
     }
 }
 
-fn parse_hue_or_none<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
+/// A `<number>` or `<percentage>` component where `100%` scales to
+/// `percentage_scale`; `none` stays missing.
+fn parse_number_or_percentage<'i>(
+    input: &mut Parser<'i, '_>,
+    percentage_scale: f32,
+) -> CssResult<'i, Option<f32>> {
+    let location = input.current_source_location();
+    let value = match input.next()?.clone() {
+        Token::Number { value, .. } => Some(value),
+        Token::Percentage { unit_value, .. } => Some(unit_value * percentage_scale),
+        Token::Ident(value) if value.eq_ignore_ascii_case("none") => None,
+        _ => return Err(location.new_custom_error(())),
+    };
+    if value.is_none_or(f32::is_finite) {
+        Ok(value)
+    } else {
+        Err(location.new_custom_error(()))
+    }
+}
+
+fn parse_hue_or_none<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, Option<f32>> {
     if let Ok(hue) = input.try_parse(parse_hue) {
-        return Ok(hue);
+        return Ok(Some(hue));
     }
     let location = input.current_source_location();
     match input.next()?.clone() {
-        Token::Ident(value) if value.eq_ignore_ascii_case("none") => Ok(0.0),
+        Token::Ident(value) if value.eq_ignore_ascii_case("none") => Ok(None),
         _ => Err(location.new_custom_error(())),
     }
 }
 
-fn parse_modern_alpha<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
+/// The modern `/ <alpha-value>` term, where `none` is a missing alpha (§4.2).
+fn parse_modern_alpha<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, Option<f32>> {
     if input
         .try_parse(|candidate| candidate.expect_delim('/'))
         .is_err()
     {
-        return Ok(1.0);
+        return Ok(Some(1.0));
     }
     let location = input.current_source_location();
-    match input.next()?.clone() {
-        Token::Number { value, .. } => Ok(value.clamp(0.0, 1.0)),
-        Token::Percentage { unit_value, .. } => Ok(unit_value.clamp(0.0, 1.0)),
-        Token::Ident(value) if value.eq_ignore_ascii_case("none") => Ok(0.0),
-        _ => Err(location.new_custom_error(())),
+    let value = match input.next()?.clone() {
+        Token::Number { value, .. } => Some(value.clamp(0.0, 1.0)),
+        Token::Percentage { unit_value, .. } => Some(unit_value.clamp(0.0, 1.0)),
+        Token::Ident(value) if value.eq_ignore_ascii_case("none") => None,
+        _ => return Err(location.new_custom_error(())),
+    };
+    if value.is_none_or(f32::is_finite) {
+        Ok(value)
+    } else {
+        Err(location.new_custom_error(()))
     }
 }
 
@@ -2598,7 +2686,10 @@ fn parse_raw_single_layer<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, Strin
     }
 }
 
-fn parse_rgb_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
+fn parse_rgb_color<'i>(
+    input: &mut Parser<'i, '_>,
+    preserve_space: bool,
+) -> CssResult<'i, CssColor> {
     let location = input.current_source_location();
     let first = parse_rgb_component(input)?;
     let comma_syntax = input.try_parse(Parser::expect_comma).is_ok();
@@ -2609,28 +2700,38 @@ fn parse_rgb_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
     let third = parse_rgb_component(input)?;
     let alpha = if comma_syntax {
         if input.try_parse(Parser::expect_comma).is_ok() {
-            parse_alpha_component(input)?
+            parse_alpha_component(input, false)?
         } else {
-            1.0
+            Some(1.0)
         }
     } else if input
         .try_parse(|candidate| candidate.expect_delim('/'))
         .is_ok()
     {
-        parse_alpha_component(input)?
+        parse_alpha_component(input, true)?
     } else {
-        1.0
+        Some(1.0)
     };
-    if first.is_finite() && second.is_finite() && third.is_finite() && alpha.is_finite() {
-        Ok(CssColor::Srgb {
-            red: rounded_rgb_channel(first),
-            green: rounded_rgb_channel(second),
-            blue: rounded_rgb_channel(third),
-            alpha: alpha.clamp(0.0, 1.0),
-        })
-    } else {
-        Err(location.new_custom_error(()))
+    if comma_syntax && (first.is_none() || second.is_none() || third.is_none() || alpha.is_none()) {
+        // CSS Color 4 §4.1.2: legacy comma syntax never accepts `none`.
+        return Err(location.new_custom_error(()));
     }
+    let components = [first, second, third]
+        .map(|component| component.map(|value| value.clamp(0.0, 255.0) / 255.0));
+    if preserve_space || components.iter().any(Option::is_none) || alpha.is_none() {
+        return Ok(CssColor::Space(Box::new(crate::color::SpaceColor::new(
+            crate::color::ColorSpace::Srgb,
+            components,
+            alpha,
+        ))));
+    }
+    let values = components.map(|component| component.unwrap_or(0.0));
+    Ok(CssColor::Srgb {
+        red: rounded_rgb_channel(values[0] * 255.0),
+        green: rounded_rgb_channel(values[1] * 255.0),
+        blue: rounded_rgb_channel(values[2] * 255.0),
+        alpha: alpha.unwrap_or(1.0).clamp(0.0, 1.0),
+    })
 }
 
 fn rounded_rgb_channel(value: f32) -> u8 {
@@ -2644,36 +2745,57 @@ fn rounded_rgb_channel(value: f32) -> u8 {
     }
 }
 
-fn parse_rgb_component<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
+fn parse_rgb_component<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, Option<f32>> {
     let location = input.current_source_location();
-    match input.next()?.clone() {
-        Token::Number { value, .. } => Ok(value),
-        Token::Percentage { unit_value, .. } => Ok(unit_value * 255.0),
-        _ => Err(location.new_custom_error(())),
+    let value = match input.next()?.clone() {
+        Token::Number { value, .. } => Some(value),
+        Token::Percentage { unit_value, .. } => Some(unit_value * 255.0),
+        Token::Ident(value) if value.eq_ignore_ascii_case("none") => None,
+        _ => return Err(location.new_custom_error(())),
+    };
+    if value.is_none_or(f32::is_finite) {
+        Ok(value)
+    } else {
+        Err(location.new_custom_error(()))
     }
 }
 
-fn parse_alpha_component<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
+fn parse_alpha_component<'i>(
+    input: &mut Parser<'i, '_>,
+    allow_none: bool,
+) -> CssResult<'i, Option<f32>> {
     let location = input.current_source_location();
-    match input.next()?.clone() {
-        Token::Number { value, .. } => Ok(value),
-        Token::Percentage { unit_value, .. } => Ok(unit_value),
-        _ => Err(location.new_custom_error(())),
+    let value = match input.next()?.clone() {
+        Token::Number { value, .. } => Some(value.clamp(0.0, 1.0)),
+        Token::Percentage { unit_value, .. } => Some(unit_value.clamp(0.0, 1.0)),
+        Token::Ident(value) if allow_none && value.eq_ignore_ascii_case("none") => None,
+        _ => return Err(location.new_custom_error(())),
+    };
+    if value.is_none_or(f32::is_finite) {
+        Ok(value)
+    } else {
+        Err(location.new_custom_error(()))
     }
 }
 
 /// Parse `hsl()` / `hsla()` and resolve it to sRGB.
 ///
-/// CSS Color 4 §4.3 defines the modern space-separated form with a `/` alpha
+/// CSS Color 4 §7 defines the modern space-separated form with a `/` alpha
 /// separator; CSS Color 3 §4.2 defines the legacy comma-separated form that
 /// real stylesheets still ship in bulk, including a bare `.5` alpha. The
-/// computed value of both is the equivalent sRGB color (CSS Color 4 §4.3), so
+/// computed value of both is the equivalent sRGB color (CSS Color 4 §15.1), so
 /// the conversion happens here instead of adding a second color space to the
 /// paint contract.
-fn parse_hsl_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
+fn parse_hsl_color<'i>(
+    input: &mut Parser<'i, '_>,
+    preserve_space: bool,
+) -> CssResult<'i, CssColor> {
     let location = input.current_source_location();
-    let hue = parse_hue(input)?;
+    let hue = parse_hue_or_none(input)?;
     let comma_syntax = input.try_parse(Parser::expect_comma).is_ok();
+    if comma_syntax && hue.is_none() {
+        return Err(location.new_custom_error(()));
+    }
     let saturation = parse_hsl_percentage(input, comma_syntax)?;
     if comma_syntax {
         input.expect_comma()?;
@@ -2681,27 +2803,51 @@ fn parse_hsl_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
     let lightness = parse_hsl_percentage(input, comma_syntax)?;
     let alpha = if comma_syntax {
         if input.try_parse(Parser::expect_comma).is_ok() {
-            parse_alpha_component(input)?
+            parse_alpha_component(input, false)?
         } else {
-            1.0
+            Some(1.0)
         }
     } else if input
         .try_parse(|candidate| candidate.expect_delim('/'))
         .is_ok()
     {
-        parse_alpha_component(input)?
+        parse_alpha_component(input, true)?
     } else {
-        1.0
+        Some(1.0)
     };
     if !input.is_exhausted() {
         return Err(location.new_custom_error(()));
     }
-    let (red, green, blue) = hsl_to_srgb(hue, saturation, lightness);
+    if comma_syntax && (saturation.is_none() || lightness.is_none() || alpha.is_none()) {
+        return Err(location.new_custom_error(()));
+    }
+    if preserve_space
+        || hue.is_none()
+        || saturation.is_none()
+        || lightness.is_none()
+        || alpha.is_none()
+    {
+        let components = [
+            hue.map(|value| value.rem_euclid(360.0)),
+            saturation.map(|value| value.clamp(0.0, 1.0)),
+            lightness.map(|value| value.clamp(0.0, 1.0)),
+        ];
+        return Ok(CssColor::Space(Box::new(crate::color::SpaceColor::new(
+            crate::color::ColorSpace::Hsl,
+            components,
+            alpha,
+        ))));
+    }
+    let (red, green, blue) = hsl_to_srgb(
+        hue.unwrap_or(0.0),
+        saturation.unwrap_or(0.0),
+        lightness.unwrap_or(0.0),
+    );
     Ok(CssColor::Srgb {
         red,
         green,
         blue,
-        alpha: alpha.clamp(0.0, 1.0),
+        alpha: alpha.unwrap_or(1.0).clamp(0.0, 1.0),
     })
 }
 
@@ -2729,16 +2875,21 @@ fn parse_hue<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
 
 /// Saturation and lightness are `<percentage>`s in CSS Color 4. The legacy
 /// CSS Color 3 grammar also accepted bare numbers in the 0-100 range, which
-/// minified stylesheets still emit. The result is a `0.0..=1.0` fraction.
-fn parse_hsl_percentage<'i>(input: &mut Parser<'i, '_>, comma_syntax: bool) -> CssResult<'i, f32> {
+/// minified stylesheets still emit. The result is a `0.0..=1.0` fraction, or
+/// `None` for the modern missing-component keyword (§4.4).
+fn parse_hsl_percentage<'i>(
+    input: &mut Parser<'i, '_>,
+    comma_syntax: bool,
+) -> CssResult<'i, Option<f32>> {
     let location = input.current_source_location();
     let value = match input.next()?.clone() {
         // `unit_value` is already normalized to `0.0..=1.0`.
-        Token::Percentage { unit_value, .. } => unit_value,
-        Token::Number { value, .. } if comma_syntax => value / 100.0,
+        Token::Percentage { unit_value, .. } => Some(unit_value),
+        Token::Number { value, .. } if comma_syntax => Some(value / 100.0),
+        Token::Ident(value) if !comma_syntax && value.eq_ignore_ascii_case("none") => None,
         _ => return Err(location.new_custom_error(())),
     };
-    if value.is_finite() {
+    if value.is_none_or(f32::is_finite) {
         Ok(value)
     } else {
         Err(location.new_custom_error(()))
@@ -4104,12 +4255,12 @@ mod tests {
 
     fn srgb(css: &str) -> (u8, u8, u8, f32) {
         match parse("color", css) {
-            TypedPropertyValue::Color(CssColor::Srgb {
-                red,
-                green,
-                blue,
-                alpha,
-            }) => (red, green, blue, alpha),
+            TypedPropertyValue::Color(color) => {
+                let resolved = crate::color::resolve_absolute(&color)
+                    .unwrap_or_else(|| panic!("expected an absolute color, got {color:?}"));
+                let (red, green, blue) = resolved.to_srgb8();
+                (red, green, blue, resolved.alpha.clamp(0.0, 1.0))
+            }
             other => panic!("expected an srgb color, got {other:?}"),
         }
     }
@@ -5134,9 +5285,9 @@ mod tests {
         assert_eq!(srgb("color(display-p3 1 1 1)"), (255, 255, 255, 1.0));
         assert_eq!(srgb("color(display-p3 0 0 0)"), (0, 0, 0, 1.0));
         // The three saturated colors a real page ships as Display P3. Each is
-        // outside the sRGB gamut, and §14.1.1 clipping takes the red channel to
-        // zero rather than letting it wrap, so these pin the conversion and the
-        // clipping together.
+        // outside the sRGB gamut; local-MINDE mapping accepts the channel-clipped
+        // form because it stays within one JND (§14.2.2), so these pin the
+        // conversion and the 8-bit device boundary together.
         assert_eq!(
             srgb("color(display-p3 .15546 .38118 .86881)"),
             (0, 99, 230, 1.0)
@@ -5151,11 +5302,115 @@ mod tests {
         );
         // A Display P3 primary is not the sRGB primary of the same name, which
         // is what would happen if the components were copied instead of
-        // converted; clipping is what brings each back into range.
-        assert_eq!(srgb("color(display-p3 1 0 0)"), (255, 0, 0, 1.0));
-        assert_eq!(srgb("color(display-p3 0 1 0)"), (0, 255, 0, 1.0));
+        // converted. §14.2's perceptual mapping reduces OKLCH chroma rather
+        // than clipping each channel, so the green primary keeps a little red
+        // and blue and the red primary keeps a little green and blue.
+        assert_eq!(srgb("color(display-p3 1 0 0)"), (255, 11, 12, 1.0));
+        assert_eq!(srgb("color(display-p3 0 1 0)"), (0, 251, 41, 1.0));
         assert_eq!(srgb("color(display-p3 0 0 1)"), (0, 0, 255, 1.0));
-        assert_eq!(srgb("color(display-p3 1 1 0)"), (255, 255, 0, 1.0));
+        assert_eq!(srgb("color(display-p3 1 1 0)"), (254, 255, 0, 1.0));
+    }
+
+    /// CSS Color 4 §4.4: `none` parses as a missing component in every modern
+    /// color function, is preserved for interpolation/serialization, and still
+    /// behaves as zero when the color is rendered directly.
+    #[test]
+    fn parses_missing_components_and_renders_them_as_zero() {
+        match parse("color", "rgb(none 128 0 / none)") {
+            TypedPropertyValue::Color(CssColor::Space(space)) => {
+                assert_eq!(space.space, crate::color::ColorSpace::Srgb);
+                assert_eq!(space.components[0], None);
+                assert!((space.components[1].unwrap() - 128.0 / 255.0).abs() < 1e-6);
+                assert_eq!(space.components[2], Some(0.0));
+                assert_eq!(space.alpha, None);
+                assert_eq!(space.to_css(), "color(srgb none 0.5019608 0 / none)");
+            }
+            other => panic!("expected a missing-component color, got {other:?}"),
+        }
+        let css = |value: &str| match parse("color", value) {
+            TypedPropertyValue::Color(color) => color.to_css(),
+            other => panic!("expected a color, got {other:?}"),
+        };
+        assert_eq!(css("hsl(none 100% 50%)"), "hsl(none 100% 50%)");
+        assert_eq!(css("hwb(none 0% 50%)"), "hwb(none 0% 50%)");
+        assert_eq!(css("lab(none 20 30 / none)"), "lab(none 20 30 / none)");
+        assert_eq!(css("lch(none 20 30)"), "lch(none 20 30)");
+        assert_eq!(css("oklab(none 0.1 0.2)"), "oklab(none 0.1 0.2)");
+        assert_eq!(css("oklch(none 0.1 30 / 50%)"), "oklch(none 0.1 30 / 0.5)");
+        assert_eq!(
+            css("color(display-p3 none 0.5 0)"),
+            "color(display-p3 none 0.5 0)"
+        );
+
+        // Rendering directly treats each missing component as zero (§4.4).
+        assert_eq!(srgb("rgb(none 128 0 / 50%)"), (0, 128, 0, 0.5));
+        assert_eq!(srgb("rgb(none 128 0 / none)"), (0, 128, 0, 0.0));
+        assert_eq!(srgb("hsl(none 100% 50%)"), (255, 0, 0, 1.0));
+        assert_eq!(srgb("hsl(0 100% 50% / none)"), (255, 0, 0, 0.0));
+        assert_eq!(srgb("hwb(none 0% 0%)"), (255, 0, 0, 1.0));
+        assert_eq!(srgb("lab(none 0 0)"), (0, 0, 0, 1.0));
+        assert_eq!(srgb("lch(none 0 0)"), (0, 0, 0, 1.0));
+        assert_eq!(srgb("oklab(none 0 0)"), (0, 0, 0, 1.0));
+        assert_eq!(srgb("oklch(none 0 0)"), (0, 0, 0, 1.0));
+        assert_eq!(srgb("color(srgb none 0 0)"), (0, 0, 0, 1.0));
+
+        // Legacy comma syntax may not use `none` (§4.1.2).
+        for invalid in [
+            "rgb(none, 0, 0)",
+            "rgba(0, 0, 0, none)",
+            "hsl(none, 100%, 50%)",
+            "hsla(0, 100%, 50%, none)",
+        ] {
+            assert!(
+                parse_typed_property("color", invalid)
+                    .expect("supported property")
+                    .is_err(),
+                "{invalid:?} must not parse"
+            );
+        }
+    }
+
+    /// CSS Color 4 §13.3: analogous components carry missing state across
+    /// color spaces before interpolation, then fill from the other color.
+    #[test]
+    fn color_mix_carries_missing_components_forward() {
+        // Missing OKLCH lightness is carried from the other color, so L is
+        // 0.8 rather than the average of 0 and 0.8. C=0.1875, H=45.
+        assert_eq!(
+            srgb("color-mix(in oklch, oklch(none 0.25 30), oklch(0.8 0.125 60))"),
+            (255, 157, 105, 1.0)
+        );
+        // A missing HSL hue is analogous to the other HSL hue.
+        assert_eq!(
+            srgb("color-mix(in hsl, hsl(none 100% 50%), hsl(240 100% 50%))"),
+            (0, 0, 255, 1.0)
+        );
+        // Missing on both sides stays missing and serializes as `none`.
+        match parse(
+            "color",
+            "color-mix(in srgb, rgb(none 128 0), rgb(none 0 255))",
+        ) {
+            TypedPropertyValue::Color(CssColor::Space(space)) => {
+                assert_eq!(space.components[0], None);
+                assert!((space.components[1].unwrap() - 64.0 / 255.0).abs() < 1e-6);
+                assert!((space.components[2].unwrap() - 0.5).abs() < 1e-6);
+                assert_eq!(space.to_css(), "color(srgb none 0.2509804 0.5)");
+            }
+            other => panic!("expected a missing-component mix, got {other:?}"),
+        }
+        // Lab's a/b opponents form an analogous set with LCH chroma and hue.
+        assert_eq!(
+            srgb("color-mix(in lch, lab(50 none none), lch(50 40 120))"),
+            (99, 128, 56, 1.0)
+        );
+        let css = match parse(
+            "color",
+            "color-mix(in hsl, hsl(none 0% 100%), hsl(none 0% 0%))",
+        ) {
+            TypedPropertyValue::Color(color) => color.to_css(),
+            other => panic!("expected a color, got {other:?}"),
+        };
+        assert_eq!(css, "hsl(none 0% 50%)");
     }
 
     /// Every predefined `color()` space the engine can convert is accepted,
@@ -5258,6 +5513,13 @@ mod tests {
         assert_eq!(
             srgb("color-mix(in srgb, color-mix(in srgb, red, blue), transparent)"),
             (128, 0, 128, 0.5)
+        );
+        // A mix result outside sRGB is gamut mapped at the device boundary,
+        // not channel-clipped: the midpoint of the out-of-gamut Display P3
+        // primaries is (78, 98, 0) perceptually, while clipping gives (74, 101, 0).
+        assert_eq!(
+            srgb("color-mix(in srgb, color(display-p3 1 0 0), color(display-p3 0 1 0))"),
+            (78, 98, 0, 1.0)
         );
     }
 

@@ -1,9 +1,15 @@
-//! CSS Color 4 color spaces and CSS Color 5 `color-mix()` interpolation.
+//! CSS Color 4 color spaces, missing components and CSS Color 5 `color-mix()`.
 //!
 //! The paint contract is sRGB, so every color space here exists to convert
 //! into and out of sRGB. The conversion matrices and transfer functions are
 //! the sample code in CSS Color 4 §19, evaluated in `f32` because the engine's
 //! device colors are eight-bit sRGB.
+//!
+//! Colors that contain `none` components (CSS Color 4 §4.4) keep their
+//! authored color space in [`SpaceColor`] so interpolation can carry missing
+//! components forward to analogous components (§13.3). Every other use treats
+//! a missing component as zero. Out-of-gamut colors are mapped into sRGB with
+//! the OKLCH chroma-reduction algorithm of §14.2 rather than clipped.
 
 use crate::properties::{CssColor, format_number};
 
@@ -42,7 +48,9 @@ impl Rgba {
         }
     }
 
-    /// The eight-bit sRGB color a device boundary accepts.
+    /// Clamp every channel, including alpha, to its reference range without
+    /// any perceptual gamut mapping. Used for the clipping stage inside the
+    /// gamut-mapping algorithm and for already-sRGB interpolation inputs.
     #[must_use]
     pub fn clamped(self) -> Self {
         Self {
@@ -53,9 +61,20 @@ impl Rgba {
         }
     }
 
+    /// CSS Color 4 §14.2: map an out-of-gamut sRGB color into the sRGB
+    /// gamut by reducing OKLCH chroma while preserving lightness and hue.
+    /// In-gamut colors are returned unchanged.
+    #[must_use]
+    pub fn gamut_mapped(self) -> Self {
+        gamut_map_srgb(self)
+    }
+
+    /// The eight-bit sRGB color a device boundary accepts. Out-of-gamut
+    /// colors are perceptually mapped with [`Self::gamut_mapped`], not
+    /// clipped channel by channel.
     #[must_use]
     pub fn to_srgb8(self) -> (u8, u8, u8) {
-        let value = self.clamped();
+        let value = self.gamut_mapped();
         (
             rounded_channel(value.red * 255.0),
             rounded_channel(value.green * 255.0),
@@ -162,6 +181,133 @@ impl ColorSpace {
     }
 }
 
+/// A color retained in its authored color space because at least one
+/// component is missing (CSS Color 4 §4.4).
+///
+/// Components use the same units as the corresponding color function, except
+/// that sRGB components are normalized to `0.0..=1.0`; `lab()`/`lch()`
+/// lightness is `0.0..=100.0` and `oklab()`/`oklch()` lightness is
+/// `0.0..=1.0`, matching [`ColorSpace`] conversions. Keeping the source space
+/// lets interpolation carry a missing component forward to its analogous
+/// component before the color is converted (§13.3).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpaceColor {
+    pub space: ColorSpace,
+    pub components: [Option<f32>; 3],
+    pub alpha: Option<f32>,
+}
+
+impl SpaceColor {
+    #[must_use]
+    pub const fn new(space: ColorSpace, components: [Option<f32>; 3], alpha: Option<f32>) -> Self {
+        Self {
+            space,
+            components,
+            alpha,
+        }
+    }
+
+    #[must_use]
+    pub fn from_rgba(color: Rgba) -> Self {
+        Self {
+            space: ColorSpace::Srgb,
+            components: [Some(color.red), Some(color.green), Some(color.blue)],
+            alpha: Some(color.alpha),
+        }
+    }
+
+    #[must_use]
+    pub fn from_srgb8(red: u8, green: u8, blue: u8, alpha: f32) -> Self {
+        Self::from_rgba(Rgba::from_srgb8(red, green, blue, alpha))
+    }
+
+    /// Whether any component or the alpha is missing.
+    #[must_use]
+    pub fn has_missing(self) -> bool {
+        self.alpha.is_none() || self.components.iter().any(Option::is_none)
+    }
+
+    /// Convert to sRGB, treating missing components as zero (§4.4). The
+    /// resulting components may be outside `0.0..=1.0`; the device boundary
+    /// applies [`Rgba::gamut_mapped`].
+    #[must_use]
+    pub fn to_rgba(self) -> Rgba {
+        let components = self.components.map(|component| component.unwrap_or(0.0));
+        let mut color = space_to_srgb(self.space, components);
+        color.alpha = self.alpha.unwrap_or(0.0);
+        color
+    }
+
+    /// Serialize the color with missing components spelled `none`, preserving
+    /// the function shape of its color space (§4.4, §16).
+    #[must_use]
+    pub fn to_css(&self) -> String {
+        let component = |value: Option<f32>| match value {
+            None => "none".to_owned(),
+            Some(value) => format_number(value),
+        };
+        let percentage = |value: Option<f32>| match value {
+            None => "none".to_owned(),
+            Some(value) => format!("{}%", format_number(value * 100.0)),
+        };
+        let alpha = match self.alpha {
+            None => " / none".to_owned(),
+            Some(value) if value < 1.0 => format!(" / {}", format_number(value)),
+            Some(_) => String::new(),
+        };
+        let [first, second, third] = self.components;
+        let lightness = |value: Option<f32>| match value {
+            None => "none".to_owned(),
+            Some(value) => format!("{}%", format_number(value)),
+        };
+        match self.space {
+            ColorSpace::Hsl => format!(
+                "hsl({} {} {}{alpha})",
+                component(first),
+                percentage(second),
+                percentage(third)
+            ),
+            ColorSpace::Hwb => format!(
+                "hwb({} {} {}{alpha})",
+                component(first),
+                percentage(second),
+                percentage(third)
+            ),
+            ColorSpace::Lab => format!(
+                "lab({} {} {}{alpha})",
+                lightness(first),
+                component(second),
+                component(third)
+            ),
+            ColorSpace::Lch => format!(
+                "lch({} {} {}{alpha})",
+                lightness(first),
+                component(second),
+                component(third)
+            ),
+            ColorSpace::Oklab => format!(
+                "oklab({} {} {}{alpha})",
+                component(first),
+                component(second),
+                component(third)
+            ),
+            ColorSpace::Oklch => format!(
+                "oklch({} {} {}{alpha})",
+                component(first),
+                component(second),
+                component(third)
+            ),
+            _ => format!(
+                "color({} {} {} {}{alpha})",
+                self.space.name(),
+                component(first),
+                component(second),
+                component(third)
+            ),
+        }
+    }
+}
+
 /// CSS Color 4 §12.4 hue interpolation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HueMethod {
@@ -240,17 +386,25 @@ impl ColorMix {
 /// system palette and stay unresolved.
 #[must_use]
 pub fn resolve_absolute(value: &CssColor) -> Option<Rgba> {
+    Some(resolve_absolute_space(value)?.to_rgba())
+}
+
+/// Like [`resolve_absolute`], but retains missing components (§4.4) so a
+/// nested `color-mix()` can carry them into its own interpolation.
+#[must_use]
+pub fn resolve_absolute_space(value: &CssColor) -> Option<SpaceColor> {
     match value {
         CssColor::Srgb {
             red,
             green,
             blue,
             alpha,
-        } => Some(Rgba::from_srgb8(*red, *green, *blue, *alpha)),
+        } => Some(SpaceColor::from_srgb8(*red, *green, *blue, *alpha)),
+        CssColor::Space(color) => Some(**color),
         CssColor::Mix(mix) => {
-            let left = resolve_absolute(&mix.left)?;
-            let right = resolve_absolute(&mix.right)?;
-            Some(mix_colors(
+            let left = resolve_absolute_space(&mix.left)?;
+            let right = resolve_absolute_space(&mix.right)?;
+            Some(mix_space_colors(
                 mix.space,
                 mix.hue,
                 left,
@@ -290,55 +444,262 @@ pub fn mix_colors(
     right_weight: f32,
     alpha_multiplier: f32,
 ) -> Rgba {
-    let left = left.clamped();
-    let right = right.clamped();
-    let mut left_components = srgb_to_space(left, space);
-    let mut right_components = srgb_to_space(right, space);
-    let hue_axis = space.hue_axis();
-    if let Some(axis) = hue_axis {
-        let left_powerless = is_powerless(space, left_components);
-        let right_powerless = is_powerless(space, right_components);
-        if left_powerless && right_powerless {
-            left_components[axis] = 0.0;
-            right_components[axis] = 0.0;
-        } else if left_powerless {
-            left_components[axis] = right_components[axis];
-        } else if right_powerless {
-            right_components[axis] = left_components[axis];
-        }
-        let (left_hue, right_hue) =
-            adjust_hues(hue_method, left_components[axis], right_components[axis]);
-        left_components[axis] = left_hue;
-        right_components[axis] = right_hue;
+    mix_space_colors(
+        space,
+        hue_method,
+        SpaceColor::from_rgba(left.clamped()),
+        SpaceColor::from_rgba(right.clamped()),
+        left_weight,
+        right_weight,
+        alpha_multiplier,
+    )
+    .to_rgba()
+}
+
+/// CSS Color 4 §13: interpolate two colors that may have missing components.
+///
+/// Carry-forward is decided in the source color spaces, before conversion, by
+/// matching analogous components and analogous sets (§13.3). Missing
+/// components are then filled from the other color; only components missing
+/// on both sides stay missing in the result. Hue interpolation follows
+/// §13.5 and premultiplication follows §13.4.
+#[must_use]
+pub fn mix_space_colors(
+    space: ColorSpace,
+    hue_method: HueMethod,
+    left: SpaceColor,
+    right: SpaceColor,
+    left_weight: f32,
+    right_weight: f32,
+    alpha_multiplier: f32,
+) -> SpaceColor {
+    let left_carried = carried_missing(left.space, space, &left.components);
+    let right_carried = carried_missing(right.space, space, &right.components);
+    let mut left_components = convert_components(left.space, space, left.components).map(Some);
+    let mut right_components = convert_components(right.space, space, right.components).map(Some);
+    // A converted color's powerless components become missing (§4.4.1).
+    // Authored components in the interpolation space itself stay explicit.
+    if left.space != space {
+        powerless_to_missing(space, &mut left_components);
     }
-    let alpha = left.alpha * left_weight + right.alpha * right_weight;
-    let mut mixed = [0.0; 3];
+    if right.space != space {
+        powerless_to_missing(space, &mut right_components);
+    }
+    for index in 0..3 {
+        if left_carried[index] {
+            left_components[index] = None;
+        }
+        if right_carried[index] {
+            right_components[index] = None;
+        }
+    }
+
+    // Fill a component missing on one side with the other color's value; only
+    // components missing on both sides stay missing in the result.
+    let mut both_missing = [false; 3];
+    for index in 0..3 {
+        match (left_components[index], right_components[index]) {
+            (None, Some(value)) => left_components[index] = Some(value),
+            (Some(value), None) => right_components[index] = Some(value),
+            (None, None) => both_missing[index] = true,
+            (Some(_), Some(_)) => {}
+        }
+    }
+    let mut left_alpha = left.alpha;
+    let mut right_alpha = right.alpha;
+    let alpha_missing = match (left_alpha, right_alpha) {
+        (None, Some(value)) => {
+            left_alpha = Some(value);
+            false
+        }
+        (Some(value), None) => {
+            right_alpha = Some(value);
+            false
+        }
+        (None, None) => true,
+        (Some(_), Some(_)) => false,
+    };
+    // A missing alpha is not premultiplied (§13.4); it also cannot divide the
+    // components, so it acts as an opaque factor for this step.
+    let left_alpha = left_alpha.unwrap_or(1.0);
+    let right_alpha = right_alpha.unwrap_or(1.0);
+
+    let hue_axis = space.hue_axis();
+    if let Some(axis) = hue_axis
+        && !both_missing[axis]
+    {
+        let (left_hue, right_hue) = adjust_hues(
+            hue_method,
+            left_components[axis].unwrap_or(0.0),
+            right_components[axis].unwrap_or(0.0),
+        );
+        left_components[axis] = Some(left_hue);
+        right_components[axis] = Some(right_hue);
+    }
+
+    let alpha = left_alpha * left_weight + right_alpha * right_weight;
+    let mut mixed = [None; 3];
     for (index, slot) in mixed.iter_mut().enumerate() {
-        if Some(index) == hue_axis {
+        if both_missing[index] {
+            continue;
+        }
+        let left_value = left_components[index].unwrap_or(0.0);
+        let right_value = right_components[index].unwrap_or(0.0);
+        *slot = if Some(index) == hue_axis {
             // Hue is not premultiplied; interpolate the adjusted angles.
-            *slot = left_components[index] * left_weight + right_components[index] * right_weight;
-            *slot = slot.rem_euclid(360.0);
+            Some((left_value * left_weight + right_value * right_weight).rem_euclid(360.0))
         } else {
-            let premultiplied = left_components[index] * left.alpha * left_weight
-                + right_components[index] * right.alpha * right_weight;
-            *slot = if alpha > f32::EPSILON {
+            let premultiplied =
+                left_value * left_alpha * left_weight + right_value * right_alpha * right_weight;
+            Some(if alpha > f32::EPSILON {
                 premultiplied / alpha
             } else {
                 0.0
-            };
-        }
+            })
+        };
     }
-    let mut result = space_to_srgb(space, mixed);
-    result.alpha = (alpha * alpha_multiplier).clamp(0.0, 1.0);
-    result
+    let alpha = if alpha_missing {
+        None
+    } else {
+        Some((alpha * alpha_multiplier).clamp(0.0, 1.0))
+    };
+    SpaceColor::new(space, mixed, alpha)
 }
 
-fn is_powerless(space: ColorSpace, components: [f32; 3]) -> bool {
+/// The analogous-component categories of CSS Color 4 §13.3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Analogous {
+    Red,
+    Green,
+    Blue,
+    Lightness,
+    Colorfulness,
+    Hue,
+    OpponentA,
+    OpponentB,
+}
+
+fn components_of(space: ColorSpace) -> [Option<Analogous>; 3] {
+    use Analogous::{Blue, Colorfulness, Green, Hue, Lightness, OpponentA, OpponentB, Red};
     match space {
-        ColorSpace::Hsl => components[1] <= 1e-6,
-        ColorSpace::Hwb => components[1] + components[2] >= 1.0 - 1e-6,
-        ColorSpace::Lch | ColorSpace::Oklch => components[1] <= 1e-6,
-        _ => false,
+        ColorSpace::Srgb
+        | ColorSpace::SrgbLinear
+        | ColorSpace::DisplayP3
+        | ColorSpace::A98Rgb
+        | ColorSpace::ProphotoRgb
+        | ColorSpace::Rec2020
+        | ColorSpace::Xyz
+        | ColorSpace::XyzD50
+        | ColorSpace::XyzD65 => [Some(Red), Some(Green), Some(Blue)],
+        ColorSpace::Lab | ColorSpace::Oklab => [Some(Lightness), Some(OpponentA), Some(OpponentB)],
+        ColorSpace::Lch | ColorSpace::Oklch => [Some(Lightness), Some(Colorfulness), Some(Hue)],
+        ColorSpace::Hsl => [Some(Hue), Some(Colorfulness), Some(Lightness)],
+        ColorSpace::Hwb => [Some(Hue), None, None],
+    }
+}
+
+/// The missing components of `source` that carry forward to `target` (§13.3).
+///
+/// Individual analogous components carry their missing state. The components
+/// that remain after removing analogous ones form an analogous set, which
+/// carries only when every component in the source set is missing.
+fn carried_missing(
+    source: ColorSpace,
+    target: ColorSpace,
+    components: &[Option<f32>; 3],
+) -> [bool; 3] {
+    let source_components = components_of(source);
+    let target_components = components_of(target);
+    let mut carried = [false; 3];
+    let mut source_matched = [false; 3];
+    let mut target_matched = [false; 3];
+    for (index, category) in source_components.iter().enumerate() {
+        let Some(category) = category else {
+            continue;
+        };
+        for (target_index, target_category) in target_components.iter().enumerate() {
+            if target_category == &Some(*category) {
+                source_matched[index] = true;
+                target_matched[target_index] = true;
+                if components[index].is_none() {
+                    carried[target_index] = true;
+                }
+            }
+        }
+    }
+    let remaining_source: Vec<usize> = (0..3).filter(|&index| !source_matched[index]).collect();
+    let remaining_target: Vec<usize> = (0..3).filter(|&index| !target_matched[index]).collect();
+    if !remaining_source.is_empty()
+        && remaining_source
+            .iter()
+            .all(|&index| components[index].is_none())
+    {
+        for index in remaining_target {
+            carried[index] = true;
+        }
+    }
+    carried
+}
+
+fn convert_components(from: ColorSpace, to: ColorSpace, components: [Option<f32>; 3]) -> [f32; 3] {
+    let values = components.map(|component| component.unwrap_or(0.0));
+    if from == to {
+        values
+    } else {
+        srgb_to_space(space_to_srgb(from, values), to)
+    }
+}
+
+/// CSS Color 4 §4.4.1: converted powerless components become missing.
+///
+/// The epsilon values are the ones in §19's sample code: 0.1% saturation for
+/// HSL, 0.0015 chroma for LCH, 0.000004 chroma for OKLCH, and a 99.999%
+/// white-plus-black sum for HWB.
+fn powerless_to_missing(space: ColorSpace, components: &mut [Option<f32>; 3]) {
+    match space {
+        ColorSpace::Hsl => {
+            let saturation = components[1].unwrap_or(0.0);
+            if saturation <= 0.001 {
+                components[0] = None;
+                if saturation > 0.0 {
+                    components[1] = Some(0.0);
+                }
+            }
+        }
+        ColorSpace::Hwb => {
+            let white = components[1].unwrap_or(0.0);
+            let black = components[2].unwrap_or(0.0);
+            if white + black >= 1.0 - 1e-5 {
+                components[0] = None;
+                if white + black < 1.0 {
+                    match (components[1], components[2]) {
+                        (None, Some(_)) => components[2] = Some(1.0),
+                        (Some(_), None) => components[1] = Some(1.0),
+                        (Some(_), Some(_)) => components[2] = Some(1.0 - white),
+                        (None, None) => {}
+                    }
+                }
+            }
+        }
+        ColorSpace::Lch => {
+            let chroma = components[1].unwrap_or(0.0);
+            if chroma <= 0.0015 {
+                components[2] = None;
+                if chroma > 0.0 {
+                    components[1] = Some(0.0);
+                }
+            }
+        }
+        ColorSpace::Oklch => {
+            let chroma = components[1].unwrap_or(0.0);
+            if chroma <= 0.000_004 {
+                components[2] = None;
+                if chroma > 0.0 {
+                    components[1] = Some(0.0);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -439,6 +800,83 @@ pub fn space_to_srgb(space: ColorSpace, components: [f32; 3]) -> Rgba {
         ]
     };
     Rgba::new(encoded[0], encoded[1], encoded[2], 1.0)
+}
+
+/// CSS Color 4 §14.2.1: one just-noticeable difference in OKLCH is 0.02.
+const GAMUT_JND: f32 = 0.02;
+
+/// The binary search terminates once the OKLCH chroma interval is this small
+/// (§14.2.2).
+const GAMUT_EPSILON: f32 = 0.0001;
+
+fn in_srgb_gamut(color: Rgba) -> bool {
+    [color.red, color.green, color.blue]
+        .iter()
+        .all(|value| (0.0..=1.0).contains(value))
+}
+
+/// ΔEOK: Euclidean distance in Oklab (CSS Color 4 §20.3).
+fn delta_e_ok(left: [f32; 3], right: [f32; 3]) -> f32 {
+    let difference = [left[0] - right[0], left[1] - right[1], left[2] - right[2]];
+    (difference[0] * difference[0] + difference[1] * difference[1] + difference[2] * difference[2])
+        .sqrt()
+}
+
+/// CSS Color 4 §14.2.2, "Binary Search Gamut Mapping with Local MINDE".
+///
+/// The color is represented in OKLCH; lightness and hue stay fixed while
+/// chroma is binary-searched towards the sRGB boundary. At each step the
+/// current OKLCH color and its channel-clipped sRGB form are compared with
+/// ΔEOK, and a clipped result within one JND is accepted. This is a
+/// relative-colorimetric map: colors already inside sRGB are returned
+/// unchanged.
+fn gamut_map_srgb(color: Rgba) -> Rgba {
+    if in_srgb_gamut(color) {
+        return color;
+    }
+    let origin = srgb_to_space(color, ColorSpace::Oklch);
+    if origin[0] >= 1.0 {
+        return Rgba::new(1.0, 1.0, 1.0, color.alpha);
+    }
+    if origin[0] <= 0.0 {
+        return Rgba::new(0.0, 0.0, 0.0, color.alpha);
+    }
+    let mut current = origin;
+    let mut clipped = space_to_srgb(ColorSpace::Oklch, current).clamped();
+    let mut difference = delta_e_ok(
+        srgb_to_space(clipped, ColorSpace::Oklab),
+        oklch_to_oklab(current),
+    );
+    if difference < GAMUT_JND {
+        return Rgba::new(clipped.red, clipped.green, clipped.blue, color.alpha);
+    }
+    let mut min = 0.0;
+    let mut max = origin[1];
+    let mut min_in_gamut = true;
+    while max - min > GAMUT_EPSILON {
+        let chroma = (min + max) / 2.0;
+        current = [origin[0], chroma, origin[2]];
+        let srgb = space_to_srgb(ColorSpace::Oklch, current);
+        if min_in_gamut && in_srgb_gamut(srgb) {
+            min = chroma;
+            continue;
+        }
+        clipped = srgb.clamped();
+        difference = delta_e_ok(
+            srgb_to_space(clipped, ColorSpace::Oklab),
+            oklch_to_oklab(current),
+        );
+        if difference < GAMUT_JND {
+            if GAMUT_JND - difference < GAMUT_EPSILON {
+                return Rgba::new(clipped.red, clipped.green, clipped.blue, color.alpha);
+            }
+            min_in_gamut = false;
+            min = chroma;
+        } else {
+            max = chroma;
+        }
+    }
+    Rgba::new(clipped.red, clipped.green, clipped.blue, color.alpha)
 }
 
 fn rounded_channel(value: f32) -> u8 {
@@ -835,9 +1273,11 @@ fn oklch_to_oklab(lch: [f32; 3]) -> [f32; 3] {
 }
 
 fn srgb_to_hsl(rgb: [f32; 3]) -> [f32; 3] {
-    let red = rgb[0].clamp(0.0, 1.0);
-    let green = rgb[1].clamp(0.0, 1.0);
-    let blue = rgb[2].clamp(0.0, 1.0);
+    // CSS Color 4 §19's sample code does not clamp here: conversion to an
+    // interpolation space must preserve out-of-gamut values (§13.2).
+    let red = rgb[0];
+    let green = rgb[1];
+    let blue = rgb[2];
     let maximum = red.max(green).max(blue);
     let minimum = red.min(green).min(blue);
     let lightness = (maximum + minimum) / 2.0;
@@ -853,13 +1293,13 @@ fn srgb_to_hsl(rgb: [f32; 3]) -> [f32; 3] {
     } else {
         (red - green) / delta + 4.0
     } * 60.0;
-    [hue.rem_euclid(360.0), saturation.clamp(0.0, 1.0), lightness]
+    [hue.rem_euclid(360.0), saturation, lightness]
 }
 
 fn hsx_to_srgb(hsl: [f32; 3]) -> [f32; 3] {
     let hue = hsl[0];
-    let saturation = hsl[1].clamp(0.0, 1.0);
-    let lightness = hsl[2].clamp(0.0, 1.0);
+    let saturation = hsl[1];
+    let lightness = hsl[2];
     let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
     let sector = (hue.rem_euclid(360.0)) / 60.0;
     let second = chroma * (1.0 - ((sector % 2.0) - 1.0).abs());
@@ -877,32 +1317,21 @@ fn hsx_to_srgb(hsl: [f32; 3]) -> [f32; 3] {
         (chroma, 0.0, second)
     };
     let offset = lightness - chroma / 2.0;
-    [
-        (red + offset).clamp(0.0, 1.0),
-        (green + offset).clamp(0.0, 1.0),
-        (blue + offset).clamp(0.0, 1.0),
-    ]
+    [red + offset, green + offset, blue + offset]
 }
 
 fn srgb_to_hwb(rgb: [f32; 3]) -> [f32; 3] {
     let hue = srgb_to_hsl(rgb)[0];
-    let red = rgb[0].clamp(0.0, 1.0);
-    let green = rgb[1].clamp(0.0, 1.0);
-    let blue = rgb[2].clamp(0.0, 1.0);
-    let white = red.min(green).min(blue);
-    let black = 1.0 - red.max(green).max(blue);
+    let white = rgb[0].min(rgb[1]).min(rgb[2]);
+    let black = 1.0 - rgb[0].max(rgb[1]).max(rgb[2]);
     [hue, white, black]
 }
 
 fn hwb_to_srgb(hwb: [f32; 3]) -> [f32; 3] {
     let hue = hwb[0];
-    let mut white = hwb[1].clamp(0.0, 1.0);
-    let mut black = hwb[2].clamp(0.0, 1.0);
+    let white = hwb[1];
+    let black = hwb[2];
     let sum = white + black;
-    if sum > 1.0 {
-        white /= sum;
-        black /= sum;
-    }
     if sum >= 1.0 {
         let gray = white / sum;
         return [gray, gray, gray];
@@ -910,9 +1339,9 @@ fn hwb_to_srgb(hwb: [f32; 3]) -> [f32; 3] {
     let pure = hsx_to_srgb([hue, 1.0, 0.5]);
     let factor = 1.0 - white - black;
     [
-        (pure[0] * factor + white).clamp(0.0, 1.0),
-        (pure[1] * factor + white).clamp(0.0, 1.0),
-        (pure[2] * factor + white).clamp(0.0, 1.0),
+        pure[0] * factor + white,
+        pure[1] * factor + white,
+        pure[2] * factor + white,
     ]
 }
 
@@ -920,7 +1349,10 @@ fn hwb_to_srgb(hwb: [f32; 3]) -> [f32; 3] {
 mod tests {
     #![allow(clippy::float_cmp)]
 
-    use super::{ColorSpace, HueMethod, Rgba, mix_colors, space_to_srgb, srgb_to_space};
+    use super::{
+        ColorSpace, HueMethod, Rgba, SpaceColor, mix_colors, mix_space_colors, space_to_srgb,
+        srgb_to_space,
+    };
 
     fn assert_rgb(color: Rgba, expected: (u8, u8, u8)) {
         assert_eq!(color.to_srgb8(), expected, "{color:?}");
@@ -1050,5 +1482,166 @@ mod tests {
             1.0,
         );
         assert_rgb(decreasing, (255, 0, 255));
+    }
+
+    /// CSS Color 4 §13.3: a missing component is replaced with the other
+    /// color's corresponding component before interpolation, so a missing
+    /// OKLCH lightness takes the other lightness instead of acting as zero.
+    #[test]
+    fn missing_component_carries_forward_before_interpolation() {
+        let left = SpaceColor::new(ColorSpace::Oklch, [None, Some(0.25), Some(30.0)], Some(1.0));
+        let right = SpaceColor::new(
+            ColorSpace::Oklch,
+            [Some(0.8), Some(0.125), Some(60.0)],
+            Some(1.0),
+        );
+        let mixed = mix_space_colors(
+            ColorSpace::Oklch,
+            HueMethod::Shorter,
+            left,
+            right,
+            0.5,
+            0.5,
+            1.0,
+        );
+        assert_eq!(mixed.space, ColorSpace::Oklch);
+        // L is carried from the right color (0.8), not averaged with 0.
+        assert_eq!(mixed.components[0], Some(0.8));
+        // C and H interpolate normally: (0.25 + 0.125) / 2 and (30 + 60) / 2.
+        assert_eq!(mixed.components[1], Some(0.1875));
+        assert_eq!(mixed.components[2], Some(45.0));
+        assert_eq!(mixed.alpha, Some(1.0));
+        assert_eq!(mixed.to_css(), "oklch(0.8 0.1875 45)");
+    }
+
+    /// When both operands miss a component, the result misses it too; a
+    /// component missing on only one side is filled from the other side.
+    #[test]
+    fn components_missing_on_both_sides_stay_missing() {
+        let left = SpaceColor::new(ColorSpace::Srgb, [None, Some(0.5), Some(0.0)], Some(1.0));
+        let right = SpaceColor::new(ColorSpace::Srgb, [None, Some(0.0), Some(1.0)], Some(1.0));
+        let mixed = mix_space_colors(
+            ColorSpace::Srgb,
+            HueMethod::Shorter,
+            left,
+            right,
+            0.5,
+            0.5,
+            1.0,
+        );
+        assert_eq!(mixed.components[0], None);
+        assert_eq!(mixed.components[1], Some(0.25));
+        assert_eq!(mixed.components[2], Some(0.5));
+        assert!(mixed.to_css().starts_with("color(srgb none 0.25 0.5"));
+    }
+
+    /// CSS Color 4 §13.3 analogous set: both CIE Lab opponents `a` and `b`
+    /// missing carry to both LCH chroma and hue, rather than becoming zero.
+    #[test]
+    fn analogous_set_carries_lab_opponents_to_lch_chroma_and_hue() {
+        let left = SpaceColor::new(ColorSpace::Lab, [Some(50.0), None, None], Some(1.0));
+        let right = SpaceColor::new(
+            ColorSpace::Lch,
+            [Some(50.0), Some(40.0), Some(120.0)],
+            Some(1.0),
+        );
+        let mixed = mix_space_colors(
+            ColorSpace::Lch,
+            HueMethod::Shorter,
+            left,
+            right,
+            0.5,
+            0.5,
+            1.0,
+        );
+        // The carried-forward missing chroma and hue are filled from the
+        // right color, so both operands land on lch(50 40 120).
+        assert!((mixed.components[0].unwrap() - 50.0).abs() < 1e-3);
+        assert!((mixed.components[1].unwrap() - 40.0).abs() < 1e-3);
+        assert!((mixed.components[2].unwrap() - 120.0).abs() < 1e-3);
+    }
+
+    /// A missing alpha is carried forward before premultiplication; it must
+    /// not be treated as fully transparent.
+    #[test]
+    fn missing_alpha_is_carried_forward() {
+        let left = SpaceColor::new(ColorSpace::Oklch, [Some(0.5), Some(0.1), Some(30.0)], None);
+        let right = SpaceColor::new(
+            ColorSpace::Oklch,
+            [Some(0.8), Some(0.1), Some(60.0)],
+            Some(0.5),
+        );
+        let mixed = mix_space_colors(
+            ColorSpace::Oklch,
+            HueMethod::Shorter,
+            left,
+            right,
+            0.5,
+            0.5,
+            1.0,
+        );
+        assert_eq!(mixed.alpha, Some(0.5));
+        assert!((mixed.components[0].unwrap() - 0.65).abs() < 1e-6);
+        assert!((mixed.components[1].unwrap() - 0.1).abs() < 1e-6);
+        assert!((mixed.components[2].unwrap() - 45.0).abs() < 1e-4);
+    }
+
+    /// CSS Color 4 §14.2.2: out-of-gamut colors reduce OKLCH chroma and keep
+    /// lightness/hue, which differs from per-channel clipping for the display
+    /// P3 primaries.
+    #[test]
+    fn gamut_mapping_reduces_oklch_chroma_instead_of_clipping() {
+        let p3_red = space_to_srgb(ColorSpace::DisplayP3, [1.0, 0.0, 0.0]);
+        assert_eq!(p3_red.to_srgb8(), (255, 11, 12));
+        // Channel clipping would give (0, 255, 0); perceptual mapping keeps
+        // the sRGB green primary in gamut but lowers the blue spill.
+        let p3_green = space_to_srgb(ColorSpace::DisplayP3, [0.0, 1.0, 0.0]);
+        assert_eq!(p3_green.to_srgb8(), (0, 251, 41));
+        let p3_blue = space_to_srgb(ColorSpace::DisplayP3, [0.0, 0.0, 1.0]);
+        assert_eq!(p3_blue.to_srgb8(), (0, 0, 255));
+        let p3_yellow = space_to_srgb(ColorSpace::DisplayP3, [1.0, 1.0, 0.0]);
+        assert_eq!(p3_yellow.to_srgb8(), (254, 255, 0));
+        // A strongly out-of-gamut OKLCH color is mapped through the binary
+        // search: chroma falls from 0.4 while L=0.7 and H=150 stay fixed.
+        let oklch = space_to_srgb(ColorSpace::Oklch, [0.7, 0.4, 150.0]);
+        assert_eq!(oklch.to_srgb8(), (0, 194, 72));
+        // Colors already inside sRGB pass through the relative-colorimetric
+        // map unchanged.
+        let in_gamut = Rgba::from_srgb8(40, 120, 200, 1.0);
+        assert_eq!(in_gamut.gamut_mapped(), in_gamut);
+    }
+
+    /// Out-of-gamut values are not clipped when converting into an
+    /// interpolation space. This pins the §3.4 CSS Color 5 example:
+    /// `color-mix(in hsl, color(display-p3 0 1 0) 80%, yellow)` produces
+    /// hsl(114.3032 261.5568% 30.2672%) and color(srgb -0.3387 1.0943 -0.48899).
+    #[test]
+    fn out_of_gamut_operands_keep_their_hsl_coordinates() {
+        let left = SpaceColor::new(
+            ColorSpace::DisplayP3,
+            [Some(0.0), Some(1.0), Some(0.0)],
+            Some(1.0),
+        );
+        let right = SpaceColor::from_srgb8(255, 255, 0, 1.0);
+        let mixed = mix_space_colors(
+            ColorSpace::Hsl,
+            HueMethod::Shorter,
+            left,
+            right,
+            0.8,
+            0.2,
+            1.0,
+        );
+        assert_eq!(mixed.space, ColorSpace::Hsl);
+        assert!((mixed.components[0].unwrap() - 114.3032).abs() < 1e-2);
+        assert!((mixed.components[1].unwrap() - 2.615_568).abs() < 1e-3);
+        assert!((mixed.components[2].unwrap() - 0.302_672).abs() < 1e-3);
+        let srgb = space_to_srgb(
+            ColorSpace::Hsl,
+            mixed.components.map(|component| component.unwrap_or(0.0)),
+        );
+        assert!((srgb.red + 0.3387).abs() < 1e-2);
+        assert!((srgb.green - 1.0943).abs() < 1e-2);
+        assert!((srgb.blue + 0.488_99).abs() < 1e-2);
     }
 }

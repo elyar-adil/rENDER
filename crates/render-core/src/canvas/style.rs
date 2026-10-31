@@ -23,7 +23,7 @@
 )]
 
 use super::bitmap::round_byte;
-use crate::css::properties::{CssColor, TypedPropertyValue, parse_typed_property};
+use crate::css::properties::{TypedPropertyValue, parse_typed_property};
 use render_js::canvas::GradientKind;
 
 /// A colour as the context stores it: opaque RGB and a CSS alpha in `0.0..=1.0`.
@@ -108,17 +108,18 @@ impl LineJoin {
 #[must_use]
 pub fn parse_paint(text: &str) -> Option<Paint> {
     match parse_typed_property("color", text) {
-        Some(Ok(TypedPropertyValue::Color(CssColor::Srgb {
-            red,
-            green,
-            blue,
-            alpha,
-        }))) => Some(Paint {
-            red,
-            green,
-            blue,
-            alpha: alpha.clamp(0.0, 1.0),
-        }),
+        Some(Ok(TypedPropertyValue::Color(color))) => {
+            // Missing components behave as zero outside interpolation
+            // (CSS Color 4 §4.4), so a `none` channel still yields a paint.
+            let rgba = crate::css::color::resolve_absolute(&color)?;
+            let (red, green, blue) = rgba.to_srgb8();
+            Some(Paint {
+                red,
+                green,
+                blue,
+                alpha: rgba.alpha.clamp(0.0, 1.0),
+            })
+        }
         _ => None,
     }
 }
@@ -257,5 +258,13 @@ mod tests {
         assert_eq!(parse_paint("not a colour"), None);
         assert_eq!(parse_paint(""), None);
         assert_eq!(Paint::BLACK.alpha, 1.0);
+    }
+
+    #[test]
+    fn missing_and_wide_gamut_colors_resolve_to_srgb_paint() {
+        let missing = parse_paint("rgb(none 128 0)").expect("none is zero outside interpolation");
+        assert_eq!((missing.red, missing.green, missing.blue), (0, 128, 0));
+        let wide = parse_paint("oklch(0.7 0.1 120)").expect("a modern color parses");
+        assert_eq!((wide.red, wide.green, wide.blue), (150, 168, 94));
     }
 }

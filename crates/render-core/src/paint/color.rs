@@ -1,6 +1,6 @@
 //! Device-independent sRGB paint colors.
 
-use crate::css::color::{Rgba, mix_colors};
+use crate::css::color::{Rgba, SpaceColor, mix_space_colors};
 use crate::css::properties::CssColor;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -58,34 +58,35 @@ impl Default for SystemPalette {
 impl SystemPalette {
     #[must_use]
     pub fn resolve(self, value: CssColor, current_color: Color) -> Color {
+        rgba_to_color(self.resolve_space(value, current_color).to_rgba())
+    }
+
+    /// Resolve context-dependent colors while retaining missing components so
+    /// a `color-mix()` can carry them forward (§13.3).
+    fn resolve_space(self, value: CssColor, current_color: Color) -> SpaceColor {
         match value {
             CssColor::Srgb {
                 red,
                 green,
                 blue,
                 alpha,
-            } => Color::rgba(
-                red,
-                green,
-                blue,
-                clamped_rounded_u8(alpha.clamp(0.0, 1.0) * 255.0),
-            ),
-            CssColor::CurrentColor => current_color,
-            CssColor::Canvas => self.canvas,
-            CssColor::CanvasText => self.canvas_text,
+            } => SpaceColor::from_srgb8(red, green, blue, alpha),
+            CssColor::Space(color) => *color,
+            CssColor::CurrentColor => SpaceColor::from_rgba(rgba_from_color(current_color)),
+            CssColor::Canvas => SpaceColor::from_rgba(rgba_from_color(self.canvas)),
+            CssColor::CanvasText => SpaceColor::from_rgba(rgba_from_color(self.canvas_text)),
             CssColor::Mix(mix) => {
-                let left = self.resolve(mix.left, current_color);
-                let right = self.resolve(mix.right, current_color);
-                let mixed = mix_colors(
+                let left = self.resolve_space(mix.left, current_color);
+                let right = self.resolve_space(mix.right, current_color);
+                mix_space_colors(
                     mix.space,
                     mix.hue,
-                    rgba_from_color(left),
-                    rgba_from_color(right),
+                    left,
+                    right,
                     mix.left_weight,
                     mix.right_weight,
                     mix.alpha_multiplier,
-                );
-                rgba_to_color(mixed)
+                )
             }
         }
     }
@@ -154,5 +155,35 @@ mod tests {
             parsed("color-mix(in oklab, red, blue)"),
             CssColor::Srgb { .. }
         ));
+    }
+
+    #[test]
+    fn missing_components_render_as_zero_at_paint_time() {
+        assert_eq!(
+            SystemPalette::default().resolve(parsed("rgb(none 128 0 / none)"), Color::BLACK),
+            Color::rgba(0, 128, 0, 0)
+        );
+        // All components missing in one operand are carried from currentcolor,
+        // so the mix resolves to the current color itself.
+        assert_eq!(
+            SystemPalette::default().resolve(
+                parsed("color-mix(in oklch, currentcolor, oklch(none none none))"),
+                Color::rgb(0, 0, 255),
+            ),
+            Color::rgb(0, 0, 255)
+        );
+    }
+
+    #[test]
+    fn out_of_gamut_colors_use_perceptual_gamut_mapping_for_paint() {
+        let palette = SystemPalette::default();
+        assert_eq!(
+            palette.resolve(parsed("color(display-p3 1 0 0)"), Color::BLACK),
+            Color::rgb(255, 11, 12)
+        );
+        assert_eq!(
+            palette.resolve(parsed("oklch(0.7 0.4 150)"), Color::BLACK),
+            Color::rgb(0, 194, 72)
+        );
     }
 }

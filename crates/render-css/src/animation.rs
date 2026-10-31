@@ -549,7 +549,11 @@ fn parse_color(value: &str) -> Option<CssColor> {
     match parse_typed_property("color", value) {
         Some(Ok(TypedPropertyValue::Color(color))) => match color {
             CssColor::Srgb { .. } => Some(color),
-            _ => None,
+            // A color outside sRGB, including one with missing components,
+            // is converted once here. Interpolation itself is sRGB until the
+            // compositor gains a wide-gamut space; missing components are zero
+            // outside interpolation (§4.4).
+            color => crate::color::resolve_absolute(&color).map(crate::color::rgba_to_css),
         },
         _ => None,
     }
@@ -676,8 +680,8 @@ fn format_number(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        animation_progress, interpolate_numbers, interpolate_property, sample_animations,
-        sample_property, split_numbers,
+        animation_progress, interpolate, interpolate_numbers, interpolate_property,
+        sample_animations, sample_property, split_numbers,
     };
     use crate::computed::ComputedStyle;
     use crate::stylesheet::{Declaration, Keyframe, KeyframesRule};
@@ -850,6 +854,14 @@ mod tests {
             Some("rotate(45deg)".to_owned())
         );
     }
+    #[test]
+    fn a_missing_component_is_zero_for_color_transitions() {
+        assert_eq!(
+            interpolate("rgb(none 128 0)", "rgb(0 0 255)", 0.5),
+            Some("rgb(0, 64, 128)".to_owned())
+        );
+    }
+
     #[test]
     fn unitless_zero_interpolates_to_a_length() {
         assert_eq!(
