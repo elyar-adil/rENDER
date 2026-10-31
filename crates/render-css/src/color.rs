@@ -308,6 +308,466 @@ impl SpaceColor {
     }
 }
 
+/// One of the color functions that supports relative color syntax
+/// (CSS Color 5 §4). The processing space is fixed by the function, except for
+/// `color()`, whose space is written explicitly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelativeFunction {
+    Rgb,
+    Hsl,
+    Hwb,
+    Lab,
+    Lch,
+    Oklab,
+    Oklch,
+    Color(ColorSpace),
+}
+
+/// A component keyword in a relative color expression.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelativeKeyword {
+    /// One of the three channel keywords of the processing space.
+    Component(u8),
+    /// The origin color's alpha, a number in `0.0..=1.0`.
+    Alpha,
+}
+
+/// One argument of a relative color function.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RelativeChannel {
+    /// The `none` keyword: a missing component.
+    Missing,
+    Number(f32),
+    /// A percentage stored as a unit value (`100%` is `1.0`).
+    Percentage(f32),
+    Keyword(RelativeKeyword),
+    Calc(Box<CalcExpr>),
+}
+
+/// The expression tree accepted inside `calc()` in a relative color.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CalcExpr {
+    Number(f32),
+    /// A percentage stored as a unit value (`100%` is `1.0`).
+    Percentage(f32),
+    Keyword(RelativeKeyword),
+    Add(Box<Self>, Box<Self>),
+    Sub(Box<Self>, Box<Self>),
+    Mul(Box<Self>, Box<Self>),
+    Div(Box<Self>, Box<Self>),
+    Negate(Box<Self>),
+}
+
+/// The alpha argument of a relative color. `Inherit` is the omitted form,
+/// which copies the origin's alpha rather than defaulting to one.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RelativeAlpha {
+    Inherit,
+    Channel(RelativeChannel),
+}
+
+/// An unresolved relative color (CSS Color 5 §4).
+///
+/// A relative color whose origin is absolute is evaluated while parsing and
+/// never reaches this type. The type exists for origins that depend on context:
+/// `currentcolor`, a system color, or `light-dark()`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RelativeColor {
+    pub function: RelativeFunction,
+    pub origin: CssColor,
+    pub components: [RelativeChannel; 3],
+    pub alpha: RelativeAlpha,
+}
+
+/// `light-dark(<color>, <color>)` (CSS Color 5 §7). The used color scheme
+/// selects one arm at paint time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LightDarkColor {
+    pub light: CssColor,
+    pub dark: CssColor,
+}
+
+impl LightDarkColor {
+    #[must_use]
+    pub fn to_css(&self) -> String {
+        format!(
+            "light-dark({}, {})",
+            self.light.to_css(),
+            self.dark.to_css()
+        )
+    }
+}
+
+/// The units one relative color function uses for its three components.
+///
+/// `number_scale` converts an authored number (the form channel keywords and
+/// `calc()` use) into the engine's internal units. `percentage_scale` is the
+/// authored number that `100%` means in that position; a zero entry means the
+/// position does not accept a percentage (a hue).
+#[derive(Clone, Copy)]
+struct RelativeUnits {
+    names: [&'static str; 3],
+    number_scale: [f32; 3],
+    percentage_scale: [f32; 3],
+}
+
+impl RelativeFunction {
+    #[must_use]
+    pub const fn space(self) -> ColorSpace {
+        match self {
+            Self::Rgb => ColorSpace::Srgb,
+            Self::Hsl => ColorSpace::Hsl,
+            Self::Hwb => ColorSpace::Hwb,
+            Self::Lab => ColorSpace::Lab,
+            Self::Lch => ColorSpace::Lch,
+            Self::Oklab => ColorSpace::Oklab,
+            Self::Oklch => ColorSpace::Oklch,
+            Self::Color(space) => space,
+        }
+    }
+
+    #[must_use]
+    pub const fn component_names(self) -> [&'static str; 3] {
+        match self.space() {
+            ColorSpace::Srgb
+            | ColorSpace::SrgbLinear
+            | ColorSpace::DisplayP3
+            | ColorSpace::A98Rgb
+            | ColorSpace::ProphotoRgb
+            | ColorSpace::Rec2020 => ["r", "g", "b"],
+            ColorSpace::Xyz | ColorSpace::XyzD50 | ColorSpace::XyzD65 => ["x", "y", "z"],
+            ColorSpace::Lab | ColorSpace::Oklab => ["l", "a", "b"],
+            ColorSpace::Lch | ColorSpace::Oklch => ["l", "c", "h"],
+            ColorSpace::Hsl => ["h", "s", "l"],
+            ColorSpace::Hwb => ["h", "w", "b"],
+        }
+    }
+
+    fn units(self) -> RelativeUnits {
+        let names = self.component_names();
+        match self {
+            Self::Rgb => RelativeUnits {
+                names,
+                number_scale: [1.0 / 255.0; 3],
+                percentage_scale: [255.0; 3],
+            },
+            Self::Hsl | Self::Hwb => RelativeUnits {
+                names,
+                number_scale: [1.0, 0.01, 0.01],
+                percentage_scale: [0.0, 100.0, 100.0],
+            },
+            Self::Lab => RelativeUnits {
+                names,
+                number_scale: [1.0; 3],
+                percentage_scale: [100.0, 125.0, 125.0],
+            },
+            Self::Lch => RelativeUnits {
+                names,
+                number_scale: [1.0; 3],
+                percentage_scale: [100.0, 150.0, 0.0],
+            },
+            Self::Oklab => RelativeUnits {
+                names,
+                number_scale: [1.0; 3],
+                percentage_scale: [1.0, 0.4, 0.4],
+            },
+            Self::Oklch => RelativeUnits {
+                names,
+                number_scale: [1.0; 3],
+                percentage_scale: [1.0, 0.4, 0.0],
+            },
+            Self::Color(_) => RelativeUnits {
+                names,
+                number_scale: [1.0; 3],
+                percentage_scale: [1.0; 3],
+            },
+        }
+    }
+
+    /// Whether component `index` is a hue, whose percentage form is invalid.
+    #[must_use]
+    pub const fn is_hue(self, index: usize) -> bool {
+        matches!(
+            (self, index),
+            (Self::Hsl | Self::Hwb, 0) | (Self::Lch | Self::Oklch, 2)
+        )
+    }
+}
+
+/// Evaluate a relative color whose origin has already been resolved.
+#[must_use]
+pub fn resolve_relative_space(relative: &RelativeColor, origin: SpaceColor) -> SpaceColor {
+    let function = relative.function;
+    let space = function.space();
+    let units = function.units();
+    let converted = if origin.space == space {
+        origin.components
+    } else {
+        let carried = carried_missing(origin.space, space, &origin.components);
+        let mut converted = convert_components(origin.space, space, origin.components).map(Some);
+        powerless_to_missing(space, &mut converted);
+        for index in 0..3 {
+            if carried[index] {
+                converted[index] = None;
+            }
+        }
+        converted
+    };
+    let spec = [0, 1, 2].map(|index| {
+        converted[index].map(|value| {
+            let scale = units.number_scale[index];
+            if scale == 0.0 { value } else { value / scale }
+        })
+    });
+    let origin_alpha = origin.alpha;
+    let components = [0, 1, 2].map(|index| {
+        eval_relative_channel(
+            &relative.components[index],
+            index,
+            &spec,
+            origin_alpha,
+            &units,
+        )
+    });
+    let alpha = match &relative.alpha {
+        RelativeAlpha::Inherit => origin_alpha,
+        RelativeAlpha::Channel(channel) => eval_relative_alpha(channel, &spec, origin_alpha),
+    };
+    SpaceColor::new(space, components, alpha)
+}
+
+fn eval_relative_channel(
+    channel: &RelativeChannel,
+    slot: usize,
+    spec: &[Option<f32>; 3],
+    origin_alpha: Option<f32>,
+    units: &RelativeUnits,
+) -> Option<f32> {
+    match channel {
+        RelativeChannel::Missing => None,
+        RelativeChannel::Number(value) => Some(value * units.number_scale[slot]),
+        RelativeChannel::Percentage(value) => {
+            let scale = units.percentage_scale[slot];
+            (scale != 0.0).then_some(value * scale * units.number_scale[slot])
+        }
+        RelativeChannel::Keyword(RelativeKeyword::Component(index)) => spec
+            .get(usize::from(*index))
+            .copied()
+            .flatten()
+            .map(|value| value * units.number_scale[slot]),
+        RelativeChannel::Keyword(RelativeKeyword::Alpha) => origin_alpha,
+        RelativeChannel::Calc(expression) => {
+            Some(eval_calc(expression, slot, spec, origin_alpha, units))
+        }
+    }
+}
+
+fn eval_relative_alpha(
+    channel: &RelativeChannel,
+    spec: &[Option<f32>; 3],
+    origin_alpha: Option<f32>,
+) -> Option<f32> {
+    let value = match channel {
+        RelativeChannel::Missing => None,
+        RelativeChannel::Number(value) => Some(*value),
+        RelativeChannel::Percentage(value) => Some(*value),
+        RelativeChannel::Keyword(RelativeKeyword::Component(index)) => {
+            spec.get(usize::from(*index)).copied().flatten()
+        }
+        RelativeChannel::Keyword(RelativeKeyword::Alpha) => origin_alpha,
+        RelativeChannel::Calc(expression) => Some(eval_alpha_calc(expression, spec, origin_alpha)),
+    };
+    value.map(|value| value.clamp(0.0, 1.0))
+}
+
+fn eval_calc(
+    expression: &CalcExpr,
+    slot: usize,
+    spec: &[Option<f32>; 3],
+    origin_alpha: Option<f32>,
+    units: &RelativeUnits,
+) -> f32 {
+    eval_calc_spec(expression, slot, spec, origin_alpha, units) * units.number_scale[slot]
+}
+
+/// Evaluate a `calc()` tree in the function's authored number units. The
+/// channel keywords are the origin's numbers (`r` is 0..255 in `rgb()`), a
+/// percentage uses the slot's reference range, and the caller converts the
+/// final number into the engine's internal units once.
+fn eval_calc_spec(
+    expression: &CalcExpr,
+    slot: usize,
+    spec: &[Option<f32>; 3],
+    origin_alpha: Option<f32>,
+    units: &RelativeUnits,
+) -> f32 {
+    match expression {
+        CalcExpr::Number(value) => *value,
+        CalcExpr::Percentage(value) => *value * units.percentage_scale[slot],
+        CalcExpr::Keyword(RelativeKeyword::Component(index)) => spec
+            .get(usize::from(*index))
+            .copied()
+            .flatten()
+            .unwrap_or(0.0),
+        CalcExpr::Keyword(RelativeKeyword::Alpha) => origin_alpha.unwrap_or(0.0),
+        CalcExpr::Add(left, right) => {
+            eval_calc_spec(left, slot, spec, origin_alpha, units)
+                + eval_calc_spec(right, slot, spec, origin_alpha, units)
+        }
+        CalcExpr::Sub(left, right) => {
+            eval_calc_spec(left, slot, spec, origin_alpha, units)
+                - eval_calc_spec(right, slot, spec, origin_alpha, units)
+        }
+        CalcExpr::Mul(left, right) => {
+            eval_calc_spec(left, slot, spec, origin_alpha, units)
+                * eval_calc_spec(right, slot, spec, origin_alpha, units)
+        }
+        CalcExpr::Div(left, right) => {
+            let divisor = eval_calc_spec(right, slot, spec, origin_alpha, units);
+            if divisor == 0.0 {
+                0.0
+            } else {
+                eval_calc_spec(left, slot, spec, origin_alpha, units) / divisor
+            }
+        }
+        CalcExpr::Negate(value) => -eval_calc_spec(value, slot, spec, origin_alpha, units),
+    }
+}
+
+fn eval_alpha_calc(
+    expression: &CalcExpr,
+    spec: &[Option<f32>; 3],
+    origin_alpha: Option<f32>,
+) -> f32 {
+    match expression {
+        CalcExpr::Number(value) | CalcExpr::Percentage(value) => *value,
+        CalcExpr::Keyword(RelativeKeyword::Component(index)) => spec
+            .get(usize::from(*index))
+            .copied()
+            .flatten()
+            .unwrap_or(0.0),
+        CalcExpr::Keyword(RelativeKeyword::Alpha) => origin_alpha.unwrap_or(0.0),
+        CalcExpr::Add(left, right) => {
+            eval_alpha_calc(left, spec, origin_alpha) + eval_alpha_calc(right, spec, origin_alpha)
+        }
+        CalcExpr::Sub(left, right) => {
+            eval_alpha_calc(left, spec, origin_alpha) - eval_alpha_calc(right, spec, origin_alpha)
+        }
+        CalcExpr::Mul(left, right) => {
+            eval_alpha_calc(left, spec, origin_alpha) * eval_alpha_calc(right, spec, origin_alpha)
+        }
+        CalcExpr::Div(left, right) => {
+            let divisor = eval_alpha_calc(right, spec, origin_alpha);
+            if divisor == 0.0 {
+                0.0
+            } else {
+                eval_alpha_calc(left, spec, origin_alpha) / divisor
+            }
+        }
+        CalcExpr::Negate(value) => -eval_alpha_calc(value, spec, origin_alpha),
+    }
+}
+
+impl RelativeColor {
+    #[must_use]
+    pub fn to_css(&self) -> String {
+        let function = self.function;
+        let units = function.units();
+        let channels =
+            [0, 1, 2].map(|index| relative_channel_to_css(&self.components[index], &units));
+        let alpha = match &self.alpha {
+            RelativeAlpha::Inherit => String::new(),
+            RelativeAlpha::Channel(channel) => {
+                format!(" / {}", relative_channel_to_css(channel, &units))
+            }
+        };
+        match function {
+            RelativeFunction::Color(space) => format!(
+                "color(from {} {} {} {} {}{alpha})",
+                self.origin.to_css(),
+                space.name(),
+                channels[0],
+                channels[1],
+                channels[2]
+            ),
+            _ => format!(
+                "{}(from {} {} {} {}{alpha})",
+                function_name(function),
+                self.origin.to_css(),
+                channels[0],
+                channels[1],
+                channels[2]
+            ),
+        }
+    }
+}
+
+const fn function_name(function: RelativeFunction) -> &'static str {
+    match function {
+        RelativeFunction::Rgb => "rgb",
+        RelativeFunction::Hsl => "hsl",
+        RelativeFunction::Hwb => "hwb",
+        RelativeFunction::Lab => "lab",
+        RelativeFunction::Lch => "lch",
+        RelativeFunction::Oklab => "oklab",
+        RelativeFunction::Oklch => "oklch",
+        RelativeFunction::Color(_) => "color",
+    }
+}
+
+fn relative_channel_to_css(channel: &RelativeChannel, units: &RelativeUnits) -> String {
+    match channel {
+        RelativeChannel::Missing => "none".to_owned(),
+        RelativeChannel::Number(value) => format_number(*value),
+        RelativeChannel::Percentage(value) => format!("{}%", format_number(*value * 100.0)),
+        RelativeChannel::Keyword(RelativeKeyword::Component(index)) => units
+            .names
+            .get(usize::from(*index))
+            .copied()
+            .unwrap_or("none")
+            .to_owned(),
+        RelativeChannel::Keyword(RelativeKeyword::Alpha) => "alpha".to_owned(),
+        RelativeChannel::Calc(expression) => {
+            format!("calc({})", calc_to_css(expression, units))
+        }
+    }
+}
+
+fn calc_to_css(expression: &CalcExpr, units: &RelativeUnits) -> String {
+    match expression {
+        CalcExpr::Number(value) => format_number(*value),
+        CalcExpr::Percentage(value) => format!("{}%", format_number(*value * 100.0)),
+        CalcExpr::Keyword(RelativeKeyword::Component(index)) => units
+            .names
+            .get(usize::from(*index))
+            .copied()
+            .unwrap_or("none")
+            .to_owned(),
+        CalcExpr::Keyword(RelativeKeyword::Alpha) => "alpha".to_owned(),
+        CalcExpr::Add(left, right) => format!(
+            "{} + {}",
+            calc_to_css(left, units),
+            calc_to_css(right, units)
+        ),
+        CalcExpr::Sub(left, right) => format!(
+            "{} - {}",
+            calc_to_css(left, units),
+            calc_to_css(right, units)
+        ),
+        CalcExpr::Mul(left, right) => format!(
+            "{} * {}",
+            calc_to_css(left, units),
+            calc_to_css(right, units)
+        ),
+        CalcExpr::Div(left, right) => format!(
+            "{} / {}",
+            calc_to_css(left, units),
+            calc_to_css(right, units)
+        ),
+        CalcExpr::Negate(value) => format!("-({})", calc_to_css(value, units)),
+    }
+}
+
 /// CSS Color 4 §12.4 hue interpolation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HueMethod {
@@ -415,6 +875,11 @@ pub fn resolve_absolute_space(value: &CssColor) -> Option<SpaceColor> {
             ))
         }
         CssColor::CurrentColor | CssColor::Canvas | CssColor::CanvasText => None,
+        CssColor::LightDark(_) => None,
+        CssColor::Relative(relative) => {
+            let origin = resolve_absolute_space(&relative.origin)?;
+            Some(resolve_relative_space(relative, origin))
+        }
     }
 }
 

@@ -3390,14 +3390,14 @@ mod tests {
     fn a_supports_condition_gates_its_block() {
         let source = "@supports (display: grid) { #a { color: red } } \
              @supports (backdrop-filter: blur(2px)) { #b { color: blue } } \
-             @supports (color: lab(from red l 1 1%/calc(alpha + 0.1))) { #c { color: lime } }";
+             @supports (color: device-cmyk(0 0 0 0)) { #c { color: lime } }";
         let sheet = parse_stylesheet(source);
 
         assert!(messages(&sheet).is_empty(), "{:?}", sheet.diagnostics);
         // The first is supported and applies; the second is a property this
         // engine has no grammar and no metadata for, and the third is a colour
-        // space this engine cannot represent. Both are complete false answers,
-        // not gaps, so neither reports anything - and neither applies.
+        // function this engine cannot represent. Both are complete false
+        // answers, not gaps, so neither reports anything - and neither applies.
         //
         // Observed as what the rules match, which is the only thing a consumer
         // can see, rather than as a count of rules.

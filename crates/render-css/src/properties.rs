@@ -1273,6 +1273,11 @@ pub enum CssColor {
     /// authored space is retained so a `color-mix()` can carry `none` forward
     /// to an analogous component before conversion.
     Space(Box<super::color::SpaceColor>),
+    /// A relative color whose origin depends on context, so it cannot be
+    /// evaluated before paint (CSS Color 5 §4).
+    Relative(Box<super::color::RelativeColor>),
+    /// `light-dark(<color>, <color>)` (CSS Color 5 §7).
+    LightDark(Box<super::color::LightDarkColor>),
 }
 
 impl CssColor {
@@ -1296,6 +1301,8 @@ impl CssColor {
             Self::CanvasText => "canvastext".to_owned(),
             Self::Mix(mix) => mix.to_css(),
             Self::Space(color) => color.to_css(),
+            Self::Relative(relative) => relative.to_css(),
+            Self::LightDark(light_dark) => light_dark.to_css(),
         }
     }
 }
@@ -2249,6 +2256,289 @@ fn parse_color_with_space<'i>(
         Token::Function(name) if name.eq_ignore_ascii_case("color-mix") => {
             input.parse_nested_block(|input| parse_color_mix(input, preserve_space))
         }
+        // CSS Color 5 §7 `light-dark()`.
+        Token::Function(name) if name.eq_ignore_ascii_case("light-dark") => {
+            input.parse_nested_block(|input| parse_light_dark(input, preserve_space))
+        }
+        _ => Err(location.new_custom_error(())),
+    }
+}
+
+/// CSS Color 5 §7: `light-dark(<color>, <color>)`.
+fn parse_light_dark<'i>(
+    input: &mut Parser<'i, '_>,
+    preserve_space: bool,
+) -> CssResult<'i, CssColor> {
+    let location = input.current_source_location();
+    let light = parse_color_with_space(input, preserve_space)?;
+    input.expect_comma()?;
+    let dark = parse_color_with_space(input, preserve_space)?;
+    if !input.is_exhausted() {
+        return Err(
+            location.new_custom_error(ValueError::detail("light-dark() takes exactly two colors"))
+        );
+    }
+    Ok(CssColor::LightDark(Box::new(
+        crate::color::LightDarkColor { light, dark },
+    )))
+}
+
+/// Detect and consume `from <color>` at the start of a relative color
+/// function. A missing `from` rewinds the parser and returns `None`.
+fn parse_relative_origin<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, Option<CssColor>> {
+    if input
+        .try_parse(|candidate| candidate.expect_ident_matching("from"))
+        .is_err()
+    {
+        return Ok(None);
+    }
+    Ok(Some(parse_color_with_space(input, true)?))
+}
+
+/// Parse the three channels and optional alpha of a relative color, evaluate
+/// it when its origin is absolute, and otherwise retain it for paint.
+fn parse_relative_color<'i>(
+    input: &mut Parser<'i, '_>,
+    function: crate::color::RelativeFunction,
+    origin: CssColor,
+    preserve_space: bool,
+) -> CssResult<'i, CssColor> {
+    let location = input.current_source_location();
+    let names = function.component_names();
+    let components = [
+        parse_relative_channel(input, function, &names, 0)?,
+        parse_relative_channel(input, function, &names, 1)?,
+        parse_relative_channel(input, function, &names, 2)?,
+    ];
+    let alpha = if input
+        .try_parse(|candidate| candidate.expect_delim('/'))
+        .is_ok()
+    {
+        crate::color::RelativeAlpha::Channel(parse_relative_alpha(input, &names)?)
+    } else {
+        crate::color::RelativeAlpha::Inherit
+    };
+    if !input.is_exhausted() {
+        return Err(location.new_custom_error(ValueError::detail(
+            "trailing tokens after the relative color components",
+        )));
+    }
+    let relative = crate::color::RelativeColor {
+        function,
+        origin,
+        components,
+        alpha,
+    };
+    if let Some(color) =
+        crate::color::resolve_absolute_space(&CssColor::Relative(Box::new(relative.clone())))
+    {
+        if preserve_space || color.has_missing() {
+            Ok(CssColor::Space(Box::new(color)))
+        } else {
+            Ok(crate::color::rgba_to_css(color.to_rgba()))
+        }
+    } else {
+        Ok(CssColor::Relative(Box::new(relative)))
+    }
+}
+
+fn parse_relative_channel<'i>(
+    input: &mut Parser<'i, '_>,
+    function: crate::color::RelativeFunction,
+    names: &[&str; 3],
+    slot: usize,
+) -> CssResult<'i, crate::color::RelativeChannel> {
+    let location = input.current_source_location();
+    let token = input.next()?.clone();
+    match token {
+        Token::Number { value, .. } => Ok(crate::color::RelativeChannel::Number(value)),
+        Token::Percentage { unit_value, .. } if !function.is_hue(slot) => {
+            Ok(crate::color::RelativeChannel::Percentage(unit_value))
+        }
+        Token::Ident(value) if value.eq_ignore_ascii_case("none") => {
+            Ok(crate::color::RelativeChannel::Missing)
+        }
+        Token::Ident(value) => {
+            let lower = value.to_ascii_lowercase();
+            if lower == "alpha" {
+                Ok(crate::color::RelativeChannel::Keyword(
+                    crate::color::RelativeKeyword::Alpha,
+                ))
+            } else if let Some(index) = names
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(&lower))
+            {
+                Ok(crate::color::RelativeChannel::Keyword(
+                    crate::color::RelativeKeyword::Component(u8::try_from(index).unwrap_or(0)),
+                ))
+            } else {
+                Err(location.new_custom_error(ValueError::detail(format!(
+                    "'{value}' is not a component of this relative color function"
+                ))))
+            }
+        }
+        Token::Function(name) if name.eq_ignore_ascii_case("calc") => {
+            input.parse_nested_block(|input| {
+                Ok(crate::color::RelativeChannel::Calc(Box::new(
+                    parse_calc_expr(input, names, function.is_hue(slot))?,
+                )))
+            })
+        }
+        _ => Err(location.new_custom_error(())),
+    }
+}
+
+fn parse_relative_alpha<'i>(
+    input: &mut Parser<'i, '_>,
+    names: &[&str; 3],
+) -> CssResult<'i, crate::color::RelativeChannel> {
+    let location = input.current_source_location();
+    let token = input.next()?.clone();
+    match token {
+        Token::Number { value, .. } => Ok(crate::color::RelativeChannel::Number(value)),
+        Token::Percentage { unit_value, .. } => {
+            Ok(crate::color::RelativeChannel::Percentage(unit_value))
+        }
+        Token::Ident(value) if value.eq_ignore_ascii_case("none") => {
+            Ok(crate::color::RelativeChannel::Missing)
+        }
+        Token::Ident(value) => {
+            let lower = value.to_ascii_lowercase();
+            if lower == "alpha" {
+                Ok(crate::color::RelativeChannel::Keyword(
+                    crate::color::RelativeKeyword::Alpha,
+                ))
+            } else if let Some(index) = names
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(&lower))
+            {
+                Ok(crate::color::RelativeChannel::Keyword(
+                    crate::color::RelativeKeyword::Component(u8::try_from(index).unwrap_or(0)),
+                ))
+            } else {
+                Err(location.new_custom_error(()))
+            }
+        }
+        Token::Function(name) if name.eq_ignore_ascii_case("calc") => {
+            input.parse_nested_block(|input| {
+                Ok(crate::color::RelativeChannel::Calc(Box::new(
+                    parse_calc_expr(input, names, false)?,
+                )))
+            })
+        }
+        _ => Err(location.new_custom_error(())),
+    }
+}
+
+fn parse_calc_expr<'i>(
+    input: &mut Parser<'i, '_>,
+    names: &[&str; 3],
+    hue: bool,
+) -> CssResult<'i, crate::color::CalcExpr> {
+    let mut expression = parse_calc_product(input, names, hue)?;
+    loop {
+        let state = input.state();
+        let operator = if input
+            .try_parse(|candidate| candidate.expect_delim('+'))
+            .is_ok()
+        {
+            Some(true)
+        } else if input
+            .try_parse(|candidate| candidate.expect_delim('-'))
+            .is_ok()
+        {
+            Some(false)
+        } else {
+            None
+        };
+        let Some(add) = operator else {
+            input.reset(&state);
+            break;
+        };
+        let right = parse_calc_product(input, names, hue)?;
+        expression = if add {
+            crate::color::CalcExpr::Add(Box::new(expression), Box::new(right))
+        } else {
+            crate::color::CalcExpr::Sub(Box::new(expression), Box::new(right))
+        };
+    }
+    Ok(expression)
+}
+
+fn parse_calc_product<'i>(
+    input: &mut Parser<'i, '_>,
+    names: &[&str; 3],
+    hue: bool,
+) -> CssResult<'i, crate::color::CalcExpr> {
+    let mut expression = parse_calc_factor(input, names, hue)?;
+    loop {
+        let state = input.state();
+        let operator = if input
+            .try_parse(|candidate| candidate.expect_delim('*'))
+            .is_ok()
+        {
+            Some(true)
+        } else if input
+            .try_parse(|candidate| candidate.expect_delim('/'))
+            .is_ok()
+        {
+            Some(false)
+        } else {
+            None
+        };
+        let Some(multiply) = operator else {
+            input.reset(&state);
+            break;
+        };
+        let right = parse_calc_factor(input, names, hue)?;
+        expression = if multiply {
+            crate::color::CalcExpr::Mul(Box::new(expression), Box::new(right))
+        } else {
+            crate::color::CalcExpr::Div(Box::new(expression), Box::new(right))
+        };
+    }
+    Ok(expression)
+}
+
+fn parse_calc_factor<'i>(
+    input: &mut Parser<'i, '_>,
+    names: &[&str; 3],
+    hue: bool,
+) -> CssResult<'i, crate::color::CalcExpr> {
+    let location = input.current_source_location();
+    let token = input.next()?.clone();
+    match token {
+        Token::Number { value, .. } => Ok(crate::color::CalcExpr::Number(value)),
+        Token::Percentage { unit_value, .. } if !hue => {
+            Ok(crate::color::CalcExpr::Percentage(unit_value))
+        }
+        Token::Ident(value) => {
+            let lower = value.to_ascii_lowercase();
+            if lower == "alpha" {
+                Ok(crate::color::CalcExpr::Keyword(
+                    crate::color::RelativeKeyword::Alpha,
+                ))
+            } else if let Some(index) = names
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(&lower))
+            {
+                Ok(crate::color::CalcExpr::Keyword(
+                    crate::color::RelativeKeyword::Component(u8::try_from(index).unwrap_or(0)),
+                ))
+            } else {
+                Err(location.new_custom_error(()))
+            }
+        }
+        Token::ParenthesisBlock => {
+            input.parse_nested_block(|input| parse_calc_expr(input, names, hue))
+        }
+        Token::Function(name) if name.eq_ignore_ascii_case("calc") => {
+            input.parse_nested_block(|input| parse_calc_expr(input, names, hue))
+        }
+        Token::Delim('-') => Ok(crate::color::CalcExpr::Negate(Box::new(parse_calc_factor(
+            input, names, hue,
+        )?))),
+        Token::Delim('+') => parse_calc_factor(input, names, hue),
         _ => Err(location.new_custom_error(())),
     }
 }
@@ -2270,8 +2560,28 @@ fn parse_color_function<'i>(
     input: &mut Parser<'i, '_>,
     preserve_space: bool,
 ) -> CssResult<'i, CssColor> {
+    let origin = parse_relative_origin(input)?;
     let location = input.current_source_location();
     let space = input.expect_ident_cloned()?.to_ascii_lowercase();
+    if let Some(origin) = origin {
+        let Some(space) = crate::color::ColorSpace::from_ident(&space) else {
+            return Err(location.new_custom_error(ValueError::detail(format!(
+                "the '{space}' color space is not implemented"
+            ))));
+        };
+        if !space.is_predefined_space() {
+            return Err(location.new_custom_error(ValueError::detail(format!(
+                "the '{}' color space is not a color() space; use its dedicated function",
+                space.name()
+            ))));
+        }
+        return parse_relative_color(
+            input,
+            crate::color::RelativeFunction::Color(space),
+            origin,
+            preserve_space,
+        );
+    }
     let red = parse_color_component(input)?;
     let green = parse_color_component(input)?;
     let blue = parse_color_component(input)?;
@@ -2344,6 +2654,14 @@ fn parse_hwb_color<'i>(
     input: &mut Parser<'i, '_>,
     preserve_space: bool,
 ) -> CssResult<'i, CssColor> {
+    if let Some(origin) = parse_relative_origin(input)? {
+        return parse_relative_color(
+            input,
+            crate::color::RelativeFunction::Hwb,
+            origin,
+            preserve_space,
+        );
+    }
     let location = input.current_source_location();
     let hue = parse_hue_or_none(input)?;
     let white = parse_percentage_or_none(input)?;
@@ -2370,6 +2688,14 @@ fn parse_lab_color<'i>(
     input: &mut Parser<'i, '_>,
     preserve_space: bool,
 ) -> CssResult<'i, CssColor> {
+    if let Some(origin) = parse_relative_origin(input)? {
+        return parse_relative_color(
+            input,
+            crate::color::RelativeFunction::Lab,
+            origin,
+            preserve_space,
+        );
+    }
     let location = input.current_source_location();
     let lightness = parse_number_or_percentage(input, 100.0)?.map(|value| value.clamp(0.0, 100.0));
     let a = parse_number_or_percentage(input, 125.0)?;
@@ -2391,6 +2717,14 @@ fn parse_lch_color<'i>(
     input: &mut Parser<'i, '_>,
     preserve_space: bool,
 ) -> CssResult<'i, CssColor> {
+    if let Some(origin) = parse_relative_origin(input)? {
+        return parse_relative_color(
+            input,
+            crate::color::RelativeFunction::Lch,
+            origin,
+            preserve_space,
+        );
+    }
     let location = input.current_source_location();
     let lightness = parse_number_or_percentage(input, 100.0)?.map(|value| value.clamp(0.0, 100.0));
     let chroma = parse_number_or_percentage(input, 150.0)?.map(|value| value.max(0.0));
@@ -2412,6 +2746,14 @@ fn parse_oklab_color<'i>(
     input: &mut Parser<'i, '_>,
     preserve_space: bool,
 ) -> CssResult<'i, CssColor> {
+    if let Some(origin) = parse_relative_origin(input)? {
+        return parse_relative_color(
+            input,
+            crate::color::RelativeFunction::Oklab,
+            origin,
+            preserve_space,
+        );
+    }
     let location = input.current_source_location();
     let lightness = parse_number_or_percentage(input, 1.0)?.map(|value| value.clamp(0.0, 1.0));
     let a = parse_number_or_percentage(input, 0.4)?;
@@ -2433,6 +2775,14 @@ fn parse_oklch_color<'i>(
     input: &mut Parser<'i, '_>,
     preserve_space: bool,
 ) -> CssResult<'i, CssColor> {
+    if let Some(origin) = parse_relative_origin(input)? {
+        return parse_relative_color(
+            input,
+            crate::color::RelativeFunction::Oklch,
+            origin,
+            preserve_space,
+        );
+    }
     let location = input.current_source_location();
     let lightness = parse_number_or_percentage(input, 1.0)?.map(|value| value.clamp(0.0, 1.0));
     let chroma = parse_number_or_percentage(input, 0.4)?.map(|value| value.max(0.0));
@@ -2690,6 +3040,14 @@ fn parse_rgb_color<'i>(
     input: &mut Parser<'i, '_>,
     preserve_space: bool,
 ) -> CssResult<'i, CssColor> {
+    if let Some(origin) = parse_relative_origin(input)? {
+        return parse_relative_color(
+            input,
+            crate::color::RelativeFunction::Rgb,
+            origin,
+            preserve_space,
+        );
+    }
     let location = input.current_source_location();
     let first = parse_rgb_component(input)?;
     let comma_syntax = input.try_parse(Parser::expect_comma).is_ok();
@@ -2790,6 +3148,14 @@ fn parse_hsl_color<'i>(
     input: &mut Parser<'i, '_>,
     preserve_space: bool,
 ) -> CssResult<'i, CssColor> {
+    if let Some(origin) = parse_relative_origin(input)? {
+        return parse_relative_color(
+            input,
+            crate::color::RelativeFunction::Hsl,
+            origin,
+            preserve_space,
+        );
+    }
     let location = input.current_source_location();
     let hue = parse_hue_or_none(input)?;
     let comma_syntax = input.try_parse(Parser::expect_comma).is_ok();
@@ -5536,6 +5902,94 @@ mod tests {
                 assert!(mix.to_css().contains("currentcolor 20%"));
             }
             other => panic!("expected an unresolved color mix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relative_colors_use_origin_components_and_calc() {
+        // Channel keywords read the origin in the function's processing space.
+        assert_eq!(srgb("rgb(from rgb(10 20 30) r g b)"), (10, 20, 30, 1.0));
+        // A direct number in rgb() is the 0..255 form, not a percentage.
+        assert_eq!(srgb("rgb(from rgb(10 20 30) 255 g b)"), (255, 20, 30, 1.0));
+        assert_eq!(
+            srgb("rgb(from rgb(10 20 30) calc(r + 10) g b)"),
+            (20, 20, 30, 1.0)
+        );
+        // The spec's grayscale approximation: red * .3 + green * .59 + blue * .11.
+        assert_eq!(
+            srgb(
+                "rgb(from red calc(r * .3 + g * .59 + b * .11) \
+                 calc(r * .3 + g * .59 + b * .11) calc(r * .3 + g * .59 + b * .11))"
+            ),
+            (77, 77, 77, 1.0)
+        );
+        assert_eq!(
+            srgb("hsl(from hsl(120 100% 50%) calc(h + 180) s l)"),
+            (255, 0, 255, 1.0)
+        );
+        assert_eq!(
+            srgb("oklch(from oklch(0.7 0.1 120) l c h)"),
+            (150, 168, 94, 1.0)
+        );
+        assert_eq!(
+            srgb("color(from color(srgb 0.1 0.2 0.3) srgb calc(r + 0.1) g b)"),
+            (51, 51, 77, 1.0)
+        );
+        assert_eq!(srgb("rgb(from red r g b / 50%)"), (255, 0, 0, 0.5));
+    }
+
+    #[test]
+    fn relative_colors_carry_missing_components() {
+        match parse("color", "oklch(from hsl(none 100% 50%) l c h)") {
+            TypedPropertyValue::Color(CssColor::Space(space)) => {
+                assert_eq!(space.space, crate::color::ColorSpace::Oklch);
+                assert!(space.components[2].is_none(), "hue must stay missing");
+            }
+            other => panic!("expected a missing-component space color, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relative_colors_with_context_origins_stay_unresolved() {
+        match parse("color", "rgb(from currentcolor r g b)") {
+            TypedPropertyValue::Color(CssColor::Relative(relative)) => {
+                assert_eq!(relative.function, crate::color::RelativeFunction::Rgb);
+                assert!(relative.to_css().contains("currentcolor"));
+            }
+            other => panic!("expected an unresolved relative color, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn light_dark_parses_both_arms() {
+        match parse("color", "light-dark(rgb(1 2 3), rgb(4 5 6))") {
+            TypedPropertyValue::Color(CssColor::LightDark(color)) => {
+                assert_eq!(color.to_css(), "light-dark(rgb(1, 2, 3), rgb(4, 5, 6))");
+            }
+            other => panic!("expected light-dark, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_relative_colors() {
+        for invalid in [
+            "rgb(from red r g)",
+            "rgb(from red r g b 0)",
+            "rgb(from red r, g, b)",
+            "rgb(from red h s l)",
+            "hsl(from red h,s,l)",
+            "oklch(from red l c 50%)",
+            "oklch(from red l c calc(50%))",
+            "rgb(from red calc(r + ) g b)",
+            "light-dark(red)",
+            "light-dark(red, blue, green)",
+        ] {
+            assert!(
+                parse_typed_property("color", invalid)
+                    .expect("supported property")
+                    .is_err(),
+                "{invalid:?} must not parse"
+            );
         }
     }
 

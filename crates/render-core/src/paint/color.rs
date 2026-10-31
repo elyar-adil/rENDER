@@ -44,6 +44,10 @@ impl Color {
 pub struct SystemPalette {
     pub canvas: Color,
     pub canvas_text: Color,
+    /// The used color scheme for `light-dark()` (CSS Color 5 §7). The default
+    /// is light; an embedding that supports a dark used scheme sets this before
+    /// building the display list.
+    pub dark: bool,
 }
 
 impl Default for SystemPalette {
@@ -51,6 +55,7 @@ impl Default for SystemPalette {
         Self {
             canvas: Color::WHITE,
             canvas_text: Color::BLACK,
+            dark: false,
         }
     }
 }
@@ -72,6 +77,18 @@ impl SystemPalette {
                 alpha,
             } => SpaceColor::from_srgb8(red, green, blue, alpha),
             CssColor::Space(color) => *color,
+            CssColor::LightDark(color) => self.resolve_space(
+                if self.dark {
+                    color.dark.clone()
+                } else {
+                    color.light.clone()
+                },
+                current_color,
+            ),
+            CssColor::Relative(relative) => {
+                let origin = self.resolve_space(relative.origin.clone(), current_color);
+                crate::css::color::resolve_relative_space(&relative, origin)
+            }
             CssColor::CurrentColor => SpaceColor::from_rgba(rgba_from_color(current_color)),
             CssColor::Canvas => SpaceColor::from_rgba(rgba_from_color(self.canvas)),
             CssColor::CanvasText => SpaceColor::from_rgba(rgba_from_color(self.canvas_text)),
@@ -171,6 +188,36 @@ mod tests {
                 Color::rgb(0, 0, 255),
             ),
             Color::rgb(0, 0, 255)
+        );
+    }
+
+    #[test]
+    fn light_dark_and_relative_colors_resolve_against_paint_context() {
+        let light = SystemPalette::default();
+        let dark = SystemPalette {
+            dark: true,
+            ..SystemPalette::default()
+        };
+        let scheme = parsed("light-dark(rgb(1 2 3), rgb(4 5 6))");
+        assert_eq!(
+            light.resolve(scheme.clone(), Color::BLACK),
+            Color::rgb(1, 2, 3)
+        );
+        assert_eq!(dark.resolve(scheme, Color::BLACK), Color::rgb(4, 5, 6));
+
+        assert_eq!(
+            light.resolve(
+                parsed("rgb(from currentcolor r g b)"),
+                Color::rgb(10, 20, 30)
+            ),
+            Color::rgb(10, 20, 30)
+        );
+        assert_eq!(
+            light.resolve(
+                parsed("rgb(from currentcolor calc(r + 10) g b)"),
+                Color::rgb(10, 20, 30)
+            ),
+            Color::rgb(20, 20, 30)
         );
     }
 

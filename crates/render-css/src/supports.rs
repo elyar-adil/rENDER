@@ -738,12 +738,14 @@ mod tests {
         // uses. Whether layout honours a sticky box is a different question, in
         // a different crate, and it is not this one's to answer.
         assert!(evaluates("(position: sticky)"));
-        // A claimed grammar and a value it rejects: the declaration is discarded
-        // as a parse error, so §6.1 says it is not supported. `lab()` is the
-        // rejection 91 `@supports` blocks in the production corpus test for.
-        assert!(!evaluates(
-            "(color: lab(from red l 1 1%/calc(alpha + 0.1)))"
+        // Relative color syntax is part of the engine's color grammar now, so
+        // the oracle answers it from the same parser the cascade uses.
+        assert!(evaluates(
+            "(color: lab(from red l 1 1% / calc(alpha + 0.1)))"
         ));
+        // A claimed grammar and a value it rejects: the declaration is discarded
+        // as a parse error, so §6.1 says it is not supported.
+        assert!(!evaluates("(color: device-cmyk(0 0 0 0))"));
         assert!(!evaluates("(display: nonsense)"));
         // A property with no grammar but with metadata, which the engine does
         // read: supported.
@@ -1048,6 +1050,7 @@ mod tests {
             ("display", "grid"),
             ("display", "flex"),
             ("color", "rgb(1, 2, 3)"),
+            ("color", "oklch(from red l c h)"),
             ("position", "sticky"),
             ("font-size", "1rem"),
             ("z-index", "auto"),
@@ -1061,7 +1064,7 @@ mod tests {
         // Nothing the engine discards as a parse error is supported.
         for (property, value) in [
             ("display", "nonsense"),
-            ("color", "lab(from red l 1 1%/calc(alpha + 0.1))"),
+            ("color", "device-cmyk(0 0 0 0)"),
             ("backdrop-filter", "blur(2px)"),
             ("text-overflow", "clip"),
             ("-moz-box-shadow", "0 0 2px black"),
