@@ -2533,6 +2533,12 @@ report it had been given wrong in its mechanism while right about its consequenc
   inline/block axis eligibility, range syntax, orientation/aspect-ratio, and bounded
   style/layout feedback. Container-relative units (`cqw`/`cqh`/`cqi`/`cqb`/`cqmin`/`cqmax`)
   resolve per axis against the nearest eligible ancestor and fall back to the small viewport.
+  `container-type: size`/`inline-size` now also apply their CSS Containment 3 §3 semantics
+  (HANDOFF 续四十八): layout containment makes the box an independent formatting context and a
+  containing block for absolutely positioned descendants, and size containment zeroes intrinsic
+  sizes on the contained axes. A fixed-position descendant is not yet contained, `style()`
+  containment does not isolate counters, and `container-type` does not yet create the stacking
+  context layout containment implies.
   `style()` and `scroll-state()` queries are diagnosed as unsupported.
   Media Queries 4/5 condition syntax and environment features have also landed; print media and
   `@page` remain absent.

@@ -45,6 +45,18 @@ impl ContainerType {
         }
     }
 
+    /// The `container-type` a computed style declares.
+    ///
+    /// A missing or invalid declaration is the initial value `normal`, which
+    /// is exactly what the property grammar's invalid-value handling produces.
+    #[must_use]
+    pub fn from_style(style: &ComputedStyle) -> Self {
+        style
+            .get("container-type")
+            .and_then(|value| Self::parse(value.css_text()))
+            .unwrap_or_default()
+    }
+
     /// Whether this container can answer a query that needs the block axis.
     #[must_use]
     pub const fn supports_block_axis(self) -> bool {
@@ -524,10 +536,7 @@ pub fn container_geometry_for_style(
     width: f32,
     height: f32,
 ) -> Option<ContainerGeometry> {
-    let container_type = style
-        .get("container-type")
-        .and_then(|value| ContainerType::parse(value.css_text()))
-        .unwrap_or_default();
+    let container_type = ContainerType::from_style(style);
     if container_type == ContainerType::Normal {
         return None;
     }

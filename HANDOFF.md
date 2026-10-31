@@ -1,3 +1,62 @@
+# 交接文档 (2026-10-31, 续四十八) — `container-type` 的尺寸包含与布局包含
+
+这一轮把 CSS Containment 3 §3 的包含语义接到 `container-type`：非 `normal` 的容器不再只是
+查询目标，它自己的布局也按包含规则求解。没有站点特判。
+
+## 布局包含
+
+- `size` 与 `inline-size` 都施加布局包含：主盒成为独立格式化上下文，内部浮动计入其
+  `auto` 高度（与 `flow-root` 相同）；静态定位的主盒成为绝对定位后代的包含块，包含块是
+  其 padding box。
+- `establishes_block_formatting_context` 现在纳入 `container-type`，和其他 BFC 来源共用
+  同一条浮动包含路径。
+- `layout_block_with_containing_height` 在子布局前与最终高度确定后都使用同一条件
+  （`position: static && !layout_contained`），避免静态包含容器在重算阶段退回祖先包含块。
+
+## 尺寸包含
+
+- `size`：块轴内在尺寸视为 0，`height: auto` 不再被内容撑开；显式 `height`、
+  `aspect-ratio` 派生高度与 `min-height`/`max-height` 仍然生效，内容可以溢出主盒。
+- `inline-size`：inline 轴内在尺寸视为 0。`max_content_width`、`min_content_width_at`、
+  `shrink_to_fit_width`（float 与 `inline-block`）以及
+  `atomic_outer_intrinsic_width` 都按空内容测量；显式 `width` 与 padding、border、margin
+  仍按自身声明参与外框尺寸。
+- `ContainerType::from_style` 统一从 computed style 读取 `container-type`，
+  `container_geometry_for_style` 与布局层使用同一解析结果。
+
+## 测试
+
+- `size` 的 auto 高度为 0，而 `inline-size` 的 block 轴仍随内容增高。
+- `size` 下显式高度、`aspect-ratio`、`min-height` 继续生效。
+- 容器建立独立格式化上下文后，内部 float 计入 auto 高度。
+- inline-size containment 的 `inline-block` 内在宽度为 0，显式宽度保留。
+- 静态 `container-type` 盒成为绝对定位子元素的包含块；同一标记去掉包含后回到初始包含块，
+  证明测试观察的是包含语义。
+
+## 验证
+
+```
+cargo test -p render-css --lib                     248 passed, 0 failed
+cargo test -p render-layout --lib                  318 passed, 1 ignored
+cargo test -p render-core --lib                    435 passed, 1 failed
+                                                   （临时关闭 avif-native；失败仅为 AVIF 解码测试）
+cargo fmt --all --check                            clean
+cargo clippy -p render-css -p render-layout -p render-core --all-targets -D warnings  clean
+python tools/check_site_neutrality.py              0 blocking, 26 advisory
+```
+
+本机全工作区门禁仍被 `dav1d-sys v0.8.3` 的 `pkg-config` 缺失阻塞，与本轮代码无关。
+
+## 下一步
+
+- 布局包含对 fixed 定位后代的包含块（当前 `position: fixed` 仍直接取 viewport）。
+- 布局包含隐含的 stacking context，以及 style containment 的计数器隔离。
+- `style()` / `scroll-state()` 容器查询。
+- 独立的 `contain: size/layout/style/paint` 属性（当前只由 `container-type` 触发）。
+- 继续现代 CSS：`@scope`、`@starting-style`、`@font-face` 描述符、`color-mix()` 等。
+
+---
+
 # 交接文档 (2026-10-31, 续四十七) — 容器查询单位 `cqw`/`cqh`/`cqi`/`cqb`/`cqmin`/`cqmax`
 
 这一轮把 CSS Containment 3 §5.1 的容器相对单位接到真实布局与绘制路径，没有站点特判。

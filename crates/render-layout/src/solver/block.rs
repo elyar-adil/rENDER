@@ -17,6 +17,7 @@ use crate::tree::FormattingContextKind;
 use crate::tree::FormattingNodeId;
 use crate::tree::FormattingNodeKind;
 use render_css::computed::ComputedStyle;
+use render_css::container::ContainerType;
 use render_css::properties::AspectRatio;
 use render_css::properties::BoxSizing;
 use render_css::properties::Clear;
@@ -31,12 +32,34 @@ use render_dom::NodeId;
 use crate::scrollport::ClipMode;
 
 pub(super) fn establishes_block_formatting_context(style: Option<&ComputedStyle>) -> bool {
-    ["overflow-x", "overflow-y"].into_iter().any(|property| {
-        matches!(
-            style.and_then(|style| style.typed(property)),
-            Some(TypedPropertyValue::Overflow(value)) if !matches!(value, Overflow::Visible)
-        )
-    })
+    // CSS Containment 3 §3: `container-type: size` and `inline-size` both
+    // apply layout containment, and layout containment makes the principal box
+    // an independent formatting context. Like `overflow: hidden`, that keeps
+    // an in-flow float's height inside the box instead of letting it escape
+    // into the parent flow.
+    style.is_some_and(|style| ContainerType::from_style(style) != ContainerType::Normal)
+        || ["overflow-x", "overflow-y"].into_iter().any(|property| {
+            matches!(
+                style.and_then(|style| style.typed(property)),
+                Some(TypedPropertyValue::Overflow(value)) if !matches!(value, Overflow::Visible)
+            )
+        })
+}
+
+/// Whether a box applies block-axis size containment.
+///
+/// CSS Containment 3 §3: `container-type: size` applies size containment, so
+/// the intrinsic block size is zero and an `auto` height no longer grows to
+/// fit the contents. `inline-size` does not contain the block axis.
+pub(super) fn has_size_containment(style: Option<&ComputedStyle>) -> bool {
+    style.is_some_and(|style| ContainerType::from_style(style) == ContainerType::Size)
+}
+
+/// Whether a box applies inline-axis size containment.
+///
+/// Both `size` and `inline-size` contain the inline axis.
+pub(super) fn has_inline_size_containment(style: Option<&ComputedStyle>) -> bool {
+    style.is_some_and(|style| ContainerType::from_style(style).supports_inline_axis())
 }
 
 /// The computed `overflow-x` and `overflow-y` of a box. An absent value is
@@ -264,6 +287,11 @@ impl Solver<'_> {
         }
         let position = position(style);
         let out_of_flow = matches!(position, Position::Absolute | Position::Fixed);
+        // CSS Containment 3 §3: both container types apply layout containment,
+        // which makes the principal box a containing block for absolutely
+        // positioned descendants even when it is statically positioned.
+        let layout_contained =
+            style.is_some_and(|style| ContainerType::from_style(style) != ContainerType::Normal);
         // An out-of-flow box is never subject to the CSS 2 §10.5
         // "percentage height computes to auto" rule: its containing block is
         // the positioning ancestor's padding box (or the viewport), whose
@@ -550,7 +578,7 @@ impl Solver<'_> {
         } else {
             (0.0, 0.0)
         };
-        let positioned_child_containing = if position == Position::Static {
+        let positioned_child_containing = if position == Position::Static && !layout_contained {
             // An absolute descendant may cross one or more static wrappers
             // before reaching its positioned ancestor.  During the first
             // pass an auto-height positioned ancestor has a zero provisional
@@ -783,6 +811,15 @@ impl Solver<'_> {
                 )
             }
         };
+        // CSS Containment 3 §3: size containment makes the intrinsic block size
+        // zero, so an `auto` height is determined as if the box had no
+        // contents. A specified height, aspect ratio, and min/max constraints
+        // still apply, and the laid-out children may overflow the box.
+        let auto_height = if has_size_containment(style) {
+            0.0
+        } else {
+            auto_height
+        };
         let content_height = self.apply_min_max_height(
             style,
             specified_content_height.unwrap_or(auto_height),
@@ -793,7 +830,7 @@ impl Solver<'_> {
             box_sizing,
         );
         self.finish_box(fragment, content_height, children.clone());
-        let positioned_child_containing = if position == Position::Static {
+        let positioned_child_containing = if position == Position::Static && !layout_contained {
             if positioning_containing.size.height <= 0.0 {
                 // The positioning ancestor's provisional padding box had no
                 // height because its auto height comes from this wrapper's

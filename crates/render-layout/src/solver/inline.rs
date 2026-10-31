@@ -22,6 +22,7 @@ use crate::solver::Solver;
 use crate::solver::TextRun;
 use crate::solver::TextSpacing;
 use crate::solver::TextStyle;
+use crate::solver::block::has_inline_size_containment;
 use crate::solver::block::inline_float_band;
 use crate::solver::is_word_separator;
 use crate::solver::resolve::count_as_f32;
@@ -1509,6 +1510,17 @@ impl<'a> Solver<'a> {
     /// as for floating elements", so the same formula answers for both, and this
     /// is where they are answered.
     fn shrink_to_fit_width(&mut self, node_id: FormattingNodeId, available: f32) -> f32 {
+        // CSS Containment 3 §3: a box with inline-size containment has an
+        // intrinsic inline size of zero, so its shrink-to-fit width is zero
+        // unless a specified width (handled by the caller) replaces it.
+        let style = self
+            .formatting
+            .get(node_id)
+            .and_then(|node| node.style_source)
+            .and_then(|source| self.styles.get(&source));
+        if has_inline_size_containment(style) {
+            return 0.0;
+        }
         let preferred = self.atomic_inline_intrinsic_width(node_id);
         let preferred_minimum = self.atomic_inline_min_content_width(node_id);
         f32::min(preferred, f32::max(preferred_minimum, available))
@@ -1584,6 +1596,17 @@ impl<'a> Solver<'a> {
         let Some(node) = self.formatting.get(node_id).cloned() else {
             return 0.0;
         };
+        // CSS Containment 3 §3: inline-size containment makes the intrinsic
+        // inline size zero, as if the box had no contents. Atomic boxes keep
+        // their own width contribution and are handled below.
+        if !matches!(node.kind, FormattingNodeKind::AtomicInline { .. })
+            && has_inline_size_containment(
+                node.style_source
+                    .and_then(|source| self.styles.get(&source)),
+            )
+        {
+            return 0.0;
+        }
         if let FormattingNodeKind::Text(text) = &node.kind {
             let style = self.inline_text_style(node.style_source);
             return self.intrinsic_text_width(text, node.style_source, style);
@@ -1673,6 +1696,16 @@ impl<'a> Solver<'a> {
         let Some(node) = self.formatting.get(node_id).cloned() else {
             return 0.0;
         };
+        // CSS Containment 3 §3: inline-size containment zeroes the intrinsic
+        // inline size of the box in the same way for min- and max-content.
+        if !matches!(node.kind, FormattingNodeKind::AtomicInline { .. })
+            && has_inline_size_containment(
+                node.style_source
+                    .and_then(|source| self.styles.get(&source)),
+            )
+        {
+            return 0.0;
+        }
         if let FormattingNodeKind::Text(text) = &node.kind {
             let style = self.inline_text_style(node.style_source);
             let options = self.line_break_options(node.style_source);
@@ -1943,9 +1976,16 @@ impl<'a> Solver<'a> {
             _ => BoxSizing::ContentBox,
         };
         let specified = self.resolve_size(style.as_ref(), "width", basis, source);
+        let contained = has_inline_size_containment(style.as_ref());
         let children = node.map(|node| node.children).unwrap_or_default();
         let content_width = specified.map_or_else(
             || {
+                // CSS Containment 3 §3: an auto width sizes the box as if it
+                // had no contents, while a specified width keeps its own used
+                // size plus the padding, border, and margin below.
+                if contained {
+                    return 0.0;
+                }
                 children
                     .into_iter()
                     .map(|child| {

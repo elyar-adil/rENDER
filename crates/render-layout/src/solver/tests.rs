@@ -2442,3 +2442,162 @@ fn container_units_use_their_own_axis_container_and_the_viewport_fallback() {
         }
     );
 }
+
+#[test]
+fn size_containment_zeroes_content_determined_height() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body>\
+           <div id='size'><div class='content'></div></div>\
+           <div id='inline'><div class='content'></div></div>\
+         </body>",
+        "html, body, div { display:block; margin:0 }\
+         #size { container-type: size } #inline { container-type: inline-size }\
+         .content { height: 40px }",
+        200.0,
+    );
+    // CSS Containment 3 §3: size containment makes the intrinsic block size
+    // zero, so the auto height ignores the 40px child and the child overflows.
+    assert_eq!(
+        fragment(&layout, find(&output.dom, "#size"))
+            .rect
+            .size
+            .height,
+        0.0
+    );
+    // `inline-size` only contains the inline axis; the block axis still sizes
+    // to the content.
+    assert_eq!(
+        fragment(&layout, find(&output.dom, "#inline"))
+            .rect
+            .size
+            .height,
+        40.0
+    );
+}
+
+#[test]
+fn size_containment_keeps_specified_height_aspect_ratio_and_min_height() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body>\
+           <div id='aspect'><div class='content'></div></div>\
+           <div id='minimum'><div class='content'></div></div>\
+           <div id='fixed'><div class='content'></div></div>\
+         </body>",
+        "html, body, div { display:block; margin:0 }\
+         .content { height: 40px }\
+         #aspect { container-type: size; width: 100px; aspect-ratio: 2 / 1 }\
+         #minimum { container-type: size; min-height: 30px }\
+         #fixed { container-type: size; height: 25px }",
+        200.0,
+    );
+    // Size containment only makes the *intrinsic* block size zero; a specified
+    // height, an aspect-ratio-derived height, and min/max constraints remain.
+    assert_eq!(
+        fragment(&layout, find(&output.dom, "#aspect"))
+            .rect
+            .size
+            .height,
+        50.0
+    );
+    assert_eq!(
+        fragment(&layout, find(&output.dom, "#minimum"))
+            .rect
+            .size
+            .height,
+        30.0
+    );
+    assert_eq!(
+        fragment(&layout, find(&output.dom, "#fixed"))
+            .rect
+            .size
+            .height,
+        25.0
+    );
+}
+
+#[test]
+fn container_type_contains_floats_like_a_flow_root() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='container'><div id='float'></div></div></body>",
+        "html, body, div { display:block; margin:0 }\
+         #container { container-type: inline-size }\
+         #float { float:left; width:50px; height:35px }",
+        200.0,
+    );
+    // CSS Containment 3 §3: both container types apply layout containment,
+    // which makes the box an independent formatting context, so the float
+    // contributes to its auto height instead of escaping into the parent.
+    assert_eq!(
+        fragment(&layout, find(&output.dom, "#container"))
+            .rect
+            .size
+            .height,
+        35.0
+    );
+}
+
+#[test]
+fn inline_size_containment_zeroes_intrinsic_inline_size_but_keeps_specified_width() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='host'>\
+           <span id='auto'>wide text</span>\
+           <span id='fixed'>wide text</span>\
+         </div></body>",
+        "html, body, div { display:block; margin:0 }\
+         #host { width: 300px }\
+         span { display:inline-block; container-type: inline-size }\
+         #fixed { width: 80px }",
+        300.0,
+    );
+    // CSS Containment 3 §3: an auto width measures as if the box were empty,
+    // so the shrink-to-fit inline-block contributes no inline size.
+    assert_eq!(
+        fragment(&layout, find(&output.dom, "#auto"))
+            .rect
+            .size
+            .width,
+        0.0
+    );
+    // A specified width is not an intrinsic contribution and stays in use.
+    assert_eq!(
+        fragment(&layout, find(&output.dom, "#fixed"))
+            .rect
+            .size
+            .width,
+        80.0
+    );
+}
+
+#[test]
+fn layout_containment_makes_a_static_box_the_containing_block_for_absolute_children() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='container'><div id='child'></div></div></body>",
+        "html, body, div { display:block; margin:0 }\
+         #container { container-type: size; margin-left:50px; width:200px; height:100px }\
+         #child { position:absolute; left:10px; top:10px; width:5px; height:5px }",
+        400.0,
+    );
+    let child = fragment(&layout, find(&output.dom, "#child"));
+    // CSS Containment 3 §3: layout containment makes the static container the
+    // containing block for absolutely positioned descendants, so `left:10px`
+    // resolves against the container's padding box at x=50.
+    assert_eq!(child.rect.origin.x, 60.0);
+    assert_eq!(child.rect.origin.y, 10.0);
+
+    // Without containment the same markup resolves `left` against the initial
+    // containing block, proving the assertion above observes containment.
+    let (plain_output, _, plain) = pipeline(
+        "<!doctype html><body><div id='container'><div id='child'></div></div></body>",
+        "html, body, div { display:block; margin:0 }\
+         #container { margin-left:50px; width:200px; height:100px }\
+         #child { position:absolute; left:10px; top:10px; width:5px; height:5px }",
+        400.0,
+    );
+    assert_eq!(
+        fragment(&plain, find(&plain_output.dom, "#child"))
+            .rect
+            .origin
+            .x,
+        10.0
+    );
+}
