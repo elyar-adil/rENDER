@@ -14,12 +14,13 @@ use cssparser::{ParseError, Parser, ParserInput, Token};
 use render_dom::{Dom, Node, NodeId, NodeKind};
 
 use super::cascade::{
-    CascadeInput, CascadeRuleIndex, CascadedStyle, cascade_element_with_origins_indexed,
-    media_query_list_matches,
+    CascadeInput, CascadeLookup, CascadeRuleIndex, CascadedStyle,
+    cascade_element_with_origins_indexed, media_query_list_matches,
 };
+use super::container::{StyleFeature, StyleQueryEnvironment, parse_container_names};
 use super::properties::{TypedPropertyValue, parse_typed_property};
 use super::pseudo::{self, PseudoElement};
-use super::registered::{PropertyRegistration, RegisteredSyntax};
+use super::registered::{PropertyRegistration, RegisteredSyntax, SyntaxKind, SyntaxMultiplier};
 use super::selector::MatchContext;
 use super::stylesheet::{CssWideKeyword, Declaration, css_wide_keyword, parse_declaration_list};
 
@@ -1211,6 +1212,237 @@ impl RegisteredProperties {
     }
 }
 
+/// Answers `style()` container features from the top-down style pass.
+///
+/// The style map only ever contains ancestors of the element being cascaded:
+/// `compute_document_styles_with_hints` walks parent-before-child, so a style
+/// query cannot observe a descendant and cannot form a cycle.
+struct ComputedStyleQueries<'a> {
+    styles: &'a BTreeMap<NodeId, ComputedStyle>,
+    registered: &'a RegisteredProperties,
+    limits: &'a ComputationLimits,
+}
+
+impl StyleQueryEnvironment for ComputedStyleQueries<'_> {
+    fn container_has_name(&self, element: NodeId, name: &str) -> bool {
+        self.styles.get(&element).is_some_and(|style| {
+            style.get("container-name").is_some_and(|value| {
+                parse_container_names(value.css_text())
+                    .iter()
+                    .any(|candidate| candidate == name)
+            })
+        })
+    }
+
+    fn style_feature_matches(&self, element: NodeId, feature: &StyleFeature) -> bool {
+        self.styles.get(&element).is_some_and(|style| {
+            style_feature_matches(style, feature, self.registered, self.limits)
+        })
+    }
+}
+
+/// CSS Conditional 5 §3.1: match one `style()` feature against the query
+/// container's computed style.
+fn style_feature_matches(
+    style: &ComputedStyle,
+    feature: &StyleFeature,
+    registered: &RegisteredProperties,
+    limits: &ComputationLimits,
+) -> bool {
+    let custom = feature.name.starts_with("--");
+    let Some(value) = feature.value.as_deref() else {
+        return boolean_style_feature_matches(style, feature, registered, custom);
+    };
+    if is_cascade_dependent_style_value(value) {
+        return false;
+    }
+    let Some(computed) = style.get(&feature.name) else {
+        return false;
+    };
+    let Ok(query_tokens) = tokenize(value, limits) else {
+        return false;
+    };
+    if !custom {
+        return token_streams_match(&computed.tokens, &query_tokens, true);
+    }
+    match registered.definition(&feature.name) {
+        Some(registration) if !matches!(registration.syntax, RegisteredSyntax::Universal) => {
+            // A registered property compares its computed value with the
+            // declaration value. Both must match the registered syntax; then
+            // token equality is the common case, and a color registration also
+            // compares equal colors written differently.
+            if !registration.syntax.matches(value)
+                || !registration.syntax.matches(computed.css_text())
+            {
+                return false;
+            }
+            token_streams_match(&computed.tokens, &query_tokens, false)
+                || (syntax_is_color(&registration.syntax)
+                    && color_values_match(computed.css_text(), value))
+        }
+        // Unregistered custom properties compare as token streams; CSS
+        // Properties and Values 1 gives them no canonicalization.
+        _ => token_streams_match(&computed.tokens, &query_tokens, false),
+    }
+}
+
+/// Boolean style feature: true when the computed value differs from the
+/// property's initial value. An unregistered custom property has no initial
+/// value, so any computed value satisfies it.
+fn boolean_style_feature_matches(
+    style: &ComputedStyle,
+    feature: &StyleFeature,
+    registered: &RegisteredProperties,
+    custom: bool,
+) -> bool {
+    if custom {
+        let Some(computed) = style.get(&feature.name) else {
+            return false;
+        };
+        if let Some(initial) = registered.initial(&feature.name) {
+            return !token_streams_match(&computed.tokens, &initial.tokens, false);
+        }
+        return true;
+    }
+    let Some(computed) = style.get(&feature.name) else {
+        return false;
+    };
+    let Some(initial) = style
+        .initial
+        .as_ref()
+        .and_then(|initial| initial.values.get(&feature.name))
+        .filter(|initial| !initial.rejected)
+        .and_then(|initial| initial.value.as_ref())
+    else {
+        return false;
+    };
+    !token_streams_match(&computed.tokens, &initial.tokens, true)
+}
+
+/// The CSS-wide keywords are not declarations a style feature may match, and
+/// `!important` is invalid inside a feature.
+fn is_cascade_dependent_style_value(value: &str) -> bool {
+    let value = value.trim();
+    if value
+        .to_ascii_lowercase()
+        .split_ascii_whitespace()
+        .any(|part| part == "!important")
+    {
+        return true;
+    }
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+    )
+}
+
+/// Whether every alternative of a registration is a single `<color>`.
+fn syntax_is_color(syntax: &RegisteredSyntax) -> bool {
+    let RegisteredSyntax::Alternatives(alternatives) = syntax else {
+        return false;
+    };
+    !alternatives.is_empty()
+        && alternatives.iter().all(|alternative| {
+            alternative.terms.len() == 1
+                && alternative.terms[0].kind == SyntaxKind::Color
+                && alternative.terms[0].multiplier == SyntaxMultiplier::Single
+        })
+}
+
+/// Compare two colors after parsing them with the engine's color grammar, so a
+/// registered `<color>` property matches `blue`, `#00f`, and `rgb(0 0 255)`.
+fn color_values_match(left: &str, right: &str) -> bool {
+    matches!(
+        (
+            parse_typed_property("color", left),
+            parse_typed_property("color", right)
+        ),
+        (
+            Some(Ok(TypedPropertyValue::Color(left))),
+            Some(Ok(TypedPropertyValue::Color(right)))
+        ) if left == right
+    )
+}
+
+/// Compare two token streams, ignoring whitespace and comments. Custom
+/// properties are case-sensitive; ordinary property names fold identifiers.
+fn token_streams_match(left: &TokenStream, right: &TokenStream, fold_identifiers: bool) -> bool {
+    let mut left = left.0.iter().filter(|value| !value.is_insignificant());
+    let mut right = right.0.iter().filter(|value| !value.is_insignificant());
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return true,
+            (Some(left), Some(right)) if component_values_match(left, right, fold_identifiers) => {}
+            _ => return false,
+        }
+    }
+}
+
+fn component_values_match(
+    left: &ComponentValue,
+    right: &ComponentValue,
+    fold_identifiers: bool,
+) -> bool {
+    match (left, right) {
+        (
+            ComponentValue::Token {
+                class: left_class,
+                source: left,
+            },
+            ComponentValue::Token {
+                class: right_class,
+                source: right,
+            },
+        ) => {
+            if fold_identifiers
+                && matches!(left_class, TokenClass::Ident(_))
+                && matches!(right_class, TokenClass::Ident(_))
+            {
+                left.eq_ignore_ascii_case(right)
+            } else {
+                left == right
+            }
+        }
+        (
+            ComponentValue::Function {
+                name: left_name,
+                values: left,
+                ..
+            },
+            ComponentValue::Function {
+                name: right_name,
+                values: right,
+                ..
+            },
+        ) => {
+            left_name.eq_ignore_ascii_case(right_name)
+                && token_streams_match(left, right, fold_identifiers)
+        }
+        (
+            ComponentValue::Block {
+                prefix: left_prefix,
+                values: left,
+                ..
+            },
+            ComponentValue::Block {
+                prefix: right_prefix,
+                values: right,
+                ..
+            },
+        ) => left_prefix == right_prefix && token_streams_match(left, right, fold_identifiers),
+        (ComponentValue::Substitution(left), ComponentValue::Substitution(right)) => {
+            token_streams_match(left, right, fold_identifiers)
+        }
+        _ => false,
+    }
+}
+
+impl ComponentValue {
+    fn is_insignificant(&self) -> bool {
+        matches!(self, Self::Token { class, .. } if class.insignificant())
+    }
+}
+
 /// Resolve token-level computed values for one element.
 #[must_use]
 pub fn compute_style(
@@ -1794,7 +2026,14 @@ pub fn compute_document_styles_with_hints(
                 context,
                 &ua_hints,
                 &inline,
-                &rule_index,
+                &CascadeLookup {
+                    rule_index: Some(&rule_index),
+                    style_queries: &ComputedStyleQueries {
+                        styles: &styles,
+                        registered: &registered,
+                        limits,
+                    },
+                },
             );
             if let Some(started) = cascade_started {
                 cascade_time += started.elapsed();
@@ -1828,7 +2067,14 @@ pub fn compute_document_styles_with_hints(
                     &pseudo_context,
                     &[],
                     &[],
-                    &rule_index,
+                    &CascadeLookup {
+                        rule_index: Some(&rule_index),
+                        style_queries: &ComputedStyleQueries {
+                            styles: &styles,
+                            registered: &registered,
+                            limits,
+                        },
+                    },
                 );
                 if let Some(started) = pseudo_started {
                     pseudo_cascade_time += started.elapsed();
@@ -3177,6 +3423,288 @@ mod tests {
                 .map(super::ComputedValue::css_text),
             Some("red"),
             "the unconditional registration supplies its initial value"
+        );
+    }
+
+    /// CSS Conditional 5 §5.1: every element is a style container, so a
+    /// style-only query needs no `container-type` and no measured geometry.
+    /// The nearest ancestor answers; the queried element itself does not.
+    #[test]
+    fn style_queries_read_ancestor_styles_without_geometry() {
+        let output = parse_document(
+            "<!doctype html><div id='theme'><p id='target'></p></div><span id='self'></span>",
+        );
+        let sheet = parse_stylesheet(
+            "#theme { --theme: dark; container-name: theme } \
+             #self { --theme: dark } \
+             @container style(--theme: dark) { #target { color: red } } \
+             @container theme style(--theme: dark) { #target { background-color: blue } } \
+             @container style(--theme: dark) { #self { color: green } }",
+        );
+        let target = target_id(&output.dom, "#target");
+        let quoted = target_id(&output.dom, "#self");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        assert_eq!(
+            styles[&target]
+                .get("color")
+                .map(super::ComputedValue::css_text),
+            Some("red"),
+            "the parent is a style container without container-type"
+        );
+        assert_eq!(
+            styles[&target]
+                .get("background-color")
+                .map(super::ComputedValue::css_text),
+            Some("blue"),
+            "a named style container answers by name alone"
+        );
+        assert_ne!(
+            styles[&quoted]
+                .get("color")
+                .map(super::ComputedValue::css_text),
+            Some("green"),
+            "a style query never observes the queried element itself"
+        );
+    }
+
+    /// A condition that mixes a size feature and a style feature selects one
+    /// query container that can answer both. A nearer style-only container
+    /// cannot answer the size half, and an outer size container's own style is
+    /// what the style half reads.
+    #[test]
+    fn style_and_size_features_share_one_query_container() {
+        let output = parse_document(
+            "<!doctype html><div id='outer'><div id='inner'><p id='target'></p></div></div>",
+        );
+        let outer = target_id(&output.dom, "#outer");
+        let target = target_id(&output.dom, "#target");
+        let context = context_with_container(outer, ContainerType::InlineSize, &[], 500.0, 300.0);
+        let mixed = "@container (min-width: 400px) and style(--theme: dark) { \
+                         #target { color: red } \
+                     }";
+
+        let matching = parse_stylesheet(&format!(
+            "#outer {{ container-type: inline-size; --theme: dark }} \
+             #inner {{ --theme: light }} \
+             {mixed}"
+        ));
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &matching,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &context,
+        );
+        assert_eq!(
+            styles[&target]
+                .get("color")
+                .map(super::ComputedValue::css_text),
+            Some("red"),
+            "the size container is also a style container and answers both halves"
+        );
+
+        let nearer_style_only = parse_stylesheet(&format!(
+            "#outer {{ container-type: inline-size; --theme: light }} \
+             #inner {{ --theme: dark }} \
+             {mixed}"
+        ));
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &nearer_style_only,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &context,
+        );
+        assert_ne!(
+            styles[&target]
+                .get("color")
+                .map(super::ComputedValue::css_text),
+            Some("red"),
+            "the style half is not answered by a nearer container than the size half"
+        );
+
+        let without_geometry = parse_stylesheet(&format!(
+            "#outer {{ container-type: inline-size; --theme: dark }} \
+             #inner {{ --theme: dark }} \
+             {mixed}"
+        ));
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &without_geometry,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        assert_ne!(
+            styles[&target]
+                .get("color")
+                .map(super::ComputedValue::css_text),
+            Some("red"),
+            "a mixed condition needs real geometry, not just a matching style"
+        );
+    }
+
+    /// A boolean style feature compares the computed value with the property's
+    /// initial value. For a registered custom property the initial value is
+    /// the registration's, not "guaranteed-invalid".
+    #[test]
+    fn boolean_style_features_compare_with_initial_values() {
+        let output = parse_document("<!doctype html><div id='theme'><p id='target'></p></div>");
+        let target = target_id(&output.dom, "#target");
+        let registration =
+            "@property --accent { syntax: \"<color>\"; inherits: false; initial-value: purple }";
+        let queries = "@container style(--accent) { #target { color: red } } \
+                       @container style(border-top-style) { #target { background-color: blue } }";
+
+        let at_initial = parse_stylesheet(&format!("{registration} #theme {{ }} {queries}"));
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &at_initial,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        assert_ne!(
+            styles[&target]
+                .get("color")
+                .map(super::ComputedValue::css_text),
+            Some("red"),
+            "a registered property at its initial value does not satisfy a boolean feature"
+        );
+        assert_ne!(
+            styles[&target]
+                .get("background-color")
+                .map(super::ComputedValue::css_text),
+            Some("blue"),
+            "an unset standard property is at its initial value"
+        );
+
+        let declared = parse_stylesheet(&format!(
+            "{registration} #theme {{ --accent: red; border-top-style: solid }} {queries}"
+        ));
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &declared,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        assert_eq!(
+            styles[&target]
+                .get("color")
+                .map(super::ComputedValue::css_text),
+            Some("red")
+        );
+        assert_eq!(
+            styles[&target]
+                .get("background-color")
+                .map(super::ComputedValue::css_text),
+            Some("blue")
+        );
+    }
+
+    /// A registered `<color>` property compares by computed color, so the two
+    /// spellings of the same color match, while a different color does not.
+    #[test]
+    fn registered_color_style_features_compare_equal_colors() {
+        let output = parse_document("<!doctype html><div id='theme'><p id='target'></p></div>");
+        let sheet = parse_stylesheet(
+            "@property --accent { syntax: \"<color>\"; inherits: false; initial-value: red } \
+             #theme { --accent: #00f } \
+             @container style(--accent: rgb(0 0 255)) { #target { color: red } } \
+             @container style(--accent: blue) { #target { border-top-style: solid } } \
+             @container style(--accent: red) { #target { border-top-color: green } }",
+        );
+        let target = target_id(&output.dom, "#target");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let style = &styles[&target];
+        assert_eq!(
+            style.get("color").map(super::ComputedValue::css_text),
+            Some("red"),
+            "rgb() containing spaces matches #00f"
+        );
+        assert_eq!(
+            style
+                .get("border-top-style")
+                .map(super::ComputedValue::css_text),
+            Some("solid"),
+            "the blue keyword matches #00f"
+        );
+        assert_ne!(
+            style
+                .get("border-top-color")
+                .map(super::ComputedValue::css_text),
+            Some("green"),
+            "a different color does not match"
+        );
+    }
+
+    /// CSS Conditional 5 §6.2: cascade-dependent keywords and `!important` are
+    /// invalid in a style feature and make the query false.
+    #[test]
+    fn cascade_dependent_style_feature_values_are_false() {
+        let output = parse_document("<!doctype html><div id='theme'><p id='target'></p></div>");
+        let sheet = parse_stylesheet(
+            "#theme { color: red } \
+             @container style(color: inherit) { #target { background-color: blue } } \
+             @container style(color: red !important) { #target { border-top-style: solid } }",
+        );
+        let target = target_id(&output.dom, "#target");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let style = &styles[&target];
+        assert_ne!(
+            style
+                .get("background-color")
+                .map(super::ComputedValue::css_text),
+            Some("blue")
+        );
+        assert_ne!(
+            style
+                .get("border-top-style")
+                .map(super::ComputedValue::css_text),
+            Some("solid")
         );
     }
 }

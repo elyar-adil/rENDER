@@ -1,3 +1,82 @@
+# 交接文档 (2026-10-31, 续四十九) — `style()` 容器查询
+
+这一轮把 CSS Conditional 5 §3.1/§6.2 的 `style()` 容器查询接到自顶向下样式过程：
+样式查询直接读取查询容器已经计算好的样式，不依赖布局回馈，也不需要 `container-type`。
+没有站点特判。
+
+## 语义
+
+- 每个元素都是 style 查询容器（§5.1）：`container-type: normal` 不影响 `style()`，只有
+  `@container` 的尺寸部分继续要求 `size`/`inline-size` 资格。
+- 查询容器仍从祖先链上选，元素自身不参与；可选 `container-name` 先过滤，再要求该容器能
+  回答条件中出现的全部轴。混合条件（尺寸 + 样式）必须由同一个容器回答，不能把样式部分
+  退给更近的 style-only 祖先。
+- `style()` 的 feature 支持声明形式 `style(--theme: dark)` 与布尔形式 `style(--theme)`；
+  值里的函数与字符串按顶层冒号切分，`var(--x)`、`content: "a:b"` 不会被截断；标准属性名
+  大小写折叠，`-webkit-*` 前缀与 `--*` 自定义属性分别校验。
+- 未注册自定义属性按 token 流比较，忽略空白与注释且区分大小写；标准属性名下的标识符按
+  ASCII 大小写折叠。注册属性先校验注册语法，再比较 token；`<color>` 注册额外按解析后的
+  颜色值比较，因此 `#00f`、`blue`、`rgb(0 0 255)` 等价。
+- 布尔 feature 与属性初始值比较：注册自定义属性用注册的 `initial-value`，标准属性用
+  computed style 保存的初始值；未注册且未声明的自定义属性没有值，布尔形式为 false。
+- CSS-wide 关键字（`initial`/`inherit`/`unset`/`revert`/`revert-layer`）和 `!important`
+  在 feature 值中无效，整个条件求值为 false（§6.2）。
+- 没有任何几何或样式环境时一律 false；公开的 `ContainerContext::matches` 保持旧的
+  size-only 语义，级联内部使用 `matches_with_style` 并传入自顶向下样式表。
+
+## 接入点
+
+- `render-css::container`：`ContainerQuery::Style(StyleFeature)`、`StyleQueryEnvironment`
+  （`container_has_name` + `style_feature_matches`）与 `NoStyleQueries`；解析器把
+  `style(...)` 变成 AST，`scroll-state(...)` 仍记为 unsupported。
+- `render-css::cascade`：`CascadeLookup` 打包规则索引与样式环境，`@container` 条件用
+  `matches_with_style` 判断。
+- `render-css::computed`：`ComputedStyleQueries` 读取已计算祖先样式；`style_feature_matches`
+  实现 token/注册语法/颜色/布尔/级联关键字规则。
+
+## 测试
+
+- 解析：声明、布尔、函数值、字符串中的冒号、标准属性名折叠、vendor 前缀、`scroll-state`
+  仍为 unsupported。
+- 集成：无 `container-type`/无几何的样式查询、命名的 style-only 容器、自身排除；
+  混合尺寸+样式必须同一容器回答（更近的 style-only 容器不能满足尺寸部分）；布尔初始值
+  （注册 `<color>` 初始值与标准属性初始值）；注册 `<color>` 的三种等价写法；混合条件缺
+  几何时为 false；CSS-wide 与 `!important` 为 false。
+
+## 验证
+
+```
+cargo test -p render-css --lib                     254 passed, 0 failed
+cargo test -p render-layout --lib                  318 passed, 1 ignored
+cargo test -p render-core --lib                    435 passed, 1 failed
+                                                   （临时关闭 avif-native；失败仅为 AVIF 解码测试）
+cargo fmt --all --check                            clean
+cargo clippy -p render-css -p render-layout -p render-core --all-targets -D warnings  clean
+python tools/check_site_neutrality.py              0 blocking, 26 advisory
+```
+
+本机全工作区门禁仍被 `dav1d-sys v0.8.3` 的 `pkg-config` 缺失阻塞，与本轮代码无关。
+
+## 已知缺口
+
+- `scroll-state()` 容器查询尚未实现（解析为 unsupported，条件 false）。
+- 伪元素 `::before`/`::after` 的样式查询应查询其 originating element；当前查询链从
+  originating element 的父节点开始，且伪元素级联时该元素样式尚未写入样式表。
+- `style()` 的 shorthand feature 应按各 longhand 计算值全部匹配（§6.2）；当前只查同名
+  属性，未展开 shorthand。
+- 注册属性的非 `<color>` 语法（长度、数字等）目前按 token 比较，未按 computed value 归一化
+  （如 `1em` 与 `16px`）。
+
+## 下一步
+
+- 布局包含对 fixed 定位后代的包含块（当前 `position: fixed` 仍直接取 viewport）。
+- 布局包含隐含的 stacking context，以及 style containment 的计数器隔离。
+- `scroll-state()` 容器查询；伪元素样式查询的 inclusive 祖先链。
+- 独立的 `contain: size/layout/style/paint` 属性（当前只由 `container-type` 触发）。
+- 继续现代 CSS：`@scope`、`@starting-style`、`@font-face` 描述符、`color-mix()` 等。
+
+---
+
 # 交接文档 (2026-10-31, 续四十八) — `container-type` 的尺寸包含与布局包含
 
 这一轮把 CSS Containment 3 §3 的包含语义接到 `container-type`：非 `normal` 的容器不再只是

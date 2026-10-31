@@ -63,13 +63,18 @@ project's history. `@property` registrations validate their syntax and initial v
 registered unset value before `var()` substitution. Media Queries 4/5 conditions support
 `not`/`and`/`or`, nested parentheses and range syntax, plus the common environment features.
 `@container` size queries parse at stylesheet time and evaluate against measured ancestor content
-boxes, with a bounded three-pass style/layout feedback loop. Container-relative units
+boxes, with a bounded three-pass style/layout feedback loop. `style()` queries read the query
+container's already-computed style during the same top-down cascade, so every element is a style
+container without `container-type` or geometry; declarations, boolean features, registered syntax,
+and `<color>` equivalence are supported, and a condition mixing size and style features is
+answered by one container. Container-relative units
 (`cqw`/`cqh`/`cqi`/`cqb`/`cqmin`/`cqmax`) resolve per axis against the nearest eligible ancestor,
 falling back to the small viewport size when none exists. The `container-type` that enables those
 queries also applies CSS Containment 3 §3: layout containment makes the box an independent
 formatting context and a containing block for absolutely positioned descendants, while size
 containment zeroes the intrinsic size of the contained axes, so an `auto` block size no longer
-grows with the content.
+grows with the content. `scroll-state()` queries, pseudo-element inclusive style queries, and
+`style()` shorthand features remain gaps.
 
 **Table layout.** 47 tests. CSS 2.1 §17 including border-collapse conflict resolution, row groups,
 `colspan`/`rowspan`, `caption-side`, fixed layout, intrinsic widths. This is the single most-used

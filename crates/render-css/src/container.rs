@@ -139,11 +139,15 @@ impl ContainerCondition {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ContainerQuery {
     Feature(SizeFeature),
+    /// `style(...)`: a declaration evaluated against the query container's
+    /// computed style. Style containers need no `container-type` (CSS
+    /// Conditional 5 §3): every element is a style container.
+    Style(StyleFeature),
     Not(Box<Self>),
     And(Vec<Self>),
     Or(Vec<Self>),
-    /// `style()` and `scroll-state()` queries: recognised syntax this engine
-    /// does not evaluate yet.
+    /// `scroll-state()` queries: recognised syntax this engine does not
+    /// evaluate yet.
     Unsupported(String),
 }
 
@@ -155,6 +159,10 @@ impl ContainerQuery {
     pub fn axes(&self) -> AxisRequirement {
         match self {
             Self::Feature(feature) => feature.name.axes(),
+            Self::Style(_) => AxisRequirement {
+                inline: false,
+                block: false,
+            },
             Self::Not(inner) => inner.axes(),
             Self::And(parts) | Self::Or(parts) => parts.iter().map(Self::axes).fold(
                 AxisRequirement {
@@ -170,14 +178,51 @@ impl ContainerQuery {
         }
     }
 
+    /// Whether the condition contains a `style()` feature.
+    #[must_use]
+    pub fn uses_style(&self) -> bool {
+        match self {
+            Self::Style(_) => true,
+            Self::Feature(_) | Self::Unsupported(_) => false,
+            Self::Not(inner) => inner.uses_style(),
+            Self::And(parts) | Self::Or(parts) => parts.iter().any(Self::uses_style),
+        }
+    }
+
     /// Evaluate against a container's measured content box.
     #[must_use]
     pub fn matches(&self, geometry: &ContainerGeometry, context: &ContainerContext) -> bool {
         match self {
             Self::Feature(feature) => feature.matches(geometry, context),
+            // A style feature needs a computed style, which this entry point
+            // does not have. `matches_with_style` is the answering path.
+            Self::Style(_) => false,
             Self::Not(inner) => !inner.matches(geometry, context),
             Self::And(parts) => parts.iter().all(|part| part.matches(geometry, context)),
             Self::Or(parts) => parts.iter().any(|part| part.matches(geometry, context)),
+            Self::Unsupported(_) => false,
+        }
+    }
+
+    fn matches_with_style(
+        &self,
+        geometry: Option<&ContainerGeometry>,
+        node: NodeId,
+        context: &ContainerContext,
+        styles: &dyn StyleQueryEnvironment,
+    ) -> bool {
+        match self {
+            Self::Feature(feature) => {
+                geometry.is_some_and(|geometry| feature.matches(geometry, context))
+            }
+            Self::Style(feature) => styles.style_feature_matches(node, feature),
+            Self::Not(inner) => !inner.matches_with_style(geometry, node, context, styles),
+            Self::And(parts) => parts
+                .iter()
+                .all(|part| part.matches_with_style(geometry, node, context, styles)),
+            Self::Or(parts) => parts
+                .iter()
+                .any(|part| part.matches_with_style(geometry, node, context, styles)),
             Self::Unsupported(_) => false,
         }
     }
@@ -189,8 +234,50 @@ impl ContainerQuery {
             Self::Unsupported(reason) => Some(reason),
             Self::Not(inner) => inner.unsupported(),
             Self::And(parts) | Self::Or(parts) => parts.iter().find_map(Self::unsupported),
-            Self::Feature(_) => None,
+            Self::Feature(_) | Self::Style(_) => None,
         }
+    }
+}
+
+/// One `style()` feature: a property declaration or a bare property name.
+///
+/// CSS Conditional 5 §3.1: the feature is matched against the computed value
+/// of the property on the query container. A feature without a value is true
+/// when the computed value differs from the property's initial value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StyleFeature {
+    /// The property name as written. Custom properties keep their leading
+    /// `--`; standard property names are case-folded to lowercase.
+    pub name: String,
+    /// The declared value as written, or `None` for a boolean feature.
+    pub value: Option<String>,
+}
+
+/// Computed styles for elements that have already been cascaded, so a style
+/// query can be answered during the same top-down style pass that reads it.
+///
+/// Style queries never consult descendant styles, so an element can answer
+/// them before its own style is computed, provided its ancestors are done.
+pub trait StyleQueryEnvironment {
+    /// Whether `element` declares `container-name: name`.
+    fn container_has_name(&self, element: NodeId, name: &str) -> bool;
+
+    /// Whether `element`'s computed style matches `feature`.
+    fn style_feature_matches(&self, element: NodeId, feature: &StyleFeature) -> bool;
+}
+
+/// The environment used when no computed styles are available: every style
+/// feature is false, as CSS Conditional 5 requires for an unknown container.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoStyleQueries;
+
+impl StyleQueryEnvironment for NoStyleQueries {
+    fn container_has_name(&self, _element: NodeId, _name: &str) -> bool {
+        false
+    }
+
+    fn style_feature_matches(&self, _element: NodeId, _feature: &StyleFeature) -> bool {
+        false
     }
 }
 
@@ -419,11 +506,50 @@ impl ContainerContext {
 
     /// Whether `condition` holds for `element`'s nearest eligible container.
     /// No context, no eligible container, or an unsupported sub-condition all
-    /// answer false, as CSS Containment 3 §4.1 requires.
+    /// answer false, as CSS Conditional 5 §3.1 requires.
     #[must_use]
     pub fn matches(&self, dom: &Dom, element: NodeId, condition: &ContainerCondition) -> bool {
-        self.query_container(dom, element, condition)
-            .is_some_and(|geometry| condition.query.matches(geometry, self))
+        self.matches_with_style(dom, element, condition, &NoStyleQueries)
+    }
+
+    /// Style-aware container query evaluation.
+    ///
+    /// A style feature is answered from the candidate ancestor's computed
+    /// style. Size and style features are answered by the *same* query
+    /// container: the nearest ancestor that matches the optional name and can
+    /// answer every axis the condition names. Style-only conditions need no
+    /// geometry and therefore need no `container-type`; CSS Conditional 5 §3.1
+    /// makes every element a style container.
+    #[must_use]
+    pub fn matches_with_style(
+        &self,
+        dom: &Dom,
+        element: NodeId,
+        condition: &ContainerCondition,
+        styles: &dyn StyleQueryEnvironment,
+    ) -> bool {
+        let axes = condition.query.axes();
+        let needs_geometry = axes.inline || axes.block;
+        let mut current = dom.parent(element);
+        while let Some(node) = current {
+            let geometry = self.containers.get(&node);
+            let name_matches = condition.name.as_ref().is_none_or(|name| {
+                styles.container_has_name(node, name)
+                    || geometry
+                        .is_some_and(|geometry| geometry.names.iter().any(|item| item == name))
+            });
+            if name_matches
+                && (!needs_geometry
+                    || geometry
+                        .is_some_and(|geometry| condition.is_eligible_for(geometry.container_type)))
+            {
+                return condition
+                    .query
+                    .matches_with_style(geometry, node, self, styles);
+            }
+            current = dom.parent(node);
+        }
+        false
     }
 
     /// The nearest ancestor that accepts size queries on one axis.
@@ -640,6 +766,88 @@ fn is_condition_keyword(text: &str) -> bool {
     )
 }
 
+/// Parse the contents of a `style(...)` query into one style feature.
+///
+/// CSS Conditional 5 §3.1 defines a style feature as a declaration or a bare
+/// property name. A declaration is split at the first top-level colon, so
+/// values containing functions (`style(--theme: var(--x))`) and strings
+/// (`content: "a:b"`) stay intact.
+fn parse_style_function(text: &str) -> Result<StyleFeature, String> {
+    let (_, rest) = text
+        .split_once('(')
+        .ok_or_else(|| "style() is missing its opening parenthesis".to_owned())?;
+    let inner = rest
+        .strip_suffix(')')
+        .ok_or_else(|| "style() is missing its closing parenthesis".to_owned())?
+        .trim();
+    if inner.is_empty() {
+        return Err("style() requires a property name or declaration".to_owned());
+    }
+    let (name, value) = split_style_declaration(inner);
+    let name = name.trim();
+    let value = value.map(str::trim);
+    if !is_style_property_name(name) {
+        return Err(format!("'{name}' is not a property name"));
+    }
+    if value.is_some_and(str::is_empty) {
+        return Err("style() declaration is missing its value".to_owned());
+    }
+    Ok(StyleFeature {
+        name: if name.starts_with("--") {
+            name.to_owned()
+        } else {
+            name.to_ascii_lowercase()
+        },
+        value: value.map(str::to_owned),
+    })
+}
+
+/// Split a style feature at its first top-level colon.
+fn split_style_declaration(source: &str) -> (&str, Option<&str>) {
+    let mut depth = 0_usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in source.char_indices() {
+        if let Some(closing) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == closing {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '"' | '\'' => quote = Some(character),
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 => return (&source[..index], Some(&source[index + 1..])),
+            _ => {}
+        }
+    }
+    (source, None)
+}
+
+/// Whether `name` is an ordinary property name or a custom property name.
+///
+/// Ordinary property names are CSS identifiers, which may carry a single
+/// leading `-` for a vendor prefix (`-webkit-transform`); the doubled prefix
+/// belongs to custom properties and is handled first.
+fn is_style_property_name(name: &str) -> bool {
+    if let Some(rest) = name.strip_prefix("--") {
+        let mut characters = rest.chars();
+        return characters.next().is_some_and(is_ident_start) && characters.all(is_ident_continue);
+    }
+    let name = name.strip_prefix('-').unwrap_or(name);
+    let mut characters = name.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    is_ident_start(first)
+        && characters.all(|character| is_ident_continue(character) || character == '-')
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
     Ident(String),
@@ -732,22 +940,25 @@ impl Cursor {
     /// One `<query-in-parens>`: a parenthesised feature or nested condition, or
     /// a functional query this engine recognises but cannot evaluate yet.
     fn parse_term(&mut self) -> Result<ContainerQuery, String> {
+        if let Some(Token::Function(text)) = self.peek().cloned() {
+            let name = text
+                .split_once('(')
+                .map_or_else(|| text.clone(), |(name, _)| name.to_ascii_lowercase());
+            if name == "style" {
+                self.advance();
+                return parse_style_function(&text).map(ContainerQuery::Style);
+            }
+            if name == "scroll-state" {
+                let reason = format!("@{name} container queries are not implemented");
+                self.advance();
+                return Ok(ContainerQuery::Unsupported(reason));
+            }
+            return Err(format!("unsupported container query function '{name}'"));
+        }
         match self.peek() {
             Some(Token::Open) => {
                 let inner = self.take_group()?;
                 parse_paren_contents(inner)
-            }
-            Some(Token::Function(text)) => {
-                let name = text
-                    .split_once('(')
-                    .map_or_else(|| text.clone(), |(name, _)| name.to_ascii_lowercase());
-                if name == "style" || name == "scroll-state" {
-                    let reason = format!("@{name} container queries are not implemented");
-                    self.advance();
-                    Ok(ContainerQuery::Unsupported(reason))
-                } else {
-                    Err(format!("unsupported container query function '{name}'"))
-                }
             }
             Some(Token::Ident(word)) if word.eq_ignore_ascii_case("not") => {
                 self.advance();
@@ -1270,15 +1481,54 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_style_queries_are_kept_as_false() {
+    fn style_queries_parse_as_features_and_stay_false_without_computed_styles() {
         let condition = parse_container_condition("style(--theme: dark)").expect("parses");
-        assert!(
-            condition
-                .query
-                .unsupported()
-                .is_some_and(|reason| reason.contains("style"))
-        );
+        assert!(matches!(
+            condition.query,
+            ContainerQuery::Style(super::StyleFeature { ref name, ref value })
+                if name == "--theme" && value.as_deref() == Some("dark")
+        ));
+        assert!(condition.query.unsupported().is_none());
+        // Size-only evaluation has no computed style to read, so the feature
+        // answers false rather than guessing.
         assert!(!matches("style(--theme: dark)", 100.0, 100.0));
+    }
+
+    #[test]
+    fn style_features_accept_boolean_declarations_and_functions() {
+        let boolean = parse_container_condition("style(--theme)").expect("parses");
+        assert!(matches!(
+            boolean.query,
+            ContainerQuery::Style(super::StyleFeature { ref name, value: None }) if name == "--theme"
+        ));
+        let function =
+            parse_container_condition("style(--theme: var(--fallback))").expect("parses");
+        assert!(matches!(
+            function.query,
+            ContainerQuery::Style(super::StyleFeature { value: Some(ref value), .. })
+                if value == "var(--fallback)"
+        ));
+        // A standard property name is case-folded and a colon inside a string
+        // does not split the declaration.
+        let standard = parse_container_condition("style(Font-Weight: bold)").expect("parses");
+        assert!(matches!(
+            standard.query,
+            ContainerQuery::Style(super::StyleFeature { ref name, .. }) if name == "font-weight"
+        ));
+        let quoted = parse_container_condition("style(content: \"a:b\")").expect("parses");
+        assert!(matches!(
+            quoted.query,
+            ContainerQuery::Style(super::StyleFeature { value: Some(ref value), .. })
+                if value == "\"a:b\""
+        ));
+        // A vendor prefix is a single leading hyphen, unlike the double prefix
+        // of a custom property.
+        let prefixed = parse_container_condition("style(-webkit-transform: none)").expect("parses");
+        assert!(matches!(
+            prefixed.query,
+            ContainerQuery::Style(super::StyleFeature { ref name, .. })
+                if name == "-webkit-transform"
+        ));
     }
 
     #[test]

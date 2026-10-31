@@ -2539,7 +2539,13 @@ report it had been given wrong in its mechanism while right about its consequenc
   sizes on the contained axes. A fixed-position descendant is not yet contained, `style()`
   containment does not isolate counters, and `container-type` does not yet create the stacking
   context layout containment implies.
-  `style()` and `scroll-state()` queries are diagnosed as unsupported.
+  `style()` queries have since landed (HANDOFF 续四十九): every element is a style container
+  without `container-type` or geometry, declarations/boolean features/registered `<color>`
+  equivalence compare against the query container's computed style, and mixed size+style
+  conditions require one container. `scroll-state()` queries are still unsupported; pseudo-element
+  style queries do not yet include the originating element, shorthand features do not expand to
+  longhands, and non-color registered syntaxes compare tokens rather than normalized computed
+  values.
   Media Queries 4/5 condition syntax and environment features have also landed; print media and
   `@page` remain absent.
 

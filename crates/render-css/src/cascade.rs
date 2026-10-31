@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use render_dom::{Dom, Node, NodeId, NodeKind};
 
+use super::container::{NoStyleQueries, StyleQueryEnvironment};
 use super::length::{LengthContext, resolve_length_expr};
 use super::properties::{
     expand_columns_shorthand, expand_flex_shorthand, expand_gap_shorthand,
@@ -293,16 +294,28 @@ pub fn cascade_element_with_origins(
         context,
         ua_declarations,
         inline_declarations,
-        None,
+        &CascadeLookup {
+            rule_index: None,
+            style_queries: &NoStyleQueries,
+        },
     )
 }
 
-/// [`cascade_element_with_origins`] with a prebuilt rule index.
+/// The per-document lookup state a cascade pass reuses for every element.
 ///
 /// [`compute_document_styles_with_hints`](super::computed::compute_document_styles_with_hints)
-/// builds the index once per document; building it inside this function would
-/// repeat that work for every element, and skipping it entirely would restore
-/// the quadratic scan this index exists to avoid.
+/// builds the rule index once per document; building it inside the cascade
+/// would repeat that work for every element, and skipping it entirely would
+/// restore the quadratic scan the index exists to avoid. The style environment
+/// is the partially built top-down style map, so a `style()` query can be
+/// answered by the same pass that consumes it.
+pub(crate) struct CascadeLookup<'a> {
+    pub(crate) rule_index: Option<&'a CascadeRuleIndex>,
+    pub(crate) style_queries: &'a dyn StyleQueryEnvironment,
+}
+
+/// [`cascade_element_with_origins`] with a prebuilt rule index and a source of
+/// computed styles for `style()` container queries.
 pub(crate) fn cascade_element_with_origins_indexed(
     dom: &Dom,
     element: NodeId,
@@ -310,7 +323,7 @@ pub(crate) fn cascade_element_with_origins_indexed(
     context: &MatchContext,
     ua_declarations: &[Declaration],
     inline_declarations: &[Declaration],
-    index: &CascadeRuleIndex,
+    lookup: &CascadeLookup<'_>,
 ) -> CascadedStyle {
     cascade_element_with_origins_impl(
         dom,
@@ -319,7 +332,7 @@ pub(crate) fn cascade_element_with_origins_indexed(
         context,
         ua_declarations,
         inline_declarations,
-        Some(index),
+        lookup,
     )
 }
 
@@ -330,7 +343,7 @@ fn cascade_element_with_origins_impl(
     context: &MatchContext,
     ua_declarations: &[Declaration],
     inline_declarations: &[Declaration],
-    rule_index: Option<&CascadeRuleIndex>,
+    lookup: &CascadeLookup<'_>,
 ) -> CascadedStyle {
     let layer_orders = collect_layer_orders(sources);
     let mut candidates: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
@@ -341,8 +354,10 @@ fn cascade_element_with_origins_impl(
     // user-agent and user origins still apply there. Shadow-tree sheets are not
     // collected yet, so no author rule applies inside a shadow tree.
     let in_shadow_tree = dom.shadow_host(dom.root_node(element, false)).is_some();
-    let subject_keys = rule_index.map(|_| element_subject_keys(dom, element));
-    if let Some(index) = rule_index
+    let subject_keys = lookup
+        .rule_index
+        .map(|_| element_subject_keys(dom, element));
+    if let Some(index) = lookup.rule_index
         && index.debug
     {
         index.elements.fetch_add(1, Ordering::Relaxed);
@@ -352,7 +367,7 @@ fn cascade_element_with_origins_impl(
             continue;
         }
         let mut candidate_rules = Vec::new();
-        if let (Some(index), Some(keys)) = (rule_index, subject_keys.as_ref()) {
+        if let (Some(index), Some(keys)) = (lookup.rule_index, subject_keys.as_ref()) {
             index.candidates(
                 source_index,
                 context.pseudo_element.as_deref().unwrap_or(""),
@@ -361,7 +376,7 @@ fn cascade_element_with_origins_impl(
             );
             candidate_rules.sort_unstable();
             candidate_rules.dedup();
-            if let Some(index) = rule_index
+            if let Some(index) = lookup.rule_index
                 && index.debug
             {
                 index.candidate_rules.fetch_add(
@@ -381,18 +396,20 @@ fn cascade_element_with_origins_impl(
             {
                 continue;
             }
-            // CSS Containment 3 §4.1: a container condition is evaluated
-            // against the element's nearest eligible ancestor container. The
-            // geometry arrives from the previous layout pass; an empty context
-            // answers false for every size query, never "maybe".
-            if !rule
-                .container
-                .iter()
-                .all(|condition| context.containers.matches(dom, element, condition))
-            {
+            // CSS Conditional 5 §3.1: a container condition is evaluated
+            // against the element's nearest eligible ancestor container. Size
+            // geometry arrives from the previous layout pass; style features
+            // read the ancestor styles already computed by this top-down pass.
+            // An empty context answers false for every size query, never
+            // "maybe".
+            if !rule.container.iter().all(|condition| {
+                context
+                    .containers
+                    .matches_with_style(dom, element, condition, lookup.style_queries)
+            }) {
                 continue;
             }
-            if let Some(index) = rule_index
+            if let Some(index) = lookup.rule_index
                 && index.debug
             {
                 index.selectors_tried.fetch_add(
@@ -404,7 +421,7 @@ fn cascade_element_with_origins_impl(
             else {
                 continue;
             };
-            if let Some(index) = rule_index
+            if let Some(index) = lookup.rule_index
                 && index.debug
             {
                 index.matched_rules.fetch_add(1, Ordering::Relaxed);
