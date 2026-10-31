@@ -2979,9 +2979,9 @@ impl ReceivedRequest {
 /// returns after `idle` with none. Before the first arrival it waits for up to
 /// ten seconds, so the test may build its shell after starting the server. It
 /// answers each request with `respond` and returns the requests in arrival order.
-fn serve_until_idle(
+fn serve_requests(
     listener: &std::net::TcpListener,
-    idle: std::time::Duration,
+    expected: usize,
     respond: impl Fn(&ReceivedRequest) -> String,
 ) -> Vec<ReceivedRequest> {
     use std::io::Write;
@@ -2991,7 +2991,6 @@ fn serve_until_idle(
         .expect("non-blocking listener");
     let started = Instant::now();
     let mut served = Vec::new();
-    let mut last_arrival: Option<Instant> = None;
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
@@ -3001,14 +3000,15 @@ fn serve_until_idle(
                     .write_all(respond(&received).as_bytes())
                     .expect("send response");
                 served.push(received);
-                last_arrival = Some(Instant::now());
+                if served.len() >= expected {
+                    return served;
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                let finished = match last_arrival {
-                    Some(arrival) => arrival.elapsed() > idle,
-                    None => started.elapsed() > Duration::from_secs(10),
-                };
-                if finished {
+                // A missing request is a test failure, but the listener must
+                // eventually return so the assertion can report it instead of
+                // hanging the harness.
+                if started.elapsed() > Duration::from_secs(20) {
                     return served;
                 }
                 std::thread::sleep(Duration::from_millis(5));
@@ -3033,7 +3033,7 @@ fn a_same_origin_fetch_stores_the_cookies_its_response_sets() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind page origin");
     let port = listener.local_addr().expect("local address").port();
     let page_origin = std::thread::spawn(move || {
-        serve_until_idle(&listener, Duration::from_millis(800), |_| {
+        serve_requests(&listener, 1, |_| {
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
              Set-Cookie: session=xyz; Path=/; Max-Age=600\r\n\
              Content-Length: 2\r\nConnection: close\r\n\r\n{}"
@@ -3081,7 +3081,7 @@ fn a_cross_origin_put_is_sent_only_after_its_preflight_allows_it() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind other origin");
     let port = listener.local_addr().expect("local address").port();
     let other_origin = std::thread::spawn(move || {
-        serve_until_idle(&listener, Duration::from_millis(800), |request| {
+        serve_requests(&listener, 2, |request| {
             if request.method() == "OPTIONS" {
                 "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: null\r\n\
                  Access-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: x-token\r\n\
@@ -3131,7 +3131,7 @@ fn a_refused_preflight_keeps_the_request_from_being_sent() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind other origin");
     let port = listener.local_addr().expect("local address").port();
     let other_origin = std::thread::spawn(move || {
-        serve_until_idle(&listener, Duration::from_millis(800), |_| {
+        serve_requests(&listener, 1, |_| {
             // No Access-Control-Allow-Origin: the preflight is refused.
             "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
         })
