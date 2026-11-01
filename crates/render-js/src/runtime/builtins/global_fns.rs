@@ -2083,10 +2083,11 @@ mod tests {
         // argument count satisfies.
         assert_eq!(supports(&["display: grid", ""]), "false");
         assert_eq!(supports(&["display", "grid"]), "true");
-        // An undecidable condition is not true, and the retry does not make it
-        // true either: `at-rule(@font-face)` needs a font backend this tree
-        // does not have, so the honest answer is `false`.
-        assert_eq!(supports(&["at-rule(@font-face)"]), "false");
+        // `@font-face` is evaluated by render-core's font discovery; `@page`
+        // is still undecidable, and an undecidable condition is not true. The
+        // retry does not make it true either.
+        assert_eq!(supports(&["at-rule(@font-face)"]), "true");
+        assert_eq!(supports(&["at-rule(@page)"]), "false");
         assert_eq!(supports(&["at-rule(@media)"]), "true");
     }
 }

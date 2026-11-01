@@ -11,6 +11,7 @@ use render_core::document::{
     ExternalStyleSheets,
 };
 use render_core::dom::{DomRevision, NodeId};
+use render_core::font_face::parse_font_faces;
 use render_net::{FetchRequest, FetchResponse, FetchResult, Url};
 
 /// `Accept` value used for stylesheet requests.
@@ -396,12 +397,27 @@ fn apply_response(
             ),
         ));
     }
+    let (font_faces, font_face_problems) = parse_font_faces(&decoded.text);
+    for problem in font_face_problems {
+        application.diagnostics.push(resource_diagnostic(
+            resource,
+            StylesheetDiagnosticSeverity::Warning,
+            StylesheetDiagnosticCode::CssSyntax,
+            format!("@font-face diagnostic at {problem}"),
+        ));
+    }
     let parser_diagnostic_count = sheet.diagnostics.len();
-    application.style_sheets.insert(resource.key.clone(), sheet);
+    let final_url = response.final_url;
+    application.style_sheets.insert_parsed_with_base(
+        resource.key.clone(),
+        sheet,
+        font_faces,
+        final_url.clone(),
+    );
     application.loaded.push(LoadedStylesheet {
         source_order: resource.source_order,
         key: resource.key.clone(),
-        final_url: response.final_url,
+        final_url,
         encoding: decoded.encoding.name().to_owned(),
         byte_len: response.body.len(),
         parser_diagnostic_count,
@@ -529,7 +545,8 @@ const fn discovery_severity(code: DocumentDiagnosticCode) -> StylesheetDiagnosti
         | DocumentDiagnosticCode::NonCssStyleType
         | DocumentDiagnosticCode::QuirksModeUnsupported
         | DocumentDiagnosticCode::EmbeddedStyleLimit
-        | DocumentDiagnosticCode::EmbeddedStyleBytesLimit => StylesheetDiagnosticSeverity::Warning,
+        | DocumentDiagnosticCode::EmbeddedStyleBytesLimit
+        | DocumentDiagnosticCode::FontFaceProblem => StylesheetDiagnosticSeverity::Warning,
     }
 }
 

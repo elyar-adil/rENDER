@@ -5,6 +5,8 @@ use crate::frame::geometry_from_layout;
 use crate::frame::surface_to_softbuffer;
 use crate::frame::viewport_dimension;
 use render_browser::font_backend::SystemFontBackend;
+use render_browser::font_faces::DocumentFontLoader;
+use render_browser::font_faces::SystemFontFaceInstaller;
 use render_browser::resources::StylesheetFetchPlan;
 use render_browser::resources::StylesheetResourceDiagnostic;
 use render_browser::resources::apply_stylesheet_batch;
@@ -111,9 +113,13 @@ pub(super) fn start_render_worker(
     fonts: Arc<SystemFontBackend>,
     proxy: EventLoopProxy<UserEvent>,
 ) -> Result<PageRenderWorker, render_browser::worker::RenderWorkerStartError> {
+    // One loader per worker, so the document's decoded faces survive a
+    // re-render but stop being reachable when the next document installs its
+    // own table.
+    let font_loader = DocumentFontLoader::new();
     RenderWorker::start(
         RenderWorkerOptions::default(),
-        move |job, cancellation| process_page_render(job, cancellation, &fonts),
+        move |job, cancellation| process_page_render(job, cancellation, &fonts, &font_loader),
         move || {
             let _event_loop_closed = proxy.send_event(UserEvent::RenderReady);
         },
@@ -129,6 +135,7 @@ pub(super) fn process_page_render(
     job: RenderJob<PageRenderPayload>,
     cancellation: &RenderCancellation,
     fonts: &SystemFontBackend,
+    font_loader: &DocumentFontLoader,
 ) -> Result<PageRenderFrame, RenderFailure> {
     cancellation.check()?;
     match job.payload {
@@ -214,12 +221,17 @@ pub(super) fn process_page_render(
             };
             let raster_background = options.raster_background;
             let mut transition_state = transition_state;
+            let font_installer = SystemFontFaceInstaller {
+                backend: fonts,
+                loader: font_loader,
+            };
             let output = document.render_with_interaction_and_transitions(
                 options,
                 DocumentBackends {
                     text_measurer: fonts,
                     text_shaper: fonts,
                     glyph_masks: fonts,
+                    font_face_installer: Some(&font_installer),
                 },
                 &base_url,
                 &style_sheets,
@@ -390,13 +402,12 @@ pub(super) fn merge_current_style_sheets(
     let mut merged = ExternalStyleSheets::default();
     for resource in &current.resources {
         let key = &resource.key;
-        let sheet = incoming
-            .get(key)
-            .or_else(|| existing.get(key))
-            .or_else(|| incoming.find_by_url(&key.requested_url))
-            .or_else(|| existing.find_by_url(&key.requested_url));
-        if let Some(sheet) = sheet {
-            merged.insert(key.clone(), sheet.clone());
+        // Copy the whole entry, not just the parsed rules: the `@font-face`
+        // rules and their base URL have to survive the merge or a fetched
+        // stylesheet removes the document's webfonts on the frame that
+        // installs it.
+        if !merged.insert_cloned_from(key.clone(), incoming) {
+            let _ = merged.insert_cloned_from(key.clone(), existing);
         }
     }
     merged

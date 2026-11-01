@@ -52,12 +52,19 @@
 //! per-face for the two to disagree about: both read the one table.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::fs;
+use std::sync::{Arc, Mutex, PoisonError};
 
+use base64::Engine as _;
 use fontdue::{Font, FontSettings};
-use render_core::font_face::{FontFaceRule, FontFaceSheet, FontSource, UnicodeRangeSet};
+use render_core::document::FontFaceInstaller;
+use render_core::font_face::{
+    FontFaceRule, FontFaceSheet, FontFaceSource, FontSource, UnicodeRangeSet,
+};
 use render_core::layout::FontStyle;
 use render_net::Url;
+
+use crate::font_backend::SystemFontBackend;
 
 /// One `@font-face` rule, with every URL already resolved.
 #[derive(Clone, Debug, PartialEq)]
@@ -152,6 +159,16 @@ impl DocumentFonts {
     /// Adds rules parsed from somewhere other than a fetched stylesheet, such as
     /// an inline `<style>` element's text, whose base is the document's URL.
     pub fn add_rules(&mut self, rules: &[FontFaceRule], base: &Url) {
+        self.add_rules_at(rules, Some(base));
+    }
+
+    /// Adds rules whose relative `src` URLs resolve against `base`.
+    ///
+    /// `None` still accepts absolute URLs, but drops relative ones: §4.3.2
+    /// resolves against "the location of the style sheet", and a document with
+    /// no URL has no such location. Inventing one would request a font from a
+    /// place the author never named.
+    pub fn add_rules_at(&mut self, rules: &[FontFaceRule], base: Option<&Url>) {
         // `FontFaceSheet::rules` is in ascending document order and §4.5.1 wants
         // the last declared rule checked first, so this sheet's rules are built
         // backwards.
@@ -286,6 +303,15 @@ impl DocumentFonts {
         Ok(())
     }
 
+    /// Registers an already-decoded face under `url`.
+    ///
+    /// A re-render rebuilds the rule table from the current stylesheets but
+    /// must not decode the same file again; this carries a previously decoded
+    /// `Arc<Font>` across that rebuild.
+    pub fn insert_resource(&mut self, url: Url, font: Arc<Font>) {
+        self.resources.insert(url, font);
+    }
+
     /// The URLs to fetch for a page that names `used_families` and contains
     /// `used_characters`, deduplicated and in check order.
     ///
@@ -370,7 +396,7 @@ impl DocumentFonts {
 
 /// §4.3.2: "the URL can be relative, in which case it is resolved relative to
 /// the location of the style sheet containing the @font-face rule."
-fn resolve_sources(sources: &[FontSource], base: &Url) -> Vec<ResolvedSource> {
+fn resolve_sources(sources: &[FontSource], base: Option<&Url>) -> Vec<ResolvedSource> {
     sources
         .iter()
         .filter_map(|source| match source {
@@ -394,21 +420,129 @@ fn resolve_sources(sources: &[FontSource], base: &Url) -> Vec<ResolvedSource> {
 /// not a source: §4.3.1's rule that an item which cannot be resolved "do[es] not
 /// add it to the list of supported sources" covers the case, and the caller
 /// reports it through the rule having no usable `src`.
-fn resolve_url(url: &str, base: &Url) -> Option<Url> {
+fn resolve_url(url: &str, base: Option<&Url>) -> Option<Url> {
     if let Some(rest) = url.strip_prefix("//") {
-        let scheme = base.scheme();
+        let scheme = base?.scheme();
         return Url::parse(&format!("{scheme}://{rest}")).ok();
     }
-    base.join(url).ok()
+    if let Ok(absolute) = Url::parse(url) {
+        return Some(absolute);
+    }
+    base?.join(url).ok()
 }
+
+#[derive(Debug, Default)]
+struct DocumentFontState {
+    document: DocumentFonts,
+    sources: Vec<FontFaceSource>,
+}
+
+/// Loads each document's `@font-face` resources and publishes the resulting
+/// family table to a [`SystemFontBackend`].
+///
+/// The loader owns the previous document's [`DocumentFonts`] so a re-render can
+/// rebuild the rule table from the current DOM while reusing decoded `Arc<Font>`
+/// values. That is the document-scoped cache described in this module's header:
+/// the rules are replaced whenever the document changes, but a file that is
+/// still named is not decoded twice. An unchanged rule set does not rebuild the
+/// backend table at all, which keeps the font-instance generation stable across
+/// scroll and animation frames.
+#[derive(Debug, Default)]
+pub struct DocumentFontLoader {
+    state: Mutex<DocumentFontState>,
+}
+
+impl DocumentFontLoader {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Installs `sources` into `backend`, loading `file:` and base64 `data:`
+    /// resources synchronously. Network resources are left outstanding: the
+    /// render worker has no fetch future at this point, and §5.2's rule for an
+    /// unavailable face then applies until a later frame supplies the bytes.
+    pub fn install(&self, backend: &SystemFontBackend, sources: &[FontFaceSource]) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let local_resource_pending = state
+            .document
+            .outstanding_urls()
+            .iter()
+            .any(|url| matches!(url.scheme(), "file" | "data"));
+        if state.sources == sources && !local_resource_pending {
+            return;
+        }
+        let mut next = DocumentFonts::new();
+        for source in sources {
+            next.add_rules_at(&source.rules, source.base_url.as_ref());
+        }
+        for url in next.outstanding_urls() {
+            if let Some(font) = state.document.resource(&url) {
+                next.insert_resource(url, font);
+                continue;
+            }
+            if let Some(bytes) = local_resource_bytes(&url) {
+                let _ = next.install(&url, &bytes);
+            }
+        }
+        backend.set_document_faces(&next);
+        state.sources = sources.to_vec();
+        state.document = next;
+    }
+}
+
+/// The adapter the render path hands to [`render_core::document::DocumentBackends`].
+pub struct SystemFontFaceInstaller<'a> {
+    pub backend: &'a SystemFontBackend,
+    pub loader: &'a DocumentFontLoader,
+}
+
+impl FontFaceInstaller for SystemFontFaceInstaller<'_> {
+    fn install_font_faces(&self, sources: &[FontFaceSource]) {
+        self.loader.install(self.backend, sources);
+    }
+}
+
+/// Reads a font resource this process can obtain without a network round trip.
+///
+/// `file:` is the scheme a local page and the layout tests use. `data:` covers
+/// inline faces; base64 is the only encoding accepted because the percent-
+/// encoded form would need a decoder for a case that is vanishingly rare in
+/// real webfont CSS.
+fn local_resource_bytes(url: &Url) -> Option<Vec<u8>> {
+    match url.scheme() {
+        "file" => fs::read(url.to_file_path().ok()?).ok(),
+        "data" => {
+            let rest = url.as_str().strip_prefix("data:")?;
+            let (metadata, payload) = rest.split_once(',')?;
+            if !metadata
+                .split(';')
+                .any(|part| part.eq_ignore_ascii_case("base64"))
+            {
+                return None;
+            }
+            base64::engine::general_purpose::STANDARD
+                .decode(payload)
+                .ok()
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::float_cmp,
+        reason = "fixture advances are exact integer font units scaled by the font size"
+    )]
+
     use std::collections::BTreeSet;
 
-    use render_core::font_face::parse_font_faces;
-    use render_core::layout::FontStyle;
+    use render_core::font_face::{FontFaceSource, parse_font_faces};
+    use render_core::layout::{FontRequest, FontStyle, TextMeasurer, TextStyle};
 
-    use super::{DocumentFonts, FontLoadFailure, ResolvedSource, Url};
+    use super::{DocumentFontLoader, DocumentFonts, FontLoadFailure, ResolvedSource, Url};
+    use crate::font_backend::SystemFontBackend;
 
     fn base() -> Url {
         Url::parse("https://cdn.test/assets/main.css").expect("a parseable base URL")
@@ -759,5 +893,41 @@ mod tests {
             !rule.range.contains('A'),
             "so the range is not §4.5's initial value of U+0-10FFFF"
         );
+    }
+
+    /// The production loader's local-file path, through the real platform
+    /// backend: a rule whose `src` is a relative `file:` URL changes the
+    /// advance the measurer returns.
+    #[test]
+    fn a_local_file_webfont_changes_the_platform_measurers_advance() {
+        let backend = SystemFontBackend::load().expect("the platform table loads");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../render-core/tests/fixtures/index.html");
+        let base = Url::from_file_path(fixture).expect("the fixture has a file URL");
+        let (sheet, problems) = parse_font_faces(
+            "@font-face { font-family: 'Render Test Webfont'; \
+             src: url(render-test-webfont.ttf) format(truetype) }",
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        let sources = vec![FontFaceSource::new(Some(base), sheet.rules().to_vec())];
+
+        let request = FontRequest::of_family("Render Test Webfont");
+        let style = TextStyle {
+            font_size: 16.0,
+            line_height: 19.2,
+            font: request,
+        };
+        let before = backend.measure("HHH", style).advance;
+        assert_ne!(before, 48.0, "no document face has been installed yet");
+
+        let loader = DocumentFontLoader::new();
+        loader.install(&backend, &sources);
+
+        let after = backend.measure("HHH", style).advance;
+        assert_eq!(
+            after, 48.0,
+            "the fixture's H advances one em, so three at 16px are 48px"
+        );
+        assert_ne!(before, after, "the local face really replaced the fallback");
     }
 }

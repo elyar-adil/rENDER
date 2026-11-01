@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 arboard = { version = "3.6.1", default-features = false }
+base64 = "0.22.1"
 encoding_rs = "0.8.35"
 fontdue = "0.9.3"
 image-codec = { package = "image", version = "0.25.8", default-features = false, features = ["png"] }

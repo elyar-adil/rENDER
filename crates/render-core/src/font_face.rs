@@ -73,6 +73,7 @@ use cssparser::{
 use render_css::at_rules::at_rule_block_is_declaration_list;
 use render_css::stylesheet::{Declaration, StyleSheetDiagnostic, parse_declaration_list};
 use render_layout::{FontStyle, computed_font_style, computed_font_weight};
+use url::Url;
 
 /// §4.5's initial value for `unicode-range`: the whole of Unicode.
 const UNICODE_ALL: (u32, u32) = (0x0000, 0x0010_FFFF);
@@ -121,6 +122,32 @@ impl FontFaceSheet {
 
     /// Whether the stylesheet declared no `@font-face` at all, which is the
     /// common case and the reason the fetch planner has nothing to do.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+}
+
+/// One stylesheet's `@font-face` rules together with the URL its relative
+/// `src` URLs resolve against (CSS Fonts 4 §4.3.2).
+///
+/// Embedded `<style>` sheets use the document's base URL; an external sheet
+/// uses the URL it was actually served from, which may differ from the
+/// requested URL after a redirect. A `None` base still permits absolute URLs,
+/// and relative ones are then unresolvable rather than being resolved against
+/// an invented origin.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FontFaceSource {
+    pub base_url: Option<Url>,
+    pub rules: Vec<FontFaceRule>,
+}
+
+impl FontFaceSource {
+    #[must_use]
+    pub fn new(base_url: Option<Url>, rules: Vec<FontFaceRule>) -> Self {
+        Self { base_url, rules }
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()

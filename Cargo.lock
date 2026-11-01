@@ -1731,6 +1731,7 @@ name = "render-browser"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "base64",
  "encoding_rs",
  "fontdue",
  "image",
@@ -1748,6 +1749,7 @@ dependencies = [
  "cssparser",
  "encoding_rs",
  "entities",
+ "fontdue",
  "image",
  "render-css",
  "render-dom",

@@ -911,9 +911,9 @@ mod tests {
 
     /// CSS Conditional Rules 5 §2's `at-rule()`, `font-tech()` and
     /// `font-format()`: the two states this crate can answer and the one it
-    /// cannot. The `at-rule` cases that matter most are `@font-face` and
-    /// `@keyframes`, because reporting them as supported is precisely the lie
-    /// this project forbids.
+    /// cannot. `@keyframes` reaches the cascade and `@font-face` is evaluated
+    /// by render-core; `@page` is still consumed by nothing, and reporting it
+    /// as supported would be precisely the lie this project forbids.
     #[test]
     fn at_rule_and_font_features_are_answered_only_where_they_can_be() {
         // The at-rules whose contents reach the cascade.
@@ -922,6 +922,10 @@ mod tests {
         assert!(evaluates("at-rule(@layer)"));
         assert!(evaluates("at-rule(@keyframes)"));
         assert!(evaluates("at-rule(@-webkit-keyframes)"));
+        // `@font-face` is parsed by this crate and evaluated by render-core's
+        // font discovery, so the capability is present even though the block
+        // does not reach the cascade here.
+        assert!(evaluates("at-rule(@font-face)"));
         // An at-rule no specification defines.
         assert!(!evaluates("at-rule(@nonesuch)"));
         // Not an `<at-keyword-token>`, so the feature does not parse and the
@@ -930,7 +934,6 @@ mod tests {
         assert!(!evaluates("at-rule()"));
         // The two that must NOT be answered here.
         for source in [
-            "at-rule(@font-face)",
             "at-rule(@page)",
             "font-tech(color-COLRv1)",
             "font-format(woff2)",
@@ -942,14 +945,12 @@ mod tests {
             assert!(!gaps[0].reason.is_empty(), "{source:?} must say why");
         }
         // The reason has to name the capability, not just the refusal.
-        let SupportsCondition::Undecidable(gaps) =
-            evaluate_supports_condition("at-rule(@font-face)")
+        let SupportsCondition::Undecidable(gaps) = evaluate_supports_condition("at-rule(@page)")
         else {
             unreachable!()
         };
-        assert!(gaps[0].reason.contains("render-net"), "{}", gaps[0].reason);
         assert!(
-            gaps[0].reason.contains("render-browser"),
+            gaps[0].reason.contains("nothing evaluates it"),
             "{}",
             gaps[0].reason
         );
@@ -962,10 +963,10 @@ mod tests {
     #[test]
     fn one_unanswerable_feature_makes_the_whole_condition_unanswerable() {
         for source in [
-            "(display: grid) and at-rule(@font-face)",
-            "at-rule(@font-face) or (display: grid)",
-            "not at-rule(@font-face)",
-            "((display: grid) and at-rule(@font-face)) or (color: red)",
+            "(display: grid) and at-rule(@page)",
+            "at-rule(@page) or (display: grid)",
+            "not at-rule(@page)",
+            "((display: grid) and at-rule(@page)) or (color: red)",
         ] {
             assert!(
                 !evaluate_supports_condition(source).is_answered(),
@@ -975,12 +976,12 @@ mod tests {
         // Every gap is reported, not just the first one: both sides of a
         // conjunction are evaluated.
         let SupportsCondition::Undecidable(gaps) =
-            evaluate_supports_condition("at-rule(@font-face) and font-tech(variations)")
+            evaluate_supports_condition("at-rule(@page) and font-tech(variations)")
         else {
             panic!("two unanswerable features must both be reported");
         };
         assert_eq!(gaps.len(), 2);
-        assert_eq!(gaps[0].feature, "at-rule(@font-face)");
+        assert_eq!(gaps[0].feature, "at-rule(@page)");
         assert_eq!(gaps[1].feature, "font-tech(variations)");
     }
 
@@ -1016,7 +1017,7 @@ mod tests {
         assert!(!supports_condition_text("backdrop-filter: blur(2px)"));
         // An undecidable condition is not true, and wrapping it does not make
         // it true either.
-        assert!(!supports_condition_text("at-rule(@font-face)"));
+        assert!(!supports_condition_text("at-rule(@page)"));
     }
 
     /// The declaration oracle on its own, so the property and value rules are

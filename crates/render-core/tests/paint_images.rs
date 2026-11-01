@@ -59,6 +59,7 @@ fn background_image_uses_border_box_as_the_default_painting_area() {
             text_measurer: &SimpleTextMeasurer,
             text_shaper: &ReferenceTextShaper,
             glyph_masks: &NoGlyphMasks,
+            font_face_installer: None,
         },
         &images,
     );
@@ -107,6 +108,7 @@ fn video_element_paints_its_presented_frame() {
             text_measurer: &SimpleTextMeasurer,
             text_shaper: &ReferenceTextShaper,
             glyph_masks: &NoGlyphMasks,
+            font_face_installer: None,
         },
     );
     assert!(!initial.display.list.items().iter().any(|item| {
@@ -130,6 +132,7 @@ fn video_element_paints_its_presented_frame() {
             text_measurer: &SimpleTextMeasurer,
             text_shaper: &ReferenceTextShaper,
             glyph_masks: &NoGlyphMasks,
+            font_face_installer: None,
         },
         &images,
     );
@@ -165,6 +168,7 @@ fn video_element_paints_its_presented_frame() {
             text_measurer: &SimpleTextMeasurer,
             text_shaper: &ReferenceTextShaper,
             glyph_masks: &NoGlyphMasks,
+            font_face_installer: None,
         },
         &images,
     );
@@ -210,6 +214,7 @@ fn absolutely_positioned_img_fills_its_padding_top_placeholder() {
             text_measurer: &SimpleTextMeasurer,
             text_shaper: &ReferenceTextShaper,
             glyph_masks: &NoGlyphMasks,
+            font_face_installer: None,
         },
         &images,
     );

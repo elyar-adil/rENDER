@@ -60,6 +60,7 @@ const RECOGNISED_AT_RULES: &[(&str, &str)] = &[
 /// [`RECOGNISED_AT_RULES`] parses and is then dropped.
 const EVALUATED_AT_RULES: &[&str] = &[
     "container",
+    "font-face",
     "keyframes",
     "layer",
     "media",
@@ -71,13 +72,17 @@ const EVALUATED_AT_RULES: &[&str] = &[
 /// The recognised at-rules whose block is a `<declaration-list>` rather than a
 /// `<rule-list>`, with the section that defines each block's contents.
 ///
-/// The block's *contents* are the point. None of these at-rules is evaluated, so
-/// the block is dropped either way, and a dropped block still has to be walked:
-/// a syntax error inside it is a fact the parser found and then threw away, and
-/// discarding a parse error that was found is the silent drop this project
-/// forbids. Before this table existed only `@font-face` was walked, so a `@page`
-/// block or a `@counter-style` block full of legacy hacks produced no diagnostic
-/// anywhere - a partial drop of the defect `at_rules` was written to end.
+/// The block's *contents* are the point. Their descriptors are still walked
+/// even when the at-rule is dropped here: a syntax error inside one is a fact
+/// the parser found and then threw away, and discarding a parse error that was
+/// found is the silent drop this project forbids. Before this table existed only
+/// `@font-face` was walked, so a `@page` block or a `@counter-style` block full
+/// of legacy hacks produced no diagnostic anywhere - a partial drop of the
+/// defect `at_rules` was written to end.
+///
+/// `@font-face` is in the table even though it is now evaluated: the evaluation
+/// lives in `render-core`'s font-face discovery, but the descriptor list grammar
+/// is still read here so a malformed descriptor is reported at parse time.
 ///
 /// `@font-feature-values` is deliberately absent: its block holds nested
 /// at-rules (`@styleset`, `@character-variant`, ...), not descriptors, so
@@ -269,8 +274,8 @@ mod tests {
     #[test]
     fn the_two_discard_reasons_read_differently() {
         assert_eq!(
-            at_rule_diagnostic("font-face"),
-            "@font-face is parsed but not evaluated yet"
+            at_rule_diagnostic("page"),
+            "@page is parsed but not evaluated yet"
         );
         assert_eq!(
             at_rule_diagnostic("nonesuch"),
@@ -292,6 +297,7 @@ mod tests {
             evaluated,
             [
                 "container",
+                "font-face",
                 "keyframes",
                 "layer",
                 "media",
@@ -303,21 +309,26 @@ mod tests {
     }
 
     /// Every at-rule whose block is read as a declaration list has to be an
-    /// at-rule a specification defines, has to be cited, and has to be one this
-    /// engine drops rather than evaluates. A name that failed any of those would
-    /// make the table claim something the code cannot do.
+    /// at-rule a specification defines and has to be cited. `@font-face` is
+    /// evaluated one layer up in render-core; the rest are still dropped, and
+    /// saying otherwise would make the table claim something the code cannot do.
     #[test]
-    fn declaration_list_at_rules_are_recognised_cited_and_unevaluated() {
+    fn declaration_list_at_rules_are_recognised_cited_and_classified() {
         for (name, specification) in super::DECLARATION_LIST_AT_RULES {
             assert_eq!(
                 at_rule_specification(name),
                 Some(*specification),
                 "{name} is read as a declaration list, so its grammar must be cited"
             );
+            let expected = if *name == "font-face" {
+                AtRuleSupport::Evaluated
+            } else {
+                AtRuleSupport::Unimplemented
+            };
             assert_eq!(
                 at_rule_support(name),
-                AtRuleSupport::Unimplemented,
-                "{name}'s block is walked and then dropped, not applied"
+                expected,
+                "{name}'s block is walked; its consumer decides whether it is applied"
             );
             assert!(at_rule_block_is_declaration_list(name), "{name}");
         }

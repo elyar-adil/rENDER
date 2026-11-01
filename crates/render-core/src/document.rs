@@ -25,6 +25,7 @@ use crate::css::selector::{ColorScheme, InteractionState, MatchContext};
 use crate::css::stylesheet::{Declaration, StyleSheet, StyleSheetDiagnostic, parse_stylesheet};
 use crate::css::transition::{TransitionEvent, TransitionState, sample_transitions};
 use crate::dom::{Dom, DomRevision, ElementData, Namespace, Node, NodeId, NodeKind};
+use crate::font_face::{FontFaceSheet, FontFaceSource, parse_font_faces};
 use crate::html::{HtmlParseError, QuirksMode, parse_document_with_scripting, serialize_html_node};
 use crate::image::inline_svg::{
     InlineSvgDiagnostic, InlineSvgDiscovery, discover_inline_svgs_with_colors, svg_geometry,
@@ -839,11 +840,31 @@ impl Default for DocumentRenderOptions {
     }
 }
 
+/// A sink for a document's `@font-face` rules, called after author
+/// stylesheet discovery and before style computation or layout.
+///
+/// The hook exists because a webfont must be in the font table before the
+/// first measurement: installing it after layout would make every line break
+/// and box size wrong until the next frame. Implementations resolve and load
+/// `src` resources, then publish the document's faces to the backend the
+/// measurer and shaper read from.
+///
+/// CSS Fonts 4 §4.1 scopes the faces to the document that declares them, so an
+/// implementation must replace the previous document's faces rather than
+/// merging into a process-wide table.
+pub trait FontFaceInstaller: Sync {
+    fn install_font_faces(&self, sources: &[FontFaceSource]);
+}
+
 #[derive(Clone, Copy)]
 pub struct DocumentBackends<'a> {
     pub text_measurer: &'a dyn TextMeasurer,
     pub text_shaper: &'a dyn TextShaper,
     pub glyph_masks: &'a dyn GlyphMaskProvider,
+    /// Optional `@font-face` install hook. `None` keeps the reference pipelines
+    /// font-free, which is what every unit test that does not name a webfont
+    /// wants.
+    pub font_face_installer: Option<&'a dyn FontFaceInstaller>,
 }
 
 impl std::fmt::Debug for DocumentBackends<'_> {
@@ -866,6 +887,7 @@ pub enum DocumentDiagnosticCode {
     AuthorStyleSlotLimit,
     ExternalStyleSheetLimit,
     ExternalStyleSheetUrlBytesLimit,
+    FontFaceProblem,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -944,24 +966,121 @@ impl ExternalStyleSheetKey {
     }
 }
 
+/// One fetched stylesheet, its parsed rules, its `@font-face` rules, and the
+/// URL those rules resolve against.
+#[derive(Clone, Debug)]
+struct ExternalStyleSheetEntry {
+    sheet: StyleSheet,
+    font_faces: FontFaceSheet,
+    /// CSS Fonts 4 §4.3.2: relative `src` URLs resolve against the stylesheet's
+    /// own location. This is the post-redirect response URL when the loader
+    /// knows it, because that is where the bytes actually came from.
+    font_face_base: Url,
+}
+
 /// Parsed external stylesheets supplied by a network/document coordinator.
 #[derive(Clone, Debug, Default)]
 pub struct ExternalStyleSheets {
-    entries: HashMap<ExternalStyleSheetKey, StyleSheet>,
+    entries: HashMap<ExternalStyleSheetKey, ExternalStyleSheetEntry>,
 }
 
 impl ExternalStyleSheets {
     pub fn insert(&mut self, key: ExternalStyleSheetKey, sheet: StyleSheet) -> Option<StyleSheet> {
-        self.entries.insert(key, sheet)
+        let font_face_base = key.requested_url.clone();
+        self.entries
+            .insert(
+                key,
+                ExternalStyleSheetEntry {
+                    sheet,
+                    font_faces: FontFaceSheet::default(),
+                    font_face_base,
+                },
+            )
+            .map(|entry| entry.sheet)
     }
 
     pub fn insert_css(&mut self, key: ExternalStyleSheetKey, source: &str) -> Option<StyleSheet> {
-        self.insert(key, parse_stylesheet(source))
+        let base_url = key.requested_url.clone();
+        self.insert_css_with_base(key, base_url, source)
+    }
+
+    /// Inserts CSS parsed from `source`, recording the URL the sheet was
+    /// actually served from so relative `@font-face` `src` URLs resolve against
+    /// it rather than against the pre-redirect request URL.
+    pub fn insert_css_with_base(
+        &mut self,
+        key: ExternalStyleSheetKey,
+        font_face_base: Url,
+        source: &str,
+    ) -> Option<StyleSheet> {
+        let sheet = parse_stylesheet(source);
+        let (font_faces, _problems) = parse_font_faces(source);
+        self.insert_parsed_with_base(key, sheet, font_faces, font_face_base)
+    }
+
+    /// Inserts an already-parsed sheet plus the `@font-face` rules parsed from
+    /// the same source. The loader uses this to avoid parsing the CSS twice.
+    pub fn insert_parsed_with_base(
+        &mut self,
+        key: ExternalStyleSheetKey,
+        sheet: StyleSheet,
+        font_faces: FontFaceSheet,
+        font_face_base: Url,
+    ) -> Option<StyleSheet> {
+        self.entries
+            .insert(
+                key,
+                ExternalStyleSheetEntry {
+                    sheet,
+                    font_faces,
+                    font_face_base,
+                },
+            )
+            .map(|entry| entry.sheet)
+    }
+
+    /// Copies a complete entry from `source` under `key`: the parsed rules,
+    /// the `@font-face` rules, and the base URL they resolve against. A merge
+    /// that copied only the [`StyleSheet`] would silently drop the document's
+    /// webfonts on the frame that installs a fetched stylesheet.
+    ///
+    /// The entry is found by exact key first and by requested URL second, which
+    /// is the same fallback [`Self::find_by_url`] provides for a link element
+    /// that was replaced while its bytes were in flight.
+    pub fn insert_cloned_from(&mut self, key: ExternalStyleSheetKey, source: &Self) -> bool {
+        let found = source
+            .entries
+            .get(&key)
+            .or_else(|| {
+                source
+                    .entries
+                    .iter()
+                    .find(|(candidate, _)| candidate.requested_url == key.requested_url)
+                    .map(|(_, entry)| entry)
+            })
+            .cloned();
+        match found {
+            Some(entry) => {
+                self.entries.insert(key, entry);
+                true
+            }
+            None => false,
+        }
     }
 
     #[must_use]
     pub fn get(&self, key: &ExternalStyleSheetKey) -> Option<&StyleSheet> {
-        self.entries.get(key)
+        self.entries.get(key).map(|entry| &entry.sheet)
+    }
+
+    /// The `@font-face` rules of `key`'s sheet and the base its relative URLs
+    /// resolve against, when the sheet was inserted with source-level
+    /// information.
+    #[must_use]
+    pub fn font_faces(&self, key: &ExternalStyleSheetKey) -> Option<(&FontFaceSheet, &Url)> {
+        self.entries
+            .get(key)
+            .map(|entry| (&entry.font_faces, &entry.font_face_base))
     }
 
     /// A sheet fetched for `url`, regardless of which `<link>` node owned the
@@ -972,7 +1091,7 @@ impl ExternalStyleSheets {
         self.entries
             .iter()
             .find(|(key, _)| &key.requested_url == url)
-            .map(|(_, sheet)| sheet)
+            .map(|(_, entry)| &entry.sheet)
     }
 
     #[must_use]
@@ -1272,6 +1391,7 @@ impl Document {
                 text_measurer: &crate::layout::SimpleTextMeasurer,
                 text_shaper: &crate::paint::ReferenceTextShaper,
                 glyph_masks: &crate::paint::NoGlyphMasks,
+                font_face_installer: None,
             },
         )
     }
@@ -1290,6 +1410,7 @@ impl Document {
                 text_measurer: &crate::layout::SimpleTextMeasurer,
                 text_shaper: &crate::paint::ReferenceTextShaper,
                 glyph_masks: &crate::paint::NoGlyphMasks,
+                font_face_installer: None,
             },
             base_url,
             external,
@@ -1571,6 +1692,14 @@ fn render_dom(
         &match_context,
     );
     stage_elapsed("collect-sheets", &mut stage_mark);
+    // CSS Fonts 4 §5.2: a document face must be in the matcher's table before
+    // the first measurement. The installer runs here, after discovery and
+    // before any layout pass, so measured advances and painted glyphs both see
+    // the same face.
+    if let Some(installer) = backends.font_face_installer {
+        installer.install_font_faces(&collected.font_faces);
+    }
+    stage_elapsed("install-font-faces", &mut stage_mark);
     let mut cascade_inputs = Vec::with_capacity(collected.sheets.len().saturating_add(1));
     cascade_inputs.push(CascadeInput {
         sheet: &ua_sheet,
@@ -1902,6 +2031,9 @@ fn with_inline_svgs(
 
 struct CollectedStyleSheets {
     sheets: Vec<(NodeId, StyleSheet)>,
+    /// Every eligible author stylesheet's `@font-face` rules, in DOM order, so
+    /// a font installer sees the same sheets the cascade does.
+    font_faces: Vec<FontFaceSource>,
     diagnostics: Vec<DocumentDiagnostic>,
 }
 
@@ -1913,8 +2045,11 @@ fn collect_author_style_sheets(
     context: &MatchContext,
 ) -> CollectedStyleSheets {
     let discovery = discover_author_style_slots(dom, base_url, limits, context);
-    let mut sheets = Vec::new();
-    let mut diagnostics = discovery.diagnostics;
+    let mut collected = CollectedStyleSheets {
+        sheets: Vec::new(),
+        font_faces: Vec::new(),
+        diagnostics: discovery.diagnostics,
+    };
     let mut style_bytes = 0_usize;
     let mut embedded_sheet_count = 0_usize;
 
@@ -1926,11 +2061,11 @@ fn collect_author_style_sheets(
             AuthorStyleSource::Embedded => collect_style_element(
                 dom,
                 slot.owner,
+                base_url,
                 limits,
                 &mut embedded_sheet_count,
                 &mut style_bytes,
-                &mut sheets,
-                &mut diagnostics,
+                &mut collected,
             ),
             AuthorStyleSource::External {
                 resolved_url: Some(requested_url),
@@ -1946,9 +2081,9 @@ fn collect_author_style_sheets(
                     let mut sheet = sheet.clone();
                     sheet.scope_owner = Some(slot.owner);
                     sheet.tree_root = Some(slot.tree_root);
-                    sheets.push((slot.owner, sheet));
+                    collected.sheets.push((slot.owner, sheet));
                 } else {
-                    diagnostics.push(DocumentDiagnostic {
+                    collected.diagnostics.push(DocumentDiagnostic {
                         node: Some(slot.owner),
                         code: DocumentDiagnosticCode::ExternalStyleSheetUnsupported,
                         message: format!(
@@ -1956,10 +2091,21 @@ fn collect_author_style_sheets(
                         ),
                     });
                 }
+                // Font faces are collected even when the sheet's style rules
+                // were empty, because a sheet may legitimately consist only of
+                // `@font-face` rules.
+                if let Some((faces, base)) = external.font_faces(&key)
+                    && !faces.is_empty()
+                {
+                    collected.font_faces.push(FontFaceSource::new(
+                        Some(base.clone()),
+                        faces.rules().to_vec(),
+                    ));
+                }
             }
             AuthorStyleSource::External {
                 resolved_url: None, ..
-            } if base_url.is_none() => diagnostics.push(DocumentDiagnostic {
+            } if base_url.is_none() => collected.diagnostics.push(DocumentDiagnostic {
                 node: Some(slot.owner),
                 code: DocumentDiagnosticCode::ExternalStyleSheetUnsupported,
                 message: "external stylesheet requires a document base URL and supplied bytes"
@@ -1968,10 +2114,7 @@ fn collect_author_style_sheets(
             AuthorStyleSource::External { .. } => {}
         }
     }
-    CollectedStyleSheets {
-        sheets,
-        diagnostics,
-    }
+    collected
 }
 
 fn discover_author_style_slots(
@@ -2220,17 +2363,17 @@ fn resolve_style_url(base_url: Option<&Url>, href: &str) -> Option<Url> {
 fn collect_style_element(
     dom: &Dom,
     node_id: NodeId,
+    base_url: Option<&Url>,
     limits: DocumentLimits,
     embedded_sheet_count: &mut usize,
     style_bytes: &mut usize,
-    sheets: &mut Vec<(NodeId, StyleSheet)>,
-    diagnostics: &mut Vec<DocumentDiagnostic>,
+    collected: &mut CollectedStyleSheets,
 ) {
     let Some(node) = dom.node(node_id) else {
         return;
     };
     if *embedded_sheet_count >= limits.max_embedded_style_sheets {
-        diagnostics.push(DocumentDiagnostic {
+        collected.diagnostics.push(DocumentDiagnostic {
             node: Some(node_id),
             code: DocumentDiagnosticCode::EmbeddedStyleLimit,
             message: "embedded stylesheet count limit exceeded".to_owned(),
@@ -2240,11 +2383,11 @@ fn collect_style_element(
 
     let remaining_bytes = limits.max_embedded_style_bytes.saturating_sub(*style_bytes);
     let Some(css) = descendant_text_with_limit(dom, node, remaining_bytes) else {
-        diagnostics.push(style_bytes_diagnostic(node_id));
+        collected.diagnostics.push(style_bytes_diagnostic(node_id));
         return;
     };
     let Some(next_style_bytes) = style_bytes.checked_add(css.len()) else {
-        diagnostics.push(style_bytes_diagnostic(node_id));
+        collected.diagnostics.push(style_bytes_diagnostic(node_id));
         return;
     };
     *style_bytes = next_style_bytes;
@@ -2257,7 +2400,24 @@ fn collect_style_element(
     // and shadow-tree author sheets apart.
     sheet.scope_owner = Some(node_id);
     sheet.tree_root = Some(dom.root_node(node_id, false));
-    sheets.push((node_id, sheet));
+    collected.sheets.push((node_id, sheet));
+    // CSS Fonts 4 §4.3.2: a `<style>` element's `@font-face` `src` URLs
+    // resolve against the document's base URL, not against the `<style>`
+    // element's own position.
+    let (faces, problems) = parse_font_faces(&css);
+    for problem in problems {
+        collected.diagnostics.push(DocumentDiagnostic {
+            node: Some(node_id),
+            code: DocumentDiagnosticCode::FontFaceProblem,
+            message: problem.to_string(),
+        });
+    }
+    if !faces.is_empty() {
+        collected.font_faces.push(FontFaceSource::new(
+            base_url.cloned(),
+            faces.rules().to_vec(),
+        ));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2910,6 +3070,7 @@ mod tests {
                     text_measurer: &crate::layout::SimpleTextMeasurer,
                     text_shaper: &crate::paint::ReferenceTextShaper,
                     glyph_masks: &crate::paint::NoGlyphMasks,
+                    font_face_installer: None,
                 },
                 &base_url,
                 &external,
@@ -3003,6 +3164,7 @@ mod tests {
                 text_measurer: &crate::layout::SimpleTextMeasurer,
                 text_shaper: &crate::paint::ReferenceTextShaper,
                 glyph_masks: &crate::paint::NoGlyphMasks,
+                font_face_installer: None,
             },
             &images,
         );
@@ -4534,6 +4696,7 @@ mod tests {
                 text_measurer: &crate::layout::SimpleTextMeasurer,
                 text_shaper: &crate::paint::ReferenceTextShaper,
                 glyph_masks: &crate::paint::NoGlyphMasks,
+                font_face_installer: None,
             },
             &base_url,
             &ExternalStyleSheets::default(),
@@ -4899,6 +5062,7 @@ mod tests {
                 text_measurer: &crate::layout::SimpleTextMeasurer,
                 text_shaper: &crate::paint::ReferenceTextShaper,
                 glyph_masks: &crate::paint::NoGlyphMasks,
+                font_face_installer: None,
             },
             &images,
         );

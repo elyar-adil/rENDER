@@ -593,6 +593,7 @@ mod tests {
                 text_measurer: &crate::layout::SimpleTextMeasurer,
                 text_shaper: &crate::paint::ReferenceTextShaper,
                 glyph_masks: &crate::paint::NoGlyphMasks,
+                font_face_installer: None,
             },
             &images,
         );

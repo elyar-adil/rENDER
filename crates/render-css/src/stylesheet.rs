@@ -11,7 +11,9 @@ use cssparser::{
 };
 use render_dom::NodeId;
 
-use super::at_rules::{at_rule_block_is_declaration_list, at_rule_diagnostic};
+use super::at_rules::{
+    AtRuleSupport, at_rule_block_is_declaration_list, at_rule_diagnostic, at_rule_support,
+};
 use super::container::ContainerCondition;
 use super::registered::{PropertyRegistration, parse_registration};
 use super::selector::{
@@ -2184,19 +2186,22 @@ fn flatten_rules(
                 location,
                 diagnostics,
             } => {
-                // A descriptor list this engine parses and then cannot use: no
-                // page box is laid out, no font is fetched, no custom property is
-                // registered. The list's own syntax errors are reported too, and
-                // first, because a parse error that was found and thrown away
-                // with the block is the same silent drop one level down. This is
-                // every at-rule `at_rule_block_is_declaration_list` names, not
-                // just `@font-face`: reading only one of them was how a `@page`
-                // block full of legacy hacks produced no diagnostic at all.
+                // A descriptor list this crate parses, and the layer above may
+                // or may not consume. `@font-face` reaches render-core's font
+                // discovery, so it is not a discarded at-rule; `@page`,
+                // `@counter-style` and the rest still are. The list's own syntax
+                // errors are reported either way, and first, because a parse
+                // error that was found and thrown away with the block is the
+                // same silent drop one level down. Reading only one of these
+                // at-rules was how a `@page` block full of legacy hacks
+                // produced no diagnostic at all.
                 sheet.diagnostics.extend(diagnostics);
-                sheet.diagnostics.push(capability_diagnostic(
-                    location,
-                    at_rule_diagnostic(&at_keyword),
-                ));
+                if !matches!(at_rule_support(&at_keyword), AtRuleSupport::Evaluated) {
+                    sheet.diagnostics.push(capability_diagnostic(
+                        location,
+                        at_rule_diagnostic(&at_keyword),
+                    ));
+                }
             }
             ParsedRule::NestedLayerBlock { location } => {
                 sheet.diagnostics.push(capability_diagnostic(
@@ -2939,12 +2944,16 @@ mod tests {
                 ["color: red"],
                 "@{name} must not affect the rules around it"
             );
+            let mut expected = vec![
+                "invalid declaration: a declaration starts with a property name, and '*' is not one",
+            ];
+            let unevaluated = format!("@{name} is parsed but not evaluated yet");
+            if name != "font-face" {
+                expected.push(&unevaluated);
+            }
             assert_eq!(
                 messages(&sheet),
-                [
-                    "invalid declaration: a declaration starts with a property name, and '*' is not one",
-                    &format!("@{name} is parsed but not evaluated yet"),
-                ],
+                expected,
                 "@{name}'s descriptor list reports its own syntax errors"
             );
         }
@@ -3073,10 +3082,7 @@ mod tests {
 
         assert_eq!(
             messages(&sheet),
-            [
-                "@nonesuch is not an at-rule this engine knows",
-                "@font-face is parsed but not evaluated yet",
-            ]
+            ["@nonesuch is not an at-rule this engine knows"]
         );
     }
 
@@ -3157,15 +3163,15 @@ mod tests {
     }
 
     /// Every recognised at-rule this engine does not evaluate is reported, once
-    /// per occurrence, naming itself. This is the defect `css.font-face` and
-    /// `css.animations` in the capability registry are about: 223 `@font-face`
-    /// and 249 `@keyframes` blocks of real production CSS were parsed and then
-    /// discarded with nothing anywhere saying why, and this project's law is
-    /// that unsupported CSS must never be silently ignored.
+    /// per occurrence, naming itself. This is the defect `css.animations` in the
+    /// capability registry is about: 249 `@keyframes` blocks of real production
+    /// CSS were parsed and then discarded with nothing anywhere saying why, and
+    /// this project's law is that unsupported CSS must never be silently
+    /// ignored. `@font-face` has left this list because render-core evaluates
+    /// it; its descriptor errors are still reported by the test above.
     #[test]
     fn every_recognised_but_unimplemented_at_rule_is_reported() {
         for name in [
-            "font-face",
             "page",
             "counter-style",
             "namespace",
@@ -3210,7 +3216,6 @@ mod tests {
     #[test]
     fn every_unimplemented_at_rule_is_covered_by_the_reporting_test() {
         for name in [
-            "font-face",
             "page",
             "counter-style",
             "namespace",
@@ -3271,15 +3276,15 @@ mod tests {
     fn at_rule_diagnostics_survive_conditional_grouping() {
         // Inside `@media`, inside `@supports`, and inside both, in either order.
         for source in [
-            "@media screen { @font-face { font-family: 'X' } }",
-            "@supports (display: grid) { @font-face { font-family: 'X' } }",
-            "@media screen { @supports (display: grid) { @font-face { font-family: 'X' } } }",
-            "@supports (display: grid) { @media screen { @font-face { font-family: 'X' } } }",
+            "@media screen { @page { margin: 1cm } }",
+            "@supports (display: grid) { @page { margin: 1cm } }",
+            "@media screen { @supports (display: grid) { @page { margin: 1cm } } }",
+            "@supports (display: grid) { @media screen { @page { margin: 1cm } } }",
             // And inside a cascade layer, which is a group rule too.
-            "@layer base { @font-face { font-family: 'X' } }",
-            "@media screen { @layer base { @font-face { font-family: 'X' } } }",
+            "@layer base { @page { margin: 1cm } }",
+            "@media screen { @layer base { @page { margin: 1cm } } }",
             // Nested in a style rule, where the block is a `<block-contents>`.
-            "a { @media screen { @font-face { font-family: 'X' } } }",
+            "a { @media screen { @page { margin: 1cm } } }",
         ] {
             let sheet = parse_stylesheet(source);
             assert!(
@@ -3296,8 +3301,7 @@ mod tests {
         }
         // The grouping itself is still not broken by reporting: an at-rule
         // inside `@media` contributes no rules, and the rules beside it do.
-        let sheet =
-            parse_stylesheet("@media screen { @font-face { font-family: 'X' } } b { color: red }");
+        let sheet = parse_stylesheet("@media screen { @page { margin: 1cm } } b { color: red }");
         assert_eq!(sheet.rules.len(), 1);
         assert_eq!(sheet.rules[0].declarations[0].value, "red");
     }
@@ -3306,19 +3310,18 @@ mod tests {
     /// same silent drop in a harder form, and this is that case: `@font-face`
     /// is recognised, and its descriptor list is *parsed*, so a descriptor with
     /// a syntax error is found and was being thrown away with the rest of the
-    /// block. A parse error that was found must be reported even when the
-    /// construct it was found in is being discarded for another reason.
+    /// block. A parse error that was found must be reported even though
+    /// render-core now evaluates the rule: a malformed `src` changes which face
+    /// exists, and the author cannot see that from a page that silently falls
+    /// back.
     #[test]
-    fn a_font_face_descriptor_error_is_not_swallowed_by_the_unimplemented_report() {
+    fn a_font_face_descriptor_error_is_not_swallowed_by_evaluation() {
         let sheet = parse_stylesheet("@font-face { font-family 'X'; src: url(a.woff2) }");
 
         assert_eq!(
             messages(&sheet),
-            [
-                r#"unexpected token: QuotedString("X")"#,
-                "@font-face is parsed but not evaluated yet",
-            ],
-            "both the descriptor's own error and why the block is unusable"
+            [r#"unexpected token: QuotedString("X")"#],
+            "the descriptor's own error survives the at-rule now being evaluated"
         );
         // And the same error is reported when the block is inside a group rule,
         // which is where 223 of them sit in the production corpus.
@@ -3440,21 +3443,24 @@ mod tests {
     #[test]
     fn an_unanswerable_supports_condition_drops_the_block_and_says_so() {
         let sheet = parse_stylesheet(
-            "@supports at-rule(@font-face) { .a { color: red } } \
+            "@supports at-rule(@page) { .a { color: red } } \
              @supports font-tech(color-COLRv1) { .b { color: blue } } c { color: lime }",
         );
 
         let messages = messages(&sheet);
         assert_eq!(messages.len(), 2, "{messages:#?}");
         assert!(
-            messages[0].starts_with("@supports at-rule(@font-face) is not answered: "),
+            messages[0].starts_with("@supports at-rule(@page) is not answered: "),
             "{}",
             messages[0]
         );
-        // The reason has to name the missing dependency, or the diagnostic is
-        // just a refusal.
-        assert!(messages[0].contains("render-net"), "{}", messages[0]);
-        assert!(messages[0].contains("render-browser"), "{}", messages[0]);
+        // The reason has to name the capability, or the diagnostic is just a
+        // refusal.
+        assert!(
+            messages[0].contains("nothing evaluates it"),
+            "{}",
+            messages[0]
+        );
         assert!(
             messages[1].starts_with("@supports font-tech(color-COLRv1) is not answered: "),
             "{}",

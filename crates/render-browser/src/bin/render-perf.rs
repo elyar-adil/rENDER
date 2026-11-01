@@ -294,6 +294,7 @@ fn run_fixture(fixture: &Fixture, options: &Options) -> FixtureResult {
             text_measurer: fonts.as_ref(),
             text_shaper: fonts.as_ref(),
             glyph_masks: fonts.as_ref(),
+            font_face_installer: None,
         };
 
         let render_started = Instant::now();

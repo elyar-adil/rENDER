@@ -479,6 +479,7 @@ impl Page {
                 text_measurer: &SimpleTextMeasurer,
                 text_shaper: &ReferenceTextShaper,
                 glyph_masks: &NoGlyphMasks,
+                font_face_installer: None,
             },
             document_url,
         )
@@ -1216,6 +1217,7 @@ impl Page {
                 text_measurer: &SimpleTextMeasurer,
                 text_shaper: &ReferenceTextShaper,
                 glyph_masks: &NoGlyphMasks,
+                font_face_installer: None,
             },
         )
     }
@@ -1440,6 +1442,7 @@ impl Page {
             text_measurer: &SimpleTextMeasurer,
             text_shaper: &ReferenceTextShaper,
             glyph_masks: &NoGlyphMasks,
+            font_face_installer: None,
         }))
     }
 
