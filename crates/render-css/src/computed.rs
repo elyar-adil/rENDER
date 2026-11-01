@@ -2053,6 +2053,7 @@ pub fn compute_document_styles_with_hints(
                         registered: &registered,
                         limits,
                     },
+                    include_starting_style: false,
                 },
             );
             if let Some(started) = cascade_started {
@@ -2095,6 +2096,7 @@ pub fn compute_document_styles_with_hints(
                             registered: &registered,
                             limits,
                         },
+                        include_starting_style: false,
                     },
                 );
                 if let Some(started) = pseudo_started {
@@ -2145,11 +2147,109 @@ pub fn compute_document_styles_with_hints(
     styles
 }
 
+/// Compute the [starting style](https://drafts.csswg.org/css-transitions-2/#starting-style)
+/// of `nodes` (CSS Transitions 2 §3.3).
+///
+/// The starting style is defined as "the after-change style with
+/// `@starting-style` rules applied in addition". Those rules therefore take
+/// part in a full cascade at their ordinary source position, so a normal
+/// declaration that outranks them still wins; `after_change` supplies every
+/// value the starting rules do not override, and inheritance uses the parent's
+/// after-change style as §3.3 requires.
+///
+/// Only the elements that are becoming rendered need a starting style, so the
+/// caller passes exactly those in `nodes`. The cost is one cascade per entering
+/// element and a second rule index, which is why this is a separate pass rather
+/// than something every document pays for.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn compute_starting_styles(
+    dom: &Dom,
+    sources: &[CascadeInput<'_>],
+    registry: &PropertyRegistry,
+    limits: &ComputationLimits,
+    context: &MatchContext,
+    hints: &dyn Fn(NodeId) -> Vec<Declaration>,
+    after_change: &BTreeMap<NodeId, ComputedStyle>,
+    nodes: &BTreeSet<NodeId>,
+) -> BTreeMap<NodeId, ComputedStyle> {
+    let mut styles = BTreeMap::new();
+    if nodes.is_empty() {
+        return styles;
+    }
+    let initials = Arc::new(InitialValues::new(registry, limits));
+    let registered =
+        RegisteredProperties::new(collect_registered_properties(sources, context), limits);
+    let rule_index = CascadeRuleIndex::new(sources);
+    for node in nodes {
+        if !matches!(dom.node(*node).map(Node::kind), Some(NodeKind::Element(_))) {
+            continue;
+        }
+        let inline = dom
+            .attribute(*node, "style")
+            .ok()
+            .flatten()
+            .map_or_else(Vec::new, |source| parse_declaration_list(source).0);
+        let ua_hints = hints(*node);
+        let cascaded = cascade_element_with_origins_indexed(
+            dom,
+            *node,
+            sources,
+            context,
+            &ua_hints,
+            &inline,
+            &CascadeLookup {
+                rule_index: Some(&rule_index),
+                style_queries: &ComputedStyleQueries {
+                    styles: after_change,
+                    current: None,
+                    registered: &registered,
+                    limits,
+                },
+                include_starting_style: true,
+            },
+        );
+        let parent = closest_element_style(dom, *node, after_change);
+        let style = compute_style_with_initials(
+            &cascaded,
+            parent,
+            registry,
+            limits,
+            &initials,
+            &registered,
+        );
+        styles.insert(*node, style);
+    }
+    styles
+}
+
+/// The computed style of the nearest ancestor element, which is what
+/// inheritance consumes. Shadow roots are not elements, so the walk continues
+/// through them to the host.
+fn closest_element_style<'a>(
+    dom: &Dom,
+    node: NodeId,
+    styles: &'a BTreeMap<NodeId, ComputedStyle>,
+) -> Option<&'a ComputedStyle> {
+    let mut current = dom.parent(node);
+    while let Some(candidate) = current {
+        if matches!(
+            dom.node(candidate).map(Node::kind),
+            Some(NodeKind::Element(_))
+        ) && let Some(style) = styles.get(&candidate)
+        {
+            return Some(style);
+        }
+        current = dom.parent(candidate);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ComputationLimits, PropertyRegistry, compute_document_styles,
-        compute_document_styles_with_hints, compute_style,
+        compute_document_styles_with_hints, compute_starting_styles, compute_style,
     };
     use crate::cascade::{CascadeInput, CascadeOrigin, cascade_element};
     use crate::container::{ContainerContext, ContainerGeometry, ContainerType};
@@ -2159,6 +2259,7 @@ mod tests {
     use crate::selector::{MatchContext, parse_selector_list, select_all};
     use crate::stylesheet::parse_stylesheet;
     use render_html::parse_document;
+    use std::collections::BTreeSet;
 
     fn target_id(dom: &render_dom::Dom, selector: &str) -> render_dom::NodeId {
         let selector = parse_selector_list(selector).expect("valid test selector");
@@ -3760,6 +3861,88 @@ mod tests {
                 .get("border-top-style")
                 .map(super::ComputedValue::css_text),
             Some("solid")
+        );
+    }
+
+    /// CSS Transitions 2 §3.3: `@starting-style` rules never reach the
+    /// after-change style, and in the starting style they cascade in their
+    /// ordinary source position. A normal declaration with higher specificity
+    /// therefore still wins over a matching starting declaration.
+    #[test]
+    fn starting_style_rules_join_only_the_starting_cascade() {
+        let output = parse_document("<!doctype html><div id='x' class='x'></div>");
+        let node = target_id(&output.dom, "#x");
+
+        let sheet = parse_stylesheet(
+            "#x { opacity: 1; transition: opacity 1s } \
+             @starting-style { #x { opacity: 0 } }",
+        );
+        let inputs = [CascadeInput {
+            sheet: &sheet,
+            origin: CascadeOrigin::Author,
+        }];
+        let styles = compute_document_styles(
+            &output.dom,
+            &inputs,
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        assert_eq!(
+            styles[&node]
+                .get("opacity")
+                .map(super::ComputedValue::css_text),
+            Some("1"),
+            "the after-change style does not see @starting-style"
+        );
+
+        let nodes = BTreeSet::from([node]);
+        let starting = compute_starting_styles(
+            &output.dom,
+            &inputs,
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+            &|_| Vec::new(),
+            &styles,
+            &nodes,
+        );
+        assert_eq!(
+            starting[&node]
+                .get("opacity")
+                .map(super::ComputedValue::css_text),
+            Some("0"),
+            "the starting style applies the starting declaration"
+        );
+
+        let sheet = parse_stylesheet("@starting-style { .x { opacity: 0 } } #x { opacity: 1 }");
+        let inputs = [CascadeInput {
+            sheet: &sheet,
+            origin: CascadeOrigin::Author,
+        }];
+        let styles = compute_document_styles(
+            &output.dom,
+            &inputs,
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let starting = compute_starting_styles(
+            &output.dom,
+            &inputs,
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+            &|_| Vec::new(),
+            &styles,
+            &nodes,
+        );
+        assert_eq!(
+            starting[&node]
+                .get("opacity")
+                .map(super::ComputedValue::css_text),
+            Some("1"),
+            "a higher-specificity normal declaration still beats the starting one"
         );
     }
 }

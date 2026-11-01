@@ -66,6 +66,7 @@ const EVALUATED_AT_RULES: &[&str] = &[
     "media",
     "property",
     "scope",
+    "starting-style",
     "supports",
 ];
 
@@ -303,6 +304,7 @@ mod tests {
                 "media",
                 "property",
                 "scope",
+                "starting-style",
                 "supports"
             ]
         );

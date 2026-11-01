@@ -115,6 +115,17 @@ pub struct StyleRule {
     /// Every enclosing `@scope` boundary, from outermost to innermost. Empty
     /// for an ordinary rule.
     pub scopes: Vec<Scope>,
+    /// Whether the declarations came from an `@starting-style` block (CSS
+    /// Transitions 2 §3.3).
+    ///
+    /// Such a rule takes part in the cascade only while the *starting style* of
+    /// a newly rendered element is computed. The ordinary style computation
+    /// skips it, which is what keeps the starting values from applying to the
+    /// after-change style once the entry transition is running. The rule keeps
+    /// its ordinary position in source order while it does take part, because
+    /// §3.3 says `@starting-style` rules "cascade as any other grouped style
+    /// rules without introducing any new ordering to the cascade".
+    pub starting_style: bool,
     pub source_order: u64,
 }
 
@@ -322,6 +333,19 @@ enum ParsedRule {
         diagnostics: Vec<StyleSheetDiagnostic>,
         location: SourceLocation,
     },
+    /// An `@starting-style` block (CSS Transitions 2 §3.3). Its style rules
+    /// establish the starting style of newly rendered elements and are marked
+    /// [`StyleRule::starting_style`] when flattened.
+    StartingStyleBlock {
+        body: RuleBody,
+        /// A prelude is not part of §3.3's grammar; a rule with one is dropped
+        /// and reported rather than silently treated as empty.
+        valid: bool,
+        diagnostics: Vec<StyleSheetDiagnostic>,
+    },
+    /// `@starting-style;` without a block. The rule establishes starting values
+    /// only through a block, so the statement form is invalid and reported.
+    StartingStyleStatement { location: SourceLocation },
     /// A `@property` registration. The declaration list is not a discarded
     /// descriptor block: a valid registration reaches the custom-property
     /// computation stage, and an invalid one is reported with the reason CSS
@@ -506,6 +530,9 @@ impl<'i> AtRuleParser<'i> for RuleParser<'_> {
                 _ => Ok(ParsedRule::InvalidLayerStatement { location }),
             };
         }
+        if prelude.name == "starting-style" {
+            return Ok(ParsedRule::StartingStyleStatement { location });
+        }
         Ok(ParsedRule::IgnoredAtRule {
             name: prelude.name,
             location,
@@ -621,6 +648,27 @@ fn parse_at_rule_block<'i, 't>(
             body,
             diagnostics,
             location,
+        });
+    }
+
+    if prelude.name == "starting-style" {
+        // CSS Transitions 2 §3.3: a grouping rule with no prelude. Nested in a
+        // style rule, CSS Nesting §3.3 makes its block a `<block-contents>`, so
+        // plain declarations establish starting values for the enclosing
+        // selector and nested style rules resolve against it.
+        let valid = prelude.value.trim().is_empty();
+        let (body, mut diagnostics) = parse_group_body(input, next_anonymous_layer, parent, scoped);
+        if !valid {
+            diagnostics.push(capability_diagnostic(
+                location,
+                "@starting-style takes no prelude, so the rule and its contents are dropped"
+                    .to_owned(),
+            ));
+        }
+        return Ok(ParsedRule::StartingStyleBlock {
+            body,
+            valid,
+            diagnostics,
         });
     }
 
@@ -1458,6 +1506,11 @@ impl<'i> AtRuleParser<'i> for PropertyParser<'_> {
                 })),
             };
         }
+        if prelude.name == "starting-style" {
+            return Ok(RuleBodyItem::Rule(ParsedRule::StartingStyleStatement {
+                location,
+            }));
+        }
         Ok(RuleBodyItem::Rule(ParsedRule::IgnoredAtRule {
             name: prelude.name,
             location,
@@ -1496,7 +1549,7 @@ pub fn parse_stylesheet(source: &str) -> StyleSheet {
         diagnostics,
         ..StyleSheet::default()
     };
-    flatten_rules(rules, None, &[], &[], &[], &mut sheet);
+    flatten_rules(rules, None, &[], &[], &[], false, &mut sheet);
     sheet
 }
 
@@ -1915,6 +1968,7 @@ fn flatten_rules(
     media: &[String],
     containers: &[ContainerCondition],
     scopes: &[Scope],
+    starting_style: bool,
     sheet: &mut StyleSheet,
 ) {
     for rule in rules {
@@ -1942,9 +1996,18 @@ fn flatten_rules(
                     media: media.to_vec(),
                     container: containers.to_vec(),
                     scopes: scopes.to_vec(),
+                    starting_style,
                     source_order: u64::try_from(sheet.rules.len()).unwrap_or(u64::MAX),
                 });
-                flatten_rules(nested, layer, media, containers, scopes, sheet);
+                flatten_rules(
+                    nested,
+                    layer,
+                    media,
+                    containers,
+                    scopes,
+                    starting_style,
+                    sheet,
+                );
             }
             ParsedRule::NestedDeclarations {
                 selectors,
@@ -1964,6 +2027,7 @@ fn flatten_rules(
                     media: media.to_vec(),
                     container: containers.to_vec(),
                     scopes: scopes.to_vec(),
+                    starting_style,
                     source_order: u64::try_from(sheet.rules.len()).unwrap_or(u64::MAX),
                 });
             }
@@ -1984,6 +2048,7 @@ fn flatten_rules(
                     media: media.to_vec(),
                     container: containers.to_vec(),
                     scopes: scopes.to_vec(),
+                    starting_style,
                     source_order: u64::try_from(sheet.rules.len()).unwrap_or(u64::MAX),
                 });
             }
@@ -1998,7 +2063,15 @@ fn flatten_rules(
                     Ok(scope) => {
                         let mut nested = scopes.to_vec();
                         nested.push(scope);
-                        flatten_group_body(body, layer, media, containers, &nested, sheet);
+                        flatten_group_body(
+                            body,
+                            layer,
+                            media,
+                            containers,
+                            &nested,
+                            starting_style,
+                            sheet,
+                        );
                     }
                     Err(reason) => {
                         sheet.diagnostics.push(capability_diagnostic(
@@ -2034,7 +2107,15 @@ fn flatten_rules(
                     ));
                 } else {
                     register_layer(sheet, &nested_layer);
-                    flatten_rules(rules, Some(&nested_layer), media, containers, scopes, sheet);
+                    flatten_rules(
+                        rules,
+                        Some(&nested_layer),
+                        media,
+                        containers,
+                        scopes,
+                        starting_style,
+                        sheet,
+                    );
                 }
             }
             ParsedRule::MediaBlock {
@@ -2045,7 +2126,15 @@ fn flatten_rules(
                 sheet.diagnostics.extend(diagnostics);
                 let mut nested_media = media.to_vec();
                 nested_media.push(query);
-                flatten_group_body(body, layer, &nested_media, containers, scopes, sheet);
+                flatten_group_body(
+                    body,
+                    layer,
+                    &nested_media,
+                    containers,
+                    scopes,
+                    starting_style,
+                    sheet,
+                );
             }
             ParsedRule::ContainerBlock {
                 condition,
@@ -2070,7 +2159,15 @@ fn flatten_rules(
                         }
                         let mut nested = containers.to_vec();
                         nested.push(condition);
-                        flatten_group_body(body, layer, media, &nested, scopes, sheet);
+                        flatten_group_body(
+                            body,
+                            layer,
+                            media,
+                            &nested,
+                            scopes,
+                            starting_style,
+                            sheet,
+                        );
                     }
                     Err(reason) => {
                         sheet.diagnostics.push(capability_diagnostic(
@@ -2102,7 +2199,15 @@ fn flatten_rules(
                     // though they were at the group rule's location, and when
                     // it is false none of them apply.
                     SupportsCondition::Evaluated(true) => {
-                        flatten_group_body(body, layer, media, containers, scopes, sheet);
+                        flatten_group_body(
+                            body,
+                            layer,
+                            media,
+                            containers,
+                            scopes,
+                            starting_style,
+                            sheet,
+                        );
                     }
                     // A false condition is a complete answer, not a gap: the
                     // author wrote the query to find out whether the engine
@@ -2136,6 +2241,30 @@ fn flatten_rules(
                         }
                     }
                 }
+            }
+            ParsedRule::StartingStyleBlock {
+                body,
+                valid,
+                diagnostics,
+            } => {
+                // The block's own syntax errors are the author's problem
+                // whether or not the prelude is valid, so they are reported
+                // first.
+                sheet.diagnostics.extend(diagnostics);
+                if valid {
+                    // §3.3: the rules cascade in place but contribute only to
+                    // the starting style. `starting_style` propagates through
+                    // any grouping rule nested inside the block, while global
+                    // name-defining at-rules keep their ordinary handling.
+                    flatten_group_body(body, layer, media, containers, scopes, true, sheet);
+                }
+            }
+            ParsedRule::StartingStyleStatement { location } => {
+                sheet.diagnostics.push(capability_diagnostic(
+                    location,
+                    "@starting-style needs a block; a statement establishes no starting values"
+                        .to_owned(),
+                ));
             }
             ParsedRule::PropertyBlock {
                 registration,
@@ -2233,12 +2362,21 @@ fn flatten_group_body(
     media: &[String],
     containers: &[ContainerCondition],
     scopes: &[Scope],
+    starting_style: bool,
     sheet: &mut StyleSheet,
 ) {
     let rules = match body {
         RuleBody::Rules(rules) | RuleBody::Block(rules) => rules,
     };
-    flatten_rules(rules, layer, media, containers, scopes, sheet);
+    flatten_rules(
+        rules,
+        layer,
+        media,
+        containers,
+        scopes,
+        starting_style,
+        sheet,
+    );
 }
 
 #[cfg(test)]
@@ -2372,6 +2510,88 @@ mod tests {
         assert_eq!(sheet.rules[2].media, ["screen and (min-width: 700px)"]);
         assert_eq!(sheet.rules[3].declarations[0].value, "grid");
         assert!(sheet.rules[3].media.is_empty());
+    }
+
+    /// CSS Transitions 2 §3.3: `@starting-style` is a grouping rule whose
+    /// style rules are retained but marked, at top level and inside a
+    /// conditional group rule. They are not dropped and they are not ordinary
+    /// rules: the marker is what keeps them out of the after-change style.
+    #[test]
+    fn starting_style_rules_are_retained_and_marked() {
+        let sheet = parse_stylesheet(
+            "@starting-style { .box { opacity: 0 } } \
+             .box { opacity: 1; transition: opacity 1s } \
+             @media screen { @starting-style { .other { color: red } } } \
+             .other { color: blue }",
+        );
+
+        assert!(sheet.diagnostics.is_empty(), "{:?}", sheet.diagnostics);
+        let starting: Vec<&super::StyleRule> = sheet
+            .rules
+            .iter()
+            .filter(|rule| rule.starting_style)
+            .collect();
+        assert_eq!(starting.len(), 2);
+        assert_eq!(starting[0].declarations[0].name, "opacity");
+        assert_eq!(starting[0].declarations[0].value, "0");
+        assert_eq!(starting[1].declarations[0].value, "red");
+        assert_eq!(starting[1].media, ["screen"]);
+        assert_eq!(
+            sheet
+                .rules
+                .iter()
+                .filter(|rule| !rule.starting_style)
+                .count(),
+            2,
+            "the declarations outside @starting-style stay ordinary"
+        );
+    }
+
+    /// Nested in a style rule, `@starting-style`'s direct declarations are a
+    /// nested declarations rule under that selector (CSS Nesting §3.3), so
+    /// they establish starting values for exactly the elements the enclosing
+    /// selector matches and for no other selector.
+    #[test]
+    fn nested_starting_style_uses_the_enclosing_selector() {
+        let matched = matched_ids(
+            NESTED_DOM,
+            ".foo { opacity: 1; @starting-style { opacity: 0 } } \
+             .plain { opacity: 1; @starting-style { opacity: 0.5 } }",
+        );
+
+        let ids: Vec<Vec<String>> = matched.iter().map(|(ids, _)| ids.clone()).collect();
+        assert_eq!(
+            ids,
+            [
+                vec!["a".to_owned()],
+                vec!["a".to_owned()],
+                vec!["e".to_owned()],
+                vec!["e".to_owned()],
+            ],
+            "each nested @starting-style matches only its enclosing selector"
+        );
+    }
+
+    /// A statement form establishes nothing and a prelude is not part of
+    /// §3.3's grammar, so both are reported rather than silently ignored.
+    #[test]
+    fn a_malformed_starting_style_rule_is_reported() {
+        assert_eq!(
+            messages(&parse_stylesheet("@starting-style;")),
+            ["@starting-style needs a block; a statement establishes no starting values"]
+        );
+        assert_eq!(
+            messages(&parse_stylesheet(
+                "@starting-style foo { .box { opacity: 0 } }"
+            )),
+            ["@starting-style takes no prelude, so the rule and its contents are dropped"]
+        );
+        assert!(
+            parse_stylesheet("@starting-style foo { .box { opacity: 0 } }")
+                .rules
+                .is_empty(),
+            "the dropped rule contributes no style rule"
+        );
     }
 
     /// CSS Nesting §3.4/§5: declarations that follow a nested rule become a
@@ -3176,7 +3396,6 @@ mod tests {
             "counter-style",
             "namespace",
             "color-profile",
-            "starting-style",
             "position-try",
             "view-transition",
             "viewport",
@@ -3220,7 +3439,6 @@ mod tests {
             "counter-style",
             "namespace",
             "color-profile",
-            "starting-style",
             "position-try",
             "view-transition",
             "viewport",

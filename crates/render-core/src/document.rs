@@ -6,7 +6,7 @@
 
 #![allow(clippy::too_many_lines)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use url::Url;
 
@@ -16,14 +16,16 @@ use crate::css::cascade::{
 };
 use crate::css::computed::{
     ComputationDiagnostic, ComputationLimits, ComputedStyle, PropertyRegistry,
-    compute_document_styles_with_hints,
+    compute_document_styles_with_hints, compute_starting_styles,
 };
 use crate::css::container::{ContainerContext, container_geometry_for_style};
 use crate::css::length::{LengthContext, resolve_length_expr};
 use crate::css::properties::TypedPropertyValue;
 use crate::css::selector::{ColorScheme, InteractionState, MatchContext};
 use crate::css::stylesheet::{Declaration, StyleSheet, StyleSheetDiagnostic, parse_stylesheet};
-use crate::css::transition::{TransitionEvent, TransitionState, sample_transitions};
+use crate::css::transition::{
+    TransitionEvent, TransitionState, sample_transitions_in_rendered_document,
+};
 use crate::dom::{Dom, DomRevision, ElementData, Namespace, Node, NodeId, NodeKind};
 use crate::font_face::{FontFaceSheet, FontFaceSource, parse_font_faces};
 use crate::html::{HtmlParseError, QuirksMode, parse_document_with_scripting, serialize_html_node};
@@ -1639,6 +1641,39 @@ fn root_font_size(dom: &Dom, styles: &BTreeMap<NodeId, ComputedStyle>) -> f32 {
         .map_or(16.0, |value| value as f32)
 }
 
+/// The elements that have a box in this style change event.
+///
+/// `display: none` removes an element and its whole subtree from this set, and
+/// so does an ancestor that is display none. The walk follows the flat tree,
+/// exactly as style computation and inheritance do, so a slot's assigned nodes
+/// are rendered where the slot is and a shadow tree's elements are reached
+/// through its host.
+///
+/// CSS Transitions 2 §3.3 uses "was not rendered during the previous style
+/// change event" as the condition without a before-change style; keeping the
+/// set explicit is what makes the difference between a first render, a DOM
+/// insertion and `display: none` to rendered observable to the sampler.
+fn rendered_elements(dom: &Dom, styles: &BTreeMap<NodeId, ComputedStyle>) -> BTreeSet<NodeId> {
+    let mut rendered = BTreeSet::new();
+    let mut stack = vec![(dom.document(), true)];
+    while let Some((node, parent_rendered)) = stack.pop() {
+        let is_element = matches!(dom.node(node).map(Node::kind), Some(NodeKind::Element(_)));
+        let display_none = styles.get(&node).is_some_and(|style| {
+            style
+                .get("display")
+                .is_some_and(|value| value.css_text().trim().eq_ignore_ascii_case("none"))
+        });
+        let node_rendered = parent_rendered && !display_none;
+        if is_element && node_rendered {
+            rendered.insert(node);
+        }
+        for child in dom.flat_children(node) {
+            stack.push((child, node_rendered));
+        }
+    }
+    rendered
+}
+
 fn render_dom(
     dom: &Dom,
     quirks_mode: QuirksMode,
@@ -1710,6 +1745,27 @@ fn render_dom(
         origin: CascadeOrigin::Author,
     }));
 
+    // CSS Transitions 2 §3.3: only elements that did not have a before-change
+    // style need a starting style, and computing one is a second cascade. The
+    // candidates are the elements the previous style change event did not
+    // render; the rendered set for *this* event is only known after the
+    // cascade, so a candidate that is still `display: none` costs a style
+    // computation but no transition.
+    let starting_candidates: BTreeSet<NodeId> = if cascade_inputs
+        .iter()
+        .any(|input| input.sheet.rules.iter().any(|rule| rule.starting_style))
+    {
+        dom.nodes()
+            .filter(|(node, _)| {
+                matches!(dom.node(*node).map(Node::kind), Some(NodeKind::Element(_)))
+                    && !transitions.rendered().contains(node)
+            })
+            .map(|(node, _)| node)
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+
     let cascade_match_started = std::time::Instant::now();
     let mut styles = compute_document_styles_with_hints(
         dom,
@@ -1763,7 +1819,37 @@ fn render_dom(
         }
     }
     let transitions_started = std::time::Instant::now();
-    let transition_events = sample_transitions(&mut styles, transitions, options.animation_time);
+    // CSS Transitions 2 §3.3: elements that were not rendered at the previous
+    // style change event have no before-change style. Their starting style —
+    // the after-change style with `@starting-style` rules applied in addition —
+    // supplies the values their entry transitions start from.
+    let rendered = rendered_elements(dom, &styles);
+    let starting_styles = if starting_candidates.is_empty() {
+        BTreeMap::new()
+    } else {
+        let entering: BTreeSet<NodeId> = starting_candidates
+            .iter()
+            .copied()
+            .filter(|node| rendered.contains(node))
+            .collect();
+        compute_starting_styles(
+            dom,
+            &cascade_inputs,
+            &PropertyRegistry::standard_baseline(),
+            &options.computation_limits,
+            &match_context,
+            &|node| presentational_hint_declarations(dom, node, quirks_mode),
+            &styles,
+            &entering,
+        )
+    };
+    let transition_events = sample_transitions_in_rendered_document(
+        &mut styles,
+        &starting_styles,
+        Some(&rendered),
+        transitions,
+        options.animation_time,
+    );
     if stage_timing {
         eprintln!("stage transitions: {:?}", transitions_started.elapsed());
     }
@@ -4766,6 +4852,244 @@ mod tests {
         assert_eq!(end.transition_events[0].node, node);
         assert_eq!(end.transition_events[0].property, "width");
         assert!((end.transition_events[0].elapsed_time - 1.0).abs() < 1.0e-6);
+        assert!(!transitions.has_active());
+    }
+
+    /// CSS Transitions 2 §3.3: a newly rendered element has no before-change
+    /// style, so `@starting-style` supplies the origin of its entry transition.
+    #[test]
+    fn css_starting_style_animates_opacity_on_first_render() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0 }
+               #box { width: 20px; height: 20px; background: red;
+                      opacity: 1; transition: opacity 1s linear;
+                      @starting-style { opacity: 0 } }
+               </style><div id="box"></div>"#,
+        );
+        let node = target_id(document.dom(), "#box");
+        let mut transitions = TransitionState::default();
+
+        let start = render_with_transitions(&document, &mut transitions, 0.0);
+        assert_eq!(
+            start.styles[&node]
+                .get("opacity")
+                .map(render_css::computed::ComputedValue::css_text),
+            Some("0"),
+            "the first frame paints the starting value"
+        );
+        assert_eq!(
+            start
+                .transition_events
+                .iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            [
+                render_css::transition::TransitionEventKind::Run,
+                render_css::transition::TransitionEventKind::Start,
+            ]
+        );
+        assert!(transitions.has_active());
+
+        let middle = render_with_transitions(&document, &mut transitions, 0.5);
+        assert_eq!(
+            middle.styles[&node]
+                .get("opacity")
+                .map(render_css::computed::ComputedValue::css_text),
+            Some("0.5")
+        );
+
+        let end = render_with_transitions(&document, &mut transitions, 1.0);
+        assert_eq!(
+            end.styles[&node]
+                .get("opacity")
+                .map(render_css::computed::ComputedValue::css_text),
+            Some("1")
+        );
+        assert_eq!(end.transition_events.len(), 1);
+        assert_eq!(
+            end.transition_events[0].kind,
+            render_css::transition::TransitionEventKind::End
+        );
+        assert_eq!(end.transition_events[0].property, "opacity");
+        assert!((end.transition_events[0].elapsed_time - 1.0).abs() < 1.0e-6);
+        assert!(!transitions.has_active());
+    }
+
+    /// A starting value is only an origin for a covered property. When the
+    /// transition list does not name `opacity`, the entry leaves it at its
+    /// after-change value and starts nothing.
+    #[test]
+    fn css_starting_style_needs_a_matching_transition_property() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0 }
+               #box { width: 20px; height: 20px; background: red;
+                      opacity: 1; transition: color 1s linear;
+                      @starting-style { opacity: 0 } }
+               </style><div id="box"></div>"#,
+        );
+        let node = target_id(document.dom(), "#box");
+        let mut transitions = TransitionState::default();
+
+        let output = render_with_transitions(&document, &mut transitions, 0.0);
+        assert_eq!(
+            output.styles[&node]
+                .get("opacity")
+                .map(render_css::computed::ComputedValue::css_text),
+            Some("1")
+        );
+        assert!(output.transition_events.is_empty());
+        assert!(!transitions.has_active());
+    }
+
+    /// A `@starting-style` nested in one rule matches only that rule's
+    /// selector: the sibling with no starting rule keeps its opacity.
+    #[test]
+    fn css_nested_starting_style_matches_only_its_enclosing_selector() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0 }
+               #a { width: 20px; height: 20px; background: red;
+                    opacity: 1; transition: opacity 1s linear;
+                    @starting-style { opacity: 0 } }
+               #b { width: 20px; height: 20px; background: blue;
+                    opacity: 1; transition: opacity 1s linear; }
+               </style><div id="a"></div><div id="b"></div>"#,
+        );
+        let a = target_id(document.dom(), "#a");
+        let b = target_id(document.dom(), "#b");
+        let mut transitions = TransitionState::default();
+
+        let output = render_with_transitions(&document, &mut transitions, 0.0);
+        assert_eq!(
+            output.styles[&a]
+                .get("opacity")
+                .map(render_css::computed::ComputedValue::css_text),
+            Some("0")
+        );
+        assert_eq!(
+            output.styles[&b]
+                .get("opacity")
+                .map(render_css::computed::ComputedValue::css_text),
+            Some("1"),
+            "the other selector has no starting rule"
+        );
+        assert_eq!(transitions.active_count(), 1);
+        assert!(
+            output.transition_events.iter().all(|event| event.node == a),
+            "only #a enters with a transition"
+        );
+    }
+
+    /// `display: none` elements are not rendered, so they have no entry
+    /// transition. Removing the hidden class makes the element rendered for
+    /// the first time and starts the transition from the starting value.
+    #[test]
+    fn css_starting_style_waits_for_display_none_to_become_rendered() {
+        let mut document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0 }
+               #box { width: 20px; height: 20px; background: red;
+                      opacity: 1; transition: opacity 1s linear;
+                      @starting-style { opacity: 0 } }
+               #box.hidden { display: none }
+               </style><div id="box" class="hidden"></div>"#,
+        );
+        let node = target_id(document.dom(), "#box");
+        let mut transitions = TransitionState::default();
+
+        let hidden = render_with_transitions(&document, &mut transitions, 0.0);
+        assert!(hidden.transition_events.is_empty());
+        assert!(!transitions.has_active());
+        assert_eq!(
+            hidden.styles[&node]
+                .get("opacity")
+                .map(render_css::computed::ComputedValue::css_text),
+            Some("1")
+        );
+
+        document
+            .dom_mut()
+            .set_attribute(node, "class", "")
+            .expect("class attribute");
+        let shown = render_with_transitions(&document, &mut transitions, 0.0);
+        assert_eq!(
+            shown.styles[&node]
+                .get("opacity")
+                .map(render_css::computed::ComputedValue::css_text),
+            Some("0"),
+            "becoming rendered starts the entry transition"
+        );
+        assert!(transitions.has_active());
+
+        let middle = render_with_transitions(&document, &mut transitions, 0.5);
+        assert_eq!(
+            middle.styles[&node]
+                .get("opacity")
+                .map(render_css::computed::ComputedValue::css_text),
+            Some("0.5")
+        );
+    }
+
+    /// A node inserted after the first style change event has no before-change
+    /// style either, so it enters through its starting style just like an
+    /// element present at first render.
+    #[test]
+    fn css_starting_style_applies_to_an_inserted_node() {
+        let mut document = Document::parse(
+            r"<!doctype html><style>
+               html, body { margin: 0 }
+               .box { width: 20px; height: 20px; background: red;
+                      opacity: 1; transition: opacity 1s linear;
+                      @starting-style { opacity: 0 } }
+               </style><body></body>",
+        );
+        let mut transitions = TransitionState::default();
+        let initial = render_with_transitions(&document, &mut transitions, 0.0);
+        assert!(initial.transition_events.is_empty());
+
+        let node = {
+            let dom = document.dom_mut();
+            let node = dom.create_element("div");
+            dom.set_attribute(node, "class", "box").expect("class");
+            let body = target_id(dom, "body");
+            dom.append_child(body, node).expect("append");
+            node
+        };
+        let output = render_with_transitions(&document, &mut transitions, 0.0);
+        assert_eq!(
+            output.styles[&node]
+                .get("opacity")
+                .map(render_css::computed::ComputedValue::css_text),
+            Some("0")
+        );
+        assert_eq!(transitions.active_count(), 1);
+    }
+
+    /// A document with no `@starting-style` has no entry transitions: the
+    /// static computed values are exactly the after-change values and the
+    /// sampler has nothing to start.
+    #[test]
+    fn css_without_starting_style_keeps_static_first_render() {
+        let document = Document::parse(
+            r#"<!doctype html><style>
+               html, body { margin: 0 }
+               #box { width: 20px; height: 20px; background: red;
+                      opacity: 1; transition: opacity 1s linear; }
+               </style><div id="box"></div>"#,
+        );
+        let node = target_id(document.dom(), "#box");
+        let mut transitions = TransitionState::default();
+
+        let output = render_with_transitions(&document, &mut transitions, 0.0);
+        assert_eq!(
+            output.styles[&node]
+                .get("opacity")
+                .map(render_css::computed::ComputedValue::css_text),
+            Some("1")
+        );
+        assert!(output.transition_events.is_empty());
         assert!(!transitions.has_active());
     }
 

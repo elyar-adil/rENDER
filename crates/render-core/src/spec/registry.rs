@@ -565,8 +565,8 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
     FeatureDefinition {
         id: CSS_TRANSITIONS,
         family: StandardFamily::Css,
-        specification: "CSS Transitions Level 1",
-        section: "2 Starting and reversing transitions",
+        specification: "CSS Transitions Level 2",
+        section: "3.3 Defining before-change style: the @starting-style rule",
         status: SupportStatus::Partial,
         notes: "The `transition` shorthand and its four longhands parse and reach \
                 computed style. A per-document sampler remembers the previous computed \
@@ -578,10 +578,14 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 `transition-behavior: allow-discrete` steps discrete properties and \
                 transitionrun/transitionstart/transitionend/transitioncancel are \
                 reported for style changes, node removal and document switches. \
-                Reversing-adjusted start values follow CSS Transitions 1 §3.1. The \
-                self-hosted Web Animations core covers element.animate, \
-                playbackRate/reverse and composition on the same document clock as \
-                this transition timeline.",
+                Reversing-adjusted start values follow CSS Transitions 1 §3.1. \
+                `@starting-style` rules parse at top level and nested in a style rule, \
+                cascade in their ordinary source position for the starting style, and \
+                supply the origin of entry transitions for elements that were not \
+                rendered at the previous style change event (first render, DOM \
+                insertion, and display:none to rendered). The self-hosted Web \
+                Animations core covers element.animate, playbackRate/reverse and \
+                composition on the same document clock as this transition timeline.",
         dependencies: &[CSS_SYNTAX],
         tests: &[ConformanceTest::new("rust", "css::transition::tests")],
     },

@@ -17,6 +17,14 @@ use crate::computed::ComputedStyle;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TransitionState {
     nodes: BTreeMap<NodeId, NodeTransitions>,
+    /// The elements that had a box at the previous style change event.
+    ///
+    /// CSS Transitions 2 §3.3: an element without a before-change style is one
+    /// that "was not rendered or part of the DOM during the previous style
+    /// change event". Keeping the rendered set here is what tells a first
+    /// render, a DOM insertion and a `display: none` to rendered transition
+    /// apart from an ordinary value change.
+    rendered: BTreeSet<NodeId>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -84,6 +92,16 @@ impl TransitionState {
         self.nodes.values().map(|node| node.active.len()).sum()
     }
 
+    /// The elements that were rendered at the previous style change event.
+    ///
+    /// The renderer uses this to decide which elements need a starting style
+    /// computed at all: an element already in this set has a before-change
+    /// style and takes the ordinary transition path.
+    #[must_use]
+    pub fn rendered(&self) -> &BTreeSet<NodeId> {
+        &self.rendered
+    }
+
     /// Cancel every running transition, as a document switch requires, and
     /// return the `transitioncancel` events for the old document's runtime.
     #[must_use]
@@ -101,6 +119,7 @@ impl TransitionState {
             }
         }
         self.nodes.clear();
+        self.rendered.clear();
         events
     }
 }
@@ -110,8 +129,36 @@ impl TransitionState {
 /// `time` is the document timeline position in seconds. A transition that ends
 /// at or before `time` is painted at its final value and emits one
 /// [`TransitionEvent`].
+///
+/// This is the no-entry-information form: every element in `styles` is treated
+/// as having a before-change style from the previous call. Renderers that know
+/// which elements are rendered call
+/// [`sample_transitions_in_rendered_document`] instead.
 pub fn sample_transitions(
     styles: &mut BTreeMap<NodeId, ComputedStyle>,
+    state: &mut TransitionState,
+    time: f32,
+) -> Vec<TransitionEvent> {
+    sample_transitions_in_rendered_document(styles, &BTreeMap::new(), None, state, time)
+}
+
+/// [`sample_transitions`] with the rendered set and the starting styles that
+/// CSS Transitions 2 §3.3 needs for entry transitions.
+///
+/// `rendered` is the set of elements that have a box in this style change
+/// event. An element that is in it and was not in the state's rendered set has
+/// no before-change style, so its before-change values come from
+/// `starting_styles` instead of from the values remembered at the previous
+/// call. An element with no starting-style rule simply agrees with its
+/// after-change style and starts no transition.
+///
+/// `starting_styles` must have been computed with the `@starting-style` rules
+/// taking part in the cascade; see
+/// [`compute_starting_styles`](crate::computed::compute_starting_styles).
+pub fn sample_transitions_in_rendered_document(
+    styles: &mut BTreeMap<NodeId, ComputedStyle>,
+    starting_styles: &BTreeMap<NodeId, ComputedStyle>,
+    rendered: Option<&BTreeSet<NodeId>>,
     state: &mut TransitionState,
     time: f32,
 ) -> Vec<TransitionEvent> {
@@ -120,6 +167,8 @@ pub fn sample_transitions(
     for (node, style) in styles.iter_mut() {
         live.insert(*node);
         let plan = TransitionPlan::from_style(style);
+        let entering = rendered
+            .is_some_and(|rendered| rendered.contains(node) && !state.rendered.contains(node));
         let node_state = state.nodes.entry(*node).or_default();
         let candidates = plan.candidates(style, node_state);
         let mut cancel = Vec::new();
@@ -132,6 +181,66 @@ pub fn sample_transitions(
             };
             let previous = node_state.targets.insert(property.clone(), target.clone());
             let covered = plan.covers(&property);
+            if entering {
+                // §3.3: the starting style replaces the before-change style,
+                // so a value remembered before the element stopped being
+                // rendered is not a transition origin. A running transition is
+                // not the before-change style either; it is cancelled and the
+                // entry transition starts from the starting value.
+                if let Some(active) = node_state.active.remove(&property) {
+                    events.push(transition_event(
+                        *node,
+                        &property,
+                        &active,
+                        time,
+                        TransitionEventKind::Cancel,
+                    ));
+                }
+                let Some(starting_style) = starting_styles.get(node) else {
+                    continue;
+                };
+                let Some(from) = starting_style
+                    .get(&property)
+                    .map(|value| value.css_text().trim().to_owned())
+                else {
+                    continue;
+                };
+                if !covered || from == target {
+                    continue;
+                }
+                let duration = plan.duration_for(&property);
+                let allow_discrete = plan.allow_discrete(&property);
+                if duration <= 0.0
+                    || (!allow_discrete
+                        && interpolate_property(&property, &from, &target, 0.0).is_none())
+                {
+                    continue;
+                }
+                node_state.active.insert(
+                    property.clone(),
+                    ActiveTransition {
+                        from: from.clone(),
+                        to: target,
+                        start: time,
+                        delay: plan.delay_for(&property),
+                        duration,
+                        timing: plan.timing_for(&property),
+                        shortening: 1.0,
+                        reversing_adjusted_start: from,
+                        allow_discrete,
+                        started: false,
+                    },
+                );
+                if let Some(active) = node_state.active.get(&property) {
+                    events.push(transition_run_event(
+                        *node,
+                        &property,
+                        active,
+                        TransitionEventKind::Run,
+                    ));
+                }
+                continue;
+            }
             if let Some(active) = node_state.active.get_mut(&property) {
                 if active.to == target {
                     continue;
@@ -288,6 +397,11 @@ pub fn sample_transitions(
         events.extend(cancellations.into_iter().map(|(_, event)| event));
     }
     state.nodes.retain(|node, _| live.contains(node));
+    if let Some(rendered) = rendered {
+        // The next call compares against this set to recognize a first render
+        // or a `display: none` to rendered change.
+        state.rendered = rendered.clone();
+    }
     events
 }
 
@@ -609,10 +723,17 @@ fn is_common_transition_property(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{TransitionEventKind, TransitionState, sample_transitions};
+    use super::{
+        TransitionEventKind, TransitionState, sample_transitions,
+        sample_transitions_in_rendered_document,
+    };
     use crate::computed::ComputedStyle;
     use render_dom::NodeId;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn rendered(nodes: &[NodeId]) -> BTreeSet<NodeId> {
+        nodes.iter().copied().collect()
+    }
 
     fn style_with(pairs: &[(&str, &str)]) -> ComputedStyle {
         let mut style = ComputedStyle::default();
@@ -975,5 +1096,127 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].kind, TransitionEventKind::Start);
         assert!(active[0].elapsed_time.abs() < 1.0e-6);
+    }
+
+    fn opacity_style(opacity: &str, transition_property: &str) -> ComputedStyle {
+        style_with(&[
+            ("opacity", opacity),
+            ("transition-property", transition_property),
+            ("transition-duration", "1s"),
+            ("transition-timing-function", "linear"),
+        ])
+    }
+
+    /// CSS Transitions 2 §3.3: an element with no before-change style uses its
+    /// starting style as the transition origin, and the transition then samples
+    /// on the ordinary document clock.
+    #[test]
+    fn an_entry_transition_starts_from_the_starting_style() {
+        let node = NodeId::from_u64(20);
+        let mut styles = BTreeMap::new();
+        styles.insert(node, opacity_style("1", "opacity"));
+        let mut starting = BTreeMap::new();
+        starting.insert(node, opacity_style("0", "opacity"));
+        let mut state = TransitionState::default();
+
+        let started = sample_transitions_in_rendered_document(
+            &mut styles,
+            &starting,
+            Some(&rendered(&[node])),
+            &mut state,
+            0.0,
+        );
+        assert_eq!(
+            started.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            [TransitionEventKind::Run, TransitionEventKind::Start]
+        );
+        assert_eq!(
+            styles[&node].get("opacity").map(|value| value.css_text()),
+            Some("0")
+        );
+
+        styles.insert(node, opacity_style("1", "opacity"));
+        sample_transitions_in_rendered_document(
+            &mut styles,
+            &starting,
+            Some(&rendered(&[node])),
+            &mut state,
+            0.5,
+        );
+        assert_eq!(
+            styles[&node].get("opacity").map(|value| value.css_text()),
+            Some("0.5")
+        );
+        assert!(state.has_active());
+    }
+
+    /// A starting value is only an origin for a property the transition list
+    /// covers. Changing an uncovered property on entry must not invent a
+    /// transition.
+    #[test]
+    fn entry_does_not_transition_a_property_outside_transition_property() {
+        let node = NodeId::from_u64(21);
+        let mut styles = BTreeMap::new();
+        styles.insert(node, opacity_style("1", "color"));
+        let mut starting = BTreeMap::new();
+        starting.insert(node, opacity_style("0", "color"));
+        let mut state = TransitionState::default();
+
+        let events = sample_transitions_in_rendered_document(
+            &mut styles,
+            &starting,
+            Some(&rendered(&[node])),
+            &mut state,
+            0.0,
+        );
+        assert!(events.is_empty());
+        assert!(!state.has_active());
+        assert_eq!(
+            styles[&node].get("opacity").map(|value| value.css_text()),
+            Some("1"),
+            "an uncovered property keeps its after-change value"
+        );
+    }
+
+    /// §3.3 conditions entry on the previous style change event not rendering
+    /// the element. An element that is still `display: none` is not entering,
+    /// even when it has a starting style, and becomes entering on the first
+    /// call whose rendered set contains it.
+    #[test]
+    fn a_not_rendered_element_waits_to_start_until_it_is_rendered() {
+        let node = NodeId::from_u64(22);
+        let mut styles = BTreeMap::new();
+        styles.insert(node, opacity_style("1", "opacity"));
+        let mut starting = BTreeMap::new();
+        starting.insert(node, opacity_style("0", "opacity"));
+        let mut state = TransitionState::default();
+
+        let hidden = sample_transitions_in_rendered_document(
+            &mut styles,
+            &starting,
+            Some(&rendered(&[])),
+            &mut state,
+            0.0,
+        );
+        assert!(hidden.is_empty());
+        assert_eq!(
+            styles[&node].get("opacity").map(|value| value.css_text()),
+            Some("1")
+        );
+
+        styles.insert(node, opacity_style("1", "opacity"));
+        let shown = sample_transitions_in_rendered_document(
+            &mut styles,
+            &starting,
+            Some(&rendered(&[node])),
+            &mut state,
+            1.0,
+        );
+        assert_eq!(shown[0].kind, TransitionEventKind::Run);
+        assert_eq!(
+            styles[&node].get("opacity").map(|value| value.css_text()),
+            Some("0"),
+            "the entry transition starts at the starting value"
+        );
     }
 }

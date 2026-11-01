@@ -307,6 +307,7 @@ pub fn cascade_element_with_origins(
         &CascadeLookup {
             rule_index: None,
             style_queries: &NoStyleQueries,
+            include_starting_style: false,
         },
     )
 }
@@ -322,6 +323,14 @@ pub fn cascade_element_with_origins(
 pub(crate) struct CascadeLookup<'a> {
     pub(crate) rule_index: Option<&'a CascadeRuleIndex>,
     pub(crate) style_queries: &'a dyn StyleQueryEnvironment,
+    /// Whether rules from `@starting-style` blocks take part in this cascade.
+    ///
+    /// CSS Transitions 2 §3.3: those rules establish a starting style and
+    /// "do not apply to after-change style". The ordinary style computation
+    /// leaves this `false`; the starting-style pass sets it `true` and the
+    /// rules then cascade in their ordinary source position, so a normal
+    /// declaration with higher precedence still wins.
+    pub(crate) include_starting_style: bool,
 }
 
 /// [`cascade_element_with_origins`] with a prebuilt rule index and a source of
@@ -735,6 +744,11 @@ fn cascade_element_with_origins_impl(
         let source_tree_depth = tree_depth(dom, sheet_tree);
         for candidate_rule in candidate_rules {
             let rule = &source.sheet.rules[candidate_rule];
+            // CSS Transitions 2 §3.3: `@starting-style` declarations are only
+            // part of the starting style, never of the after-change style.
+            if rule.starting_style && !lookup.include_starting_style {
+                continue;
+            }
             if !rule
                 .media
                 .iter()
