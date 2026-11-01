@@ -7,19 +7,26 @@
 //! independent requests over one `Read + Write` transport and dispatches
 //! response frames to the correct stream.
 //!
-//! # Cleartext scope and the transport wiring point
+//! # Transport integration
 //!
-//! This turn deliberately stops at a cleartext (prior-knowledge) connection so
-//! the whole stack can be exercised against an in-process loopback server. TLS
-//! with ALPN `h2` is **not** wired yet. The exact integration point for the next
-//! turn is `HttpTransport::send_hop` in
-//! `crates/render-net/src/transport.rs`: after a connection is established with
-//! ALPN `h2` (or when the caller opts into cleartext prior knowledge), build an
-//! [`H2Connection`] over that stream, call [`H2Connection::send_request`], then
-//! [`H2Connection::read_response`], and translate [`H2Response`] into the
-//! existing `FetchResponse`. The hop loop in `HttpTransport::fetch_transfer`
-//! remains the owner of redirects, cookies, timeouts, and observers; no
-//! HTTP/1.1 code is changed by this module.
+//! The connection itself is transport-agnostic: [`H2Connection`] works over any
+//! `Read + Write` stream and still supports cleartext prior knowledge for tests.
+//! `HttpTransport` in `crates/render-net/src/transport.rs` owns TLS: it offers
+//! ALPN `h2` and `http/1.1`, and only constructs an [`H2Connection`] when the
+//! server selected `h2`. Other HTTPS origins keep the existing ureq HTTP/1.1
+//! path, and plain `http` origins never receive h2 prior knowledge implicitly.
+//!
+//! The transport pools one connection per origin behind a mutex. A request
+//! calls [`H2Connection::send_request`] and then polls with
+//! [`H2Connection::poll_frame`] (bounded by a socket read timeout) until
+//! [`H2Connection::take_response`] completes. Holding the socket lock for only
+//! one frame at a time lets independent streams take turns while frames for all
+//! of them are dispatched by stream id. Redirects, cookies, request validation,
+//! observers, and fetch phase budgets stay in `HttpTransport::fetch_transfer`.
+//! A server that negotiates anything other than `h2` uses HTTP/1.1; a TLS
+//! verification failure is reported as such. A protocol failure on an
+//! already-negotiated h2 connection evicts and reconnects rather than silently
+//! mixing protocols.
 //!
 //! # Explicit non-features
 //!

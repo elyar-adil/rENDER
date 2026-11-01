@@ -18,7 +18,7 @@ const MAX_GOAWAY_DEBUG: usize = 256;
 /// `SETTINGS_HEADER_TABLE_SIZE`. RFC 7541 permits an encoder to use less.
 const MAX_ENCODER_TABLE_SIZE: usize = 64 << 10;
 
-/// Configuration for a cleartext (prior-knowledge) HTTP/2 client connection.
+/// Configuration for an HTTP/2 client connection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct H2Config {
     /// Largest frame payload this endpoint accepts. Advertised through
@@ -238,14 +238,16 @@ struct PendingInboundHeaders {
     fragments: Vec<u8>,
 }
 
-/// A synchronous cleartext HTTP/2 client connection.
+/// A synchronous HTTP/2 client connection over any `Read + Write` transport.
 ///
-/// The caller owns a `Read + Write` transport. [`H2Connection::connect`] sends
+/// The caller owns the transport; it may be a cleartext loopback stream, a
+/// TLS stream with ALPN `h2`, or anything else. [`H2Connection::connect`] sends
 /// the client connection preface and SETTINGS, reads the server's initial
 /// SETTINGS, and acknowledges them. Multiple [`H2Connection::send_request`]
-/// calls can be outstanding on one connection; [`H2Connection::read_response`]
-/// dispatches frames to the requested stream, which is the multiplexing
-/// foundation the HTTP/1.1 transport currently lacks.
+/// calls can be outstanding on one connection; [`H2Connection::poll_frame`] and
+/// [`H2Connection::take_response`] let a shared transport dispatch frames for
+/// all streams, while [`H2Connection::read_response`] is the simple blocking
+/// form for a single owner.
 ///
 /// Scope boundaries:
 /// - **Server push** is not implemented. Receiving `PUSH_PROMISE` fails with
@@ -254,9 +256,9 @@ struct PendingInboundHeaders {
 ///   block of `HEADERS` are validated, counted in
 ///   [`H2Stats::priority_frames_ignored`], and otherwise ignored as RFC 9113
 ///   permits.
-/// - **TLS/ALPN** is outside this module. This type performs cleartext prior
-///   knowledge so it can be tested without the network. Wiring it behind rustls
-///   ALPN is the next transport step.
+/// - **TLS/ALPN** is outside this module. `HttpTransport` only builds this type
+///   after rustls negotiated ALPN `h2`; the type itself also supports cleartext
+///   prior knowledge for in-process tests.
 /// - Informational (1xx) responses are decoded and discarded while waiting
 ///   for the final response.
 pub struct H2Connection<S> {
@@ -268,9 +270,21 @@ pub struct H2Connection<S> {
     peer: PeerSettings,
     next_stream_id: u32,
     streams: HashMap<StreamId, Stream>,
+    /// Stream-scoped failures discovered while pumping frames on behalf of a
+    /// different stream. They are delivered to the affected stream's next
+    /// `take_response` / `read_response` call instead of failing the pump.
+    stream_errors: HashMap<StreamId, H2Error>,
     conn_send_window: i64,
     conn_recv_window: i64,
     pending_inbound: Option<PendingInboundHeaders>,
+    /// Bytes read from the transport but not yet split into complete frames.
+    ///
+    /// Keeping this buffer on the connection (rather than letting
+    /// `Frame::read_from` own a transient `read_exact` buffer) is what makes
+    /// [`H2Connection::poll_frame`] safe on a socket with a read timeout: a
+    /// timeout in the middle of a frame leaves the partial bytes here, and the
+    /// next poll resumes at the same frame boundary.
+    read_buffer: Vec<u8>,
     goaway: Option<(StreamId, ErrorCode, Vec<u8>)>,
     stats: H2Stats,
 }
@@ -303,9 +317,11 @@ impl<S: Read + Write> H2Connection<S> {
             peer: PeerSettings::default(),
             next_stream_id: 1,
             streams: HashMap::new(),
+            stream_errors: HashMap::new(),
             conn_send_window: INITIAL_CONNECTION_WINDOW,
             conn_recv_window: INITIAL_CONNECTION_WINDOW,
             pending_inbound: None,
+            read_buffer: Vec::new(),
             goaway: None,
             stats: H2Stats::default(),
         };
@@ -396,6 +412,107 @@ impl<S: Read + Write> H2Connection<S> {
         }
     }
 
+    /// Reads and dispatches at most one frame without blocking past the
+    /// transport's read timeout.
+    ///
+    /// Returns `Ok(false)` when the underlying `Read` yielded
+    /// [`std::io::ErrorKind::WouldBlock`] (or `TimedOut`) before a complete
+    /// frame arrived. Partial frame bytes are retained on the connection, so a
+    /// later poll resumes exactly at the same frame boundary.
+    ///
+    /// Stream-scoped failures are stored and delivered by
+    /// [`H2Connection::take_response`] for the affected stream, so pumping a
+    /// frame for one request does not fail another request that happens to be
+    /// sharing the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a connection-level [`H2Error`] (`GOAWAY`, I/O failure, EOF, or
+    /// a protocol error) that makes the whole connection unusable.
+    pub fn poll_frame(&mut self) -> Result<bool, H2Error> {
+        self.ensure_open()?;
+        let Some(frame) = self.try_read_frame()? else {
+            return Ok(false);
+        };
+        match self.handle_frame(&frame) {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                self.report_error(&error);
+                if error.is_connection_error()
+                    || matches!(
+                        error,
+                        H2Error::GoAway { .. } | H2Error::ConnectionClosed | H2Error::Io(_)
+                    )
+                {
+                    Err(error)
+                } else if let Some(stream_id) = error.stream_id() {
+                    self.stream_errors.insert(stream_id, error);
+                    Ok(true)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    /// Removes and returns a completed response, or reports a stream-scoped
+    /// failure recorded by [`H2Connection::poll_frame`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the recorded stream error (for example `RST_STREAM`, a body
+    /// limit, or a response header violation), or
+    /// [`H2Error::InvalidRequest`] when `stream_id` was not opened here.
+    pub fn take_response(&mut self, stream_id: StreamId) -> Result<Option<H2Response>, H2Error> {
+        if let Some(error) = self.stream_errors.remove(&stream_id) {
+            self.streams.remove(&stream_id);
+            return Err(error);
+        }
+        let Some(response) = self.completed_response(stream_id)? else {
+            return Ok(None);
+        };
+        self.streams.remove(&stream_id);
+        Ok(Some(response))
+    }
+
+    /// The response status once the final response headers have arrived.
+    #[must_use]
+    pub fn response_status(&self, stream_id: StreamId) -> Option<u16> {
+        self.streams
+            .get(&stream_id)
+            .and_then(|stream| stream.response_status)
+    }
+
+    /// Bytes of response body accepted so far for `stream_id`.
+    #[must_use]
+    pub fn response_body_len(&self, stream_id: StreamId) -> Option<usize> {
+        self.streams.get(&stream_id).map(|stream| stream.body.len())
+    }
+
+    /// Best-effort `RST_STREAM(CANCEL)` for a stream the caller abandoned.
+    ///
+    /// The stream is removed from the connection either way. A closed
+    /// connection is left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O or frame serialization error when the reset could not be
+    /// written. The stream is still removed.
+    pub fn cancel_stream(&mut self, stream_id: StreamId) -> Result<(), H2Error> {
+        let Some(stream) = self.streams.get_mut(&stream_id) else {
+            return Ok(());
+        };
+        let already_closed = stream.state == StreamState::Closed;
+        stream.state = StreamState::Closed;
+        let connection_closed = self.state == ConnectionState::Closed;
+        self.streams.remove(&stream_id);
+        self.stream_errors.remove(&stream_id);
+        if already_closed || connection_closed {
+            return Ok(());
+        }
+        self.write_frame(&Frame::rst_stream(stream_id, ErrorCode::Cancel))
+    }
+
     /// Sends a `GOAWAY(NO_ERROR)` and closes the local side.
     ///
     /// # Errors
@@ -436,6 +553,13 @@ impl<S: Read + Write> H2Connection<S> {
     #[must_use]
     pub const fn is_closed(&self) -> bool {
         matches!(self.state, ConnectionState::Closed)
+    }
+
+    /// The underlying transport, for querying or changing socket options
+    /// between operations (for example a read timeout used while polling).
+    #[must_use]
+    pub const fn io(&self) -> &S {
+        &self.io
     }
 
     fn write_connection_preface(&mut self) -> Result<(), H2Error> {
@@ -640,20 +764,71 @@ impl<S: Read + Write> H2Connection<S> {
     }
 
     fn read_next_frame(&mut self) -> Result<Frame, H2Error> {
-        match Frame::read_from(&mut self.io, self.config.max_frame_size) {
-            Ok(frame) => {
-                self.stats.frames_read += 1;
-                Ok(frame)
+        self.try_read_frame()?.ok_or_else(|| {
+            self.state = ConnectionState::Closed;
+            H2Error::Io("timed out waiting for the next HTTP/2 frame".to_owned())
+        })
+    }
+
+    /// Reads until one complete frame is buffered, returning `None` if the
+    /// transport timed out with no new bytes.
+    ///
+    /// `Frame::read_from` cannot be used here: its `read_exact` state is local,
+    /// so a timeout after a partial frame would lose those bytes. This
+    /// connection owns the unparsed prefix instead.
+    fn try_read_frame(&mut self) -> Result<Option<Frame>, H2Error> {
+        loop {
+            if self.read_buffer.len() >= 9 {
+                let length = (u32::from(self.read_buffer[0]) << 16)
+                    | (u32::from(self.read_buffer[1]) << 8)
+                    | u32::from(self.read_buffer[2]);
+                if length > self.config.max_frame_size {
+                    self.state = ConnectionState::Closed;
+                    return Err(H2Error::Frame(FrameError::connection(
+                        ErrorCode::FrameSizeError,
+                        format!(
+                            "frame length {length} exceeds configured maximum {}",
+                            self.config.max_frame_size
+                        ),
+                    )));
+                }
+                let total = 9 + usize::try_from(length).unwrap_or(usize::MAX);
+                if self.read_buffer.len() >= total {
+                    let bytes: Vec<u8> = self.read_buffer.drain(..total).collect();
+                    self.stats.frames_read += 1;
+                    let frame = Frame::decode(&bytes, self.config.max_frame_size)
+                        .map_err(H2Error::Frame)?;
+                    return Ok(Some(frame));
+                }
             }
-            Err(FrameError::Closed) => {
-                self.state = ConnectionState::Closed;
-                Err(H2Error::ConnectionClosed)
+
+            let mut chunk = [0_u8; 16 * 1024];
+            match self.io.read(&mut chunk) {
+                Ok(0) => {
+                    self.state = ConnectionState::Closed;
+                    return if self.read_buffer.is_empty() {
+                        Err(H2Error::ConnectionClosed)
+                    } else {
+                        Err(H2Error::Io(
+                            "connection ended inside an HTTP/2 frame".to_owned(),
+                        ))
+                    };
+                }
+                Ok(count) => self.read_buffer.extend_from_slice(&chunk[..count]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    self.state = ConnectionState::Closed;
+                    return Err(H2Error::Io(error.to_string()));
+                }
             }
-            Err(FrameError::Io(message)) => {
-                self.state = ConnectionState::Closed;
-                Err(H2Error::Io(message))
-            }
-            Err(error) => Err(H2Error::Frame(error)),
         }
     }
 
@@ -837,8 +1012,12 @@ impl<S: Read + Write> H2Connection<S> {
         let increment = u32::try_from(flow_length).unwrap_or(0);
         if increment > 0 {
             self.send_window_update(StreamId::CONNECTION, increment)?;
+            self.conn_recv_window += i64::from(increment);
             if !end_stream {
                 self.send_window_update(stream_id, increment)?;
+                if let Some(stream) = self.streams.get_mut(&stream_id) {
+                    stream.recv_window += i64::from(increment);
+                }
             }
         }
         Ok(())

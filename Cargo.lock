@@ -2081,6 +2081,7 @@ dependencies = [
  "rustls",
  "ureq",
  "url",
+ "webpki-roots",
 ]
 
 [[package]]

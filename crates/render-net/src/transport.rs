@@ -1,7 +1,9 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Read;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{
-    Arc, RwLock,
+    Arc, Mutex, RwLock,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -9,11 +11,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use ureq::ResponseExt;
 use url::Url;
 
 use crate::CookieJar;
 use crate::diagnostics::{FetchEvent, FetchObserver, FetchPhase, StderrObserver};
+use crate::h2::{H2Config, H2Connection, H2Error, H2Request, H2Response, StreamId};
 use crate::{DEFAULT_PER_ORIGIN_CONCURRENCY, ORIGINS_BEFORE_TOTAL_CEILING};
 
 /// Minimum average body throughput once [`FetchConfig::body_idle_timeout`]
@@ -23,6 +28,21 @@ use crate::{DEFAULT_PER_ORIGIN_CONCURRENCY, ORIGINS_BEFORE_TOTAL_CEILING};
 /// keeps making progress must not spuriously fail), so this floor bounds how
 /// long a connection that only trickles bytes can pin a worker thread.
 const MIN_BODY_BYTES_PER_SECOND: usize = 1024;
+
+/// How long one request may hold the per-connection socket lock while waiting
+/// for a frame before yielding it to the other multiplexed streams.
+///
+/// The mutex is what serialises socket access for a shared `H2Connection`; the
+/// bound is what keeps one idle stream from preventing another from sending a
+/// request. Frames themselves are still multiplexed and dispatched by stream
+/// id as they arrive.
+const H2_POLL_READ_TIMEOUT: Duration = Duration::from_millis(20);
+
+/// Request bodies up to the default HTTP/2 initial stream window are sent
+/// without needing a `WINDOW_UPDATE` during the request. Larger uploads use
+/// the HTTP/1.1 path rather than parking a shared h2 connection in its
+/// flow-control pump.
+const H2_MAX_INLINE_BODY: usize = 60 * 1024;
 
 /// Cooperative cancellation shared by a request and its caller.
 #[derive(Clone, Debug, Default)]
@@ -898,6 +918,780 @@ struct TransportAgent {
     /// the platform, rather than handed in by a caller. See
     /// [`HttpTransport::new`].
     implicit_proxy: bool,
+    /// Whether any proxy is configured at all. HTTP/2 is only attempted when
+    /// the hop is direct: a proxied origin stays on the HTTP/1.1 path (which
+    /// uses ureq's CONNECT support), never bypassing the proxy.
+    has_proxy: bool,
+}
+
+/// One origin (`https` host and port) whose HTTP/2 connection is pooled.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct H2Origin {
+    host: String,
+    port: u16,
+}
+
+impl H2Origin {
+    fn from_url(url: &Url) -> Option<Self> {
+        if url.scheme() != "https" {
+            return None;
+        }
+        Some(Self {
+            host: url.host_str()?.to_owned(),
+            port: url.port_or_known_default()?,
+        })
+    }
+
+    /// The `:authority` value, including a bracketed IPv6 literal and a
+    /// non-default port.
+    fn authority(&self) -> String {
+        let host = if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        if self.port == 443 {
+            host
+        } else {
+            format!("{host}:{}", self.port)
+        }
+    }
+
+    fn server_name(&self) -> Result<ServerName<'static>, FetchError> {
+        // `Url::host_str` keeps the brackets around an IPv6 literal, but
+        // `ServerName` expects the bare address (or a DNS name).
+        let host = self
+            .host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_owned();
+        ServerName::try_from(host)
+            .map_err(|_| FetchError::InvalidUrl(format!("invalid TLS server name {:?}", self.host)))
+    }
+}
+
+type H2Stream = StreamOwned<ClientConnection, TcpStream>;
+
+/// A shared HTTP/2 connection plus the mutex that serialises socket access.
+///
+/// The socket itself can only be read by one thread at a time. Each streaming
+/// request holds the mutex for at most [`H2_POLL_READ_TIMEOUT`] while waiting
+/// for a frame, then releases it so another stream can send or consume its
+/// response. A request write briefly holds the same mutex and is bounded by the
+/// socket write timeout. Frames for all streams on the connection are
+/// dispatched by stream id by [`H2Connection::poll_frame`], so the requests do
+/// share one TCP connection even though byte-level socket access is serialised.
+struct H2Entry {
+    connection: Mutex<H2Connection<H2Stream>>,
+}
+
+/// Per-origin HTTP/2 connection pool.
+///
+/// Direct `https` origins only. A hop that inherits an HTTP proxy is never
+/// given an h2 connection here: it stays on ureq's HTTP/1.1 path, which already
+/// performs the `CONNECT` tunnel, so no request can silently bypass a proxy.
+struct H2Pool {
+    tls: Arc<ClientConfig>,
+    entries: Mutex<HashMap<H2Origin, Arc<H2Entry>>>,
+    /// Per-origin creation locks: concurrent first fetches must not race into
+    /// opening several connections that would immediately be discarded, while
+    /// different origins still establish their connections in parallel.
+    connect_locks: Mutex<HashMap<H2Origin, Arc<Mutex<()>>>>,
+    /// Origins whose TLS server selected ALPN `http/1.1` (or no ALPN). They are
+    /// sent straight to ureq on later requests instead of paying a probe
+    /// handshake every time.
+    http1_only: Mutex<HashSet<H2Origin>>,
+    max_entries: usize,
+}
+
+struct H2Failure {
+    error: FetchError,
+    phase: FetchPhase,
+    /// The connection is unusable and must leave the pool.
+    evict: bool,
+    /// No response headers were seen, so a safe method may be retried once.
+    retry: bool,
+}
+
+enum H2AttemptError {
+    /// The server negotiated HTTP/1.1 or no ALPN; use the ureq path.
+    FallbackHttp1(String),
+    Failed(H2Failure),
+}
+
+impl H2Pool {
+    fn new(config: &FetchConfig) -> Self {
+        let roots = RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        Self::with_roots(config, roots)
+    }
+
+    fn with_roots(config: &FetchConfig, roots: RootCertStore) -> Self {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut tls = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("the ring provider supports the default TLS versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        // Advertising `http/1.1` as well as `h2` is what lets an origin that
+        // only speaks HTTP/1.1 complete the probe and fall back cleanly.
+        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Self {
+            tls: Arc::new(tls),
+            entries: Mutex::new(HashMap::new()),
+            connect_locks: Mutex::new(HashMap::new()),
+            http1_only: Mutex::new(HashSet::new()),
+            max_entries: config.idle_connections_total.max(1),
+        }
+    }
+
+    fn is_http1_only(&self, origin: &H2Origin) -> bool {
+        self.http1_only
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(origin)
+    }
+
+    fn mark_http1_only(&self, origin: &H2Origin) {
+        self.http1_only
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(origin.clone());
+    }
+
+    fn remove(&self, origin: &H2Origin, entry: &Arc<H2Entry>) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if entries
+            .get(origin)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            entries.remove(origin);
+        }
+    }
+
+    fn entry_for(
+        &self,
+        origin: &H2Origin,
+        config: &FetchConfig,
+        cancel: &CancelToken,
+    ) -> Result<Arc<H2Entry>, H2AttemptError> {
+        let existing = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(origin)
+            .cloned();
+        if let Some(entry) = existing {
+            let closed = entry
+                .connection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_closed();
+            if !closed {
+                return Ok(entry);
+            }
+            self.remove(origin, &entry);
+        }
+
+        let creation_lock = self
+            .connect_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(origin.clone())
+            .or_default()
+            .clone();
+        let _connecting = creation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Another request may have established the connection while this one
+        // waited for the creation lock.
+        let existing = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(origin)
+            .cloned();
+        if let Some(entry) = existing {
+            let closed = entry
+                .connection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_closed();
+            if !closed {
+                return Ok(entry);
+            }
+            self.remove(origin, &entry);
+        }
+
+        let connection = self.connect(origin, config, cancel)?;
+        let entry = Arc::new(H2Entry {
+            connection: Mutex::new(connection),
+        });
+
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if entries.len() >= self.max_entries
+            && let Some(victim) = entries.keys().find(|key| *key != origin).cloned()
+        {
+            entries.remove(&victim);
+        }
+        entries.insert(origin.clone(), Arc::clone(&entry));
+        drop(entries);
+        Ok(entry)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "TCP, TLS, ALPN, and the HTTP/2 preface belong to one bounded connect pipeline"
+    )]
+    fn connect(
+        &self,
+        origin: &H2Origin,
+        config: &FetchConfig,
+        cancel: &CancelToken,
+    ) -> Result<H2Connection<H2Stream>, H2AttemptError> {
+        let started = Instant::now();
+        let connect_timeout = config.effective_connect_timeout();
+        if cancel.is_cancelled() {
+            return Err(H2AttemptError::Failed(H2Failure {
+                error: FetchError::Cancelled,
+                phase: FetchPhase::TcpConnect,
+                evict: false,
+                retry: false,
+            }));
+        }
+
+        let resolve_host = origin.host.trim_start_matches('[').trim_end_matches(']');
+        let addresses =
+            resolve_h2(resolve_host, origin.port, connect_timeout).map_err(|error| {
+                H2AttemptError::Failed(H2Failure {
+                    error,
+                    phase: FetchPhase::Dns,
+                    evict: false,
+                    retry: false,
+                })
+            })?;
+        let server_name = origin.server_name().map_err(|error| {
+            H2AttemptError::Failed(H2Failure {
+                error,
+                phase: FetchPhase::TlsHandshake,
+                evict: false,
+                retry: false,
+            })
+        })?;
+
+        let mut last_error = None;
+        let mut socket = None;
+        for address in addresses {
+            let remaining = connect_timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            match TcpStream::connect_timeout(&address, remaining) {
+                Ok(stream) => {
+                    socket = Some(stream);
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        let Some(socket) = socket else {
+            let error = if started.elapsed() >= connect_timeout {
+                FetchError::Timeout
+            } else {
+                FetchError::Io(last_error.map_or_else(
+                    || "no address resolved".to_owned(),
+                    |error| error.to_string(),
+                ))
+            };
+            return Err(H2AttemptError::Failed(H2Failure {
+                error,
+                phase: FetchPhase::TcpConnect,
+                evict: false,
+                retry: false,
+            }));
+        };
+
+        let handshake_budget = connect_timeout.saturating_sub(started.elapsed()).max(
+            // A zero remaining budget would disable the timeout entirely on
+            // some platforms; keep a tiny positive bound instead.
+            Duration::from_millis(1),
+        );
+        let _ = socket.set_nodelay(true);
+        let _ = socket.set_read_timeout(Some(handshake_budget));
+        let _ = socket.set_write_timeout(Some(handshake_budget));
+
+        let client =
+            ClientConnection::new(Arc::clone(&self.tls), server_name).map_err(|error| {
+                H2AttemptError::Failed(H2Failure {
+                    error: FetchError::Tls(error.to_string()),
+                    phase: FetchPhase::TlsHandshake,
+                    evict: false,
+                    retry: false,
+                })
+            })?;
+        let mut stream = StreamOwned::new(client, socket);
+        {
+            let StreamOwned { conn, sock } = &mut stream;
+            if let Err(error) = conn.complete_io(sock) {
+                let timed_out = matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                );
+                let error = if timed_out {
+                    FetchError::Timeout
+                } else if let Some(tls_error) = rustls_error_from_io(&error) {
+                    FetchError::Tls(tls_error.to_string())
+                } else {
+                    FetchError::Tls(error.to_string())
+                };
+                return Err(H2AttemptError::Failed(H2Failure {
+                    error,
+                    phase: FetchPhase::TlsHandshake,
+                    evict: false,
+                    retry: false,
+                }));
+            }
+        }
+
+        if stream.conn.alpn_protocol() != Some(b"h2".as_slice()) {
+            let negotiated = stream.conn.alpn_protocol().map_or_else(
+                || "none".to_owned(),
+                |protocol| String::from_utf8_lossy(protocol).into_owned(),
+            );
+            drop(stream);
+            return Err(H2AttemptError::FallbackHttp1(format!(
+                "ALPN negotiated {negotiated}, not h2"
+            )));
+        }
+
+        // The initial SETTINGS exchange runs inside the connect budget; only
+        // afterwards is the socket switched to the short polling timeout that
+        // lets all multiplexed streams take turns.
+        let h2_config = H2Config {
+            max_body_size: config.max_body_bytes,
+            max_header_list_size: u32::try_from(config.max_header_bytes).unwrap_or(u32::MAX),
+            max_header_block_size: config.max_header_bytes.max(1024),
+            ..H2Config::default()
+        };
+        let connection = H2Connection::connect(stream, h2_config).map_err(|error| {
+            let timed_out = started.elapsed() >= connect_timeout;
+            let (error, phase) = if timed_out {
+                (FetchError::Timeout, FetchPhase::TcpConnect)
+            } else {
+                (map_h2_error(&error, config), FetchPhase::TlsHandshake)
+            };
+            H2AttemptError::Failed(H2Failure {
+                error,
+                phase,
+                evict: false,
+                retry: false,
+            })
+        })?;
+
+        let socket = connection_socket(&connection);
+        let _ = socket.set_read_timeout(Some(H2_POLL_READ_TIMEOUT));
+        let _ = socket.set_write_timeout(Some(config.effective_response_timeout()));
+        Ok(connection)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the pool forwards the already-prepared hop request without rebuilding it"
+    )]
+    fn send(
+        &self,
+        origin: &H2Origin,
+        config: &FetchConfig,
+        method: HttpMethod,
+        url: &Url,
+        headers: &[(String, String)],
+        body: Option<&[u8]>,
+        cancel: &CancelToken,
+    ) -> Result<H2Response, H2AttemptError> {
+        let mut attempt = 0;
+        loop {
+            let entry = self.entry_for(origin, config, cancel)?;
+            match send_h2_request(&entry, config, method, url, headers, body, cancel) {
+                Ok(response) => return Ok(response),
+                Err(failure) => {
+                    if failure.evict {
+                        self.remove(origin, &entry);
+                    }
+                    let safe_to_retry = matches!(
+                        method,
+                        HttpMethod::Get
+                            | HttpMethod::Head
+                            | HttpMethod::Options
+                            | HttpMethod::Put
+                            | HttpMethod::Delete
+                    );
+                    if failure.retry && safe_to_retry && attempt == 0 {
+                        attempt = 1;
+                        continue;
+                    }
+                    return Err(H2AttemptError::Failed(failure));
+                }
+            }
+        }
+    }
+}
+
+/// The socket behind a connected [`H2Connection`], used to change timeouts
+/// after the handshake.
+fn connection_socket(connection: &H2Connection<H2Stream>) -> &TcpStream {
+    &connection.io().sock
+}
+
+/// Resolves `host:port` in a worker so a stuck resolver cannot outlive the
+/// connect budget. A timed-out resolver thread is abandoned; the OS resolver
+/// has no cancellation API.
+fn resolve_h2(host: &str, port: u16, timeout: Duration) -> Result<Vec<SocketAddr>, FetchError> {
+    let host = host.to_owned();
+    let (sender, receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name("render-net-h2-resolve".to_owned())
+        .spawn(move || {
+            let result = (host.as_str(), port)
+                .to_socket_addrs()
+                .map(std::iter::Iterator::collect::<Vec<_>>)
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        })
+        .map_err(|error| FetchError::Transport(format!("resolver spawn failed: {error}")))?;
+    match receiver.recv_timeout(timeout) {
+        Ok(Ok(addresses)) if !addresses.is_empty() => Ok(addresses),
+        Ok(Ok(_)) => Err(FetchError::Dns),
+        Ok(Err(message)) => Err(FetchError::Io(message)),
+        Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+            Err(FetchError::Timeout)
+        }
+    }
+}
+
+fn map_h2_error(error: &H2Error, config: &FetchConfig) -> FetchError {
+    match error {
+        H2Error::ConnectionClosed | H2Error::Io(_) => FetchError::Io(error.to_string()),
+        H2Error::GoAway { .. } | H2Error::Protocol { .. } | H2Error::Frame(_) => {
+            FetchError::Protocol(error.to_string())
+        }
+        H2Error::Hpack(_) => FetchError::Protocol(format!("HPACK: {error}")),
+        H2Error::StreamReset { .. } | H2Error::Stream { .. } => {
+            if let H2Error::Stream { detail, .. } = error
+                && detail.starts_with("response body exceeds limit")
+            {
+                return FetchError::BodyLimitExceeded {
+                    limit: config.max_body_bytes,
+                };
+            }
+            FetchError::Protocol(error.to_string())
+        }
+        H2Error::ResponseBodyTooLarge { .. } => FetchError::BodyLimitExceeded {
+            limit: config.max_body_bytes,
+        },
+        H2Error::HeaderBlockTooLarge { .. } | H2Error::HeaderListTooLarge { .. } => {
+            FetchError::HeaderLimitExceeded {
+                limit: config.max_header_bytes,
+            }
+        }
+        H2Error::InvalidRequest(message) => FetchError::InvalidRequest(message.clone()),
+        H2Error::InvalidConfig(message) => FetchError::Transport(message.clone()),
+        H2Error::ConcurrentStreamLimit { limit } => {
+            FetchError::Transport(format!("HTTP/2 concurrent stream limit {limit} reached"))
+        }
+        H2Error::StreamIdExhausted => {
+            FetchError::Transport("HTTP/2 stream identifier space exhausted".to_owned())
+        }
+        H2Error::Unsupported(feature) => {
+            FetchError::Transport(format!("unsupported HTTP/2 feature: {feature}"))
+        }
+    }
+}
+
+fn is_h2_forbidden_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "transfer-encoding"
+            | "upgrade"
+            | "accept-encoding"
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "send and the polling read loop share one stream id and one set of deadlines"
+)]
+fn send_h2_request(
+    entry: &H2Entry,
+    config: &FetchConfig,
+    method: HttpMethod,
+    url: &Url,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    cancel: &CancelToken,
+) -> Result<H2Response, H2Failure> {
+    let authority = H2Origin::from_url(url).map_or_else(
+        || url.host_str().unwrap_or_default().to_owned(),
+        |origin| origin.authority(),
+    );
+    let mut path = url.path().to_owned();
+    if let Some(query) = url.query() {
+        if !query.is_empty() {
+            path.push('?');
+            path.push_str(query);
+        }
+    } else if path.is_empty() {
+        path.push('/');
+    }
+
+    let mut request = H2Request::new(method.as_str(), "https", authority, path);
+    let mut has_user_agent = false;
+    for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        if lower == "user-agent" {
+            has_user_agent = true;
+        }
+        if is_h2_forbidden_header(&lower) {
+            continue;
+        }
+        request = request.with_header(lower, value);
+    }
+    if !has_user_agent {
+        request = request.with_header("user-agent", &config.user_agent);
+    }
+    // The h2 path has no content decoder, so it must not claim an encoding it
+    // cannot undo. Caller-supplied `Accept-Encoding` is dropped above for the
+    // same reason; ureq's HTTP/1.1 path keeps its gzip behaviour.
+    request = request.with_header("accept-encoding", "identity");
+    if let Some(body) = body {
+        request = request.with_body(body.to_vec());
+    }
+
+    let send_started = Instant::now();
+    let stream_id = {
+        let mut connection = entry
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if connection.is_closed() {
+            return Err(H2Failure {
+                error: FetchError::Protocol("HTTP/2 connection is closed".to_owned()),
+                phase: FetchPhase::RequestSend,
+                evict: true,
+                retry: true,
+            });
+        }
+        connection.send_request(&request).map_err(|error| {
+            let connection_error = error.is_connection_error()
+                || matches!(error, H2Error::ConnectionClosed | H2Error::Io(_));
+            H2Failure {
+                error: map_h2_error(&error, config),
+                phase: FetchPhase::RequestSend,
+                evict: connection_error,
+                retry: connection_error,
+            }
+        })?
+    };
+
+    let response_timeout = config.effective_response_timeout();
+    let body_idle = config.effective_body_idle_timeout();
+    let headers_deadline = send_started + response_timeout;
+    let mut status_seen = false;
+    let mut body_started = Instant::now();
+    let mut last_progress = Instant::now();
+    let mut last_body_len = 0_usize;
+
+    loop {
+        if cancel.is_cancelled() {
+            cancel_h2_stream(entry, stream_id);
+            return Err(H2Failure {
+                error: FetchError::Cancelled,
+                phase: FetchPhase::RequestSend,
+                evict: false,
+                retry: false,
+            });
+        }
+
+        let now = Instant::now();
+        if !status_seen && now >= headers_deadline {
+            cancel_h2_stream(entry, stream_id);
+            return Err(H2Failure {
+                error: FetchError::Timeout,
+                phase: FetchPhase::ResponseHeaders,
+                evict: false,
+                retry: false,
+            });
+        }
+
+        let mut completed = None;
+        let mut stream_error = None;
+        let mut connection_error = None;
+        {
+            let mut connection = entry
+                .connection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match connection.take_response(stream_id) {
+                Ok(Some(response)) => completed = Some(response),
+                Ok(None) => {
+                    if connection.response_status(stream_id).is_some() && !status_seen {
+                        status_seen = true;
+                        body_started = Instant::now();
+                        last_progress = body_started;
+                    }
+                    if status_seen {
+                        let body_len = connection.response_body_len(stream_id).unwrap_or(0);
+                        if body_len > last_body_len {
+                            last_body_len = body_len;
+                            last_progress = Instant::now();
+                        }
+                    }
+                    match connection.poll_frame() {
+                        Ok(_) => {}
+                        Err(error) => connection_error = Some(error),
+                    }
+                    if connection_error.is_none() {
+                        match connection.take_response(stream_id) {
+                            Ok(response) => completed = response,
+                            Err(error) => stream_error = Some(error),
+                        }
+                        if stream_error.is_none() && status_seen {
+                            let body_len = connection.response_body_len(stream_id).unwrap_or(0);
+                            if body_len > last_body_len {
+                                last_body_len = body_len;
+                                last_progress = Instant::now();
+                            }
+                        }
+                    }
+                }
+                Err(error) => stream_error = Some(error),
+            }
+        }
+
+        if let Some(response) = completed {
+            return Ok(response);
+        }
+        if let Some(error) = stream_error {
+            cancel_h2_stream(entry, stream_id);
+            return Err(H2Failure {
+                error: map_h2_error(&error, config),
+                phase: FetchPhase::BodyTransfer,
+                evict: false,
+                retry: false,
+            });
+        }
+        if let Some(error) = connection_error {
+            let evict = error.is_connection_error()
+                || matches!(
+                    error,
+                    H2Error::ConnectionClosed | H2Error::Io(_) | H2Error::GoAway { .. }
+                );
+            return Err(H2Failure {
+                error: map_h2_error(&error, config),
+                phase: if status_seen {
+                    FetchPhase::BodyTransfer
+                } else {
+                    FetchPhase::ResponseHeaders
+                },
+                evict,
+                retry: evict && !status_seen,
+            });
+        }
+
+        let now = Instant::now();
+        if status_seen {
+            if now.duration_since(last_progress) >= body_idle {
+                cancel_h2_stream(entry, stream_id);
+                return Err(H2Failure {
+                    error: FetchError::Timeout,
+                    phase: FetchPhase::BodyTransfer,
+                    evict: false,
+                    retry: false,
+                });
+            }
+            let body_elapsed = now.duration_since(body_started);
+            if body_elapsed > body_idle {
+                let elapsed_seconds = body_elapsed.as_secs().max(1);
+                let minimum = MIN_BODY_BYTES_PER_SECOND
+                    .saturating_mul(usize::try_from(elapsed_seconds).unwrap_or(usize::MAX));
+                if last_body_len < minimum {
+                    cancel_h2_stream(entry, stream_id);
+                    return Err(H2Failure {
+                        error: FetchError::Timeout,
+                        phase: FetchPhase::BodyTransfer,
+                        evict: false,
+                        retry: false,
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn cancel_h2_stream(entry: &H2Entry, stream_id: StreamId) {
+    let mut connection = entry
+        .connection
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = connection.cancel_stream(stream_id);
+}
+
+/// The wire response of one hop, before the transport converts it to a
+/// [`FetchResponse`]. HTTP/2 bodies are already fully assembled by the h2
+/// connection; HTTP/1.1 bodies are still streamed from ureq.
+enum HopResponse {
+    Http1(ureq::http::Response<ureq::Body>),
+    Http2(H2Response),
+}
+
+impl HopResponse {
+    fn status(&self) -> u16 {
+        match self {
+            Self::Http1(response) => response.status().as_u16(),
+            Self::Http2(response) => response.status,
+        }
+    }
+
+    fn headers(&self) -> Vec<Header> {
+        match self {
+            Self::Http1(response) => response
+                .headers()
+                .iter()
+                .map(|(name, value)| Header {
+                    name: name.as_str().to_owned(),
+                    value: value.as_bytes().to_vec(),
+                })
+                .collect(),
+            Self::Http2(response) => response
+                .headers
+                .iter()
+                .map(|field| Header {
+                    name: String::from_utf8_lossy(&field.name).into_owned(),
+                    value: field.value.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn final_url(&self, current_url: &Url, request_url: &Url) -> Result<Url, FetchError> {
+        match self {
+            Self::Http1(response) => Ok(normalize_redirect_url(
+                Url::parse(&response.get_uri().to_string())
+                    .map_err(|error| FetchError::InvalidUrl(error.to_string()))?,
+                request_url,
+            )),
+            Self::Http2(_) => Ok(normalize_redirect_url(current_url.clone(), request_url)),
+        }
+    }
 }
 
 /// Cloneable blocking HTTP transport. Call this on a network thread, or use
@@ -907,10 +1701,17 @@ struct TransportAgent {
 /// applied without restarting the worker pool or cancelling requests already in
 /// flight: each fetch snapshots the agent it starts with, and only later fetches
 /// see the new proxy.
+///
+/// HTTPS hops negotiate ALPN `h2` first. When the origin supports it, requests
+/// to that origin share one multiplexed HTTP/2 connection; otherwise the hop
+/// uses ureq's HTTP/1.1 path. Hops that inherit an HTTP proxy always stay on
+/// HTTP/1.1 (ureq's `CONNECT` tunnel), so h2 can never bypass a configured
+/// proxy. Plain `http` URLs also stay on HTTP/1.1.
 #[derive(Clone)]
 pub struct HttpTransport {
     config: Arc<FetchConfig>,
     agent: Arc<RwLock<TransportAgent>>,
+    h2: Arc<H2Pool>,
 }
 
 impl fmt::Debug for HttpTransport {
@@ -942,10 +1743,18 @@ fn hop_proxy(implicit_proxy: bool, url: &Url) -> HopProxy {
 }
 
 fn build_agent(config: &FetchConfig, proxy: Option<ureq::Proxy>) -> ureq::Agent {
+    build_agent_with_tls(config, proxy, None)
+}
+
+fn build_agent_with_tls(
+    config: &FetchConfig,
+    proxy: Option<ureq::Proxy>,
+    tls: Option<ureq::tls::TlsConfig>,
+) -> ureq::Agent {
     let connect_timeout = config.effective_connect_timeout();
     let response_timeout = config.effective_response_timeout();
     let body_idle_timeout = config.effective_body_idle_timeout();
-    ureq::Agent::config_builder()
+    let builder = ureq::Agent::config_builder()
         .http_status_as_error(false)
         // Redirects are handled here so intermediate response headers are
         // available to the browser cookie jar.
@@ -1010,9 +1819,13 @@ fn build_agent(config: &FetchConfig, proxy: Option<ureq::Proxy>) -> ureq::Agent 
         .max_idle_connections(config.idle_connections_total)
         .max_idle_connections_per_host(config.idle_connections_per_origin)
         .user_agent(config.user_agent.clone())
-        .proxy(proxy)
-        .build()
-        .into()
+        .proxy(proxy);
+    let builder = if let Some(tls) = tls {
+        builder.tls_config(tls)
+    } else {
+        builder
+    };
+    builder.build().into()
 }
 
 impl HttpTransport {
@@ -1041,13 +1854,17 @@ impl HttpTransport {
             );
         }
         let implicit_proxy = proxy.is_some();
+        let has_proxy = proxy.is_some();
         let agent = build_agent(&config, proxy);
+        let h2 = Arc::new(H2Pool::new(&config));
         Self {
             config: Arc::new(config),
             agent: Arc::new(RwLock::new(TransportAgent {
                 agent,
                 implicit_proxy,
+                has_proxy,
             })),
+            h2,
         }
     }
 
@@ -1057,13 +1874,17 @@ impl HttpTransport {
     /// used for every target, including loopback addresses.
     #[must_use]
     pub fn with_http_proxy(config: FetchConfig, proxy: Option<HttpProxyConfig>) -> Self {
+        let has_proxy = proxy.is_some();
         let agent = build_agent(&config, proxy.map(|proxy| proxy.proxy));
+        let h2 = Arc::new(H2Pool::new(&config));
         Self {
             config: Arc::new(config),
             agent: Arc::new(RwLock::new(TransportAgent {
                 agent,
                 implicit_proxy: false,
+                has_proxy,
             })),
+            h2,
         }
     }
 
@@ -1074,6 +1895,7 @@ impl HttpTransport {
     /// Passing `None` means direct connections; it does not re-read the
     /// environment.
     pub fn set_http_proxy(&self, proxy: Option<HttpProxyConfig>) {
+        let has_proxy = proxy.is_some();
         let agent = build_agent(&self.config, proxy.map(|proxy| proxy.proxy));
         let mut state = self
             .agent
@@ -1081,6 +1903,7 @@ impl HttpTransport {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.agent = agent;
         state.implicit_proxy = false;
+        state.has_proxy = has_proxy;
     }
 
     /// Creates a transport that routes every request through `proxy` when set.
@@ -1093,13 +1916,38 @@ impl HttpTransport {
     /// target bypasses the proxy.
     #[must_use]
     pub fn with_proxy(config: FetchConfig, proxy: Option<ureq::Proxy>) -> Self {
+        let has_proxy = proxy.is_some();
         let agent = build_agent(&config, proxy);
+        let h2 = Arc::new(H2Pool::new(&config));
         Self {
             config: Arc::new(config),
             agent: Arc::new(RwLock::new(TransportAgent {
                 agent,
                 implicit_proxy: false,
+                has_proxy,
             })),
+            h2,
+        }
+    }
+
+    /// Test-only constructor that points both TLS stacks at a private root
+    /// store. It never disables certificate verification.
+    #[cfg(test)]
+    fn with_test_roots(
+        config: FetchConfig,
+        roots: RootCertStore,
+        tls: ureq::tls::TlsConfig,
+    ) -> Self {
+        let agent = build_agent_with_tls(&config, None, Some(tls));
+        let h2 = Arc::new(H2Pool::with_roots(&config, roots));
+        Self {
+            config: Arc::new(config),
+            agent: Arc::new(RwLock::new(TransportAgent {
+                agent,
+                implicit_proxy: false,
+                has_proxy: false,
+            })),
+            h2,
         }
     }
 
@@ -1108,13 +1956,14 @@ impl HttpTransport {
         &self.config
     }
 
-    /// Returns the agent a fetch should use and whether its proxy is implicit.
-    fn agent_snapshot(&self) -> (ureq::Agent, bool) {
+    /// Returns the agent a fetch should use, whether its proxy is implicit,
+    /// and whether any proxy is configured at all.
+    fn agent_snapshot(&self) -> (ureq::Agent, bool, bool) {
         let state = self
             .agent
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (state.agent.clone(), state.implicit_proxy)
+        (state.agent.clone(), state.implicit_proxy, state.has_proxy)
     }
 
     /// Performs one bounded HTTP(S) request or `data:` URL decode.
@@ -1174,7 +2023,7 @@ impl HttpTransport {
         // One snapshot for the whole redirect chain: changing the proxy while a
         // chain is in flight applies to later fetches, not halfway through this
         // one.
-        let (agent, implicit_proxy) = self.agent_snapshot();
+        let (agent, implicit_proxy, proxy_configured) = self.agent_snapshot();
 
         let mut current_url = request.url.clone();
         // Redirect method semantics are applied per hop below; the original
@@ -1253,43 +2102,23 @@ impl HttpTransport {
                     }
                 }
             }
-            let hop_started = Instant::now();
-            let response = Self::send_hop(
+            let response = self.send_hop(
                 &agent,
                 implicit_proxy,
+                proxy_configured,
                 current_method,
                 &current_url,
                 hop_body,
                 &hop_headers,
-            )
-            .map_err(|error| {
-                let (error, mut phase) = classify_ureq_error(&error, &self.config);
-                // ureq reports a `SendRequest` timeout against the send-request
-                // budget, which this transport deliberately also uses to bound
-                // the wait for the response headers (see the phase-budget layout
-                // in `HttpTransport::with_proxy`), so that reason is ambiguous by
-                // itself. A request without a body writes a few hundred bytes
-                // and leaves the send phase immediately, so for those the budget
-                // can only have expired while waiting for the origin to answer.
-                if hop_body.is_none() && phase == FetchPhase::RequestSend {
-                    phase = FetchPhase::ResponseHeaders;
-                }
-                error.in_phase(phase, hop_started.elapsed())
-            })?;
+                cancel,
+            )?;
 
             if cancel.is_cancelled() {
                 return Err(FetchError::Cancelled);
             }
 
-            let status = HttpStatus(response.status().as_u16());
-            let headers = response
-                .headers()
-                .iter()
-                .map(|(name, value)| Header {
-                    name: name.as_str().to_owned(),
-                    value: value.as_bytes().to_vec(),
-                })
-                .collect::<Vec<_>>();
+            let status = HttpStatus(response.status());
+            let headers = response.headers();
             if is_redirect_status(status)
                 && self.config.redirect_limit > 0
                 && let Some(location) = header_text(&headers, "location")
@@ -1336,16 +2165,25 @@ impl HttpTransport {
                 continue;
             }
 
-            let final_url = normalize_redirect_url(
-                Url::parse(&response.get_uri().to_string())
-                    .map_err(|error| FetchError::InvalidUrl(error.to_string()))?,
-                &request.url,
-            );
+            if matches!(&response, HopResponse::Http2(_))
+                && let Some(encoding) = header_text(&headers, "content-encoding")
+                && !encoding.eq_ignore_ascii_case("identity")
+            {
+                return Err(FetchError::Protocol(format!(
+                    "HTTP/2 response used content-encoding {encoding:?} despite an identity request"
+                )));
+            }
+            let final_url = response.final_url(&current_url, &request.url)?;
             if let Some(last) = redirect_chain.last_mut() {
                 *last = final_url.clone();
             }
             let content_type = header_text(&headers, "content-type").and_then(parse_content_type);
-            let body = self.read_bounded_body(response.into_body().into_reader(), cancel)?;
+            let body = match response {
+                HopResponse::Http1(response) => {
+                    self.read_bounded_body(response.into_body().into_reader(), cancel)?
+                }
+                HopResponse::Http2(response) => response.body,
+            };
             // A `HEAD` response has no body by definition; stray bytes from a
             // non-conforming origin are drained above but never surfaced.
             let body = if current_method == HttpMethod::Head {
@@ -1367,20 +2205,81 @@ impl HttpTransport {
         }
     }
 
-    /// Sends one hop of the request chain through ureq, applying the method
-    /// and the prepared headers. Bodyless methods use `call` (no
-    /// `Content-Length` on the wire); body-carrying methods send the bytes and
-    /// let ureq derive `Content-Length` from the body.
+    /// Sends one hop, preferring HTTP/2 when the origin is direct HTTPS and
+    /// TLS ALPN selected `h2`, and otherwise using the ureq HTTP/1.1 path.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one hop already carries the prepared URL, headers, body, and proxy policy"
+    )]
     fn send_hop(
+        &self,
         agent: &ureq::Agent,
         implicit_proxy: bool,
+        proxy_configured: bool,
+        method: HttpMethod,
+        url: &Url,
+        body: Option<&[u8]>,
+        headers: &[(String, String)],
+        cancel: &CancelToken,
+    ) -> Result<HopResponse, FetchError> {
+        let hop_started = Instant::now();
+        let proxy = hop_proxy(implicit_proxy, url);
+        let direct = !proxy_configured || proxy == HopProxy::Direct;
+        let body_fits_h2 = body.is_none_or(|bytes| bytes.len() <= H2_MAX_INLINE_BODY);
+        if direct
+            && body_fits_h2
+            && let Some(origin) = H2Origin::from_url(url)
+            && !self.h2.is_http1_only(&origin)
+        {
+            match self
+                .h2
+                .send(&origin, &self.config, method, url, headers, body, cancel)
+            {
+                Ok(response) => return Ok(HopResponse::Http2(response)),
+                Err(H2AttemptError::FallbackHttp1(_reason)) => {
+                    // The probe completed and the server chose HTTP/1.1 (or
+                    // sent no ALPN). Remember it so later requests do not pay
+                    // for the probe again; the request itself continues below
+                    // on ureq's HTTP/1.1 stack.
+                    self.h2.mark_http1_only(&origin);
+                }
+                Err(H2AttemptError::Failed(failure)) => {
+                    return Err(failure.error.in_phase(failure.phase, hop_started.elapsed()));
+                }
+            }
+        }
+
+        let response =
+            Self::send_http1_hop(agent, proxy, method, url, body, headers).map_err(|error| {
+                let (error, mut phase) = classify_ureq_error(&error, &self.config);
+                // ureq reports a `SendRequest` timeout against the send-request
+                // budget, which this transport deliberately also uses to bound
+                // the wait for the response headers (see the phase-budget layout
+                // in `HttpTransport::with_proxy`), so that reason is ambiguous by
+                // itself. A request without a body writes a few hundred bytes
+                // and leaves the send phase immediately, so for those the budget
+                // can only have expired while waiting for the origin to answer.
+                if body.is_none() && phase == FetchPhase::RequestSend {
+                    phase = FetchPhase::ResponseHeaders;
+                }
+                error.in_phase(phase, hop_started.elapsed())
+            })?;
+        Ok(HopResponse::Http1(response))
+    }
+
+    /// Sends one hop through ureq, applying the method and prepared headers.
+    /// Bodyless methods use `call` (no `Content-Length` on the wire);
+    /// body-carrying methods send the bytes and let ureq derive
+    /// `Content-Length` from the body.
+    fn send_http1_hop(
+        agent: &ureq::Agent,
+        proxy: HopProxy,
         method: HttpMethod,
         url: &Url,
         body: Option<&[u8]>,
         headers: &[(String, String)],
     ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         let uri = url.as_str();
-        let proxy = hop_proxy(implicit_proxy, url);
         match (method, body) {
             (HttpMethod::Get, _) => decorate(agent.get(uri), headers, proxy).call(),
             (HttpMethod::Head, _) => decorate(agent.head(uri), headers, proxy).call(),
@@ -1905,13 +2804,23 @@ fn parse_content_type(value: &str) -> Option<ContentType> {
 mod tests {
     use std::io;
     use std::io::{Read as _, Write as _};
-    use std::sync::Arc;
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread::{self, JoinHandle};
     use std::time::Duration;
+
+    use base64::Engine as _;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer};
+    use rustls::{RootCertStore, ServerConfig, ServerConnection, StreamOwned};
 
     use super::{
         CancelToken, ContentType, FetchConfig, FetchError, FetchPhase, FetchRequest, HttpTransport,
         map_io_error, normalize_redirect_url, parse_content_type, phase_of_timeout,
+    };
+    use crate::h2::{
+        ErrorCode, Frame, FrameKind, HeaderField, HpackDecoder, HpackEncoder, Setting, SettingId,
+        StreamId,
     };
     use url::Url;
 
@@ -2418,5 +3327,533 @@ mod tests {
             combined_cookie_header(Some("a=1"), Some("A=server")).as_deref(),
             Some("a=1; A=server")
         );
+    }
+
+    // ------------------------------------------------------------------
+    // TLS / HTTP/2 transport tests.
+    //
+    // The certificate chain below is a throwaway test CA and a `localhost`
+    // leaf (SAN DNS:localhost, IP:127.0.0.1) valid until 2036. It exists only
+    // so the loopback TLS server can be verified without network access or
+    // disabling certificate verification.
+    // ------------------------------------------------------------------
+
+    const TEST_CA_CERT_DER_B64: &str = "MIIC+jCCAeKgAwIBAgIIHe/fBjKyHoYwDQYJKoZIhvcNAQELBQAwGzEZMBcGA1UEAxMQckVOREVSIFRlc3QgUm9vdDAeFw0yNDAxMDEwMDAwMDBaFw0zNjAxMDEwMDAwMDBaMBsxGTAXBgNVBAMTEHJFTkRFUiBUZXN0IFJvb3QwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC+xMif1j+eWBccBTQYGw/ta/f4wIFYgvCA5Vs/hGk6SW16zfK4KQ5m7VYk7FcfcjmWxLPhFFQHFYe+VM6jvQxlbbYE4VaOQf4Hq8fCIyqG7zWwxNXLkFm3luqPgMdzU5blq+jfWoaRgtjoHXRLcG2R9+oLhyzZzNYu1LgkJwexywrTfp4/NgQ2nLkG8MZUXYxck9EMgrVP4XnBtEEfUXOLAGSQ9znsGDJLiqFFRtvPXXbEtFwCutMz2MDl+JKH6RBbiHdv4X+nk/W8ZLU2TRYK8DMGOw+Mv9xki0R/kxwCuKm/SKzt/7MlfD9/0tEUnpWBt40knP0HkX0cNMrwJkshAgMBAAGjQjBAMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBRvdrtzYmIhjOqh9tLh1uQ7l9QE4jANBgkqhkiG9w0BAQsFAAOCAQEASWRnql8fqJCEVsADnGpBHLIy+Hwa8eVmQ+PSXsBXsjhQbDr7t0w9R9C6+oaTUOtwlwmNBcvGB+HSf1fglfJNl3MvibuQcfXre1Aw3heNQC6xADmRpodnU3zCTGDCoXGp5uHUbE1QA3DeyMMwU33VizsfCGI7l1KEbntTi3F6iGWkrxwa4FFa3bvh6ANNTXgFoBk/lXg5rV0l6xDDc+2Zjt12t+9wdc29Z5WXqxgob+g9qLA8riVz1Trxv4l4JApgaudMuHMbOeP/V6j3hvYpfLmq7Q5vsJWckzYn7t7wEf7ujHqmOTsXbBjp5WTRo1rv1ZC5AJd8DkZoAQGcbqlZKw==";
+    const TEST_SERVER_CERT_DER_B64: &str = "MIIDCjCCAfKgAwIBAgIQcv+ifFH9xEjWzA8poe9hVDANBgkqhkiG9w0BAQsFADAbMRkwFwYDVQQDExByRU5ERVIgVGVzdCBSb290MB4XDTI0MDEwMTAwMDAwMFoXDTM2MDEwMTAwMDAwMFowFDESMBAGA1UEAxMJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqecjQPLynw0I/jGsv1KQZFsDF7Vw8rm5R4irvh2p40NdDI9v2BQ4PfNRnSmUJ7Uv2zne/yLo2VAMnOU71TlMvjnUqLP2TvP4nMwOEZni89EfTLUhYaV6/QA6zpFnNnZeimQjQzfBF2lokdznFyHaOVzys/XvPLCaxCoTOqa9nF7Rq5/C2gL9CWBQyodzq1zfmnoIbprFaJgmydHqLuAgsr1YAVc2j9+r5CugGJKQusdAy1WiLJCcVzK0eJb41L85yC1pkXVC2jzC5JoLVYAn1CF1EDnUHioMIKytAEGzQLILiiHcj3vzdeTJjb1m/g9g1g6aS9EZzGa2OfEruZBfJQIDAQABo1EwTzAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwDAYDVR0TAQH/BAIwADAOBgNVHQ8BAf8EBAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDQYJKoZIhvcNAQELBQADggEBAAIezD01Dj1YSS6cm/NaJpxr1lzhIGtxEb9JgKhYZKFOxjHYKfowbwRYUvY56FDqlKNPb9ZZ8YHpmYm4un2auyA45uVwhw3tn8I0LLyXxsdFVKKp6vzqCN4pQGt8ImraucqP8jRGGZU/szLMAiRdRTL8yJ5elKbBITDr9zyrdDeXuC7Jxz8vxp1jf2Pew7vNwhT5fob3cQ2NP5/h9XQa+0XZ0srkUsKPsoes1zxYnoCZUKECjJNcO3isNSXAxaS/04JaM1K/UonW9M/zthgATPeWb/Wm4iQscYF35tH1cOWYTJ6feOj/GeGnAdg47RQZ+bokFtVl5aO65UzOA8YbDHs=";
+    const TEST_SERVER_KEY_PKCS1_B64: &str = "MIIEpAIBAAKCAQEAqecjQPLynw0I/jGsv1KQZFsDF7Vw8rm5R4irvh2p40NdDI9v2BQ4PfNRnSmUJ7Uv2zne/yLo2VAMnOU71TlMvjnUqLP2TvP4nMwOEZni89EfTLUhYaV6/QA6zpFnNnZeimQjQzfBF2lokdznFyHaOVzys/XvPLCaxCoTOqa9nF7Rq5/C2gL9CWBQyodzq1zfmnoIbprFaJgmydHqLuAgsr1YAVc2j9+r5CugGJKQusdAy1WiLJCcVzK0eJb41L85yC1pkXVC2jzC5JoLVYAn1CF1EDnUHioMIKytAEGzQLILiiHcj3vzdeTJjb1m/g9g1g6aS9EZzGa2OfEruZBfJQIDAQABAoIBAEsh6EgPZ1UIWaK26tJMO4f1az+vv7vGf3VvrarLyVWzc1FbmLTv9BMJJ10dhuOsTvZd+AvRLzDyIjG7eSMITLSONElKE7DEWHtWDR6hc2goYPP14UYh/GonENpKGF9QJuyB7coKvLuSpGhkTFjBYpQdU0JbjijDXB1FEe3M0Gp2FtS9XJJQjK4wb8HfQz71z33+y1KjxUAe54/LlvMgkcJ2oo3aiUMuKwYrwVgzypCqvmN1DaFq/OQ3hyekmFTnOPdVtWtw2mZgpZtPGN3Dj/k0l59BIjAX5OOGLWaw86b1WUeWo7VcEj11a6ICYtzI8wqB50h6/dFROCESOLgWiZ0CgYEAwrO7QoeV3GF3nXlWK54XbUtc4Aw4X7URl9hpngXpurLXmZOBWbCuVNSfDrl6TvA+3UHBht9o2EutReEi77yeZrmdvwUK+OYB2UgjLqgpo5cIWh+N0aIEuZGq2h2mWG8RO+Z3Bww1t0rupsNc3B7G6Mfn5ovmpR8XTyTLg1rcRgcCgYEA32SuxiBLuobYOgg/D3sfY2rtezF/6RlCGj95tdhRayPs30swqzjSOHM6EYSAvX1aVMQoVrXjHnGmI4GlV/jM2MIg/rqulwXuihHfDNQ8gSzv1BJCMNls7Qz2LFeH9mSdkTAcHpLZe2j7zBrXFCHqNaaZGJ+XlBOwSsBcfQERRnMCgYARu671i0XR8aqkVBXOGTMHCFMoMNS9ms9EZjiQZPd5wqoyWaXxVk86eLcX7zq9j9IZ8tA+iYCSGqpob+3vqd0/e+5rJHlwW/qVIKXbrQNF3A6trqwLCNenUyYdgY/SBCOssfvrT2hhDlkYJTkC72ascvCjJeDW7zL/SVmj2BWx5wKBgQCwCIu8rlhebMHYwQTIMzJhyjHHAROVYIT5YAmNpR9LeSzALGT2l7j4KLyabzpvl2bmIwjSg1Osesv7cL8VGoZ5TEhp0juf4Fm/TSPh3SCsffeiupyUF9FA3xThjjwiidisPyf5Y6ijGfBJPuE7CRqhGl3LzH7KfdVOolR/YKb3RwKBgQCXfzX5tFtoSKoBs9tYpTYs0qVyeyYX4y58WHSODG5k4+Y+9bdjsB+WPM34Pw9iP2/57Mfst3UTmv9G/lT/A2Iu26BgQSfrSBDtRp6nRTkGR2KbpLgAsNJmnefx3Kf47lgYDDwggANkENxfpnKJ5hUc4PbHZAQ1b3Z3V7R8SkqU0Q==";
+
+    fn test_der(encoded: &str) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("embedded test fixture is valid base64")
+    }
+
+    fn test_ca_cert() -> CertificateDer<'static> {
+        CertificateDer::from(test_der(TEST_CA_CERT_DER_B64))
+    }
+
+    fn test_server_config(alpn: &[&str]) -> Arc<ServerConfig> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let certs = vec![CertificateDer::from(test_der(TEST_SERVER_CERT_DER_B64))];
+        let key = PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(test_der(
+            TEST_SERVER_KEY_PKCS1_B64,
+        )));
+        let mut config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("ring supports the default TLS versions")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("test certificate and key match");
+        config.alpn_protocols = alpn
+            .iter()
+            .map(|protocol| protocol.as_bytes().to_vec())
+            .collect();
+        Arc::new(config)
+    }
+
+    fn test_transport() -> HttpTransport {
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(test_ca_cert())
+            .expect("test CA is a valid trust anchor");
+        let certificate_der = test_der(TEST_CA_CERT_DER_B64);
+        let certificate = ureq::tls::Certificate::from_der(&certificate_der).to_owned();
+        let tls = ureq::tls::TlsConfig::builder()
+            .provider(ureq::tls::TlsProvider::Rustls)
+            .root_certs(ureq::tls::RootCerts::new_with_certs(&[certificate]))
+            .build();
+        HttpTransport::with_test_roots(FetchConfig::default(), roots, tls)
+    }
+
+    type TestHandler = Box<dyn FnOnce(TcpStream, Arc<ServerConfig>) + Send>;
+
+    fn spawn_tls_server(
+        config: Arc<ServerConfig>,
+        handlers: Vec<TestHandler>,
+    ) -> (SocketAddr, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback TLS server");
+        let address = listener.local_addr().expect("read TLS server address");
+        let handle = thread::spawn(move || {
+            for handler in handlers {
+                let (stream, _) = listener.accept().expect("accept TLS client");
+                handler(stream, Arc::clone(&config));
+            }
+        });
+        (address, handle)
+    }
+
+    fn tls_server_stream(
+        stream: TcpStream,
+        config: &ServerConfig,
+    ) -> StreamOwned<ServerConnection, TcpStream> {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+        let _ = stream.set_nodelay(true);
+        StreamOwned::new(
+            ServerConnection::new(Arc::new(config.clone())).expect("TLS server connection"),
+            stream,
+        )
+    }
+
+    struct TestH2Server {
+        stream: StreamOwned<ServerConnection, TcpStream>,
+        decoder: HpackDecoder,
+        encoder: HpackEncoder,
+    }
+
+    impl TestH2Server {
+        fn new(stream: TcpStream, config: &ServerConfig) -> Self {
+            Self {
+                stream: tls_server_stream(stream, config),
+                decoder: HpackDecoder::new(4096),
+                encoder: HpackEncoder::new(4096),
+            }
+        }
+
+        fn handshake(&mut self) -> Option<String> {
+            let mut preface = [0_u8; 24];
+            self.stream
+                .read_exact(&mut preface)
+                .expect("read HTTP/2 client preface");
+            assert_eq!(&preface, crate::h2::CONNECTION_PREFACE);
+            let frame = self.read_frame();
+            match frame.kind() {
+                FrameKind::Settings {
+                    ack: false,
+                    settings,
+                } => assert!(
+                    settings
+                        .iter()
+                        .any(|setting| setting.id == SettingId::EnablePush && setting.value == 0),
+                    "client disables server push"
+                ),
+                other => panic!("expected client SETTINGS, got {other:?}"),
+            }
+            self.write_frame(&Frame::settings(vec![
+                Setting::new(SettingId::MaxConcurrentStreams, 32),
+                Setting::new(SettingId::InitialWindowSize, 65_535),
+            ]));
+            let ack = self.read_frame();
+            assert!(
+                matches!(ack.kind(), FrameKind::Settings { ack: true, .. }),
+                "client acknowledges server SETTINGS"
+            );
+            self.stream
+                .conn
+                .alpn_protocol()
+                .map(|protocol| String::from_utf8_lossy(protocol).into_owned())
+        }
+
+        fn read_frame(&mut self) -> Frame {
+            Frame::read_from(&mut self.stream, 16_384).expect("read a valid HTTP/2 frame")
+        }
+
+        fn write_frame(&mut self, frame: &Frame) {
+            frame
+                .write_to(&mut self.stream)
+                .expect("write an HTTP/2 frame");
+            self.stream.flush().expect("flush HTTP/2 frame");
+        }
+
+        fn read_request(&mut self) -> (StreamId, Vec<HeaderField>) {
+            let mut fragments = Vec::new();
+            let mut stream_id = None;
+            let mut end_headers = false;
+            while !end_headers {
+                let frame = self.read_frame();
+                match frame.kind() {
+                    FrameKind::Headers {
+                        end_headers: request_end_headers,
+                        fragment,
+                        ..
+                    } => {
+                        stream_id = Some(frame.header().stream_id());
+                        end_headers = *request_end_headers;
+                        fragments.extend_from_slice(fragment);
+                    }
+                    FrameKind::Continuation {
+                        end_headers: continuation_end,
+                        fragment,
+                    } => {
+                        end_headers = *continuation_end;
+                        fragments.extend_from_slice(fragment);
+                    }
+                    other => panic!("expected request HEADERS, got {other:?}"),
+                }
+            }
+            let fields = self
+                .decoder
+                .decode(&fragments)
+                .expect("decode request headers");
+            (stream_id.expect("request stream id"), fields)
+        }
+
+        fn send_response(&mut self, stream_id: StreamId, status: u16, body: &[u8]) {
+            let fields = vec![
+                HeaderField::new(b":status".as_slice(), status.to_string().into_bytes()),
+                HeaderField::new("content-type", "text/plain; charset=utf-8"),
+            ];
+            let block = self.encoder.encode(&fields);
+            self.write_frame(&Frame::headers(
+                stream_id,
+                body.is_empty(),
+                true,
+                None,
+                block,
+            ));
+            if !body.is_empty() {
+                self.write_frame(&Frame::data(stream_id, true, body.to_vec()));
+            }
+        }
+
+        fn send_large_response(&mut self, stream_id: StreamId, body: &[u8]) {
+            let fields = vec![
+                HeaderField::new(b":status".as_slice(), b"200"),
+                HeaderField::new("content-type", "application/octet-stream"),
+            ];
+            let block = self.encoder.encode(&fields);
+            self.write_frame(&Frame::headers(stream_id, false, true, None, block));
+
+            let mut offset = 0;
+            let mut window = 65_535_usize;
+            while offset < body.len() {
+                let chunk = (body.len() - offset).min(16_000).min(window);
+                let end = offset + chunk == body.len();
+                self.write_frame(&Frame::data(
+                    stream_id,
+                    end,
+                    body[offset..offset + chunk].to_vec(),
+                ));
+                offset += chunk;
+                let expected_updates = if end { 1 } else { 2 };
+                let mut received = 0_usize;
+                while received < expected_updates {
+                    let frame = self.read_frame();
+                    if let FrameKind::WindowUpdate { increment } = frame.kind() {
+                        assert_eq!(
+                            usize::try_from(*increment).expect("window increment fits usize"),
+                            chunk,
+                            "each DATA frame is replenished exactly once"
+                        );
+                        received += 1;
+                    }
+                }
+                if !end {
+                    window += chunk;
+                }
+            }
+        }
+
+        fn drain_window_updates(&mut self, expected: usize) {
+            for _ in 0..expected {
+                let frame = self.read_frame();
+                assert!(
+                    matches!(frame.kind(), FrameKind::WindowUpdate { .. }),
+                    "expected WINDOW_UPDATE, got {:?}",
+                    frame.kind()
+                );
+            }
+        }
+    }
+
+    fn field<'a>(fields: &'a [HeaderField], name: &str) -> Option<&'a [u8]> {
+        fields
+            .iter()
+            .find(|field| field.name == name.as_bytes())
+            .map(|field| field.value.as_slice())
+    }
+
+    #[test]
+    fn tls_alpn_h2_multiplexes_two_requests_over_one_connection() {
+        let config = test_server_config(&["h2"]);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        let (address, server) = spawn_tls_server(
+            config,
+            vec![Box::new(move |stream, config| {
+                let mut server = TestH2Server::new(stream, &config);
+                assert_eq!(
+                    server.handshake().as_deref(),
+                    Some("h2"),
+                    "the server must negotiate HTTP/2 through ALPN"
+                );
+                let (first, first_fields) = server.read_request();
+                let (second, second_fields) = server.read_request();
+                *captured.lock().expect("capture request paths") = vec![
+                    field(&first_fields, ":path")
+                        .map(|path| String::from_utf8_lossy(path).into_owned())
+                        .unwrap_or_default(),
+                    field(&second_fields, ":path")
+                        .map(|path| String::from_utf8_lossy(path).into_owned())
+                        .unwrap_or_default(),
+                ];
+                assert_eq!(
+                    field(&first_fields, ":scheme"),
+                    Some(&b"https"[..]),
+                    "h2 requests carry the real scheme"
+                );
+                // Complete the later stream first: both requests must already
+                // be open on the single connection for this to be possible.
+                server.send_response(second, 201, b"second");
+                server.send_response(first, 202, b"first");
+                server.drain_window_updates(2);
+            })],
+        );
+
+        let transport = test_transport();
+        let first_url =
+            Url::parse(&format!("https://127.0.0.1:{}/one", address.port())).expect("first h2 URL");
+        let second_url = Url::parse(&format!("https://127.0.0.1:{}/two", address.port()))
+            .expect("second h2 URL");
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for url in [first_url, second_url] {
+            let transport = transport.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                transport
+                    .fetch(&FetchRequest::get(url), &CancelToken::default())
+                    .expect("h2 fetch")
+            }));
+        }
+        barrier.wait();
+        let mut responses = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("h2 worker"))
+            .collect::<Vec<_>>();
+        responses.sort_by_key(|response| response.status.as_u16());
+        assert_eq!(responses[0].status.as_u16(), 201);
+        assert_eq!(responses[0].body, b"second");
+        assert_eq!(responses[1].status.as_u16(), 202);
+        assert_eq!(responses[1].body, b"first");
+        server.join().expect("TLS h2 server");
+
+        let mut paths = seen.lock().expect("read captured paths").clone();
+        paths.sort();
+        assert_eq!(paths, ["/one", "/two"]);
+    }
+
+    #[test]
+    fn tls_without_h2_alpn_falls_back_to_http1() {
+        let config = test_server_config(&["http/1.1"]);
+        let (address, server) = spawn_tls_server(
+            config,
+            vec![
+                // First connection is the h2 probe: it negotiates http/1.1 and
+                // the transport closes it without sending an HTTP request.
+                Box::new(|stream, config| {
+                    let mut tls = tls_server_stream(stream, &config);
+                    let mut byte = [0_u8; 1];
+                    let _ = tls.read(&mut byte);
+                    assert_eq!(
+                        tls.conn.alpn_protocol(),
+                        Some(b"http/1.1".as_slice()),
+                        "probe negotiated HTTP/1.1"
+                    );
+                }),
+                // Second connection is the real HTTP/1.1 request.
+                Box::new(|stream, config| {
+                    let mut tls = tls_server_stream(stream, &config);
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 512];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let count = tls.read(&mut chunk).expect("read HTTP/1.1 request");
+                        if count == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&chunk[..count]);
+                    }
+                    let request = String::from_utf8_lossy(&request);
+                    assert!(
+                        request.starts_with("GET /fallback HTTP/1.1\r\n"),
+                        "HTTP/1.1 fallback request line: {request:?}"
+                    );
+                    tls.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nh1",
+                    )
+                    .expect("write HTTP/1.1 response");
+                    tls.flush().expect("flush HTTP/1.1 response");
+                }),
+            ],
+        );
+
+        let url = Url::parse(&format!("https://127.0.0.1:{}/fallback", address.port()))
+            .expect("fallback URL");
+        let response = test_transport()
+            .fetch(&FetchRequest::get(url), &CancelToken::default())
+            .expect("HTTP/1.1 fallback fetch");
+        assert_eq!(response.status.as_u16(), 200);
+        assert_eq!(response.body, b"h1");
+        server.join().expect("TLS fallback server");
+    }
+
+    #[test]
+    fn h2_response_larger_than_the_initial_window_completes() {
+        let body = (0..120_000)
+            .map(|index| u8::try_from(index % 251).expect("byte value"))
+            .collect::<Vec<_>>();
+        let expected = body.clone();
+        let config = test_server_config(&["h2"]);
+        let (address, server) = spawn_tls_server(
+            config,
+            vec![Box::new(move |stream, config| {
+                let mut server = TestH2Server::new(stream, &config);
+                assert_eq!(server.handshake().as_deref(), Some("h2"));
+                let (stream_id, _) = server.read_request();
+                server.send_large_response(stream_id, &expected);
+            })],
+        );
+
+        let url = Url::parse(&format!("https://127.0.0.1:{}/large", address.port()))
+            .expect("large body URL");
+        let response = test_transport()
+            .fetch(&FetchRequest::get(url), &CancelToken::default())
+            .expect("large h2 body fetch");
+        assert_eq!(response.status.as_u16(), 200);
+        assert_eq!(response.body, body);
+        server.join().expect("TLS h2 flow-control server");
+    }
+
+    #[test]
+    fn h2_pool_reuses_one_connection_for_sequential_requests() {
+        let config = test_server_config(&["h2"]);
+        let (address, server) = spawn_tls_server(
+            config,
+            vec![Box::new(|stream, config| {
+                let mut server = TestH2Server::new(stream, &config);
+                assert_eq!(server.handshake().as_deref(), Some("h2"));
+                for body in [b"first".as_slice(), b"second".as_slice()] {
+                    let (stream_id, fields) = server.read_request();
+                    assert_eq!(field(&fields, ":scheme"), Some(&b"https"[..]));
+                    server.send_response(stream_id, 200, body);
+                    server.drain_window_updates(1);
+                }
+            })],
+        );
+
+        let transport = test_transport();
+        for (path, expected) in [
+            ("/first", b"first".as_slice()),
+            ("/second", b"second".as_slice()),
+        ] {
+            let url = Url::parse(&format!("https://127.0.0.1:{}{path}", address.port()))
+                .expect("sequential h2 URL");
+            let response = transport
+                .fetch(&FetchRequest::get(url), &CancelToken::default())
+                .expect("sequential h2 fetch");
+            assert_eq!(response.status.as_u16(), 200);
+            assert_eq!(response.body, expected);
+        }
+        server.join().expect("TLS h2 reuse server");
+    }
+
+    #[test]
+    fn h2_eof_evicts_the_pool_entry_and_a_retry_succeeds() {
+        let config = test_server_config(&["h2"]);
+        let connections = Arc::new(AtomicUsize::new(0));
+        let first_count = Arc::clone(&connections);
+        let second_count = Arc::clone(&connections);
+        let (address, server) = spawn_tls_server(
+            config,
+            vec![
+                Box::new(move |stream, config| {
+                    first_count.fetch_add(1, Ordering::SeqCst);
+                    let mut server = TestH2Server::new(stream, &config);
+                    assert_eq!(server.handshake().as_deref(), Some("h2"));
+                    let _ = server.read_request();
+                    // Drop the TLS stream without a response: the client sees
+                    // EOF at a frame boundary and must reconnect once.
+                }),
+                Box::new(move |stream, config| {
+                    second_count.fetch_add(1, Ordering::SeqCst);
+                    let mut server = TestH2Server::new(stream, &config);
+                    assert_eq!(server.handshake().as_deref(), Some("h2"));
+                    let (stream_id, _) = server.read_request();
+                    server.send_response(stream_id, 200, b"after-eof");
+                    server.drain_window_updates(1);
+                }),
+            ],
+        );
+
+        let url = Url::parse(&format!("https://127.0.0.1:{}/eof", address.port()))
+            .expect("EOF retry URL");
+        let response = test_transport()
+            .fetch(&FetchRequest::get(url), &CancelToken::default())
+            .expect("retry after EOF");
+        assert_eq!(response.status.as_u16(), 200);
+        assert_eq!(response.body, b"after-eof");
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            2,
+            "the EOF connection is evicted and exactly one reconnect is made"
+        );
+        server.join().expect("TLS h2 EOF server");
+    }
+
+    #[test]
+    fn h2_goaway_evicts_the_pool_entry_and_a_retry_succeeds() {
+        let config = test_server_config(&["h2"]);
+        let connections = Arc::new(AtomicUsize::new(0));
+        let first_count = Arc::clone(&connections);
+        let second_count = Arc::clone(&connections);
+        let (address, server) = spawn_tls_server(
+            config,
+            vec![
+                Box::new(move |stream, config| {
+                    first_count.fetch_add(1, Ordering::SeqCst);
+                    let mut server = TestH2Server::new(stream, &config);
+                    assert_eq!(server.handshake().as_deref(), Some("h2"));
+                    let (stream_id, _) = server.read_request();
+                    server.write_frame(&Frame::goaway(
+                        stream_id,
+                        ErrorCode::NoError,
+                        b"rotate".to_vec(),
+                    ));
+                }),
+                Box::new(move |stream, config| {
+                    second_count.fetch_add(1, Ordering::SeqCst);
+                    let mut server = TestH2Server::new(stream, &config);
+                    assert_eq!(server.handshake().as_deref(), Some("h2"));
+                    let (stream_id, _) = server.read_request();
+                    server.send_response(stream_id, 200, b"after-goaway");
+                    server.drain_window_updates(1);
+                }),
+            ],
+        );
+
+        let url =
+            Url::parse(&format!("https://127.0.0.1:{}/retry", address.port())).expect("retry URL");
+        let response = test_transport()
+            .fetch(&FetchRequest::get(url), &CancelToken::default())
+            .expect("retry after GOAWAY");
+        assert_eq!(response.status.as_u16(), 200);
+        assert_eq!(response.body, b"after-goaway");
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            2,
+            "the dead connection is evicted and exactly one reconnect is made"
+        );
+        server.join().expect("TLS h2 GOAWAY server");
     }
 }
