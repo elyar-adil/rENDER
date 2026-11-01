@@ -16,7 +16,7 @@ says so. `docs/visual_fidelity_gaps.md` is the working register; this file is th
 | --- | --- | --- |
 | `render-js` unit tests | 1,210 passed, 0 failed | 2026-11-01 |
 | `render-css` unit tests | 305 passed, 0 failed | 2026-11-01 |
-| `render-core` unit tests | 464 passed, 0 failed | 2026-11-01 |
+| `render-core` unit tests | 465 passed, 0 failed | 2026-11-01 |
 | `render-core` webfont integration tests | 2 passed, 0 failed | 2026-11-01 |
 | `render-layout` unit tests | 352 passed, 1 ignored | 2026-11-01 |
 | `render-browser` unit tests | 210 passed, 0 failed | 2026-11-01 |
@@ -136,8 +136,9 @@ each surface is divided into 512px bands. `render` only rasterizes bands that ar
 scrolling changes the composite matrices, not the scene. The browser keeps the cache on the page
 and sends `CompositedScroll` payloads, so scrolling does not re-run style, layout or display-list
 building. Fixed/sticky content, filters, masks, non-normal blending and rotate/scale transforms
-still use the complete raster. Five core tests compare composited pixels with a full raster and
-pin band reuse; `cargo run --release -p render-browser --bin render-scroll-bench` reports
+still use the complete raster. Six core tests compare composited pixels with a full raster,
+pin band reuse over twenty 16px scroll frames, and cover the fixed-position fallback;
+`cargo run --release -p render-browser --bin render-scroll-bench` reports
 **1.29ms/frame retained vs 11.78ms/frame full raster** with **117/120 frames rasterizing no new
 band** (800x600 viewport, 12,000px document, 16px scroll steps).
 

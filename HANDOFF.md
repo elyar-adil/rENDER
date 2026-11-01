@@ -39,7 +39,7 @@ layer tree、缓存 512px band、滚动时只合成已有 band，并新增 frame
 
 ## 测试
 
-`render-core/src/paint/compositor.rs` 5 个测试：
+`render-core/src/paint/compositor.rs` 6 个测试：
 
 - translated + 0.5 opacity layer 出现在正确位置并正确混色；
 - 2048px 页面首帧栅格化 2 个 band，16px 滚动新增 0 band，跳到 1400px 才新增
@@ -47,6 +47,7 @@ layer tree、缓存 512px band、滚动时只合成已有 band，并新增 frame
 - 合成结果与完整 `CpuRasterizer::rasterize` 逐像素相等（含 root segment、
   translated/opacity layer 和 layer 后内容）；
 - translated layer 不被未变换 bounds 裁掉；
+- 连续 20 个 16px 滚动帧每帧最多新增 1 个 band，且 `frames` 计数逐帧递增；
 - viewport-space item（fixed）回退为 `None`。
 
 ## Benchmark
@@ -69,7 +70,7 @@ cargo run --release -p render-browser --bin render-scroll-bench
 ## 验证
 
 ```
-cargo test -p render-core --lib paint::compositor  5 passed, 0 failed
+cargo test -p render-core --lib paint::compositor  6 passed, 0 failed
 cargo test -p render-browser --bin render-browser a_scroll_with_a_retained_compositor_uses_the_composited_payload
                                                   1 passed, 0 failed
 cargo run --release -p render-browser --bin render-scroll-bench

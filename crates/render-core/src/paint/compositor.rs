@@ -457,7 +457,11 @@ fn ceil_to_u32(value: f32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::float_cmp)]
+    #![allow(
+        clippy::float_cmp,
+        clippy::cast_precision_loss,
+        reason = "fixture geometry and band counters are exact small integers"
+    )]
 
     use super::{CompositorCache, DEFAULT_COMPOSITOR_BAND_HEIGHT};
     use crate::dom::DomRevision;
@@ -704,6 +708,48 @@ mod tests {
         let output = cache.render(PhysicalPoint::default(), &NoGlyphMasks, None, None);
         assert_eq!(output.surface.pixel(55, 5), Some(Color::rgb(255, 0, 0)));
         assert_eq!(output.surface.pixel(5, 5), Some(Color::WHITE));
+    }
+
+    #[test]
+    fn twenty_sixteen_pixel_scrolls_rasterize_at_most_one_new_band() {
+        let viewport = PhysicalSize {
+            width: 120.0,
+            height: 600.0,
+        };
+        let items = vec![
+            item(
+                0,
+                PhysicalRect::new(0.0, 0.0, 120.0, 4096.0),
+                rect(0.0, 0.0, 120.0, 4096.0, Color::WHITE),
+            ),
+            item(
+                1,
+                PhysicalRect::new(0.0, 100.0, 120.0, 20.0),
+                rect(0.0, 100.0, 120.0, 20.0, Color::rgb(0, 0, 255)),
+            ),
+        ];
+        let display = list(viewport, items);
+        let cache = CompositorCache::from_display_list(std::sync::Arc::new(display), Color::WHITE)
+            .expect("the scene is compositable");
+        let _ = cache.render(PhysicalPoint::default(), &NoGlyphMasks, None, None);
+        for frame in 1..=20 {
+            let _ = cache.render(
+                PhysicalPoint {
+                    x: 0.0,
+                    y: frame as f32 * 16.0,
+                },
+                &NoGlyphMasks,
+                None,
+                None,
+            );
+            let stats = cache.stats();
+            assert_eq!(stats.frames, frame + 1);
+            assert!(
+                stats.last_frame_bands <= 1,
+                "frame {frame} rasterized {} new bands; a 16px scroll crosses at most one 512px band boundary",
+                stats.last_frame_bands
+            );
+        }
     }
 
     #[test]
