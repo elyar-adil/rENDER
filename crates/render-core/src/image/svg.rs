@@ -15,9 +15,12 @@
 //!   strokes;
 //! - `clipPath` references on shapes and groups, with `clipPathUnits` and
 //!   transforms;
-//! - same-document `<use>` references through `href`/`xlink:href`, including
-//!   `x`/`y`, inherited paint, and `<symbol>` viewBox scaling by the use
-//!   element's `width`/`height`;
+//! - same-document `<use>` references through `href`/`xlink:href`, rendering a
+//!   shadow-tree clone of the target: `x`/`y`, the use element's transform and
+//!   inherited paint, nested `<use>` with cycle detection and a depth cap, and
+//!   `<symbol>`/`<svg>` targets whose `viewBox` and `preserveAspectRatio` map
+//!   into a viewport established by the use element's `width`/`height`; that
+//!   viewport clips the symbol, and `<symbol>` is never rendered directly;
 //! - `mask` references on shapes and groups, with offscreen alpha or
 //!   luminance compositing, `maskUnits` and `maskContentUnits`;
 //! - `filter` references with `feGaussianBlur`, `feColorMatrix`, `feOffset`,
@@ -33,9 +36,13 @@
 //! Everything else outside the subset (text, embedded images, scripting,
 //! external-document `<use>` references, gradient `xlink:href` inheritance
 //! and spread modes other than `pad`) contributes nothing, matching how an
-//! `<img>`-loaded SVG must render: static and script-free. Unknown filter
-//! primitives are the exception: their input is passed through and reported,
-//! so the rest of the filter chain stays visible.
+//! `<img>`-loaded SVG must render: static and script-free. An external
+//! `<use href="file.svg#id">` or an unresolved local fragment is a defined
+//! fallback - that use paints nothing - and is reported by
+//! [`decode_svg_with_diagnostics`] with
+//! [`SvgRenderDiagnosticCode::UnsupportedReference`], never silently treated
+//! as a local id. Unknown filter primitives are the exception: their input is
+//! passed through and reported, so the rest of the filter chain stays visible.
 //!
 //! Two things about the document are easy to get wrong and are pinned by
 //! tests: it is XML, so an attribute name is case-sensitive and `viewBox` is
@@ -151,6 +158,50 @@ enum GradientUnits {
 enum ClipPathUnits {
     ObjectBoundingBox,
     UserSpaceOnUse,
+}
+
+/// The `align` half of an SVG `preserveAspectRatio` value. `None` is the
+/// `none` keyword, which stretches the viewBox independently on both axes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewBoxAlign {
+    None,
+    Min,
+    Mid,
+    Max,
+}
+
+impl ViewBoxAlign {
+    /// The fraction of the leftover viewport axis used as the offset before
+    /// the scaled viewBox.
+    fn factor(self) -> f32 {
+        match self {
+            Self::None | Self::Min => 0.0,
+            Self::Mid => 0.5,
+            Self::Max => 1.0,
+        }
+    }
+}
+
+/// `preserveAspectRatio`, as the viewBox-to-viewport mapping needs it.
+///
+/// The SVG default is `xMidYMid meet`: scale uniformly by the smaller axis and
+/// centre the result. `slice` scales by the larger axis instead and overflows
+/// the viewport, which is why a `<use>` of a `<symbol>` clips to its viewport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PreserveAspectRatio {
+    align_x: ViewBoxAlign,
+    align_y: ViewBoxAlign,
+    slice: bool,
+}
+
+impl Default for PreserveAspectRatio {
+    fn default() -> Self {
+        Self {
+            align_x: ViewBoxAlign::Mid,
+            align_y: ViewBoxAlign::Mid,
+            slice: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -337,17 +388,36 @@ fn point_in_contours(
     }
 }
 
-/// One filter feature the rasteriser could not honour.
+/// Which part of the rasteriser reported a [`SvgRenderDiagnostic`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SvgRenderDiagnosticCode {
+    /// A filter primitive or unit outside the supported subset; its input is
+    /// passed through or the SVG default is used.
+    UnsupportedFilter,
+    /// A `<use>` reference that cannot be resolved in this document, or a
+    /// reference form outside the supported subset. Nothing is rendered for
+    /// that use element.
+    UnsupportedReference,
+    /// A presentation or geometry attribute whose value is outside the
+    /// supported subset; the documented default was used instead.
+    UnsupportedAttribute,
+}
+
+/// One rendering feature the rasteriser could not honour.
 ///
 /// The rasteriser keeps rendering the document around the unsupported
 /// feature, and reports that feature here instead of silently claiming to
-/// have applied it. The returned pixels are therefore a visible fallback:
+/// have applied it. The returned pixels are therefore a defined fallback:
 /// an unknown filter primitive passes its input through, an unknown blend
-/// mode uses `normal`, and an unknown unit falls back to the SVG default.
+/// mode uses `normal`, an unknown unit falls back to the SVG default, and an
+/// unresolved `<use>` renders nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SvgRenderDiagnostic {
-    /// The filter element or primitive the diagnostic belongs to.
+    /// The element the diagnostic belongs to: the filter primitive, or
+    /// `use` for a reference diagnostic.
     pub element: String,
+    /// The reported category, so callers can route it without parsing text.
+    pub code: SvgRenderDiagnosticCode,
     /// What could not be honoured and the fallback that was used.
     pub message: String,
 }
@@ -362,8 +432,12 @@ pub fn decode_svg(bytes: &[u8], limits: ImageLimits) -> Result<DecodedImage, Ima
     decode_svg_with_diagnostics(bytes, limits).map(|(image, _)| image)
 }
 
-/// Decode an SVG document and report filter features outside the supported
-/// subset.
+/// Decode an SVG document and report features outside the supported subset.
+///
+/// Diagnostics cover unsupported filter primitives/units/attributes and
+/// `<use>` reference failures. Every diagnostic has a defined fallback: an
+/// unsupported filter passes its input through, and a failed `<use>` paints
+/// nothing while the rest of the document renders.
 ///
 /// # Errors
 ///
@@ -486,6 +560,7 @@ fn decode_viewport(
         pixels: vec![Color::rgba(0, 0, 0, 0); width as usize * height as usize],
         clip: ClipStack::default(),
         use_depth: 0,
+        use_stack: Vec::new(),
         mask_depth: 0,
         filter_depth: 0,
         opacity_depth: 0,
@@ -529,20 +604,23 @@ fn decode_viewport(
     let mask_paths = collect_masks(root);
     let filter_paths = collect_filters(root);
     let ids = collect_element_ids(root);
+    let root_color = property(root, "color")
+        .and_then(parse_color)
+        .unwrap_or(current_color);
     let fill = root_paint(
         root,
         "fill",
-        current_color,
+        root_color,
         Paint::Color(Color::BLACK),
         &gradient_index,
     );
-    let stroke = root_paint(root, "stroke", current_color, Paint::None, &gradient_index);
+    let stroke = root_paint(root, "stroke", root_color, Paint::None, &gradient_index);
     walk(
         root,
         root_transform,
         fill,
         stroke,
-        current_color,
+        root_color,
         &gradients,
         &gradient_index,
         &clip_paths,
@@ -564,6 +642,9 @@ struct Raster {
     pixels: Vec<Color>,
     clip: ClipStack,
     use_depth: usize,
+    /// The ids of the `<use>` targets on the current expansion path. A repeat
+    /// is a reference cycle and is skipped instead of recursing forever.
+    use_stack: Vec<String>,
     mask_depth: usize,
     filter_depth: usize,
     opacity_depth: usize,
@@ -674,10 +755,303 @@ fn root_paint(
     initial: Paint,
     gradient_index: &BTreeMap<String, usize>,
 ) -> Paint {
-    match attribute(root, name).map(|raw| parse_paint(raw.trim(), current_color, gradient_index)) {
+    match property(root, name).map(|raw| parse_paint(raw.trim(), current_color, gradient_index)) {
         None | Some(Paint::Inherit) => initial,
         Some(paint) => paint,
     }
+}
+
+/// Resolve a `fill`/`stroke` value, keeping the inherited paint when the value
+/// is explicitly or implicitly `inherit`. Treating a parsed `Inherit` as an
+/// unresolved paint would make `fill="inherit"` paint nothing.
+fn inherited_paint(
+    raw: &str,
+    inherited: Paint,
+    current_color: Color,
+    gradient_index: &BTreeMap<String, usize>,
+) -> Paint {
+    match parse_paint(raw, current_color, gradient_index) {
+        Paint::Inherit => inherited,
+        paint => paint,
+    }
+}
+
+/// The maximum number of nested `<use>` expansions. A document may chain
+/// unique references deeper than this, and a reference cycle never ends, so
+/// the limit is the bounded fallback for both.
+const USE_DEPTH_LIMIT: usize = 16;
+
+fn push_diagnostic(
+    diagnostics: &mut Vec<SvgRenderDiagnostic>,
+    element: &str,
+    code: SvgRenderDiagnosticCode,
+    message: impl Into<String>,
+) {
+    diagnostics.push(SvgRenderDiagnostic {
+        element: element.to_owned(),
+        code,
+        message: message.into(),
+    });
+}
+
+/// Report a `<use>` problem. Nothing is painted for the use element, which is
+/// the same fallback a browser gives an unresolved reference link; the rest of
+/// the document still renders.
+fn use_diagnostic(diagnostics: &mut Vec<SvgRenderDiagnostic>, message: impl Into<String>) {
+    push_diagnostic(
+        diagnostics,
+        "use",
+        SvgRenderDiagnosticCode::UnsupportedReference,
+        message,
+    );
+}
+
+fn unsupported_attribute_diagnostic(
+    diagnostics: &mut Vec<SvgRenderDiagnostic>,
+    element: &XmlNode,
+    message: impl Into<String>,
+) {
+    push_diagnostic(
+        diagnostics,
+        &element.name,
+        SvgRenderDiagnosticCode::UnsupportedAttribute,
+        message,
+    );
+}
+
+impl PreserveAspectRatio {
+    /// Parse the two-token `preserveAspectRatio` grammar. An unparseable value
+    /// is `None`; the caller reports it and uses the SVG default.
+    fn parse(raw: &str) -> Option<Self> {
+        let mut tokens = raw.split_whitespace();
+        let mut align = tokens.next()?;
+        if align.eq_ignore_ascii_case("defer") {
+            align = tokens.next()?;
+        }
+        let (align_x, align_y) = match align {
+            "none" => (ViewBoxAlign::None, ViewBoxAlign::None),
+            "xMinYMin" => (ViewBoxAlign::Min, ViewBoxAlign::Min),
+            "xMinYMid" => (ViewBoxAlign::Min, ViewBoxAlign::Mid),
+            "xMinYMax" => (ViewBoxAlign::Min, ViewBoxAlign::Max),
+            "xMidYMin" => (ViewBoxAlign::Mid, ViewBoxAlign::Min),
+            "xMidYMid" => (ViewBoxAlign::Mid, ViewBoxAlign::Mid),
+            "xMidYMax" => (ViewBoxAlign::Mid, ViewBoxAlign::Max),
+            "xMaxYMin" => (ViewBoxAlign::Max, ViewBoxAlign::Min),
+            "xMaxYMid" => (ViewBoxAlign::Max, ViewBoxAlign::Mid),
+            "xMaxYMax" => (ViewBoxAlign::Max, ViewBoxAlign::Max),
+            _ => return None,
+        };
+        let slice = match tokens.next() {
+            None | Some("meet") => false,
+            Some("slice") => true,
+            Some(_) => return None,
+        };
+        if tokens.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            align_x,
+            align_y,
+            slice,
+        })
+    }
+}
+
+/// The mapping from a viewBox's user space into a `width` x `height`
+/// viewport, honouring `preserveAspectRatio`.
+fn view_box_transform(
+    view_box: (f32, f32, f32, f32),
+    width: f32,
+    height: f32,
+    preserve: PreserveAspectRatio,
+) -> Affine {
+    let (min_x, min_y, view_width, view_height) = view_box;
+    if view_width <= 0.0 || view_height <= 0.0 || width <= 0.0 || height <= 0.0 {
+        return Affine::IDENTITY;
+    }
+    let scale_x = width / view_width;
+    let scale_y = height / view_height;
+    if preserve.align_x == ViewBoxAlign::None && preserve.align_y == ViewBoxAlign::None {
+        return Affine {
+            a: scale_x,
+            b: 0.0,
+            c: 0.0,
+            d: scale_y,
+            e: -min_x * scale_x,
+            f: -min_y * scale_y,
+        };
+    }
+    let scale = if preserve.slice {
+        scale_x.max(scale_y)
+    } else {
+        scale_x.min(scale_y)
+    };
+    let offset_x = preserve.align_x.factor() * (width - view_width * scale);
+    let offset_y = preserve.align_y.factor() * (height - view_height * scale);
+    Affine {
+        a: scale,
+        b: 0.0,
+        c: 0.0,
+        d: scale,
+        e: offset_x - min_x * scale,
+        f: offset_y - min_y * scale,
+    }
+}
+
+/// A `<use>` width/height/x/y length. Percentages resolve against the current
+/// viewport axis; an unparseable value is reported and the caller falls back.
+fn use_length(
+    element: &XmlNode,
+    name: &str,
+    percentage_basis: f32,
+    diagnostics: &mut Vec<SvgRenderDiagnostic>,
+) -> Option<f32> {
+    let raw = attribute(element, name)?;
+    let value = parse_length_with_basis(raw, percentage_basis);
+    if value.is_none() {
+        unsupported_attribute_diagnostic(
+            diagnostics,
+            element,
+            format!(
+                "unsupported `<use>` {name} length `{}`; the attribute was ignored",
+                raw.trim()
+            ),
+        );
+    }
+    value
+}
+
+/// The size the generated `<use>` viewport takes. The use element's own
+/// `width`/`height` win; otherwise a `<symbol>`/`<svg>` target's own attributes
+/// apply, and finally the viewBox extent, which is the useful size for an
+/// unsized icon sprite.
+fn use_viewport_size(
+    use_element: &XmlNode,
+    target: &XmlNode,
+    name: &str,
+    basis: f32,
+    fallback: Option<f32>,
+    diagnostics: &mut Vec<SvgRenderDiagnostic>,
+) -> Option<f32> {
+    use_length(use_element, name, basis, diagnostics)
+        .or_else(|| attribute(target, name).and_then(|raw| parse_length_with_basis(raw, basis)))
+        .or(fallback)
+}
+
+/// The transform and clip rectangle a `<use>` of a `<symbol>` or nested `<svg>`
+/// establishes.
+struct UseViewport {
+    content: Affine,
+    /// The viewport quad in device space, or `None` when the target has no
+    /// resolvable size and therefore no viewport to clip to.
+    clip: Option<[(f32, f32); 4]>,
+}
+
+/// Resolve a use element's generated viewport.
+///
+/// SVG 2 §"Use element": a `<use>` of `<symbol>` or `<svg>` generates a shadow
+/// `<svg>` whose `x`/`y`/`width`/`height` come from the use element and whose
+/// viewBox comes from the target. `preserveAspectRatio` maps the target's user
+/// space into that viewport, and the viewport clips the result.
+fn use_viewport(
+    use_element: &XmlNode,
+    target: &XmlNode,
+    viewport_transform: Affine,
+    basis: (f32, f32),
+    diagnostics: &mut Vec<SvgRenderDiagnostic>,
+) -> UseViewport {
+    let view_box = root_view_box(target);
+    let fallback = view_box.map(|(_, _, width, height)| (width, height));
+    let width = use_viewport_size(
+        use_element,
+        target,
+        "width",
+        basis.0,
+        fallback.map(|size| size.0),
+        diagnostics,
+    );
+    let height = use_viewport_size(
+        use_element,
+        target,
+        "height",
+        basis.1,
+        fallback.map(|size| size.1),
+        diagnostics,
+    );
+    let (Some(width), Some(height)) = (width, height) else {
+        return UseViewport {
+            content: viewport_transform,
+            clip: None,
+        };
+    };
+    if width <= 0.0 || height <= 0.0 {
+        return UseViewport {
+            content: viewport_transform,
+            clip: Some([(0.0, 0.0); 4]),
+        };
+    }
+    let viewport = [
+        viewport_transform.apply(0.0, 0.0),
+        viewport_transform.apply(width, 0.0),
+        viewport_transform.apply(width, height),
+        viewport_transform.apply(0.0, height),
+    ];
+    let Some(view_box) = view_box else {
+        return UseViewport {
+            content: viewport_transform,
+            clip: Some(viewport),
+        };
+    };
+    let preserve = match attribute(target, "preserveAspectRatio") {
+        None => PreserveAspectRatio::default(),
+        Some(raw) => PreserveAspectRatio::parse(raw.trim()).unwrap_or_else(|| {
+            unsupported_attribute_diagnostic(
+                diagnostics,
+                target,
+                format!(
+                    "unsupported preserveAspectRatio `{}`; used xMidYMid meet",
+                    raw.trim()
+                ),
+            );
+            PreserveAspectRatio::default()
+        }),
+    };
+    UseViewport {
+        content: viewport_transform.then(view_box_transform(view_box, width, height, preserve)),
+        clip: Some(viewport),
+    }
+}
+
+/// Clone the referenced node into the use shadow tree.
+///
+/// IDs in the clone are deliberately not added to the document id map: the
+/// clone is a rendering tree, not a second DOM, and a nested `<use>` must keep
+/// resolving against the original definitions.
+fn use_shadow_content(target: &XmlNode) -> XmlNode {
+    let mut content = target.clone();
+    if matches!(target.name.as_str(), "symbol" | "svg") {
+        // The generated shadow `<svg>` supplies the viewport and viewBox
+        // mapping; the target keeps only the presentation and transform
+        // attributes that apply inside that generated viewport.
+        "g".clone_into(&mut content.name);
+        content.attributes.retain(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "viewBox" | "preserveAspectRatio" | "x" | "y" | "width" | "height"
+            )
+        });
+    }
+    content
+}
+
+/// Push an axis-aligned (or affine-mapped) viewport rectangle as a clip layer.
+fn push_device_rect_clip(raster: &mut Raster, corners: [(f32, f32); 4]) {
+    raster.clip.push(ClipLayer {
+        polygons: vec![ClipPolygon {
+            contours: vec![corners.to_vec()],
+            fill_rule: ClipFillRule::NonZero,
+        }],
+    });
 }
 
 #[allow(
@@ -702,21 +1076,32 @@ fn walk(
 ) {
     let clipped = push_element_clip(raster, element, transform, None, clip_paths);
     for child_node in &element.children {
+        let presentation = |name: &str| {
+            property(child_node, name)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        };
         let attribute = |name: &str| {
             attribute(child_node, name)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
         };
-        let child_fill =
-            attribute("fill").map_or(fill, |raw| parse_paint(raw, current_color, gradient_index));
-        let child_stroke = attribute("stroke").map_or(stroke, |raw| {
-            parse_paint(raw, current_color, gradient_index)
+        // `color` is inherited and is what `currentColor` resolves to for this
+        // element and every descendant that does not set its own.
+        let child_color = presentation("color")
+            .and_then(parse_color)
+            .unwrap_or(current_color);
+        let child_fill = presentation("fill").map_or(fill, |raw| {
+            inherited_paint(raw, fill, child_color, gradient_index)
         });
-        let child_transform = match attribute("transform") {
+        let child_stroke = presentation("stroke").map_or(stroke, |raw| {
+            inherited_paint(raw, stroke, child_color, gradient_index)
+        });
+        let child_transform = match presentation("transform") {
             Some(specification) => transform.then(parse_transform(specification)),
             None => transform,
         };
-        if attribute("display").is_some_and(|value| value.eq_ignore_ascii_case("none")) {
+        if presentation("display").is_some_and(|value| value.eq_ignore_ascii_case("none")) {
             continue;
         }
         if paint_opacity_group(
@@ -773,7 +1158,7 @@ fn walk(
             continue;
         }
         match child_node.name.as_str() {
-            "defs" | "text" | "image" | "style" | "title" | "desc" | "metadata" => {}
+            "defs" | "symbol" | "text" | "image" | "style" | "title" | "desc" | "metadata" => {}
             "rect" => {
                 let Some(points) = rect_polygon(
                     attribute("x").and_then(parse_length),
@@ -971,20 +1356,60 @@ fn walk(
             }
             "use" => {
                 let Some(reference) = attribute("href").or_else(|| attribute("xlink:href")) else {
+                    use_diagnostic(
+                        diagnostics,
+                        "`<use>` has no href or xlink:href; nothing is rendered",
+                    );
                     continue;
                 };
-                let Some(id) = fragment_id(reference) else {
+                let reference = reference.trim();
+                let Some(id) = reference.strip_prefix('#') else {
+                    use_diagnostic(
+                        diagnostics,
+                        format!(
+                            "external-document `<use>` reference `{reference}` is not supported; nothing is rendered"
+                        ),
+                    );
                     continue;
                 };
-                let Some(target) = ids.get(id) else {
-                    continue;
-                };
-                if raster.use_depth >= 16 {
+                let id = id.trim();
+                if id.is_empty() {
+                    use_diagnostic(
+                        diagnostics,
+                        "`<use>` has an empty fragment reference; nothing is rendered",
+                    );
                     continue;
                 }
-                let x = attribute("x").and_then(parse_length).unwrap_or(0.0);
-                let y = attribute("y").and_then(parse_length).unwrap_or(0.0);
-                let mut use_transform = child_transform.then(Affine {
+                let Some(target) = ids.get(id) else {
+                    use_diagnostic(
+                        diagnostics,
+                        format!(
+                            "`<use>` reference `#{id}` does not resolve to an element in this document; nothing is rendered"
+                        ),
+                    );
+                    continue;
+                };
+                if raster.use_stack.iter().any(|ancestor| ancestor == id) {
+                    use_diagnostic(
+                        diagnostics,
+                        format!(
+                            "`<use>` reference cycle through `#{id}`; the recursive expansion was stopped"
+                        ),
+                    );
+                    continue;
+                }
+                if raster.use_depth >= USE_DEPTH_LIMIT {
+                    use_diagnostic(
+                        diagnostics,
+                        format!(
+                            "`<use>` nesting is deeper than the {USE_DEPTH_LIMIT}-level limit at `#{id}`; the rest of the expansion was stopped"
+                        ),
+                    );
+                    continue;
+                }
+                let x = use_length(child_node, "x", raster.viewport.0, diagnostics).unwrap_or(0.0);
+                let y = use_length(child_node, "y", raster.viewport.1, diagnostics).unwrap_or(0.0);
+                let viewport_transform = child_transform.then(Affine {
                     a: 1.0,
                     b: 0.0,
                     c: 0.0,
@@ -992,69 +1417,46 @@ fn walk(
                     e: x,
                     f: y,
                 });
-                if matches!(target.name.as_str(), "symbol" | "svg")
-                    && let Some((min_x, min_y, view_width, view_height)) = root_view_box(target)
-                    && view_width > 0.0
-                    && view_height > 0.0
-                {
-                    let width = attribute("width")
-                        .and_then(parse_length)
-                        .or_else(|| {
-                            target
-                                .attributes
-                                .iter()
-                                .find(|(name, _)| name == "width")
-                                .and_then(|(_, value)| parse_length(value))
-                        })
-                        .unwrap_or(view_width);
-                    let height = attribute("height")
-                        .and_then(parse_length)
-                        .or_else(|| {
-                            target
-                                .attributes
-                                .iter()
-                                .find(|(name, _)| name == "height")
-                                .and_then(|(_, value)| parse_length(value))
-                        })
-                        .unwrap_or(view_height);
-                    let scale_x = width / view_width;
-                    let scale_y = height / view_height;
-                    use_transform = use_transform.then(
-                        Affine::IDENTITY
-                            .then(Affine {
-                                a: scale_x,
-                                b: 0.0,
-                                c: 0.0,
-                                d: scale_y,
-                                e: 0.0,
-                                f: 0.0,
-                            })
-                            .then(Affine {
-                                a: 1.0,
-                                b: 0.0,
-                                c: 0.0,
-                                d: 1.0,
-                                e: -min_x * scale_x,
-                                f: -min_y * scale_y,
-                            }),
-                    );
+                let (content_transform, viewport_clip) =
+                    if matches!(target.name.as_str(), "symbol" | "svg") {
+                        let viewport = use_viewport(
+                            child_node,
+                            target,
+                            viewport_transform,
+                            raster.viewport,
+                            diagnostics,
+                        );
+                        (viewport.content, viewport.clip)
+                    } else {
+                        (viewport_transform, None)
+                    };
+
+                let mut clip_layers = 0;
+                if push_element_clip(raster, child_node, viewport_transform, None, clip_paths) {
+                    clip_layers += 1;
                 }
-                let mut attributes = Vec::new();
-                if let Some(clip) = attribute("clip-path") {
-                    attributes.push(("clip-path".to_owned(), clip.to_owned()));
+                if let Some(corners) = viewport_clip {
+                    push_device_rect_clip(raster, corners);
+                    clip_layers += 1;
                 }
+
+                // Rendering goes through a synthetic wrapper so the target is
+                // processed as a child: its own fill/stroke, transform,
+                // opacity, clip-path, mask and filter then apply exactly as
+                // they would if the target had been written at this position.
                 let shadow = XmlNode {
                     name: "use-shadow".to_owned(),
-                    attributes,
-                    children: vec![(*target).clone()],
+                    attributes: Vec::new(),
+                    children: vec![use_shadow_content(target)],
                 };
                 raster.use_depth += 1;
+                raster.use_stack.push(id.to_owned());
                 walk(
                     &shadow,
-                    use_transform,
+                    content_transform,
                     child_fill,
                     child_stroke,
-                    current_color,
+                    child_color,
                     gradients,
                     gradient_index,
                     clip_paths,
@@ -1064,10 +1466,14 @@ fn walk(
                     raster,
                     diagnostics,
                 );
+                raster.use_stack.pop();
                 raster.use_depth -= 1;
+                for _ in 0..clip_layers {
+                    raster.clip.pop();
+                }
             }
             "svg" | "g" | "a" | "switch" => {
-                if attribute("display").is_some_and(|value| value.eq_ignore_ascii_case("none")) {
+                if presentation("display").is_some_and(|value| value.eq_ignore_ascii_case("none")) {
                     continue;
                 }
                 walk(
@@ -1075,7 +1481,7 @@ fn walk(
                     child_transform,
                     child_fill,
                     child_stroke,
-                    current_color,
+                    child_color,
                     gradients,
                     gradient_index,
                     clip_paths,
@@ -1093,7 +1499,7 @@ fn walk(
                     child_transform,
                     child_fill,
                     child_stroke,
-                    current_color,
+                    child_color,
                     gradients,
                     gradient_index,
                     clip_paths,
@@ -1149,6 +1555,7 @@ fn paint_opacity_group(
         pixels: vec![Color::TRANSPARENT; raster.width as usize * raster.height as usize],
         clip: raster.clip.clone(),
         use_depth: raster.use_depth,
+        use_stack: raster.use_stack.clone(),
         mask_depth: raster.mask_depth,
         filter_depth: raster.filter_depth,
         opacity_depth: raster.opacity_depth + 1,
@@ -1256,7 +1663,7 @@ fn paint_masked_element(
     ids: &BTreeMap<String, &XmlNode>,
     diagnostics: &mut Vec<SvgRenderDiagnostic>,
 ) -> bool {
-    let Some(reference) = attribute(element, "mask") else {
+    let Some(reference) = property(element, "mask") else {
         return false;
     };
     let Some(id) = reference_id(reference) else {
@@ -1279,6 +1686,7 @@ fn paint_masked_element(
         pixels: vec![Color::TRANSPARENT; raster.width as usize * raster.height as usize],
         clip: raster.clip.clone(),
         use_depth: raster.use_depth,
+        use_stack: raster.use_stack.clone(),
         mask_depth: raster.mask_depth,
         filter_depth: raster.filter_depth,
         opacity_depth: raster.opacity_depth,
@@ -1329,6 +1737,7 @@ fn paint_masked_element(
         pixels: vec![Color::TRANSPARENT; raster.width as usize * raster.height as usize],
         clip: ClipStack::default(),
         use_depth: 0,
+        use_stack: raster.use_stack.clone(),
         mask_depth: raster.mask_depth + 1,
         filter_depth: raster.filter_depth,
         opacity_depth: raster.opacity_depth,
@@ -1488,7 +1897,7 @@ fn paint_filtered_element(
     ids: &BTreeMap<String, &XmlNode>,
     diagnostics: &mut Vec<SvgRenderDiagnostic>,
 ) -> bool {
-    let Some(reference) = attribute(element, "filter") else {
+    let Some(reference) = property(element, "filter") else {
         return false;
     };
     let Some(id) = reference_id(reference) else {
@@ -1511,6 +1920,7 @@ fn paint_filtered_element(
         pixels: vec![Color::TRANSPARENT; raster.width as usize * raster.height as usize],
         clip: raster.clip.clone(),
         use_depth: raster.use_depth,
+        use_stack: raster.use_stack.clone(),
         mask_depth: raster.mask_depth,
         filter_depth: raster.filter_depth + 1,
         opacity_depth: raster.opacity_depth,
@@ -1844,6 +2254,7 @@ fn filter_diagnostic(
 ) {
     diagnostics.push(SvgRenderDiagnostic {
         element: element.name.clone(),
+        code: SvgRenderDiagnosticCode::UnsupportedFilter,
         message: message.into(),
     });
 }
@@ -3005,6 +3416,27 @@ fn attribute<'a>(element: &'a XmlNode, name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
+/// The value of a CSS property in an element's `style` attribute.
+///
+/// SVG presentation attributes are CSS properties with a lower priority than
+/// an inline `style`. This reads the last declaration of `name`, which is the
+/// one CSS winner in a single declaration block, so `style="fill:red;fill:blue"`
+/// resolves to blue.
+fn style_declaration<'a>(element: &'a XmlNode, name: &str) -> Option<&'a str> {
+    let style = attribute(element, "style")?;
+    style
+        .split(';')
+        .filter_map(|declaration| declaration.split_once(':'))
+        .filter(|(property, _)| property.trim().eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim())
+        .rfind(|value| !value.is_empty())
+}
+
+/// A presentation attribute with its `style` declaration taking precedence.
+fn property<'a>(element: &'a XmlNode, name: &str) -> Option<&'a str> {
+    style_declaration(element, name).or_else(|| attribute(element, name))
+}
+
 fn parse_xml(text: &str) -> Option<XmlNode> {
     let mut stack: Vec<XmlNode> = Vec::new();
     let mut root: Option<XmlNode> = None;
@@ -3219,16 +3651,6 @@ fn rect_polygon(
     ])
 }
 
-/// The id in an `href="#id"` or `xlink:href="#id"` reference.
-fn fragment_id(raw: &str) -> Option<&str> {
-    let trimmed = raw.trim();
-    if let Some(id) = reference_id(trimmed) {
-        return Some(id);
-    }
-    let id = trimmed.strip_prefix('#')?;
-    (!id.is_empty()).then_some(id)
-}
-
 /// The id in a `url(#id)` paint or `clip-path` reference.
 fn reference_id(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
@@ -3396,7 +3818,7 @@ fn push_element_clip(
     local_bounds: Option<Bounds>,
     clip_paths: &BTreeMap<String, &XmlNode>,
 ) -> bool {
-    let Some(reference) = attribute(element, "clip-path") else {
+    let Some(reference) = property(element, "clip-path") else {
         return false;
     };
     let Some(id) = reference_id(reference) else {
@@ -4288,9 +4710,10 @@ fn flush_number(number: &mut String, tokens: &mut Vec<PathToken>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Color, ImageLimits, decode_svg, decode_svg_viewport, decode_svg_with_diagnostics,
-        parse_path,
+        Color, ImageLimits, SvgRenderDiagnosticCode, decode_svg, decode_svg_viewport,
+        decode_svg_with_diagnostics, parse_path,
     };
+    use std::fmt::Write as _;
 
     const T5_MEDAL: &str = r#"<svg class="medal-newlevel-circled" xmlns="http://www.w3.org/2000/svg" data-priority="2" width="32" height="32" viewBox="0 0 32 32" fill="none">
   <g clip-path="url(#clip0_5048_100697)">
@@ -4624,13 +5047,208 @@ mod tests {
         assert_eq!(image.pixel(2, 2), Some(Color::rgb(255, 0, 0)));
     }
 
+    /// A `<symbol>` is a definition, not a shape: it has no direct rendering,
+    /// and only a `<use>` gives it a viewport and paints its contents.
     #[test]
-    fn a_self_referential_use_stops_at_the_depth_limit() {
+    fn a_symbol_is_invisible_until_use_references_it() {
+        let definition_only = br#"<svg width="20" height="20"><defs>
+            <symbol id="s" viewBox="0 0 10 10"><rect width="10" height="10" fill="red"/></symbol>
+            </defs></svg>"#;
+        let image = decode_svg(definition_only, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(5, 5), Some(Color::TRANSPARENT));
+        assert_eq!(image.pixel(15, 15), Some(Color::TRANSPARENT));
+
+        let used = br##"<svg width="20" height="20"><defs>
+            <symbol id="s" viewBox="0 0 10 10"><rect width="10" height="10" fill="red"/></symbol>
+            </defs><use href="#s" x="10" y="5" width="10" height="10"/></svg>"##;
+        let image = decode_svg(used, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(15, 10), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(5, 5), Some(Color::TRANSPARENT));
+        assert_eq!(image.pixel(15, 18), Some(Color::TRANSPARENT));
+    }
+
+    /// The use element contributes the outer translation and the inherited
+    /// paint; the referenced group keeps its own transform. A property the
+    /// target sets itself is not overridden by the use wrapper.
+    #[test]
+    fn use_composes_the_target_transform_and_inherits_paint_from_the_use_wrapper() {
+        let svg = br##"<svg width="20" height="20"><defs>
+            <g id="g" transform="translate(2 3)"><rect width="4" height="4"/></g>
+            </defs><use href="#g" x="5" y="1" fill="#00ff00"/></svg>"##;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(8, 5), Some(Color::rgb(0, 255, 0)));
+        assert_eq!(image.pixel(6, 5), Some(Color::TRANSPARENT));
+        assert_eq!(image.pixel(12, 5), Some(Color::TRANSPARENT));
+
+        let target_paint = br##"<svg width="10" height="10"><defs>
+            <rect id="r" width="4" height="4" style="fill:#0000ff"/></defs>
+            <use href="#r" fill="#00ff00"/></svg>"##;
+        let image = decode_svg(target_paint, ImageLimits::default()).expect("decodes");
+        assert_eq!(
+            image.pixel(1, 1),
+            Some(Color::rgb(0, 0, 255)),
+            "an explicitly filled target must keep its paint"
+        );
+
+        let explicit_inherit = br##"<svg width="10" height="10"><defs>
+            <g id="g" fill="inherit"><rect width="4" height="4"/></g></defs>
+            <use href="#g" fill="#00ff00"/></svg>"##;
+        let image = decode_svg(explicit_inherit, ImageLimits::default()).expect("decodes");
+        assert_eq!(
+            image.pixel(1, 1),
+            Some(Color::rgb(0, 255, 0)),
+            "fill=inherit takes the use wrapper's paint"
+        );
+    }
+
+    /// `<use width height>` establishes the generated viewport, the symbol's
+    /// viewBox maps into it with the default xMidYMid meet alignment, and the
+    /// viewport clips geometry the symbol draws outside the viewBox.
+    #[test]
+    fn use_clips_a_symbol_to_its_generated_viewport_and_centres_the_view_box() {
+        let svg = br##"<svg width="30" height="10"><defs>
+            <symbol id="s" viewBox="0 0 10 10"><rect width="20" height="10" fill="red"/></symbol>
+            </defs><use href="#s" x="5" width="20" height="10"/></svg>"##;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        // 1:1 meet scaling inside a 20x10 viewport leaves 5 units on each
+        // side; the symbol's oversized rect therefore starts at x=10.
+        assert_eq!(image.pixel(7, 5), Some(Color::TRANSPARENT));
+        assert_eq!(image.pixel(24, 5), Some(Color::rgb(255, 0, 0)));
+        // The generated viewport ends at x=25; the rect would otherwise reach
+        // x=30 because it is wider than the symbol's viewBox.
+        assert_eq!(image.pixel(26, 5), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn preserve_aspect_ratio_none_stretches_the_symbol_view_box() {
+        let svg = br##"<svg width="10" height="10"><defs>
+            <symbol id="s" viewBox="0 0 10 5" preserveAspectRatio="none">
+              <rect width="10" height="5" fill="red"/></symbol>
+            </defs><use href="#s" width="10" height="10"/></svg>"##;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(5, 1), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(5, 9), Some(Color::rgb(255, 0, 0)));
+    }
+
+    #[test]
+    fn nested_use_resolves_against_the_original_id_map_for_every_reference() {
+        let svg = br##"<svg width="20" height="20"><defs>
+            <rect id="r" width="2" height="2" fill="red"/>
+            <g id="g"><use href="#r" x="4"/></g>
+            </defs><use href="#g" x="2" y="3"/><use href="#g" x="10" y="10"/></svg>"##;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(6, 3), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(14, 10), Some(Color::rgb(255, 0, 0)));
+    }
+
+    /// A style declaration is a CSS property and wins over the presentation
+    /// attribute; it applies to inherited paint and to `currentColor`.
+    #[test]
+    fn use_honours_style_presentation_and_current_color() {
+        let style_on_use = br##"<svg width="10" height="10"><defs>
+            <rect id="r" width="4" height="4"/></defs>
+            <use href="#r" style="fill:#00ff00"/></svg>"##;
+        let image = decode_svg(style_on_use, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(1, 1), Some(Color::rgb(0, 255, 0)));
+
+        let current_color = br##"<svg width="10" height="10"><defs>
+            <rect id="r" width="4" height="4"/></defs>
+            <use href="#r" fill="currentColor" style="color:#0000ff"/></svg>"##;
+        let image = decode_svg(current_color, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(1, 1), Some(Color::rgb(0, 0, 255)));
+
+        let target_color = br##"<svg width="10" height="10"><defs>
+            <g id="g" color="#0000ff"><rect width="4" height="4" fill="currentColor"/></g>
+            </defs><use href="#g"/></svg>"##;
+        let image = decode_svg(target_color, ImageLimits::default()).expect("decodes");
+        assert_eq!(
+            image.pixel(1, 1),
+            Some(Color::rgb(0, 0, 255)),
+            "currentColor follows the target's own inherited color"
+        );
+    }
+
+    #[test]
+    fn a_self_referential_use_is_stopped_with_a_cycle_diagnostic() {
         let svg = br##"<svg width="10" height="10"><defs>
             <g id="loop"><use href="#loop"/></g></defs>
             <use href="#loop"/></svg>"##;
-        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        let (image, diagnostics) =
+            decode_svg_with_diagnostics(svg, ImageLimits::default()).expect("decodes");
         assert_eq!(image.pixel(5, 5), Some(Color::TRANSPARENT));
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            SvgRenderDiagnosticCode::UnsupportedReference
+        );
+        assert!(
+            diagnostics[0].message.contains("cycle"),
+            "{}",
+            diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn deeply_nested_use_is_capped_with_a_diagnostic() {
+        let mut svg = String::from("<svg width=\"10\" height=\"10\"><defs>");
+        for level in 1..=20 {
+            write!(
+                svg,
+                "<g id=\"g{level}\"><use href=\"#g{}\"/></g>",
+                level + 1
+            )
+            .expect("writing to a String cannot fail");
+        }
+        svg.push_str("<rect id=\"g21\" width=\"10\" height=\"10\" fill=\"red\"/></defs>");
+        svg.push_str("<use href=\"#g1\"/></svg>");
+        let (image, diagnostics) =
+            decode_svg_with_diagnostics(svg.as_bytes(), ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(5, 5), Some(Color::TRANSPARENT));
+        assert!(!diagnostics.is_empty());
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == SvgRenderDiagnosticCode::UnsupportedReference)
+        );
+    }
+
+    /// An external reference must not fall back to a same-named local id and
+    /// must not paint anything; the diagnostic is the whole result for that
+    /// use element.
+    #[test]
+    fn an_external_use_reference_is_reported_and_paints_nothing() {
+        let svg = br#"<svg width="10" height="10"><defs>
+            <rect id="icon" width="10" height="10" fill="red"/></defs>
+            <use href="https://example.com/icons.svg#icon"/></svg>"#;
+        let (image, diagnostics) =
+            decode_svg_with_diagnostics(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(5, 5), Some(Color::TRANSPARENT));
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            SvgRenderDiagnosticCode::UnsupportedReference
+        );
+        assert!(
+            diagnostics[0].message.contains("external-document"),
+            "{}",
+            diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn a_missing_use_target_is_reported_and_paints_nothing() {
+        let svg = br##"<svg width="10" height="10">
+            <rect width="2" height="2" fill="red"/><use href="#missing"/></svg>"##;
+        let (image, diagnostics) =
+            decode_svg_with_diagnostics(svg, ImageLimits::default()).expect("decodes");
+        // The rest of the document is unaffected by the broken reference.
+        assert_eq!(image.pixel(1, 1), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(5, 5), Some(Color::TRANSPARENT));
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            SvgRenderDiagnosticCode::UnsupportedReference
+        );
     }
 
     #[test]

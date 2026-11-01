@@ -35,6 +35,14 @@
 //!
 //! * `text` and `<image>`: outside the rasteriser's documented subset, so
 //!   they contribute nothing.
+//! * `<use>` is supported for same-document fragment references, including
+//!   `<symbol>` viewports, nested use, cycle detection and inherited paint.
+//!   An external reference (`href="file.svg#id"`, `https://...#id`) cannot be
+//!   resolved by the rasteriser and is reported as
+//!   [`InlineSvgDiagnosticCode::UnsupportedReference`] instead of being
+//!   silently dropped; nothing is painted for that use element. External CSS
+//!   selectors are not applied to the serialised markup either, so styling
+//!   must be carried by presentation attributes or inline `style`.
 //! * Filter primitives other than `feGaussianBlur`, `feColorMatrix`,
 //!   `feOffset`, `feBlend`, `feComposite`, `feFlood`, `feMerge`,
 //!   `feDropShadow` and `feMorphology`: an unsupported primitive is skipped
@@ -114,6 +122,13 @@ pub enum InlineSvgDiagnosticCode {
     /// A filter primitive or unit outside the rasteriser's subset was
     /// skipped, and its documented visible fallback was used.
     UnsupportedFilter,
+    /// A `<use>` reference was unresolved, external, cyclic, or too deeply
+    /// nested. Nothing is painted for that use element; the rest of the
+    /// inline SVG still renders.
+    UnsupportedReference,
+    /// A presentation or geometry attribute used an unsupported value, and
+    /// its documented fallback was used.
+    UnsupportedAttribute,
     /// The image store refused the decoded raster.
     StoreLimit,
 }
@@ -368,13 +383,31 @@ fn rasterise(
         },
         filter_diagnostics
             .into_iter()
-            .map(|diagnostic| InlineSvgDiagnostic {
-                node: Some(owner),
-                code: InlineSvgDiagnosticCode::UnsupportedFilter,
-                message: format!(
-                    "inline SVG filter `<{}>`: {}",
-                    diagnostic.element, diagnostic.message
-                ),
+            .map(|diagnostic| {
+                let code = match diagnostic.code {
+                    svg::SvgRenderDiagnosticCode::UnsupportedFilter => {
+                        InlineSvgDiagnosticCode::UnsupportedFilter
+                    }
+                    svg::SvgRenderDiagnosticCode::UnsupportedReference => {
+                        InlineSvgDiagnosticCode::UnsupportedReference
+                    }
+                    svg::SvgRenderDiagnosticCode::UnsupportedAttribute => {
+                        InlineSvgDiagnosticCode::UnsupportedAttribute
+                    }
+                };
+                let subject = if code == InlineSvgDiagnosticCode::UnsupportedFilter {
+                    "inline SVG filter"
+                } else {
+                    "inline SVG"
+                };
+                InlineSvgDiagnostic {
+                    node: Some(owner),
+                    code,
+                    message: format!(
+                        "{subject} `<{}>`: {}",
+                        diagnostic.element, diagnostic.message
+                    ),
+                }
             })
             .collect(),
     ))
@@ -642,6 +675,133 @@ mod tests {
         assert_eq!(
             discovery.resources[0].image.pixel(4, 4),
             Some(Color::rgb(0, 255, 0))
+        );
+    }
+
+    /// An inline icon sprite is the common `<use>`/`<symbol>` case: the
+    /// symbol is defined in `<defs>`, instantiated by `<use>`, and the
+    /// resulting pixels must reach the display list like any other inline
+    /// SVG raster.
+    #[test]
+    fn inline_svg_use_and_symbol_reach_the_display_list() {
+        let document = crate::document::Document::parse(
+            "<!doctype html><style>body{margin:0}</style>\
+             <svg id='icon' width='20' height='20' viewBox='0 0 20 20'>\
+             <defs><symbol id='tile' viewBox='0 0 10 10'>\
+             <rect width='10' height='10' fill='#ff0000'/></symbol></defs>\
+             <use href='#tile' x='10' y='0' width='10' height='10'/></svg>",
+        );
+        let limits = ImageLimits::default();
+        let discovery = discover_inline_svgs(document.dom(), limits);
+        assert_eq!(discovery.resources.len(), 1);
+        assert!(
+            discovery.diagnostics.is_empty(),
+            "{:?}",
+            discovery.diagnostics
+        );
+        assert_eq!(
+            discovery.resources[0].image.pixel(15, 5),
+            Some(Color::rgb(255, 0, 0)),
+            "the use instance is in the raster"
+        );
+        assert_eq!(
+            discovery.resources[0].image.pixel(5, 5),
+            Some(Color::TRANSPARENT),
+            "the symbol definition is not painted directly"
+        );
+
+        let mut images = ImageResources::default();
+        let (installed, diagnostics) = discovery.install(&mut images, limits);
+        assert_eq!(installed.len(), 1);
+        assert!(diagnostics.is_empty());
+        let render = document.render_with_images(
+            crate::document::DocumentRenderOptions::default(),
+            crate::document::DocumentBackends {
+                text_measurer: &crate::layout::SimpleTextMeasurer,
+                text_shaper: &crate::paint::ReferenceTextShaper,
+                glyph_masks: &crate::paint::NoGlyphMasks,
+                font_face_installer: None,
+            },
+            &images,
+        );
+        let destination = render
+            .display
+            .list
+            .items()
+            .iter()
+            .find_map(|item| match item.command {
+                crate::paint::DisplayCommand::Image(image) => Some(image.destination),
+                _ => None,
+            })
+            .expect("the use-generated raster is painted as an image");
+        assert_eq!(
+            render.raster.surface.pixel(
+                destination.origin.x as u32 + 15,
+                destination.origin.y as u32 + 5
+            ),
+            Some(PaintColor::rgb(255, 0, 0))
+        );
+        assert_eq!(
+            render.raster.surface.pixel(
+                destination.origin.x as u32 + 5,
+                destination.origin.y as u32 + 5
+            ),
+            Some(PaintColor::rgb(255, 255, 255)),
+            "the symbol definition must not be painted to the left of the use instance"
+        );
+    }
+
+    /// An `xlink:href` survives serialisation with its namespace prefix and is
+    /// accepted by the same `<use>` resolver as an SVG 2 `href`.
+    #[test]
+    fn inline_svg_use_accepts_xlink_href_after_serialisation() {
+        let dom = parse(
+            "<!doctype html><body><svg width=4 height=4 viewBox='0 0 4 4'>\
+             <defs><rect id='tile' width='4' height='4' fill='#ff0000'/></defs>\
+             <use xlink:href='#tile'/></svg>",
+        );
+        let discovery = discover_inline_svgs(&dom, ImageLimits::default());
+        assert_eq!(discovery.resources.len(), 1);
+        assert!(
+            discovery.diagnostics.is_empty(),
+            "{:?}",
+            discovery.diagnostics
+        );
+        assert_eq!(
+            discovery.resources[0].image.pixel(2, 2),
+            Some(Color::rgb(255, 0, 0))
+        );
+    }
+
+    /// An external reference has no resource seam in the inline-SVG path, so
+    /// it is reported and the use paints nothing rather than being mistaken
+    /// for a local fragment or drawing stale pixels.
+    #[test]
+    fn an_external_inline_svg_use_is_reported_and_paints_nothing() {
+        let dom = parse(
+            "<!doctype html><body><svg width=10 height=10 viewBox='0 0 10 10'>\
+             <defs><rect id='icon' width='10' height='10' fill='#ff0000'/></defs>\
+             <use href='https://example.com/icons.svg#icon'/></svg>",
+        );
+        let discovery = discover_inline_svgs(&dom, ImageLimits::default());
+
+        assert_eq!(discovery.resources.len(), 1);
+        assert_eq!(
+            discovery.resources[0].image.pixel(5, 5),
+            Some(Color::TRANSPARENT)
+        );
+        assert_eq!(discovery.diagnostics.len(), 1);
+        assert_eq!(
+            discovery.diagnostics[0].code,
+            super::InlineSvgDiagnosticCode::UnsupportedReference
+        );
+        assert_eq!(discovery.diagnostics[0].node, Some(only_svg(&dom)));
+        assert!(
+            discovery.diagnostics[0]
+                .message
+                .contains("external-document"),
+            "{}",
+            discovery.diagnostics[0].message
         );
     }
 
