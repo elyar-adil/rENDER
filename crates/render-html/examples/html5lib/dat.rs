@@ -348,14 +348,15 @@ fn node_ends_here(node: &str) -> bool {
         // quote is a node whose value continues on the next line.
         return payload.len() > 1 && payload.ends_with('"');
     }
-    if payload.starts_with('<') {
+    if payload.starts_with('<') && payload.ends_with('>') {
         // An element, a DOCTYPE, or a processing instruction: each is written
         // as a single line that ends at its `>`.
         //
-        // This test has to come before the attribute case below, because a
-        // DOCTYPE's public and system identifiers are quoted and a DOCTYPE line
-        // can therefore contain `"` without being an attribute.
-        return payload.ends_with('>');
+        // The `ends_with('>')` half is load-bearing: an attribute name is
+        // allowed to start with `<`, and `|       <=""` is an attribute line,
+        // not an element. Without it the next attribute's line is swallowed as
+        // part of this one's name.
+        return true;
     }
     // `name="value"`.
     payload.ends_with('"')

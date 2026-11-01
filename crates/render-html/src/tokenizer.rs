@@ -98,6 +98,7 @@ pub enum HtmlParseErrorCode {
     EofInDoctype,
     EofInElementThatCanContainOnlyText,
     EofInTag,
+    IncorrectlyClosedComment,
     IncorrectlyOpenedComment,
     InvalidCharacterSequenceAfterDoctypeName,
     InvalidFirstCharacterOfProcessingInstructionTarget,
@@ -151,6 +152,7 @@ impl HtmlParseErrorCode {
             Self::EofInDoctype => "eof-in-doctype",
             Self::EofInElementThatCanContainOnlyText => "eof-in-element-that-can-contain-only-text",
             Self::EofInTag => "eof-in-tag",
+            Self::IncorrectlyClosedComment => "incorrectly-closed-comment",
             Self::IncorrectlyOpenedComment => "incorrectly-opened-comment",
             Self::InvalidCharacterSequenceAfterDoctypeName => {
                 "invalid-character-sequence-after-doctype-name"
@@ -369,12 +371,27 @@ impl<'a> Tokenizer<'a> {
                 let offset = self.offset;
                 self.bump_char();
                 self.error_at(offset, HtmlParseErrorCode::UnexpectedNullCharacter);
-                Token::Character("\u{fffd}".to_owned())
+                // "U+0000 NULL: Parse error. Emit the current input character
+                // as a character token" (13.2.5.1). The tree construction
+                // stage is what decides whether to ignore it ("in body") or
+                // replace it ("in foreign content"), so the tokenizer must not
+                // replace it here.
+                Token::Character("\0".to_owned())
             }
             Some(_) => {
                 let start = self.offset;
+                // Character tokens are emitted one input character at a time by
+                // the standard, and coalescing a run is only safe when every
+                // character in it takes the same branch of the tree
+                // construction rules. ASCII whitespace and anything else do not
+                // (an "in head" whitespace token is inserted into the head
+                // while the first non-whitespace token moves to the body), so a
+                // run ends where that classification changes.
+                let whitespace = self.peek_char().is_some_and(is_ascii_whitespace);
                 while let Some(character) = self.peek_char() {
-                    if matches!(character, '&' | '<' | '\0') {
+                    if matches!(character, '&' | '<' | '\0')
+                        || is_ascii_whitespace(character) != whitespace
+                    {
                         break;
                     }
                     self.bump_char();
@@ -1027,7 +1044,10 @@ impl<'a> Tokenizer<'a> {
                         less_than_offset,
                         HtmlParseErrorCode::InvalidFirstCharacterOfTagName,
                     );
-                    return Token::Character("</".to_owned());
+                    // "Anything else: This is an invalid-first-character-of-tag-name
+                    // parse error. Create a comment token whose data is the
+                    // empty string. Reconsume in the bogus comment state."
+                    return self.consume_bogus_comment("");
                 }
             }
         }
@@ -1193,23 +1213,56 @@ impl<'a> Tokenizer<'a> {
         if !start_tag {
             self.skip_ascii_whitespace();
             let mut self_closing = false;
-            if self.peek_char() != Some('>') && self.peek_char().is_some() {
+            // "End tag with attributes" is an error, but the attributes still
+            // have to be tokenized: a `>` inside a quoted value does not close
+            // the tag, and `</script foo=">" dd>` ends at the final `>`.
+            if self.peek_char().is_some()
+                && self.peek_char() != Some('>')
+                && !(self.peek_char() == Some('/') && self.remaining().chars().nth(1) == Some('>'))
+            {
                 self.error_at(self.offset, HtmlParseErrorCode::EndTagWithAttributes);
-                while let Some(character) = self.peek_char() {
-                    if character == '>' {
+            }
+            let mut quote = None;
+            loop {
+                let Some(character) = self.peek_char() else {
+                    self.error_at(self.offset, HtmlParseErrorCode::EofInTag);
+                    // "EOF: This is an eof-in-tag parse error. Emit an
+                    // end-of-file token." The half-built end tag is not a token.
+                    return self.emit_eof();
+                };
+                if let Some(delimiter) = quote {
+                    self.bump_char();
+                    if character == delimiter {
+                        quote = None;
+                    }
+                    continue;
+                }
+                match character {
+                    '>' => {
+                        self.bump_char();
                         break;
                     }
-                    if character == '/' {
-                        self_closing = true;
+                    '"' | '\'' => {
+                        quote = Some(character);
+                        self.bump_char();
                     }
-                    self.bump_char();
+                    '/' => {
+                        self.bump_char();
+                        if self.peek_char() == Some('>') {
+                            self_closing = true;
+                        }
+                    }
+                    '\0' => {
+                        self.error_at(self.offset, HtmlParseErrorCode::UnexpectedNullCharacter);
+                        self.bump_char();
+                    }
+                    _ => {
+                        self.bump_char();
+                    }
                 }
             }
             if self_closing {
                 self.error_at(self.offset, HtmlParseErrorCode::EndTagWithTrailingSolidus);
-            }
-            if !self.consume_char('>') {
-                self.error_at(self.offset, HtmlParseErrorCode::EofInTag);
             }
             return Token::EndTag(TagToken {
                 name,
@@ -1220,6 +1273,7 @@ impl<'a> Tokenizer<'a> {
 
         let mut attributes = Vec::new();
         let mut self_closing = false;
+        let mut eof_in_tag = false;
         // What ended the previous attribute. Only a quoted value can leave the
         // next attribute missing its separator, so this starts as "no previous
         // attribute" and the first attribute never reports anything.
@@ -1241,6 +1295,7 @@ impl<'a> Tokenizer<'a> {
                 }
                 None => {
                     self.error_at(self.offset, HtmlParseErrorCode::EofInTag);
+                    eof_in_tag = true;
                     break;
                 }
                 Some(_) => {
@@ -1286,6 +1341,14 @@ impl<'a> Tokenizer<'a> {
                     previous_end = Some(end);
                 }
             }
+        }
+
+        if eof_in_tag {
+            // "EOF: This is an eof-in-tag parse error. Emit an end-of-file
+            // token." A start tag the input stream ends inside of is not
+            // emitted, so `<di` leaves the body empty rather than creating a
+            // `di` element from the partial tag.
+            return self.emit_eof();
         }
 
         Token::StartTag(TagToken {
@@ -1418,33 +1481,138 @@ impl<'a> Tokenizer<'a> {
 
     fn consume_comment(&mut self) -> Token {
         let start = self.offset;
-        if self.consume_char('>') {
-            self.error_at(start, HtmlParseErrorCode::AbruptClosingOfEmptyComment);
-            return Token::Comment(String::new());
+        // "Comment start state" (13.2.5.43).
+        match self.peek_char() {
+            Some('>') => {
+                self.bump_char();
+                self.error_at(start, HtmlParseErrorCode::AbruptClosingOfEmptyComment);
+                Token::Comment(String::new())
+            }
+            Some('-') => {
+                self.bump_char();
+                // "Comment start dash state" (13.2.5.44).
+                match self.peek_char() {
+                    Some('>') => {
+                        self.bump_char();
+                        self.error_at(start, HtmlParseErrorCode::AbruptClosingOfEmptyComment);
+                        Token::Comment(String::new())
+                    }
+                    Some('-') => {
+                        self.bump_char();
+                        self.consume_comment_end(start, String::new())
+                    }
+                    None => {
+                        self.error_at(self.offset, HtmlParseErrorCode::EofInComment);
+                        Token::Comment(String::new())
+                    }
+                    Some(_) => self.consume_comment_state(start, "-".to_owned()),
+                }
+            }
+            None => {
+                self.error_at(self.offset, HtmlParseErrorCode::EofInComment);
+                Token::Comment(String::new())
+            }
+            Some(_) => self.consume_comment_state(start, String::new()),
         }
-        Token::Comment(self.consume_comment_body())
     }
 
-    /// The comment body of a comment whose opening has already been consumed:
-    /// everything up to the `-->` that closes it, or up to the end of the input
-    /// stream, which is an `eof-in-comment` parse error.
-    fn consume_comment_body(&mut self) -> String {
-        if let Some(relative_end) = self.remaining().find("-->") {
-            let end = self.offset + relative_end;
-            let data = self.input[self.offset..end].replace('\0', "\u{fffd}");
-            if self.input[self.offset..end].contains('\0') {
-                self.error_at(self.offset, HtmlParseErrorCode::UnexpectedNullCharacter);
+    /// "Comment state" (13.2.5.45), the state that appends ordinary comment
+    /// data and watches for the three sequences that start an ending.
+    fn consume_comment_state(&mut self, start: usize, mut data: String) -> Token {
+        loop {
+            let Some(character) = self.bump_char() else {
+                self.error_at(self.offset, HtmlParseErrorCode::EofInComment);
+                return Token::Comment(data);
+            };
+            match character {
+                '-' => return self.consume_comment_end_dash(start, data),
+                '\0' => {
+                    self.error_at(self.offset - 1, HtmlParseErrorCode::UnexpectedNullCharacter);
+                    data.push('\u{fffd}');
+                }
+                // The comment-less-than states only matter for nested `<!--`
+                // diagnostics; they never change where the comment ends, so the
+                // character is ordinary data here.
+                _ => data.push(character),
             }
-            self.offset = end + 3;
-            return data;
         }
-        let data = self.remaining().replace('\0', "\u{fffd}");
-        if self.remaining().contains('\0') {
-            self.error_at(self.offset, HtmlParseErrorCode::UnexpectedNullCharacter);
+    }
+
+    /// "Comment end dash state" (13.2.5.50): one `-` has been seen, and a second
+    /// one moves to the end state while anything else makes it data again.
+    fn consume_comment_end_dash(&mut self, start: usize, mut data: String) -> Token {
+        match self.bump_char() {
+            Some('-') => self.consume_comment_end(start, data),
+            None => {
+                self.error_at(self.offset, HtmlParseErrorCode::EofInComment);
+                Token::Comment(data)
+            }
+            Some(character) => {
+                data.push('-');
+                self.push_comment_character(&mut data, character);
+                self.consume_comment_state(start, data)
+            }
         }
-        self.offset = self.input.len();
-        self.error_at(self.offset, HtmlParseErrorCode::EofInComment);
-        data
+    }
+
+    /// "Comment end state" (13.2.5.51): two `-` characters have been seen.
+    fn consume_comment_end(&mut self, start: usize, mut data: String) -> Token {
+        loop {
+            let Some(character) = self.bump_char() else {
+                self.error_at(self.offset, HtmlParseErrorCode::EofInComment);
+                return Token::Comment(data);
+            };
+            match character {
+                '>' => return Token::Comment(data),
+                '!' => {
+                    // "Comment end bang state" (13.2.5.52).
+                    match self.bump_char() {
+                        Some('-') => {
+                            data.push_str("--!");
+                            return self.consume_comment_end_dash(start, data);
+                        }
+                        Some('>') => {
+                            self.error_at(
+                                self.offset.saturating_sub(3),
+                                HtmlParseErrorCode::IncorrectlyClosedComment,
+                            );
+                            return Token::Comment(data);
+                        }
+                        None => {
+                            self.error_at(self.offset, HtmlParseErrorCode::EofInComment);
+                            return Token::Comment(data);
+                        }
+                        Some(other) => {
+                            data.push_str("--!");
+                            self.push_comment_character(&mut data, other);
+                            return self.consume_comment_state(start, data);
+                        }
+                    }
+                }
+                '-' => data.push('-'),
+                '\0' => {
+                    self.error_at(self.offset - 1, HtmlParseErrorCode::UnexpectedNullCharacter);
+                    data.push_str("--\u{fffd}");
+                    return self.consume_comment_state(start, data);
+                }
+                other => {
+                    data.push_str("--");
+                    data.push(other);
+                    return self.consume_comment_state(start, data);
+                }
+            }
+        }
+    }
+
+    /// Append one character that the comment state would reconsume, applying the
+    /// state's U+0000 NULL rule rather than storing the NULL itself.
+    fn push_comment_character(&mut self, data: &mut String, character: char) {
+        if character == '\0' {
+            self.error_at(self.offset - 1, HtmlParseErrorCode::UnexpectedNullCharacter);
+            data.push('\u{fffd}');
+        } else {
+            data.push(character);
+        }
     }
 
     /// "Bogus comment state" (13.2.5.41), entered with `initial` already in the
@@ -2604,5 +2772,120 @@ mod tests {
             vec![HtmlParseErrorCode::UnexpectedSolidusInTag],
             "the solidus is the only thing wrong with this markup"
         );
+    }
+
+    /// A comment is closed by the current standard's `--!>` sequence, and the
+    /// `!` and the greater-than sign are not comment data.
+    #[test]
+    fn an_incorrectly_closed_comment_ends_at_the_bang_sequence() {
+        let (tokens, errors) = tokenize("FOO<!-- BAR --!>BAZ");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Character("FOO".to_owned()),
+                Token::Comment(" BAR ".to_owned()),
+                Token::Character("BAZ".to_owned()),
+                Token::Eof,
+            ]
+        );
+        assert_eq!(errors, vec![HtmlParseErrorCode::IncorrectlyClosedComment]);
+    }
+
+    /// `<!-->` and `<!--->` are empty comments closed abruptly, not a comment
+    /// whose data runs to the end of the input.
+    #[test]
+    fn an_abrupt_empty_comment_ends_at_the_first_greater_than_sign() {
+        for input in ["<!-->BAZ", "<!--->BAZ"] {
+            let (tokens, errors) = tokenize(input);
+            assert_eq!(
+                tokens,
+                vec![
+                    Token::Comment(String::new()),
+                    Token::Character("BAZ".to_owned()),
+                    Token::Eof,
+                ],
+                "{input}"
+            );
+            assert_eq!(
+                errors,
+                vec![HtmlParseErrorCode::AbruptClosingOfEmptyComment],
+                "{input}"
+            );
+        }
+    }
+
+    /// A comment that ends inside the closing sequence keeps the data before
+    /// the dashes and reports end-of-file-in-comment.
+    #[test]
+    fn an_unterminated_comment_keeps_the_data_before_its_trailing_dashes() {
+        let (tokens, errors) = tokenize("<!--x--");
+        assert_eq!(tokens, vec![Token::Comment("x".to_owned()), Token::Eof]);
+        assert_eq!(errors, vec![HtmlParseErrorCode::EofInComment]);
+    }
+
+    /// An end tag open followed by anything but an ASCII alpha is a bogus
+    /// comment, not text, and the comment runs to the next `>`.
+    #[test]
+    fn an_end_tag_open_with_a_non_alpha_starts_a_bogus_comment() {
+        let (tokens, errors) = tokenize("</ COMMENT >");
+        assert_eq!(
+            tokens,
+            vec![Token::Comment(" COMMENT ".to_owned()), Token::Eof]
+        );
+        assert_eq!(
+            errors,
+            vec![HtmlParseErrorCode::InvalidFirstCharacterOfTagName]
+        );
+    }
+
+    /// End-tag attributes are ignored, but they are still tokenized: a `>`
+    /// inside a quoted value does not close the tag.
+    #[test]
+    fn an_end_tag_with_a_quoted_greater_than_does_not_close_early() {
+        let (tokens, errors) = tokenize("FOO<script></script foo=\">\" dd>BAR");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Character("FOO".to_owned()),
+                Token::StartTag(TagToken {
+                    name: "script".to_owned(),
+                    attributes: Vec::new(),
+                    self_closing: false,
+                }),
+                Token::EndTag(TagToken {
+                    name: "script".to_owned(),
+                    attributes: Vec::new(),
+                    self_closing: false,
+                }),
+                Token::Character("BAR".to_owned()),
+                Token::Eof,
+            ]
+        );
+        assert_eq!(errors, vec![HtmlParseErrorCode::EndTagWithAttributes]);
+    }
+
+    /// A start tag the input stream ends inside of is not emitted at all.
+    #[test]
+    fn an_unterminated_start_tag_is_not_emitted() {
+        let (tokens, errors) = tokenize("<di");
+        assert_eq!(tokens, vec![Token::Eof]);
+        assert_eq!(errors, vec![HtmlParseErrorCode::EofInTag]);
+    }
+
+    /// A data-state NUL is emitted as U+0000 so that tree construction can
+    /// decide between ignoring it and replacing it.
+    #[test]
+    fn a_data_state_null_is_emitted_as_null() {
+        let (tokens, errors) = tokenize("a\u{0}b");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Character("a".to_owned()),
+                Token::Character("\u{0}".to_owned()),
+                Token::Character("b".to_owned()),
+                Token::Eof,
+            ]
+        );
+        assert_eq!(errors, vec![HtmlParseErrorCode::UnexpectedNullCharacter]);
     }
 }

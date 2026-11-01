@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use render_dom::{Dom, Namespace, NodeId, NodeKind};
 
 use super::tokenizer::{
@@ -143,7 +145,8 @@ pub fn parse_document(input: &str) -> ParseOutput {
 /// which is the whole point of the element.
 #[must_use]
 pub fn parse_document_with_scripting(input: &str, scripting_enabled: bool) -> ParseOutput {
-    let mut builder = TreeBuilder::new(input);
+    let input = normalize_newlines(input);
+    let mut builder = TreeBuilder::new(&input);
     builder.scripting_disabled = !scripting_enabled;
     builder.parse()
 }
@@ -181,9 +184,34 @@ pub fn parse_html_fragment_with_scripting(
     context: &FragmentContext,
     scripting_enabled: bool,
 ) -> FragmentParseOutput {
-    let mut builder = TreeBuilder::new(input);
+    let input = normalize_newlines(input);
+    let mut builder = TreeBuilder::new(&input);
     builder.scripting_disabled = !scripting_enabled;
     builder.parse_fragment(context)
+}
+
+/// "Preprocessing the input stream" (13.2.3.5): every U+000D CARRIAGE RETURN
+/// and every CRLF pair becomes a single U+000A LINE FEED before tokenization.
+/// A parser that skips this keeps a raw CR in text, where the suite (and every
+/// browser) has an LF; the `<pre>` and CDATA cases in the suite are the ones
+/// that make the difference visible.
+fn normalize_newlines(input: &str) -> Cow<'_, str> {
+    if !input.contains('\r') {
+        return Cow::Borrowed(input);
+    }
+    let mut output = String::with_capacity(input.len());
+    let mut characters = input.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\r' {
+            if characters.peek() == Some(&'\n') {
+                characters.next();
+            }
+            output.push('\n');
+        } else {
+            output.push(character);
+        }
+    }
+    Cow::Owned(output)
 }
 
 struct TreeBuilder<'a> {
@@ -916,20 +944,29 @@ impl<'a> TreeBuilder<'a> {
             // is what makes a document that has produced any content at all
             // ineligible to become a frameset.
             Token::Character(data) | Token::Cdata(data) => {
-                let (data, whitespace) = if self.ignore_next_line_feed {
+                let data = if self.ignore_next_line_feed {
                     self.ignore_next_line_feed = false;
-                    (
-                        data.strip_prefix('\n').unwrap_or(data),
-                        is_all_html_whitespace(data.strip_prefix('\n').unwrap_or(data)),
-                    )
+                    data.strip_prefix('\n').unwrap_or(data)
                 } else {
-                    (data.as_str(), is_all_html_whitespace(data))
+                    data.as_str()
                 };
+                // "A character token that is U+0000 NULL: Parse error. Ignore
+                // the token." A data-state NULL arrives as its own token, while
+                // a CDATA section can carry one inside a run; either way it is
+                // dropped and does not count as content for the frameset-ok
+                // flag.
+                let data = if data.contains('\0') {
+                    self.parse_error(HtmlParseErrorCode::UnexpectedNullCharacter);
+                    Cow::Owned(data.replace('\0', ""))
+                } else {
+                    Cow::Borrowed(data)
+                };
+                let data = data.as_ref();
                 if !data.is_empty() {
                     self.reconstruct_active_formatting_elements();
                     self.insert_text(data);
                 }
-                if !whitespace {
+                if !is_all_html_whitespace(data) {
                     self.frameset_ok = false;
                 }
                 Action::Consumed
@@ -1120,9 +1157,15 @@ impl<'a> TreeBuilder<'a> {
                 self.tokenizer.switch_to(ContentModel::Plaintext, None);
                 Action::Consumed
             }
+            // "A start tag whose tag name is 'table'" (13.2.6.4.7): close a p
+            // element only when the document is *not* in quirks mode. In quirks
+            // mode a table is allowed to stay inside an open p, which is what
+            // `<p><table>` without a doctype expects.
             Token::StartTag(tag) if tag.name == "table" => {
                 self.frameset_ok = false;
-                self.close_p_if_open();
+                if self.quirks_mode != QuirksMode::Quirks {
+                    self.close_p_if_open();
+                }
                 self.insert_element(tag, true);
                 self.mode = InsertionMode::InTable;
                 Action::Consumed
@@ -1156,11 +1199,11 @@ impl<'a> TreeBuilder<'a> {
                 Action::Consumed
             }
             // "A start tag whose tag name is 'select'": if the stack of open
-            // elements has a select element in scope, this is a parse error and
-            // the token is ignored; otherwise reconstruct the active formatting
-            // elements and insert. There is no separate "in select" mode in the
-            // current standard, so `option` and `optgroup` are handled below
-            // rather than by a mode of their own.
+            // elements has a select element in scope, this is a parse error, the
+            // token is ignored, and the open select is popped; otherwise
+            // reconstruct the active formatting elements and insert. There is no
+            // separate "in select" mode in the current standard, so `option` and
+            // `optgroup` are handled below rather than by a mode of their own.
             //
             // "If the parser's fragment context element is a select element
             // (fragment case): Parse error. Ignore the token." The context
@@ -1175,7 +1218,11 @@ impl<'a> TreeBuilder<'a> {
                 }
                 self.frameset_ok = false;
                 if self.has_select_in_scope() {
+                    // "Parse error. Ignore the token. Pop elements from the
+                    // stack of open elements until a select element has been
+                    // popped from the stack."
                     self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                    self.pop_through("select");
                 } else {
                     self.reconstruct_active_formatting_elements();
                     self.insert_element(tag, true);
@@ -1331,6 +1378,7 @@ impl<'a> TreeBuilder<'a> {
             // Then insert an HTML element for the token and immediately pop the
             // current node.
             Token::StartTag(tag) if tag.name == "hr" => {
+                self.frameset_ok = false;
                 self.close_p_if_open();
                 if self.has_select_in_scope() {
                     self.generate_implied_end_tags_except(None);
@@ -1482,6 +1530,31 @@ impl<'a> TreeBuilder<'a> {
                 self.parse_error(HtmlParseErrorCode::UnexpectedToken);
                 Action::Consumed
             }
+            // "A start tag whose tag name is 'button'" (13.2.6.4.7): a button
+            // inside another button closes the open one first. The scope test is
+            // the ordinary one, so a button nested in a table cell or a foreign
+            // integration point is not in scope and the token opens normally.
+            Token::StartTag(tag) if tag.name == "button" => {
+                if self.has_element_name_in_scope("button") {
+                    self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                    self.generate_implied_end_tags_except(None);
+                    self.pop_through("button");
+                }
+                self.reconstruct_active_formatting_elements();
+                self.insert_element(tag, true);
+                self.frameset_ok = false;
+                Action::Consumed
+            }
+            // "A start tag whose tag name is 'image'": a parse error, then the
+            // token is changed to `img` and reprocessed. The alias is historical
+            // and every browser implements it, so `<image>` yields an `img`
+            // element rather than an unknown one.
+            Token::StartTag(tag) if tag.name == "image" => {
+                self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                let mut tag = tag.clone();
+                tag.name = "img".to_owned();
+                self.process_in_body(&Token::StartTag(tag))
+            }
             // "Any other start tag": reconstruct the active formatting elements,
             // then insert an HTML element for the token. This element will be an
             // ordinary element.
@@ -1572,25 +1645,44 @@ impl<'a> TreeBuilder<'a> {
             // 'header', 'hgroup', 'listing', 'main', 'menu', 'nav', 'ol', 'pre',
             // 'search', 'section', 'select', 'summary', 'ul'": if there is no
             // element in scope with that name, ignore the token. Otherwise
-            // generate implied end tags, pop until an element with that name has
-            // been popped, and clear the list of active formatting elements up to
-            // the last marker. The clearing is what stops formatting from leaking
-            // out of a cell, a caption, or an object.
+            // generate implied end tags and pop until an element with that name
+            // has been popped.
+            //
+            // The current standard does **not** clear the list of active
+            // formatting elements here. A marker is what ends a formatting
+            // scope (a cell, a caption, an object), and an ordinary block end
+            // tag is not one: `<select><div><i></div><option>` reconstructs the
+            // `i` around the option rather than dropping it.
             Token::EndTag(tag) if Self::is_block_end(&tag.name) => {
                 if !self.has_element_name_in_scope(&tag.name) {
                     self.parse_error(HtmlParseErrorCode::UnexpectedToken);
                     return Action::Consumed;
                 }
                 self.close_through_implied_end_tags(&tag.name);
-                self.clear_active_formatting_up_to_last_marker();
                 Action::Consumed
             }
             Token::EndTag(tag) if tag.name == "li" => {
-                self.pop_through_if_open("li");
+                if !self.has_element_name_in_list_item_scope("li") {
+                    self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                } else {
+                    self.generate_implied_end_tags_except(Some("li"));
+                    if self.current_tag() != Some("li") {
+                        self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                    }
+                    self.pop_through("li");
+                }
                 Action::Consumed
             }
             Token::EndTag(tag) if matches!(tag.name.as_str(), "dd" | "dt") => {
-                self.pop_through_if_open(&tag.name);
+                if !self.has_element_name_in_scope(&tag.name) {
+                    self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                } else {
+                    self.generate_implied_end_tags_except(Some(&tag.name));
+                    if self.current_tag() != Some(tag.name.as_str()) {
+                        self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                    }
+                    self.pop_through(&tag.name);
+                }
                 Action::Consumed
             }
             Token::EndTag(tag) if is_heading(&tag.name) => {
@@ -1621,7 +1713,11 @@ impl<'a> TreeBuilder<'a> {
                 Action::Consumed
             }
             Token::EndTag(tag) => {
-                self.pop_through_if_open(&tag.name);
+                // "Any other end tag": walk the stack and stop at the first
+                // special element that is not the subject, which is what keeps
+                // `</span>` from closing a `button` (and `</cite>` from closing
+                // a `div`) that the end tag is not allowed to cross.
+                self.any_other_end_tag(&tag.name);
                 Action::Consumed
             }
             // "If the stack of template insertion modes is not empty, then
@@ -1645,6 +1741,16 @@ impl<'a> TreeBuilder<'a> {
             // document that ends with an unclosed `<p>`, `<div>` or `<table>`
             // reports one error fewer than the standard says it should.
             Token::Eof => {
+                let open_options = self
+                    .open_elements
+                    .iter()
+                    .rev()
+                    .copied()
+                    .filter(|node| self.element_matches(*node, &Namespace::Html, "option"))
+                    .collect::<Vec<_>>();
+                for option in open_options {
+                    self.maybe_clone_option_into_selectedcontent(option);
+                }
                 if self
                     .open_elements
                     .iter()
@@ -1695,6 +1801,25 @@ impl<'a> TreeBuilder<'a> {
 
     fn has_select_in_scope(&self) -> bool {
         self.has_element_name_in_scope("select")
+    }
+
+    /// "The stack of open elements has a [name] element in list item scope"
+    /// (13.2.4.2): the default scope with `ol` and `ul` added as boundaries.
+    /// This is what makes `</li>` between an outer `li` and a nested `ul`
+    /// ignore the token instead of closing the outer item.
+    fn has_element_name_in_list_item_scope(&self, name: &str) -> bool {
+        for node in self.open_elements.iter().rev() {
+            if self.is_html_element(*node) && self.element_name(*node) == Some(name) {
+                return true;
+            }
+            if self.is_scope_boundary(*node)
+                || (self.is_html_element(*node)
+                    && matches!(self.element_name(*node), Some("ol" | "ul")))
+            {
+                return false;
+            }
+        }
+        false
     }
 
     /// "The stack of open elements has a [names] element in table scope" (13.2.4.2).
@@ -1850,6 +1975,24 @@ impl<'a> TreeBuilder<'a> {
                 }
                 Action::Consumed
             }
+            // "A start tag whose tag name is 'input'" (13.2.6.4.9): a hidden
+            // input stays in the table, while every other input is a parse
+            // error that is foster parented through the "in body" rules. The
+            // distinction matters for both the tree and the frameset-ok flag,
+            // which "in body" sets for all but the hidden case.
+            Token::StartTag(tag) if tag.name == "input" => {
+                if has_attribute_matching_ascii_case_insensitive(tag, "type", "hidden") {
+                    self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                    self.insert_element(tag, false);
+                } else {
+                    self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                    self.foster_parenting = true;
+                    let result = self.process_in_body(token);
+                    self.foster_parenting = false;
+                    return result;
+                }
+                Action::Consumed
+            }
             // "A start tag whose tag name is 'caption'": clear the stack back to a
             // table context, insert a marker at the end of the list of active
             // formatting elements, then insert an HTML element for the token and
@@ -1913,6 +2056,30 @@ impl<'a> TreeBuilder<'a> {
                 } else {
                     self.parse_error(HtmlParseErrorCode::UnexpectedToken);
                 }
+                Action::Consumed
+            }
+            // "An end tag whose tag name is one of: 'body', 'caption', 'col',
+            // 'colgroup', 'html', 'tbody', 'td', 'tfoot', 'th', 'thead', 'tr'":
+            // parse error, ignore the token. These are table-structure tags in
+            // the wrong place; delegating them to "in body" would let
+            // `</body>`/`</html>` end the document and drop everything after.
+            Token::EndTag(tag)
+                if matches!(
+                    tag.name.as_str(),
+                    "body"
+                        | "caption"
+                        | "col"
+                        | "colgroup"
+                        | "html"
+                        | "tbody"
+                        | "td"
+                        | "tfoot"
+                        | "th"
+                        | "thead"
+                        | "tr"
+                ) =>
+            {
+                self.parse_error(HtmlParseErrorCode::UnexpectedToken);
                 Action::Consumed
             }
             Token::StartTag(tag)
@@ -2304,7 +2471,7 @@ impl<'a> TreeBuilder<'a> {
             // been popped, clear the list of active formatting elements up to the
             // last marker, and switch the insertion mode to "in row".
             Token::EndTag(tag) if matches!(tag.name.as_str(), "td" | "th") => {
-                if self.has_open_element(&tag.name) {
+                if self.table_scope_has(&[tag.name.as_str()]) {
                     self.generate_implied_end_tags_except(None);
                     self.pop_through(&tag.name);
                     self.clear_active_formatting_up_to_last_marker();
@@ -2342,7 +2509,7 @@ impl<'a> TreeBuilder<'a> {
                     "table" | "tbody" | "tfoot" | "thead" | "tr"
                 ) =>
             {
-                if self.has_cell_in_scope() {
+                if self.table_scope_has(&[tag.name.as_str()]) {
                     self.close_current_cell();
                     Action::Reprocess
                 } else {
@@ -2917,7 +3084,12 @@ impl<'a> TreeBuilder<'a> {
             let (target, ref_node) = if self.foster_parenting_applies_to(common_ancestor) {
                 self.foster_location()
             } else {
-                (self.insertion_parent(common_ancestor), None)
+                // The adjusted insertion location of `(commonAncestor, null)` also
+                // redirects to the fragment's root insertion target when the
+                // common ancestor is the root `html` element 13.4 created; a
+                // fragment has no `html` node the caller can see, and inserting
+                // there would drop the moved nodes.
+                (self.adjusted_parent(common_ancestor), None)
             };
             if let Some(parent) = self.dom.parent(last_node)
                 && self.dom.remove_child(parent, last_node).is_err()
@@ -3328,6 +3500,11 @@ impl<'a> TreeBuilder<'a> {
     /// a parse error that is dropped.
     fn process_after_after_frameset(&mut self, token: &Token) -> Action {
         match token {
+            // "A character token that is one of U+0009 ... U+0020 SPACE: Process
+            // the token using the rules for the 'in body' insertion mode." The
+            // current node is the root html element once the frameset has been
+            // popped, so the whitespace stays a child of it.
+            Token::Character(data) if is_all_html_whitespace(data) => self.process_in_body(token),
             Token::Comment(data) => {
                 self.insert_comment(self.dom.document(), data);
                 Action::Consumed
@@ -3862,10 +4039,15 @@ impl<'a> TreeBuilder<'a> {
             self.insert_text(data);
         }
         // "Set the frameset-ok flag to 'not ok'" is in the *any other character
-        // token* clause, so a document whose only content is a foreign subtree
-        // with text in it is still ineligible to become a frameset. The CDATA
-        // section state is not a character token, so it does not set the flag.
-        if !is_all_html_whitespace(data) {
+        // token* clause, not the U+0000 NULL clause, so a NUL that is replaced
+        // by U+FFFD does not disqualify a document from becoming a frameset.
+        // `<svg>\0</svg><frameset>` is a frameset document.
+        if data.contains('\0') {
+            let remaining = data.replace('\0', "");
+            if !is_all_html_whitespace(&remaining) {
+                self.frameset_ok = false;
+            }
+        } else if !is_all_html_whitespace(data) {
             self.frameset_ok = false;
         }
     }
@@ -3903,27 +4085,35 @@ impl<'a> TreeBuilder<'a> {
             // as the tag name of the token, then this is a parse error."
             self.parse_error(HtmlParseErrorCode::UnexpectedToken);
         }
-        // The topmost element in the stack of open elements is its first entry,
-        // the root `html` element: the spec's loop returns when it reaches it,
-        // so this walk starts one entry above it. Every other step of the loop
-        // follows below.
-        for index in (1..self.open_elements.len()).rev() {
+        let mut index = self.open_elements.len().saturating_sub(1);
+        loop {
+            // "If node is the topmost element in the stack of open elements,
+            // then return. (fragment case)"
+            if index == 0 {
+                return Action::Consumed;
+            }
             let node = self.open_elements[index];
             if self.element_name_ascii_lowercase(node).as_deref() == Some(name.as_str()) {
-                // "Pop elements from the stack of open elements until node has
-                // been popped from the stack."
+                // "If node's tag name ... is the same ... pop elements from the
+                // stack of open elements until node has been popped."
                 self.open_elements.truncate(index);
                 return Action::Consumed;
             }
-            if self.is_html_element(node) {
-                // "Otherwise, process the token according to the rules given in
-                // the section corresponding to the current insertion mode in
-                // HTML content."  The current node is untouched by the walk, so
-                // the insertion mode's own rules do the matching.
+            // "Set node to the previous entry in the stack of open elements.
+            // If node is not an element in the HTML namespace, return to the
+            // step labeled loop. Otherwise, process the token according to the
+            // rules ... in HTML content."
+            //
+            // An HTML element reached this way is *not* compared by name: the
+            // name test is only for the foreign run above it. That is what makes
+            // `</div>` inside `<svg><foreignObject><math>` reach the "in body"
+            // end-tag rule (which respects the foreignObject scope boundary)
+            // rather than closing the HTML `div` across the foreign subtree.
+            index -= 1;
+            if self.is_html_element(self.open_elements[index]) {
                 return self.process_in_html_content(token);
             }
         }
-        Action::Consumed
     }
 
     fn has_open_element(&self, name: &str) -> bool {
@@ -3955,7 +4145,9 @@ impl<'a> TreeBuilder<'a> {
     }
 
     fn pop_current(&mut self) {
-        self.open_elements.pop();
+        if let Some(node) = self.open_elements.pop() {
+            self.maybe_clone_option_into_selectedcontent(node);
+        }
     }
 
     fn remove_temporary_head(&mut self) {
@@ -4011,22 +4203,22 @@ impl<'a> TreeBuilder<'a> {
 
     fn pop_through(&mut self, name: &str) {
         while let Some(node) = self.open_elements.pop() {
-            if self.element_name(node) == Some(name) {
+            // The rules that pop through a named element name HTML element
+            // types, so an SVG `td` under a table cell does not stop the walk
+            // at the foreign element before the HTML `td` it shares a name with.
+            if self.is_html_element(node) && self.element_name(node) == Some(name) {
+                self.maybe_clone_option_into_selectedcontent(node);
                 return;
             }
-        }
-    }
-
-    fn pop_through_if_open(&mut self, name: &str) {
-        if self.has_open_element(name) {
-            self.pop_through(name);
-        } else {
-            self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+            self.maybe_clone_option_into_selectedcontent(node);
         }
     }
 
     fn close_p_if_open(&mut self) {
-        if self.has_open_element("p") {
+        // The rules that close an open p all say "in button scope", not "in
+        // scope": an intervening button is a boundary, so `<p><button><div>`
+        // puts the div inside the button rather than closing the p through it.
+        if self.has_p_in_button_scope() {
             self.pop_through("p");
         }
     }
@@ -4176,6 +4368,128 @@ impl<'a> TreeBuilder<'a> {
     /// The element names the algorithm names are HTML-namespace names: an SVG
     /// `title` is not a `head` and an SVG `table` is not a `table`, and matching
     /// on the local name alone gets both wrong.
+    /// "To maybe clone an `option` into `selectedcontent`" (the `option` element
+    /// section): when a parsed `option` is popped and it is the select's selected
+    /// option, its children are deep-cloned into the select's enabled
+    /// `selectedcontent`, replacing what was there. The parser runs this step,
+    /// not script, so `<option>X` with no end tag still shows `X` in a
+    /// customizable select's button.
+    fn maybe_clone_option_into_selectedcontent(&mut self, option: NodeId) {
+        if !self.element_matches(option, &Namespace::Html, "option") {
+            return;
+        }
+        let Some(select) = self.nearest_select_ancestor(option) else {
+            return;
+        };
+        if self
+            .dom
+            .attribute(select, "multiple")
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return;
+        }
+        if self.selected_option_in(select) != Some(option) {
+            return;
+        }
+        let Some(selectedcontent) = self.enabled_selectedcontent(select) else {
+            return;
+        };
+        for child in self
+            .dom
+            .children(selectedcontent)
+            .unwrap_or_default()
+            .to_vec()
+        {
+            let _ = self.dom.remove_child(selectedcontent, child);
+        }
+        for child in self.dom.children(option).unwrap_or_default().to_vec() {
+            if let Ok(clone) = self.dom.clone_node(child, true) {
+                let _ = self.dom.append_child(selectedcontent, clone);
+            }
+        }
+    }
+
+    /// The nearest ancestor `select`, stopping at the elements that break the
+    /// option-to-select relationship.
+    fn nearest_select_ancestor(&self, option: NodeId) -> Option<NodeId> {
+        let mut current = self.dom.parent(option);
+        while let Some(node) = current {
+            if self.element_matches(node, &Namespace::Html, "select") {
+                return Some(node);
+            }
+            if self.is_html_element(node)
+                && matches!(self.element_name(node), Some("datalist" | "hr" | "option"))
+            {
+                return None;
+            }
+            current = self.dom.parent(node);
+        }
+        None
+    }
+
+    /// The option whose selectedness is true: the last option carrying the
+    /// `selected` content attribute, or the first option when none does. Options
+    /// inside a nested `select` are not in this select's list of options.
+    fn selected_option_in(&self, select: NodeId) -> Option<NodeId> {
+        let mut first = None;
+        let mut with_selected = None;
+        let mut stack = self.dom.children(select).unwrap_or_default().to_vec();
+        stack.reverse();
+        while let Some(node) = stack.pop() {
+            if self.is_html_element(node) && self.element_name(node) == Some("select") {
+                continue;
+            }
+            if self.is_html_element(node)
+                && matches!(
+                    self.element_name(node),
+                    Some("datalist" | "hr" | "selectedcontent")
+                )
+            {
+                continue;
+            }
+            if self.element_matches(node, &Namespace::Html, "option") {
+                first.get_or_insert(node);
+                if self
+                    .dom
+                    .attribute(node, "selected")
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    with_selected = Some(node);
+                }
+            }
+            let mut children = self.dom.children(node).unwrap_or_default().to_vec();
+            children.reverse();
+            stack.extend(children);
+        }
+        with_selected.or(first)
+    }
+
+    /// The first `selectedcontent` under the select's first `button` descendant.
+    fn enabled_selectedcontent(&self, select: NodeId) -> Option<NodeId> {
+        let button = self
+            .dom
+            .children(select)
+            .unwrap_or_default()
+            .iter()
+            .copied()
+            .find(|node| self.element_matches(*node, &Namespace::Html, "button"))?;
+        let mut stack = self.dom.children(button).unwrap_or_default().to_vec();
+        stack.reverse();
+        while let Some(node) = stack.pop() {
+            if self.element_matches(node, &Namespace::Html, "selectedcontent") {
+                return Some(node);
+            }
+            let mut children = self.dom.children(node).unwrap_or_default().to_vec();
+            children.reverse();
+            stack.extend(children);
+        }
+        None
+    }
+
     fn reset_insertion_mode(&mut self) {
         if self.open_elements.is_empty() {
             self.mode = InsertionMode::InBody;
@@ -4798,6 +5112,67 @@ fn is_formatting_element_name(name: &str) -> bool {
     )
 }
 
+/// The public identifiers that put a document in quirks mode when the DOCTYPE
+/// name is `html` (13.2.6.4.1), lowercased because the comparison is ASCII
+/// case-insensitive.
+const QUIRKS_PUBLIC_ID_PREFIXES: &[&str] = &[
+    "+//silmaril//dtd html pro v0r11 19970101//",
+    "-//as//dtd html 3.0 aswedit + extensions//",
+    "-//advasoft ltd//dtd html 3.0 aswedit + extensions//",
+    "-//ietf//dtd html 2.0 level 1//",
+    "-//ietf//dtd html 2.0 level 2//",
+    "-//ietf//dtd html 2.0 strict level 1//",
+    "-//ietf//dtd html 2.0 strict level 2//",
+    "-//ietf//dtd html 2.0 strict//",
+    "-//ietf//dtd html 2.0//",
+    "-//ietf//dtd html 2.1e//",
+    "-//ietf//dtd html 3.0//",
+    "-//ietf//dtd html 3.2 final//",
+    "-//ietf//dtd html 3.2//",
+    "-//ietf//dtd html 3//",
+    "-//ietf//dtd html level 0//",
+    "-//ietf//dtd html level 1//",
+    "-//ietf//dtd html level 2//",
+    "-//ietf//dtd html level 3//",
+    "-//ietf//dtd html strict level 0//",
+    "-//ietf//dtd html strict level 1//",
+    "-//ietf//dtd html strict level 2//",
+    "-//ietf//dtd html strict level 3//",
+    "-//ietf//dtd html strict//",
+    "-//ietf//dtd html//",
+    "-//metrius//dtd metrius presentational//",
+    "-//microsoft//dtd internet explorer 2.0 html strict//",
+    "-//microsoft//dtd internet explorer 2.0 html//",
+    "-//microsoft//dtd internet explorer 2.0 tables//",
+    "-//microsoft//dtd internet explorer 3.0 html strict//",
+    "-//microsoft//dtd internet explorer 3.0 html//",
+    "-//microsoft//dtd internet explorer 3.0 tables//",
+    "-//netscape comm. corp.//dtd html//",
+    "-//netscape comm. corp.//dtd strict html//",
+    "-//o'reilly and associates//dtd html 2.0//",
+    "-//o'reilly and associates//dtd html extended 1.0//",
+    "-//o'reilly and associates//dtd html extended relaxed 1.0//",
+    "-//sq//dtd html 2.0 hotmetal + extensions//",
+    "-//softquad software//dtd hotmetal pro 6.0::19990601::extensions to html 4.0//",
+    "-//softquad//dtd hotmetal pro 4.0::19971010::extensions to html 4.0//",
+    "-//spyglass//dtd html 2.0 extended//",
+    "-//sun microsystems corp.//dtd hotjava html//",
+    "-//sun microsystems corp.//dtd hotjava strict html//",
+    "-//w3c//dtd html 3 1995-03-24//",
+    "-//w3c//dtd html 3.2 draft//",
+    "-//w3c//dtd html 3.2 final//",
+    "-//w3c//dtd html 3.2//",
+    "-//w3c//dtd html 3.2s draft//",
+    "-//w3c//dtd html 4.0 frameset//",
+    "-//w3c//dtd html 4.0 transitional//",
+    "-//w3c//dtd html experimental 19960712//",
+    "-//w3c//dtd html experimental 970421//",
+    "-//w3c//dtd w3 html//",
+    "-//w3o//dtd w3 html 3.0//",
+    "-//webtechs//dtd mozilla html 2.0//",
+    "-//webtechs//dtd mozilla html//",
+];
+
 fn doctype_quirks_mode(doctype: &DoctypeToken) -> QuirksMode {
     if doctype.force_quirks
         || !doctype
@@ -4812,13 +5187,23 @@ fn doctype_quirks_mode(doctype: &DoctypeToken) -> QuirksMode {
         .as_deref()
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let system_id = doctype
+        .system_id
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    // "The system identifier is set to:
+    // 'http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd'".
+    if system_id == "http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd" {
+        return QuirksMode::Quirks;
+    }
     if public_id.starts_with("-//w3c//dtd html 4.01 frameset//")
         || public_id.starts_with("-//w3c//dtd html 4.01 transitional//")
     {
-        return if doctype.system_id.is_some() {
-            QuirksMode::LimitedQuirks
-        } else {
+        return if system_id.is_empty() {
             QuirksMode::Quirks
+        } else {
+            QuirksMode::LimitedQuirks
         };
     }
     if public_id.starts_with("-//w3c//dtd xhtml 1.0 frameset//")
@@ -4826,9 +5211,12 @@ fn doctype_quirks_mode(doctype: &DoctypeToken) -> QuirksMode {
     {
         return QuirksMode::LimitedQuirks;
     }
-    if public_id.starts_with("-//w3o//dtd w3 html strict 3.0//")
-        || public_id.starts_with("-/w3c/dtd html 4.0 transitional/en")
-        || public_id.starts_with("html")
+    if public_id == "-//w3o//dtd w3 html strict 3.0//en//"
+        || public_id == "-/w3c/dtd html 4.0 transitional/en"
+        || public_id == "html"
+        || QUIRKS_PUBLIC_ID_PREFIXES
+            .iter()
+            .any(|prefix| public_id.starts_with(prefix))
     {
         return QuirksMode::Quirks;
     }
@@ -7534,17 +7922,18 @@ select@html
     }
 
     #[test]
-    fn a_nested_select_start_tag_is_ignored() {
+    fn a_nested_select_start_tag_pops_the_open_select() {
         // "Otherwise, if the stack of open elements has a select element in
-        // scope: Parse error. Ignore the token" (13.2.6.4.7). A `select` that is
-        // itself a boundary is still found to be in scope, because the
-        // specific-scope algorithm tests the target before the boundary list.
+        // scope: Parse error. Ignore the token. Pop elements from the stack of
+        // open elements until a select element has been popped from the stack."
+        // The option after the ignored start tag is therefore a sibling of the
+        // first select, not a child of it.
         assert_eq!(
             afe_outline("<!doctype html><body><select><select><option>a</select>"),
             "\
 select@html
-  option@html
-    #text \"a\""
+option@html
+  #text \"a\""
         );
     }
 
@@ -8230,6 +8619,229 @@ table@html
             let output = parse_document(markup);
             let control = find_element_by_id(&output.dom, output.dom.document(), id).unwrap();
             assert_eq!(form_owner_label(&output, control), expected, "{markup}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tree-construction rules fixed against the html5lib suite
+    // -----------------------------------------------------------------------
+
+    /// Block content inside a button does not close the `p` that surrounds the
+    /// button: `button` is a boundary of button scope, so the `p` is not in
+    /// scope through it.
+    #[test]
+    fn a_button_boundary_keeps_block_content_inside_the_button() {
+        assert_eq!(
+            body_outline("<!doctype html><p><button><div>"),
+            "p@html\n  button@html\n    div@html"
+        );
+    }
+
+    /// A button start tag closes the open button before inserting itself, so
+    /// two buttons are siblings rather than nested.
+    #[test]
+    fn a_nested_button_closes_the_open_button_first() {
+        assert_eq!(
+            body_outline("<!doctype html><p><button><button>"),
+            "p@html\n  button@html\n  button@html"
+        );
+    }
+
+    /// The historical `image` start tag is the `img` element.
+    #[test]
+    fn image_is_an_alias_for_img() {
+        assert_eq!(body_outline("<!doctype html><image>"), "img@html");
+    }
+
+    /// A table start tag closes an open `p` in button scope only outside quirks
+    /// mode; in quirks mode the table stays inside the paragraph.
+    #[test]
+    fn a_table_closes_p_only_outside_quirks_mode() {
+        assert_eq!(
+            body_outline("<!doctype html><p><table>"),
+            "p@html\ntable@html"
+        );
+        assert_eq!(body_outline("<p><table>"), "p@html\n  table@html");
+    }
+
+    /// The data state emits U+0000 as a character token, and "in body" ignores
+    /// it; it is not a replacement character in text.
+    #[test]
+    fn a_null_character_in_body_text_is_ignored() {
+        assert_eq!(body_outline("<!doctype html><body>a\u{0}b"), "#text \"ab\"");
+    }
+
+    /// A NUL in foreign content becomes U+FFFD but does not set the
+    /// frameset-ok flag, so a frameset after an SVG subtree still replaces the
+    /// body.
+    #[test]
+    fn a_null_in_foreign_content_does_not_disqualify_a_frameset() {
+        assert_eq!(
+            document_outline("<svg>\u{0}</svg><frameset></frameset>"),
+            "html@html\n  head@html\n  frameset@html"
+        );
+    }
+
+    /// Carriage returns and CRLF pairs are normalized to LF before tokenization,
+    /// which is visible in a `pre` where the first line feed is dropped.
+    #[test]
+    fn carriage_returns_are_normalized_before_tokenization() {
+        assert_eq!(
+            body_outline("<!doctype html><pre>\r\rA</pre>"),
+            "pre@html\n  #text \"\\nA\""
+        );
+    }
+
+    /// A hidden input stays in the table, while an ordinary input is foster
+    /// parented before it.
+    #[test]
+    fn only_a_hidden_input_stays_in_the_table() {
+        assert_eq!(
+            body_outline("<!doctype html><table><input type=hidden>"),
+            "table@html\n  input@html"
+        );
+        assert_eq!(
+            body_outline("<!doctype html><table><input>"),
+            "input@html\ntable@html"
+        );
+    }
+
+    /// The adoption agency's final insertion location is the adjusted insertion
+    /// location, so a fragment whose common ancestor is 13.4's root `html`
+    /// element gets the moved nodes in the fragment rather than in the invisible
+    /// root.
+    #[test]
+    fn adoption_agency_moves_nodes_into_a_fragment() {
+        assert_eq!(
+            fragment_outline(
+                "<b><em><foo><foob><fooc><aside></b></em>",
+                &FragmentContext::html("div")
+            ),
+            "b@html\n  em@html\n    foo@html\n      foob@html\n        fooc@html\n\
+             aside@html\n  b@html"
+        );
+    }
+
+    /// A block end tag no longer clears the active formatting list: the `i`
+    /// closed by `</div>` is reconstructed around the following option.
+    #[test]
+    fn a_block_end_tag_keeps_formatting_for_reconstruction() {
+        assert_eq!(
+            body_outline("<select><div><i></div><option>option"),
+            "select@html\n  div@html\n    i@html\n  i@html\n    option@html\n      #text \"option\""
+        );
+    }
+
+    /// A select start tag inside an open select is ignored but still pops the
+    /// open select, so the following option is a sibling of it.
+    #[test]
+    fn a_nested_select_pops_the_open_select() {
+        assert_eq!(
+            body_outline(
+                "<!doctype html><select><optgroup><option></optgroup><option><select><option>"
+            ),
+            "select@html\n  optgroup@html\n    option@html\n  option@html\noption@html"
+        );
+    }
+
+    /// A stray table-structure end tag in a cell is ignored when its element is
+    /// not in table scope, so the cell stays open for the following text.
+    #[test]
+    fn a_stray_table_end_tag_does_not_close_a_cell() {
+        assert_eq!(
+            body_outline("<table><td></thead>A"),
+            "table@html\n  tbody@html\n    tr@html\n      td@html\n        #text \"A\""
+        );
+    }
+
+    /// `</html>` and the other table-structure end tags are ignored in the
+    /// table mode rather than delegated to "in body", so the table remains open
+    /// and following text is foster parented before it.
+    #[test]
+    fn table_structure_end_tags_do_not_end_the_document() {
+        assert_eq!(
+            body_outline("<table><colgroup></html>foo"),
+            "#text \"foo\"\ntable@html\n  colgroup@html"
+        );
+    }
+
+    /// An ordinary end tag stops at a special element that it does not match,
+    /// so `</span>` does not close the `button` around `foo`.
+    #[test]
+    fn a_generic_end_tag_does_not_cross_a_special_element() {
+        assert_eq!(
+            body_outline("<!doctype html><span><button>foo</span>bar"),
+            "span@html\n  button@html\n    #text \"foobar\""
+        );
+    }
+
+    /// `</li>` uses list item scope, so a nested list's boundary prevents it
+    /// from closing the outer list item.
+    #[test]
+    fn a_list_item_end_tag_respects_list_item_scope() {
+        assert_eq!(
+            body_outline("<!doctype html><ul><li><ul></li><li>a</li></ul></li></ul>"),
+            "ul@html\n  li@html\n    ul@html\n      li@html\n        #text \"a\""
+        );
+    }
+
+    /// An HTML end tag encountered while walking out of foreign content is
+    /// processed by the HTML insertion mode, not matched by name across the
+    /// foreign subtree.
+    #[test]
+    fn an_html_end_tag_outside_foreign_content_respects_the_integration_point() {
+        assert_eq!(
+            body_outline("<div><svg><path><foreignObject><math></div>a"),
+            "div@html\n  svg@svg\n    path@svg\n      foreignObject@svg\n        math@mathml\n          #text \"a\""
+        );
+    }
+
+    /// When the selected option is popped, its children are cloned into the
+    /// select's selectedcontent; a later option carrying `selected` replaces
+    /// that clone.
+    #[test]
+    fn the_selected_option_is_cloned_into_selectedcontent() {
+        assert_eq!(
+            body_outline("<!doctype html><select><button><selectedcontent></button><option>X"),
+            "select@html\n  button@html\n    selectedcontent@html\n      #text \"X\"\n  option@html\n    #text \"X\""
+        );
+        assert_eq!(
+            body_outline(
+                "<!doctype html><select><button><selectedcontent></button><option>X<option selected>Y"
+            ),
+            "select@html\n  button@html\n    selectedcontent@html\n      #text \"Y\"\n  option@html\n    #text \"X\"\n  option@html\n    #text \"Y\""
+        );
+    }
+
+    /// Whitespace after `</html>` in a frameset document is processed by the
+    /// "in body" rules and remains a child of the root element.
+    #[test]
+    fn whitespace_after_after_frameset_stays_in_the_document() {
+        assert_eq!(
+            document_outline("<html><frameset></frameset></html> "),
+            "html@html\n  head@html\n  frameset@html\n  #text \" \""
+        );
+    }
+
+    /// `hr` sets the frameset-ok flag to "not ok", so a following frameset does
+    /// not replace the body.
+    #[test]
+    fn an_hr_disqualifies_a_frameset() {
+        assert_eq!(
+            document_outline("<!doctype html><hr><frameset>"),
+            "html@html\n  head@html\n  body@html\n    hr@html"
+        );
+    }
+
+    /// The full quirks-mode list includes the IBM system identifier and the
+    /// HTML 3.2 public identifier, both of which keep a table inside a `p`.
+    #[test]
+    fn the_quirks_doctype_lists_are_honoured() {
+        for markup in [
+            "<!DOCTYPE html SYSTEM \"http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd\"><p><table>",
+            "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2//EN\"><p><table>",
+        ] {
+            assert_eq!(body_outline(markup), "p@html\n  table@html", "{markup}");
         }
     }
 }
