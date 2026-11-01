@@ -4,6 +4,14 @@
 so a `@font-face` test can prove that layout measured the declared face rather
 than the reference measurer's nominal advances.
 
+`render-test-webfont.woff` and `render-test-webfont.woff2` are the same face in
+the two compressed containers. They are used to test the WOFF 1.0 inflater and
+the WOFF2 decoder.
+
+`webfont-http-demo.html` is the manual shell fixture for the HTTP path; serve
+this directory over HTTP and screenshot the page to see the webfont line wider
+than the fallback line.
+
 Properties:
 
 - units per em: 1000
@@ -72,4 +80,16 @@ fb.setupOS2(sTypoAscender=800, sTypoDescender=-200, sTypoLineGap=0,
             usWinAscent=800, usWinDescent=200)
 fb.setupPost()
 fb.save("crates/render-core/tests/fixtures/render-test-webfont.ttf")
+```
+
+Then write the two containers from that TTF (WOFF2 needs the Python `brotli`
+package):
+
+```python
+from fontTools.ttLib import TTFont
+
+for flavor, extension in [("woff", "woff"), ("woff2", "woff2")]:
+    font = TTFont("crates/render-core/tests/fixtures/render-test-webfont.ttf")
+    font.flavor = flavor
+    font.save(f"crates/render-core/tests/fixtures/render-test-webfont.{extension}")
 ```

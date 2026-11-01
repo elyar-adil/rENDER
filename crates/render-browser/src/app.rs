@@ -36,6 +36,7 @@ use crate::page_source::source_from_network_response;
 use crate::page_state::ModulePhase;
 use crate::page_state::PageState;
 use crate::page_state::PendingDynamicImport;
+use crate::page_state::PendingFonts;
 use crate::page_state::PendingImages;
 use crate::page_state::PendingScripts;
 use crate::page_state::PendingStyleSheets;
@@ -80,6 +81,8 @@ use render_browser::editor::AddressEditor;
 use render_browser::editor::Clipboard;
 use render_browser::editor::NativeClipboard;
 use render_browser::font_backend::SystemFontBackend;
+use render_browser::font_faces::FontFetchPlan;
+use render_browser::font_faces::apply_font_batch;
 use render_browser::images::ImageDiagnosticSeverity;
 use render_browser::images::apply_image_batch;
 use render_browser::images::plan_images_with_styles_and_context;
@@ -517,8 +520,10 @@ impl BrowserApp {
             PageRenderPayload::Full(Box::new(FullPageRenderPayload {
                 document: page.page.document().clone(),
                 base_url,
+                document_serial: page.document_serial,
                 external_style_sheets: page.style_sheets.clone(),
                 style_batch: page.style_batch.clone(),
+                font_resources: Arc::clone(&page.font_resources),
                 // Re-scan after DOM mutations as well as on initial load.
                 // Script-inserted links are common on real sites, and the
                 // completed batch may itself have raced with a new link.
@@ -594,7 +599,7 @@ impl BrowserApp {
             return;
         }
         log_completed_frame_debug(&frame, completed.identity.tab_id);
-        let style_plan = {
+        let (style_plan, font_plan) = {
             let Some(page) = self.pages.get_mut(&id) else {
                 return;
             };
@@ -647,7 +652,13 @@ impl BrowserApp {
                 page.styles_resolved = true;
                 self.tabs.set_loading(id, false);
             }
-            frame
+            if !frame.installed_fonts.is_empty() {
+                let resources = Arc::make_mut(&mut page.font_resources);
+                for url in &frame.installed_fonts {
+                    resources.remove(url);
+                }
+            }
+            let style_plan = frame
                 .style_plan
                 .map(|mut plan| {
                     // Retargeting a link invalidates its old key. If it later
@@ -665,11 +676,15 @@ impl BrowserApp {
                         .retain(|resource| !page.started_style_sheets.contains(&resource.key));
                     plan
                 })
-                .filter(|plan| !plan.is_empty() || !page.styles_resolved)
+                .filter(|plan| !plan.is_empty() || !page.styles_resolved);
+            (style_plan, frame.font_plan.clone())
         };
         self.count_stylesheet_diagnostics(&frame.style_diagnostics);
         report_stylesheet_diagnostics(&frame.style_diagnostics);
 
+        if let Some(plan) = font_plan {
+            self.start_font_fetches(id, plan);
+        }
         if let Some(plan) = style_plan {
             self.start_external_style_sheets(id, plan);
         } else {
@@ -2357,6 +2372,53 @@ impl BrowserApp {
         }
     }
 
+    /// Starts the HTTP(S) font transfers a frame's rule set needs.
+    ///
+    /// The plan came from `DocumentFontLoader::plan_fetches`, so it already
+    /// excludes families the page does not name, slices no document character
+    /// falls into, and URLs whose bytes are cached. A failed URL stays in
+    /// `attempted_fonts` and is not retried until the document changes.
+    pub(super) fn start_font_fetches(&mut self, id: TabId, plan: FontFetchPlan) {
+        let (plan, requests) = {
+            let Some(page) = self.pages.get_mut(&id) else {
+                return;
+            };
+            if page.pending_fonts.is_some() {
+                return;
+            }
+            let mut plan = plan;
+            page.attempted_fonts.retain(|url| plan.urls.contains(url));
+            plan.urls.retain(|url| !page.attempted_fonts.contains(url));
+            if plan.is_empty() {
+                return;
+            }
+            page.attempted_fonts.extend(plan.urls.iter().cloned());
+            let requests = plan
+                .requests()
+                .into_iter()
+                .map(|request| self.cookies.decorate_request(request))
+                .collect::<Vec<_>>();
+            (plan, requests)
+        };
+        if env::var_os("RENDER_DEBUG_FRAME").is_some() {
+            eprintln!("render-browser font plan resources={}", plan.urls.len());
+            for url in plan.urls.iter().take(12) {
+                eprintln!("render-browser font request url={url}");
+            }
+        }
+        let handle = self.submit_cached_batch(requests);
+        if let Some(page) = self.pages.get_mut(&id) {
+            page.pending_fonts = Some(PendingFonts {
+                plan,
+                handle,
+                since: Instant::now(),
+                stall_reported: false,
+            });
+        } else {
+            handle.cancel();
+        }
+    }
+
     /// Reports resource batches that stay in flight suspiciously long, once
     /// each. A hung transfer used to be invisible: the page just never
     /// advanced. Surfacing the stuck batch makes the stall diagnosable
@@ -2384,6 +2446,17 @@ impl BrowserApp {
                     "render-browser stylesheet batch still in flight after {:?} ({} resources)",
                     pending.since.elapsed(),
                     pending.plan.resources.len(),
+                );
+            }
+            if let Some(pending) = page.pending_fonts.as_mut()
+                && !pending.stall_reported
+                && pending.since.elapsed() >= STALL_REPORT_AFTER
+            {
+                pending.stall_reported = true;
+                eprintln!(
+                    "render-browser font batch still in flight after {:?} ({} resources)",
+                    pending.since.elapsed(),
+                    pending.plan.urls.len(),
                 );
             }
             if let Some(pending) = page.pending_scripts.as_mut()
@@ -2421,11 +2494,16 @@ impl BrowserApp {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one polling pass over independent resource pipelines reads as one dispatch"
+    )]
     pub(super) fn poll_network(&mut self) {
         self.report_stalled_batches();
         self.poll_dynamic_module_imports();
         let mut completed_documents = Vec::new();
         let mut completed_style_sheets = Vec::new();
+        let mut completed_fonts = Vec::new();
         let mut completed_scripts = Vec::new();
         let mut completed_images = Vec::new();
         let mut new_fetches: Vec<(TabId, PendingFetch)> = Vec::new();
@@ -2453,6 +2531,16 @@ impl BrowserApp {
                 pending.handle.retry_deferred(resubmit);
                 match pending.handle.try_recv() {
                     Ok(results) => completed_style_sheets.push((*id, results)),
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => {
+                        unreachable!("cache batch handle maps disconnects")
+                    }
+                }
+            }
+            if let Some(pending) = page.pending_fonts.as_mut() {
+                pending.handle.retry_deferred(resubmit);
+                match pending.handle.try_recv() {
+                    Ok(results) => completed_fonts.push((*id, results)),
                     Err(TryRecvError::Empty) => {}
                     Err(TryRecvError::Disconnected) => {
                         unreachable!("cache batch handle maps disconnects")
@@ -2507,6 +2595,10 @@ impl BrowserApp {
         for (id, completions) in completed_style_sheets {
             let results = self.finish_cached_batch(completions);
             self.finish_external_style_sheets(id, results);
+        }
+        for (id, completions) in completed_fonts {
+            let results = self.finish_cached_batch(completions);
+            self.finish_font_fetches(id, results);
         }
         for (id, completions) in completed_scripts {
             let results = self.finish_cached_batch(completions);
@@ -2585,6 +2677,51 @@ impl BrowserApp {
         } else {
             // Background tabs render when activated; the decoded batch remains
             // attached to the tab snapshot until then.
+        }
+        self.repaint_chrome();
+        self.request_redraw();
+    }
+
+    pub(super) fn finish_font_fetches(&mut self, id: TabId, results: Vec<FetchResult>) {
+        let installed = {
+            let Some(page) = self.pages.get_mut(&id) else {
+                return;
+            };
+            let Some(pending) = page.pending_fonts.take() else {
+                return;
+            };
+            for response in results.iter().flatten() {
+                for issue in self.cookies.absorb_response(response) {
+                    eprintln!("browser cookie rejected: {}", issue.message);
+                }
+            }
+            let batch = apply_font_batch(&pending.plan, results);
+            for failure in &batch.failures {
+                eprintln!(
+                    "render-browser font request failed: {} ({})",
+                    failure.url, failure.message
+                );
+            }
+            if batch.resources.is_empty() {
+                false
+            } else {
+                let resources = Arc::make_mut(&mut page.font_resources);
+                for (url, bytes) in batch.resources {
+                    resources.insert(url, Arc::from(bytes));
+                }
+                true
+            }
+        };
+        if installed && id == self.tabs.active_id() {
+            let viewport = self.layout.as_ref().map(|layout| {
+                WindowSize::new(
+                    self.frame_size.width,
+                    self.frame_size.height.saturating_sub(layout.chrome_height),
+                )
+            });
+            if let Some(viewport) = viewport {
+                self.schedule_page_render(id, viewport, false);
+            }
         }
         self.repaint_chrome();
         self.request_redraw();
@@ -3282,6 +3419,7 @@ impl BrowserApp {
             || self.pages.values().any(|page| {
                 page.navigation.pending.is_some()
                     || page.pending_style_sheets.is_some()
+                    || page.pending_fonts.is_some()
                     || page.pending_scripts.is_some()
                     || page.pending_images.is_some()
                     || !page.page.pending_fetch_queue_empty()

@@ -312,12 +312,10 @@ impl FontSource {
 /// reasons of backwards compatibility" equivalent to them.
 ///
 /// `is_decodable` is the load-bearing method and it is a fact about this
-/// engine, not a preference: it names the container formats the rasteriser can
-/// actually turn into glyphs. `fontdue` 0.9.3 reads a raw sfnt through
-/// `ttf_parser`, whose `Face::parse` accepts a file beginning with `0x00010000`,
-/// `true`, `OTTO` or `ttcf` and nothing else. There is no WOFF and no WOFF2
-/// code path in that crate, and `ttf-parser` 0.21.1 has no container decoder of
-/// its own, so a `.woff2` body is rejected as an unknown magic number.
+/// engine, not a preference: it names the container formats the engine can
+/// actually turn into glyphs. The rasteriser reads raw sfnt; the browser's font
+/// loader adds WOFF and WOFF2 decoders in front of it, so those hints are
+/// decodable too. Embedded OpenType and SVG fonts still have no decoder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FontFormat {
     /// No format hint was given and the URL's extension implies nothing, so the
@@ -386,19 +384,23 @@ impl FontFormat {
         }
     }
 
-    /// Whether this engine's rasteriser can turn a body in this format into
-    /// glyphs.
+    /// Whether this engine can turn a body in this format into glyphs.
     ///
     /// TrueType, OpenType and a TrueType/OpenType collection are raw sfnt
-    /// containers and are decoded. WOFF and WOFF2 are compressed wrappers with
-    /// no decoder in this engine's dependency graph, `embedded-opentype` is an
-    /// IE-era format that is not a font container at all, and SVG fonts need an
-    /// SVG font renderer this engine does not have.
+    /// containers. WOFF and WOFF2 are compressed wrappers around the same
+    /// tables; the browser decodes both before the rasteriser sees them.
+    /// `embedded-opentype` is an IE-era format that is not a font container at
+    /// all, and SVG fonts need an SVG font renderer this engine does not have.
     #[must_use]
     pub const fn is_decodable(self) -> bool {
         matches!(
             self,
-            Self::Unknown | Self::TrueType | Self::OpenType | Self::Collection
+            Self::Unknown
+                | Self::TrueType
+                | Self::OpenType
+                | Self::Collection
+                | Self::Woff
+                | Self::Woff2
         )
     }
 }
@@ -840,7 +842,7 @@ fn parse_font_src(item: &str) -> Result<FontSource, &'static str> {
     let Some((first, rest)) = components.split_first() else {
         return Err("an empty item is not a <font-src>");
     };
-    match first {
+    let url = match first {
         Component::Function(name, arguments) if name == "local" => {
             // §4.3.3.1: the argument is a `<font-family-name>`, and "if
             // unquoted, the unquoted font family name processing conventions
@@ -851,58 +853,52 @@ fn parse_font_src(item: &str) -> Result<FontSource, &'static str> {
             let Some(name) = local_name(arguments) else {
                 return Err("`local()` needs a name to look for");
             };
-            Ok(FontSource::Local { name })
+            return Ok(FontSource::Local { name });
         }
-        Component::Url(url) => {
-            let mut format = None;
-            let mut techs = Vec::new();
-            for component in rest {
-                match component {
-                    Component::Function(name, arguments) if name == "format" => {
-                        if format.is_some() {
-                            return Err("a <font-src> carries at most one `format()`");
-                        }
-                        // §4.3.1's backwards-compatible string spellings encode
-                        // a `tech()` as well as a format, so the legacy spelling
-                        // contributes its technology to the same list an explicit
-                        // `tech()` would.
-                        let Some((parsed, legacy_tech)) = font_format(arguments) else {
-                            return Err("`format()` needs a <font-format>");
-                        };
-                        format = Some(parsed);
-                        if let Some(tech) = legacy_tech {
-                            techs.push(tech.to_owned());
-                        }
-                    }
-                    Component::Function(name, arguments) if name == "tech" => {
-                        techs.extend(font_techs(arguments));
-                    }
-                    _ => return Err("a <url> may be followed only by `format()` and `tech()`"),
-                }
-            }
-            Ok(FontSource::Url {
-                url: url.clone(),
-                format: format.unwrap_or_else(|| implied_format(url)),
-                techs,
-            })
-        }
+        Component::Url(url) => url.clone(),
         Component::Function(name, arguments) if name == "url" => {
             // `url("…")` is a `Function` token, not a `url-token`, so the quoted
-            // spelling arrives here rather than as `Component::Url`.
-            if !rest.is_empty() {
-                return Err("a `url()` cannot be followed by anything else");
-            }
+            // spelling arrives here rather than as `Component::Url`. It takes
+            // the same `format()` and `tech()` suffix as the unquoted form.
             let [Component::QuotedString(url)] = arguments.as_slice() else {
                 return Err("`url()` needs a URL");
             };
-            Ok(FontSource::Url {
-                url: url.clone(),
-                format: implied_format(url),
-                techs: Vec::new(),
-            })
+            url.clone()
         }
-        _ => Err("a <font-src> is a `url()` or a `local()`"),
+        _ => return Err("a <font-src> is a `url()` or a `local()`"),
+    };
+
+    let mut format = None;
+    let mut techs = Vec::new();
+    for component in rest {
+        match component {
+            Component::Function(name, arguments) if name == "format" => {
+                if format.is_some() {
+                    return Err("a <font-src> carries at most one `format()`");
+                }
+                // §4.3.1's backwards-compatible string spellings encode
+                // a `tech()` as well as a format, so the legacy spelling
+                // contributes its technology to the same list an explicit
+                // `tech()` would.
+                let Some((parsed, legacy_tech)) = font_format(arguments) else {
+                    return Err("`format()` needs a <font-format>");
+                };
+                format = Some(parsed);
+                if let Some(tech) = legacy_tech {
+                    techs.push(tech.to_owned());
+                }
+            }
+            Component::Function(name, arguments) if name == "tech" => {
+                techs.extend(font_techs(arguments));
+            }
+            _ => return Err("a <url> may be followed only by `format()` and `tech()`"),
+        }
     }
+    Ok(FontSource::Url {
+        format: format.unwrap_or_else(|| implied_format(&url)),
+        url,
+        techs,
+    })
 }
 
 /// §4.3.3.1's `local()` argument as a string: a `<string>` verbatim, or a
@@ -1568,12 +1564,30 @@ mod tests {
         );
     }
 
+    /// A quoted `url("…")` is a CSS function token, not a `url-token`, but
+    /// §4.3.1 gives both the same `format()` and `tech()` suffix. This is the
+    /// spelling most production stylesheets use, so the shared suffix parser is
+    /// pinned on it.
+    #[test]
+    fn a_quoted_url_takes_the_same_format_suffix_as_an_unquoted_one() {
+        let parsed = parse_src("url(\"a.woff2\") format(\"woff2\")");
+        assert_eq!(
+            parsed.sources,
+            [FontSource::Url {
+                url: "a.woff2".to_owned(),
+                format: FontFormat::Woff2,
+                techs: Vec::new(),
+            }]
+        );
+        assert_eq!(parsed.problem, None);
+    }
+
     #[test]
     fn a_format_the_engine_cannot_decode_is_dropped_and_the_list_walks_on() {
         // §4.3.3: "must skip downloading a font resource if the format hint
-        // indicates an unsupported or unknown font format". The corpus has
-        // exactly this shape in its one multi-entry list, and the engine's
-        // rasteriser cannot read any of the first four entries.
+        // indicates an unsupported or unknown font format". WOFF and WOFF2 are
+        // containers this engine now decodes, so the list walks past the eot/svg
+        // entries and keeps every container the rasteriser can read.
         let parsed = parse_src(
             "url(a.eot) format('embedded-opentype'), url(a.woff2) format('woff2'), \
              url(a.woff) format('woff'), url(a.ttf) format('truetype'), url(a.svg) format(svg)",
@@ -1584,8 +1598,12 @@ mod tests {
                 .iter()
                 .map(FontSource::describe)
                 .collect::<Vec<_>>(),
-            ["url(a.ttf) format(truetype)"],
-            "the only item this engine can decode is the one it keeps"
+            [
+                "url(a.woff2) format(woff2)",
+                "url(a.woff) format(woff)",
+                "url(a.ttf) format(truetype)"
+            ],
+            "the entries whose containers this engine can decode are the ones it keeps"
         );
         assert_eq!(
             parsed.problem, None,
@@ -1595,20 +1613,19 @@ mod tests {
 
     #[test]
     fn a_src_whose_formats_are_all_undecodable_is_a_parsed_diagnosable_failure() {
-        // The state 218 of the corpus's 223 blocks are in. §4.3.1: "If there are
-        // no supported entries at the end of this process, the value for the src
-        // descriptor is a parse error" - and the reason has to name the format,
-        // because "this engine cannot decode woff2" is a fact the author cannot
-        // see from the sheet.
-        let parsed = parse_src("url(a.woff2) format('woff2')");
+        // §4.3.1: "If there are no supported entries at the end of this process,
+        // the value for the src descriptor is a parse error" - and the reason has
+        // to name the format, because "this engine cannot decode embedded-opentype"
+        // is a fact the author cannot see from the sheet.
+        let parsed = parse_src("url(a.eot) format('embedded-opentype')");
         assert!(parsed.sources.is_empty());
         let problem = parsed.problem.expect("no supported entry is a parse error");
         assert_eq!(
             problem,
             SrcProblem::NothingSupported(
-                "url(a.woff2) format(woff2) names a format or font technology this engine cannot \
-                 use"
-                .to_owned()
+                "url(a.eot) format(embedded-opentype) names a format or font technology this \
+                 engine cannot use"
+                    .to_owned()
             )
         );
     }
@@ -1816,21 +1833,21 @@ mod tests {
     }
 
     #[test]
-    fn only_the_raw_sfnt_containers_are_decodable_and_that_is_the_corpus_finding() {
-        // The rasteriser reads a raw sfnt through `ttf_parser`, whose
-        // `Face::parse` accepts `0x00010000`, `true`, `OTTO` and `ttcf` and
-        // nothing else. WOFF and WOFF2 are compressed wrappers with no decoder
-        // in this engine's dependency graph, which is why 218 of the corpus's
-        // 223 blocks cannot be used and only the `.ttf` and `.otf` ones can.
-        assert!(FontFormat::TrueType.is_decodable());
-        assert!(FontFormat::OpenType.is_decodable());
-        assert!(FontFormat::Collection.is_decodable());
+    fn sfnt_and_woff_containers_are_decodable_and_legacy_ones_are_not() {
+        // WOFF and WOFF2 are containers around the same sfnt tables; the
+        // browser's font loader decodes both before the rasteriser sees them.
+        // Embedded OpenType and SVG fonts need different decoders that are not
+        // in this engine's dependency graph.
         for format in [
-            FontFormat::Woff2,
+            FontFormat::TrueType,
+            FontFormat::OpenType,
+            FontFormat::Collection,
             FontFormat::Woff,
-            FontFormat::EmbeddedOpenType,
-            FontFormat::Svg,
+            FontFormat::Woff2,
         ] {
+            assert!(format.is_decodable(), "{} has a decoder", format.keyword());
+        }
+        for format in [FontFormat::EmbeddedOpenType, FontFormat::Svg] {
             assert!(
                 !format.is_decodable(),
                 "{} cannot be decoded",

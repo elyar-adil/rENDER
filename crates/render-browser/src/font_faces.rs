@@ -53,16 +53,18 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::io::Read;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use base64::Engine as _;
 use fontdue::{Font, FontSettings};
 use render_core::document::FontFaceInstaller;
+use render_core::dom::{Dom, NodeKind};
 use render_core::font_face::{
     FontFaceRule, FontFaceSheet, FontFaceSource, FontSource, UnicodeRangeSet,
 };
 use render_core::layout::FontStyle;
-use render_net::Url;
+use render_net::{FetchRequest, FetchResult, Url};
 
 use crate::font_backend::SystemFontBackend;
 
@@ -122,6 +124,92 @@ impl FontLoadFailure {
             Self::Undecodable => "the body is not a font container this engine can decode",
         }
     }
+}
+
+/// The `Accept` value for a font request. It names every container this engine
+/// can decode and leaves a server that serves an unlisted type a last-resort
+/// `*/*` so a wrong hint is still a decodable body rather than a refused
+/// request.
+pub const FONT_ACCEPT: &str = "font/ttf,font/otf,font/woff2,font/woff,application/font-woff,application/octet-stream,*/*;q=0.1";
+
+/// The network work one render still needs for its webfonts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FontFetchPlan {
+    pub urls: Vec<Url>,
+}
+
+impl FontFetchPlan {
+    #[must_use]
+    pub fn new(urls: Vec<Url>) -> Self {
+        let mut seen = BTreeSet::new();
+        Self {
+            urls: urls
+                .into_iter()
+                .filter(|url| seen.insert(url.clone()))
+                .collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.urls.is_empty()
+    }
+
+    #[must_use]
+    pub fn requests(&self) -> Vec<FetchRequest> {
+        self.urls
+            .iter()
+            .map(|url| FetchRequest::get(url.clone()).with_accept(FONT_ACCEPT))
+            .collect()
+    }
+}
+
+/// A fetch plan's successful bodies, plus the URLs that did not produce one.
+#[derive(Clone, Debug, Default)]
+pub struct FontResourceBatch {
+    pub resources: Vec<(Url, Vec<u8>)>,
+    pub failures: Vec<FontResourceFailure>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FontResourceFailure {
+    pub url: Url,
+    pub message: String,
+}
+
+/// Pairs a plan's URLs with the batch results, preserving request order.
+///
+/// A successful body is kept whatever its content type: a server that labels a
+/// font `application/octet-stream` (the common case) is still serving bytes the
+/// decoder can identify from the magic number. The decoder, not the header,
+/// decides whether the body is a face.
+#[must_use]
+pub fn apply_font_batch(plan: &FontFetchPlan, results: Vec<FetchResult>) -> FontResourceBatch {
+    let mut batch = FontResourceBatch::default();
+    let mut results = results.into_iter();
+    for url in &plan.urls {
+        match results.next() {
+            Some(Ok(response)) if response.status.is_success() => {
+                batch.resources.push((url.clone(), response.body));
+            }
+            Some(Ok(response)) => batch.failures.push(FontResourceFailure {
+                url: url.clone(),
+                message: format!(
+                    "font server returned HTTP status {}",
+                    response.status.as_u16()
+                ),
+            }),
+            Some(Err(error)) => batch.failures.push(FontResourceFailure {
+                url: url.clone(),
+                message: format!("font transfer failed: {error}"),
+            }),
+            None => batch.failures.push(FontResourceFailure {
+                url: url.clone(),
+                message: "font batch ended without a result".to_owned(),
+            }),
+        }
+    }
+    batch
 }
 
 /// The `@font-face` faces of one document.
@@ -294,12 +382,8 @@ impl DocumentFonts {
         if self.resources.contains_key(url) {
             return Ok(());
         }
-        let settings = FontSettings {
-            collection_index: 0,
-            ..FontSettings::default()
-        };
-        let font = Font::from_bytes(bytes, settings).map_err(|_| FontLoadFailure::Undecodable)?;
-        self.resources.insert(url.clone(), Arc::new(font));
+        let font = load_font_bytes(bytes)?;
+        self.resources.insert(url.clone(), font);
         Ok(())
     }
 
@@ -376,6 +460,7 @@ impl DocumentFonts {
                 // already on the machine.
                 for source in &rule.sources {
                     if let ResolvedSource::Url(url) = source
+                        && !self.resources.contains_key(url)
                         && seen.insert(url.clone())
                     {
                         urls.push(url.clone());
@@ -435,6 +520,18 @@ fn resolve_url(url: &str, base: Option<&Url>) -> Option<Url> {
 struct DocumentFontState {
     document: DocumentFonts,
     sources: Vec<FontFaceSource>,
+    /// Decoded faces by URL, independent of the current rule set. A fetch can
+    /// arrive before the stylesheet that names it is re-rendered, and a rule
+    /// rebuild must not decode a 10 MB face twice.
+    resources: HashMap<Url, Arc<Font>>,
+    /// Set when `install_fetched` added a resource, so the next `install`
+    /// rebuilds the backend table even though the rule set itself did not
+    /// change.
+    dirty: bool,
+    /// The document characters for `character_revision`, so the §4.8.1
+    /// `unicode-range` hint does not walk the DOM on every frame.
+    character_revision: Option<(u64, u64, u64)>,
+    characters: Arc<BTreeSet<char>>,
 }
 
 /// Loads each document's `@font-face` resources and publishes the resulting
@@ -460,8 +557,8 @@ impl DocumentFontLoader {
 
     /// Installs `sources` into `backend`, loading `file:` and base64 `data:`
     /// resources synchronously. Network resources are left outstanding: the
-    /// render worker has no fetch future at this point, and §5.2's rule for an
-    /// unavailable face then applies until a later frame supplies the bytes.
+    /// browser fetches them and calls [`Self::install_fetched`] before the next
+    /// render, so §5.2's "not present" rule applies only until the bytes arrive.
     pub fn install(&self, backend: &SystemFontBackend, sources: &[FontFaceSource]) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let local_resource_pending = state
@@ -469,25 +566,152 @@ impl DocumentFontLoader {
             .outstanding_urls()
             .iter()
             .any(|url| matches!(url.scheme(), "file" | "data"));
-        if state.sources == sources && !local_resource_pending {
+        if state.sources == sources && !local_resource_pending && !state.dirty {
             return;
         }
         let mut next = DocumentFonts::new();
         for source in sources {
             next.add_rules_at(&source.rules, source.base_url.as_ref());
         }
+        let mut decoded = Vec::new();
         for url in next.outstanding_urls() {
-            if let Some(font) = state.document.resource(&url) {
-                next.insert_resource(url, font);
-                continue;
+            let font = state
+                .resources
+                .get(&url)
+                .cloned()
+                .or_else(|| state.document.resource(&url))
+                .or_else(|| {
+                    local_resource_bytes(&url).and_then(|bytes| load_font_bytes(&bytes).ok())
+                });
+            if let Some(font) = font {
+                next.insert_resource(url.clone(), Arc::clone(&font));
+                decoded.push((url, font));
             }
-            if let Some(bytes) = local_resource_bytes(&url) {
-                let _ = next.install(&url, &bytes);
-            }
+        }
+        for (url, font) in decoded {
+            state.resources.insert(url, font);
         }
         backend.set_document_faces(&next);
         state.sources = sources.to_vec();
         state.document = next;
+        state.dirty = false;
+    }
+
+    /// Registers bytes the browser fetched for `url`.
+    ///
+    /// WOFF and WOFF2 are decoded here, so the same path serves a network face
+    /// and a local one. A body that cannot be decoded is skipped; §5.2 then
+    /// treats the face as not present, which is the same result as a failed
+    /// transfer.
+    pub fn install_fetched(&self, resources: &[(Url, Vec<u8>)]) {
+        if resources.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        for (url, bytes) in resources {
+            if state.resources.contains_key(url) {
+                continue;
+            }
+            if let Ok(font) = load_font_bytes(bytes) {
+                state.resources.insert(url.clone(), font);
+                state.dirty = true;
+            }
+        }
+    }
+
+    /// [`Self::install_fetched`] for the render worker's byte map. Returns the
+    /// URLs that were newly decoded, so the app can drop only the raw bodies
+    /// the worker actually consumed.
+    pub fn install_fetched_map(&self, resources: &HashMap<Url, Arc<[u8]>>) -> Vec<Url> {
+        let mut installed = Vec::new();
+        if resources.is_empty() {
+            return installed;
+        }
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        for (url, bytes) in resources {
+            if state.resources.contains_key(url) {
+                continue;
+            }
+            if let Ok(font) = load_font_bytes(bytes) {
+                state.resources.insert(url.clone(), font);
+                state.dirty = true;
+                installed.push(url.clone());
+            }
+        }
+        installed
+    }
+
+    /// The HTTP(S) URLs a render still needs, narrowed by §4.8.1 to families
+    /// the page's computed styles name and characters the page contains.
+    ///
+    /// `file:` and `data:` resources were already resolved by [`Self::install`]
+    /// and are not network work; URLs whose bytes are cached are skipped.
+    #[must_use]
+    pub fn plan_fetches<'a>(
+        &self,
+        used_families: impl IntoIterator<Item = &'a str>,
+        used_characters: &BTreeSet<char>,
+    ) -> Vec<Url> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state
+            .document
+            .plan_fetches(used_families, used_characters)
+            .into_iter()
+            .filter(|url| matches!(url.scheme(), "http" | "https"))
+            .filter(|url| !state.resources.contains_key(url))
+            .collect()
+    }
+
+    /// Whether the last render declared any `@font-face` rule, so the caller
+    /// can skip walking the DOM for characters on the common font-free page.
+    #[must_use]
+    pub fn has_rules(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.document.rule_count() > 0 || !state.sources.is_empty()
+    }
+
+    /// Whether any HTTP(S) URL the last render declared still lacks bytes.
+    ///
+    /// This is the cheap guard before walking the DOM for characters: once
+    /// every face has arrived, the plan is empty and the walk would be wasted.
+    #[must_use]
+    pub fn has_pending_network(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.document.outstanding_urls().iter().any(|url| {
+            matches!(url.scheme(), "http" | "https") && !state.resources.contains_key(url)
+        })
+    }
+
+    /// Every character the document can render, cached by DOM revision.
+    ///
+    /// §4.5 uses `unicode-range` as a download hint per character, so a
+    /// multi-slice CJK face needs the page's character set. Walking every text
+    /// node each frame would be wasted work; the revision is the same key the
+    /// rest of the browser uses for a cached document snapshot.
+    #[must_use]
+    pub fn document_characters(&self, document: (u64, u64), dom: &Dom) -> Arc<BTreeSet<char>> {
+        let key = (document.0, document.1, dom.revision().as_u64());
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.character_revision == Some(key) {
+            return Arc::clone(&state.characters);
+        }
+        let mut characters = BTreeSet::new();
+        let mut stack = vec![dom.document()];
+        while let Some(node_id) = stack.pop() {
+            let Some(node) = dom.node(node_id) else {
+                continue;
+            };
+            if let NodeKind::Text(text) = node.kind() {
+                characters.extend(text.chars());
+            }
+            stack.extend(node.children().iter().rev().copied());
+            if let Some(root) = dom.shadow_root(node_id) {
+                stack.push(root);
+            }
+        }
+        state.character_revision = Some(key);
+        state.characters = Arc::new(characters);
+        Arc::clone(&state.characters)
     }
 }
 
@@ -501,6 +725,176 @@ impl FontFaceInstaller for SystemFontFaceInstaller<'_> {
     fn install_font_faces(&self, sources: &[FontFaceSource]) {
         self.loader.install(self.backend, sources);
     }
+}
+
+/// Decodes one font body and builds the rasteriser's face.
+///
+/// Raw sfnt is passed through; WOFF is inflated into sfnt here, and WOFF2 goes
+/// through the `woff2` crate's Brotli decoder. The rasteriser itself only reads
+/// sfnt, so this is the single seam that turns every webfont container into the
+/// bytes it can consume.
+fn load_font_bytes(bytes: &[u8]) -> Result<Arc<Font>, FontLoadFailure> {
+    let decoded = decode_font_container(bytes).ok_or(FontLoadFailure::Undecodable)?;
+    let settings = FontSettings {
+        collection_index: 0,
+        ..FontSettings::default()
+    };
+    Font::from_bytes(decoded, settings)
+        .map(Arc::new)
+        .map_err(|_| FontLoadFailure::Undecodable)
+}
+
+/// Turns a raw sfnt, WOFF or WOFF2 body into the sfnt the rasteriser reads.
+///
+/// A body that is already sfnt is returned as-is. Anything else is rejected, so
+/// a WOFF2 that the decoder does not support (for example one using the
+/// unimplemented `hmtx` transform) has the same §5.2 outcome as a corrupt file:
+/// the face is not present in its family.
+fn decode_font_container(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.starts_with(b"wOF2") {
+        return woff2::decode::convert_woff2_to_ttf(&mut std::io::Cursor::new(bytes)).ok();
+    }
+    if bytes.starts_with(b"wOFF") {
+        return decode_woff1(bytes);
+    }
+    if bytes.starts_with(&[0, 1, 0, 0])
+        || bytes.starts_with(b"OTTO")
+        || bytes.starts_with(b"true")
+        || bytes.starts_with(b"typ1")
+    {
+        return Some(bytes.to_vec());
+    }
+    None
+}
+
+/// WOFF 1.0: the header and table directory are uncompressed, each table is
+/// either zlib-deflated or stored raw, and the output is the ordinary sfnt the
+/// entries describe.
+///
+/// WOFF 1.0 is a container, not a different font format: a compliant decoder
+/// reconstructs the original table bytes and the sfnt header. Returning the
+/// reconstructed sfnt is what lets one `decode_font_container` feed both the
+/// direct-download and the stored-local cases.
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    reason = "WOFF's directory bounds tables and counts to u16/u32; the output size is checked against those fields"
+)]
+fn decode_woff1(bytes: &[u8]) -> Option<Vec<u8>> {
+    const HEADER: usize = 44;
+    if bytes.len() < HEADER || !bytes.starts_with(b"wOFF") {
+        return None;
+    }
+    let u16_at = |offset: usize| u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+    let u32_at = |offset: usize| {
+        u32::from_be_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize
+    };
+    let flavor = &bytes[4..8];
+    let num_tables = u16_at(12);
+    if num_tables == 0 || HEADER + num_tables.saturating_mul(20) > bytes.len() {
+        return None;
+    }
+
+    // tag, original checksum, table bytes. `tag` is kept as the four wire bytes
+    // so sorting is the byte order the sfnt directory requires.
+    let mut tables: Vec<([u8; 4], u32, Vec<u8>)> = Vec::with_capacity(num_tables);
+    for index in 0..num_tables {
+        let entry = HEADER + index * 20;
+        let tag = [
+            bytes[entry],
+            bytes[entry + 1],
+            bytes[entry + 2],
+            bytes[entry + 3],
+        ];
+        let offset = u32_at(entry + 4);
+        let compressed_len = u32_at(entry + 8);
+        let original_len = u32_at(entry + 12);
+        let checksum = u32::from_be_bytes([
+            bytes[entry + 16],
+            bytes[entry + 17],
+            bytes[entry + 18],
+            bytes[entry + 19],
+        ]);
+        if compressed_len > original_len
+            || offset
+                .checked_add(compressed_len)
+                .is_none_or(|end| end > bytes.len())
+        {
+            return None;
+        }
+        let body = &bytes[offset..offset + compressed_len];
+        let table = if compressed_len < original_len {
+            let mut decoded = Vec::with_capacity(original_len);
+            flate2::read::ZlibDecoder::new(body)
+                .read_to_end(&mut decoded)
+                .ok()?;
+            if decoded.len() != original_len {
+                return None;
+            }
+            decoded
+        } else {
+            body.to_vec()
+        };
+        tables.push((tag, checksum, table));
+    }
+    tables.sort_by_key(|(tag, _, _)| *tag);
+
+    let entry_selector = (usize::BITS - 1 - num_tables.leading_zeros()) as usize;
+    let search_range = (1_usize << entry_selector) * 16;
+    let range_shift = num_tables * 16 - search_range;
+    let table_bytes = tables
+        .iter()
+        .map(|(_, _, table)| table.len().saturating_add(3) & !3)
+        .sum::<usize>();
+    let total = 12 + num_tables * 16 + table_bytes;
+    let mut output = Vec::with_capacity(total);
+    output.extend_from_slice(flavor);
+    output.extend_from_slice(&(num_tables as u16).to_be_bytes());
+    output.extend_from_slice(&(search_range as u16).to_be_bytes());
+    output.extend_from_slice(&(entry_selector as u16).to_be_bytes());
+    output.extend_from_slice(&(range_shift as u16).to_be_bytes());
+
+    let mut offset = 12 + num_tables * 16;
+    let mut head_offset = None;
+    for (tag, checksum, table) in &tables {
+        output.extend_from_slice(tag);
+        output.extend_from_slice(&checksum.to_be_bytes());
+        output.extend_from_slice(&(offset as u32).to_be_bytes());
+        output.extend_from_slice(&(table.len() as u32).to_be_bytes());
+        if tag == b"head" {
+            head_offset = Some(offset);
+        }
+        offset += table.len().saturating_add(3) & !3;
+    }
+    for (_, _, table) in &tables {
+        output.extend_from_slice(table);
+        while output.len() % 4 != 0 {
+            output.push(0);
+        }
+    }
+
+    // sfnt's `head.checkSumAdjustment` is the value that makes the whole file
+    // sum to 0xB1B0AFBA. WOFF leaves the field zero, so reconstruct it after the
+    // tables are in place.
+    if let Some(head) = head_offset
+        && head + 12 <= output.len()
+    {
+        output[head + 8..head + 12].fill(0);
+        let mut sum = 0_u32;
+        for chunk in output.chunks(4) {
+            let mut word = [0_u8; 4];
+            word[..chunk.len()].copy_from_slice(chunk);
+            sum = sum.wrapping_add(u32::from_be_bytes(word));
+        }
+        let adjustment = 0xB1B0_AFBA_u32.wrapping_sub(sum);
+        output[head + 8..head + 12].copy_from_slice(&adjustment.to_be_bytes());
+    }
+    Some(output)
 }
 
 /// Reads a font resource this process can obtain without a network round trip.
@@ -537,11 +931,18 @@ mod tests {
     )]
 
     use std::collections::BTreeSet;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
 
     use render_core::font_face::{FontFaceSource, parse_font_faces};
     use render_core::layout::{FontRequest, FontStyle, TextMeasurer, TextStyle};
+    use render_net::{BatchOptions, CancelToken, FetchConfig, HttpTransport};
 
-    use super::{DocumentFontLoader, DocumentFonts, FontLoadFailure, ResolvedSource, Url};
+    use super::{
+        DocumentFontLoader, DocumentFonts, FontFetchPlan, FontLoadFailure, ResolvedSource, Url,
+        apply_font_batch, decode_font_container,
+    };
     use crate::font_backend::SystemFontBackend;
 
     fn base() -> Url {
@@ -595,9 +996,12 @@ mod tests {
         );
         assert_eq!(
             urls_of(&document, "abs"),
-            ["https://s1.hdslb.com/bfs/b.ttf"],
-            "the woff2 is dropped by §4.3.3 before the store ever sees it, so the \
-             engine does not request a format it cannot decode"
+            [
+                "https://s1.hdslb.com/bfs/a.woff2",
+                "https://s1.hdslb.com/bfs/b.ttf"
+            ],
+            "both WOFF2 and raw sfnt are containers this engine decodes, so \
+             both items are sources"
         );
     }
 
@@ -929,5 +1333,150 @@ mod tests {
             "the fixture's H advances one em, so three at 16px are 48px"
         );
         assert_ne!(before, after, "the local face really replaced the fallback");
+    }
+
+    fn fixture_bytes(extension: &str) -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../render-core/tests/fixtures")
+            .join(format!("render-test-webfont.{extension}"));
+        std::fs::read(path).expect("the fixture is readable")
+    }
+
+    /// The three containers are the same face: a raw sfnt, WOFF 1.0 and WOFF 2.0
+    /// all decode to an sfnt whose `H` still advances one em.
+    #[test]
+    fn woff_and_woff2_decode_to_the_fixture_face() {
+        for extension in ["ttf", "woff", "woff2"] {
+            let bytes = fixture_bytes(extension);
+            let decoded =
+                decode_font_container(&bytes).unwrap_or_else(|| panic!("{extension} decodes"));
+            assert!(
+                decoded.starts_with(&[0, 1, 0, 0]) || decoded.starts_with(b"OTTO"),
+                "{extension} decodes to an sfnt container"
+            );
+            let font = fontdue::Font::from_bytes(decoded, fontdue::FontSettings::default())
+                .unwrap_or_else(|_| panic!("{extension} decodes to a readable face"));
+            assert_eq!(
+                font.metrics('H', 16.0).advance_width,
+                16.0,
+                "{extension} preserves the fixture's one-em advance"
+            );
+        }
+    }
+
+    /// A network body follows the same path as a local file: the bytes arrive
+    /// as WOFF2, decode once, and the platform measurer reports the face's own
+    /// advance before the next layout.
+    #[test]
+    fn a_fetched_woff2_body_changes_the_platform_measurers_advance() {
+        let backend = SystemFontBackend::load().expect("the platform table loads");
+        let base = Url::parse("https://example.test/page.css").expect("a base URL");
+        let url =
+            Url::parse("https://example.test/fonts/render-test-webfont.woff2").expect("a font URL");
+        let (sheet, problems) = parse_font_faces(
+            "@font-face { font-family: 'Render Test Webfont'; \
+             src: url(fonts/render-test-webfont.woff2) format(woff2) }",
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        let sources = vec![FontFaceSource::new(Some(base), sheet.rules().to_vec())];
+
+        let loader = DocumentFontLoader::new();
+        assert_eq!(
+            loader.plan_fetches(["Render Test Webfont"], &BTreeSet::from(['H'])),
+            Vec::<Url>::new(),
+            "before the rules are installed there is nothing to fetch"
+        );
+        loader.install(&backend, &sources);
+        assert_eq!(
+            loader.plan_fetches(["Render Test Webfont"], &BTreeSet::from(['H'])),
+            vec![url.clone()],
+            "the installed rule names the HTTP URL a fetch must request"
+        );
+
+        loader.install_fetched(&[(url, fixture_bytes("woff2"))]);
+        // Force the rules to be published again now that the decoded face is
+        // cached.
+        loader.install(&backend, &sources);
+
+        let style = TextStyle {
+            font_size: 16.0,
+            line_height: 19.2,
+            font: FontRequest::of_family("Render Test Webfont"),
+        };
+        assert_eq!(
+            backend.measure("HHH", style).advance,
+            48.0,
+            "the fetched WOFF2's one-em H is the advance layout measures"
+        );
+    }
+
+    /// The whole network slice: plan an HTTP font, submit the batch, apply the
+    /// response, and measure the face that came back.
+    #[test]
+    fn an_http_fetched_woff2_changes_the_measured_advance() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let address = listener.local_addr().expect("a bound address");
+        let body = fixture_bytes("woff2");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("one client");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("a read timeout");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: font/woff2\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("response headers");
+            stream.write_all(&body).expect("response body");
+        });
+
+        let base = Url::parse(&format!("http://{address}/page.css")).expect("a base URL");
+        let url = Url::parse(&format!("http://{address}/font.woff2")).expect("a font URL");
+        let (sheet, problems) = parse_font_faces(
+            "@font-face { font-family: 'Render Test Webfont'; \
+             src: url(font.woff2) format(woff2) }",
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        let sources = vec![FontFaceSource::new(Some(base), sheet.rules().to_vec())];
+        let backend = SystemFontBackend::load().expect("the platform table loads");
+        let loader = DocumentFontLoader::new();
+        loader.install(&backend, &sources);
+
+        let plan = FontFetchPlan::new(
+            loader.plan_fetches(["Render Test Webfont"], &BTreeSet::from(['H'])),
+        );
+        assert_eq!(plan.urls, vec![url.clone()]);
+        assert_eq!(
+            plan.requests()[0].accept.as_deref(),
+            Some(super::FONT_ACCEPT)
+        );
+
+        let transport = HttpTransport::new(FetchConfig::default());
+        let results = transport.fetch_batch(
+            plan.requests(),
+            &BatchOptions::default(),
+            &CancelToken::default(),
+        );
+        let batch = apply_font_batch(&plan, results);
+        assert!(batch.failures.is_empty(), "{:?}", batch.failures);
+        assert_eq!(batch.resources.len(), 1);
+
+        loader.install_fetched(&batch.resources);
+        loader.install(&backend, &sources);
+        let style = TextStyle {
+            font_size: 16.0,
+            line_height: 19.2,
+            font: FontRequest::of_family("Render Test Webfont"),
+        };
+        assert_eq!(
+            backend.measure("HHH", style).advance,
+            48.0,
+            "the HTTP-fetched WOFF2 is the face layout measures"
+        );
+        server.join().expect("the test server finishes");
     }
 }

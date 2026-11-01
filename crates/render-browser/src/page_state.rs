@@ -80,6 +80,14 @@ pub(super) struct PageState {
     /// resubmitted on every paint; changing its URL creates a new key.
     pub(super) started_style_sheets: HashSet<ExternalStyleSheetKey>,
     pub(super) style_batch: Option<(StylesheetFetchPlan, Vec<FetchResult>)>,
+    /// Fetched webfont bodies waiting for the next full render. `Arc` keeps the
+    /// render payload clone cheap; the worker drops each body from this map once
+    /// it has decoded it.
+    pub(super) font_resources: Arc<HashMap<Url, Arc<[u8]>>>,
+    /// Font URLs already submitted for this document, so a failed transfer is
+    /// not retried on every frame.
+    pub(super) attempted_fonts: HashSet<Url>,
+    pub(super) pending_fonts: Option<PendingFonts>,
     pub(super) images: ImageResources,
     /// Failed image loads are retried when their source changes, but not on
     /// every paint of the same broken URL.
@@ -212,6 +220,13 @@ pub(super) struct PendingImages {
     pub(super) stall_reported: bool,
 }
 
+pub(super) struct PendingFonts {
+    pub(super) plan: render_browser::font_faces::FontFetchPlan,
+    pub(super) handle: CachedBatchHandle,
+    pub(super) since: Instant,
+    pub(super) stall_reported: bool,
+}
+
 impl<H> PageNavigation<H> {
     pub(super) fn new(committed: PageSource) -> Self {
         Self {
@@ -291,6 +306,9 @@ impl PageState {
             style_sheets: ExternalStyleSheets::default(),
             started_style_sheets: HashSet::new(),
             style_batch: None,
+            font_resources: Arc::new(HashMap::new()),
+            attempted_fonts: HashSet::new(),
+            pending_fonts: None,
             images: ImageResources::default(),
             attempted_images: HashSet::new(),
             computed_styles: BTreeMap::new(),
@@ -419,6 +437,9 @@ impl PageState {
         self.style_sheets = ExternalStyleSheets::default();
         self.started_style_sheets.clear();
         self.style_batch = None;
+        self.font_resources = Arc::new(HashMap::new());
+        self.attempted_fonts.clear();
+        self.cancel_fonts();
         self.images = ImageResources::default();
         self.attempted_images.clear();
         self.computed_styles.clear();
@@ -555,6 +576,7 @@ impl PageState {
         }
         self.cancel_style_sheets();
         self.cancel_scripts();
+        self.cancel_fonts();
         self.cancel_images();
     }
 
@@ -569,6 +591,12 @@ impl PageState {
             pending.handle.cancel();
         }
         self.held_scripts = None;
+    }
+
+    pub(super) fn cancel_fonts(&mut self) {
+        if let Some(pending) = self.pending_fonts.take() {
+            pending.handle.cancel();
+        }
     }
 
     pub(super) fn cancel_images(&mut self) {
@@ -843,6 +871,7 @@ impl PageState {
             || self.held_scripts.is_some()
             || self.pending_scripts.is_some()
             || self.pending_style_sheets.is_some()
+            || self.pending_fonts.is_some()
             || self.pending_images.is_some()
             || self.navigation.pending.is_some()
         {

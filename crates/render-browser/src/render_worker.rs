@@ -6,6 +6,7 @@ use crate::frame::surface_to_softbuffer;
 use crate::frame::viewport_dimension;
 use render_browser::font_backend::SystemFontBackend;
 use render_browser::font_faces::DocumentFontLoader;
+use render_browser::font_faces::FontFetchPlan;
 use render_browser::font_faces::SystemFontFaceInstaller;
 use render_browser::resources::StylesheetFetchPlan;
 use render_browser::resources::StylesheetResourceDiagnostic;
@@ -46,6 +47,7 @@ use render_core::paint::RasterRequest;
 use render_net::FetchResult;
 use render_net::Url;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
@@ -68,8 +70,13 @@ pub(super) enum PageRenderPayload {
 pub(super) struct FullPageRenderPayload {
     pub(super) document: Document,
     pub(super) base_url: Url,
+    /// Per-navigation identity, used to key the webfont character cache
+    /// independently of a tab's DOM revision (which restarts at 1 on load).
+    pub(super) document_serial: u64,
     pub(super) external_style_sheets: ExternalStyleSheets,
     pub(super) style_batch: Option<(StylesheetFetchPlan, Vec<FetchResult>)>,
+    /// Fetched webfont bodies waiting to be decoded by the render worker.
+    pub(super) font_resources: Arc<HashMap<Url, Arc<[u8]>>>,
     pub(super) discover_external_styles: bool,
     pub(super) images: ImageResources,
     pub(super) interaction: InteractionState,
@@ -89,6 +96,10 @@ pub(super) struct PageRenderFrame {
     pub(super) applied_style_sheets: Option<ExternalStyleSheets>,
     pub(super) style_plan: Option<StylesheetFetchPlan>,
     pub(super) style_diagnostics: Vec<StylesheetResourceDiagnostic>,
+    /// Webfont URLs the next render needs to fetch.
+    pub(super) font_plan: Option<FontFetchPlan>,
+    /// Font URLs whose bodies this render decoded and installed.
+    pub(super) installed_fonts: Vec<Url>,
     pub(super) computed_styles: Option<BTreeMap<render_core::dom::NodeId, ComputedStyle>>,
     pub(super) geometry: Option<BTreeMap<u64, ElementRect>>,
     pub(super) document_revision: u64,
@@ -143,14 +154,17 @@ pub(super) fn process_page_render(
             let FullPageRenderPayload {
                 document,
                 base_url,
+                document_serial,
                 external_style_sheets,
                 style_batch,
+                font_resources,
                 discover_external_styles,
                 images,
                 interaction,
                 transition_state,
             } = *full;
             cancellation.check()?;
+            let installed_fonts = font_loader.install_fetched_map(&font_resources);
             let (style_sheets, applied_style_sheets, style_diagnostics) =
                 if let Some((plan, results)) = style_batch {
                     // Page scripts mutate the DOM while a large stylesheet is
@@ -240,6 +254,19 @@ pub(super) fn process_page_render(
                 &mut transition_state,
             );
             cancellation.check()?;
+            // §4.8.1: only families the computed styles name and characters the
+            // document contains make the plan. The loader has the rules from the
+            // install hook that just ran, so this is the current stylesheet set.
+            let font_plan = if font_loader.has_pending_network() {
+                let families = used_font_families(&output.styles);
+                let characters = font_loader
+                    .document_characters((job.identity.tab_id, document_serial), document.dom());
+                let urls =
+                    font_loader.plan_fetches(families.iter().map(String::as_str), &characters);
+                (!urls.is_empty()).then(|| FontFetchPlan::new(urls))
+            } else {
+                None
+            };
             let viewport = WindowSize::new(
                 output.raster.surface.width(),
                 output.raster.surface.height(),
@@ -342,6 +369,8 @@ pub(super) fn process_page_render(
                 applied_style_sheets,
                 style_plan,
                 style_diagnostics,
+                font_plan,
+                installed_fonts,
                 computed_styles: Some(output.styles),
                 geometry: Some(geometry),
                 document_revision: output.revision.as_u64(),
@@ -376,6 +405,8 @@ pub(super) fn process_page_render(
                 applied_style_sheets: None,
                 style_plan: None,
                 style_diagnostics: Vec::new(),
+                font_plan: None,
+                installed_fonts: Vec::new(),
                 computed_styles: None,
                 geometry: None,
                 document_revision: job.identity.dom_revision,
@@ -384,6 +415,22 @@ pub(super) fn process_page_render(
             })
         }
     }
+}
+
+/// Every distinct `font-family` value the frame's computed styles name.
+///
+/// Passing the values through rather than parsing them here is deliberate:
+/// `plan_fetches` already implements §5.1's caseless comparison and §4.2's
+/// quoting rules, so there is one parser for the family list.
+fn used_font_families(styles: &BTreeMap<NodeId, ComputedStyle>) -> Vec<String> {
+    styles
+        .values()
+        .filter_map(|style| {
+            style
+                .get("font-family")
+                .map(|value| value.css_text().to_owned())
+        })
+        .collect()
 }
 
 /// Retains only sheets linked by the current DOM, preferring the newest
