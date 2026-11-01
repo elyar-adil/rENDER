@@ -1,3 +1,189 @@
+# 交接文档 (2026-11-01, 续六十七) — GPU 呈现、合成器扩展、RTL/逻辑属性、文本间距、SVG/字体/缓存/test262
+
+这一轮并行推进了十条战线，全部无站点特判：
+
+1. wgpu/D3D12 GPU presenter；
+2. retained compositor 的 filter/mask effect surface；
+3. `text-indent`/`letter-spacing`/`word-spacing`；
+4. RTL block 轴镜像；
+5. RTL flex/grid/table 轴顺序；
+6. CSS logical box properties；
+7. `@starting-style`；
+8. SVG filter primitive chains；
+9. HTTP `Vary` 缓存变体；
+10. `@font-face` 条件门控 + `font-display` 时间线；
+11. test262 `Uint8Array` base64/hex 与 `Error.prototype.stack`。
+
+## GPU presenter
+
+- `crates/render-browser/src/gpu_presenter.rs`：wgpu 30 / DX12。创建窗口
+  `Surface`、adapter/device/queue，配置 sRGB swapchain；ARGB u32 转为
+  RGBA8，按 256 字节行对齐上传纹理；WGSL fullscreen triangle 采样纹理并
+  `queue.present`。`Outdated`/`Lost` 重配一次；Timeout/Occluded 显式跳过。
+- `app.rs` 初始化时优先 `GpuPresenter::new(window.clone())`，失败才创建
+  softbuffer context/sink；`RENDER_FORCE_SOFTBUFFER=1` 可强制回退。
+- 实测 adapter：`NVIDIA GeForce RTX 4060 Ti`，backend `Dx12`。
+- `render-gpu-bench`：120/120 帧 present，mean present **3.86ms**，
+  median **4.03ms**，max **4.37ms**，mean compositor **2.90ms**。
+
+## 合成器 filter/mask
+
+- `CompositedLayer` 携带 `filter`/`mask`；顶层 filter/mask layer 不再回退。
+- 过滤/遮罩层使用单个 effect surface（不是独立 band），blur/drop-shadow 可以
+  跨 512px band 边界；filter → mask → transform → opacity 顺序与完整 raster
+  一致。`apply_layer_effects` 与完整 raster 共用。
+- 安全上限：宽 8192、高 4096、4,194,304 像素；超出仍回退。
+- compositor 测试 12 个，覆盖 blur 跨 band、gradient mask、
+  filter+opacity+transform、viewport-space filter/mask，均逐像素对齐完整 raster。
+
+## 文本间距
+
+- `text-indent`：首行/`each-line`/`hanging`、长度/百分比/calc/em/rem/vw、负值、
+  RTL start 边；只有首行或强制换行后的行受影响。
+- `letter-spacing`：CSS Text 3 §7.2 的 `n-1` 间隙；行首/行尾无 tracking，跨 inline
+  边界取两侧平均；负值支持。
+- `word-spacing`：每个 word separator 额外 advance，叠加在 separator 的 tracking 上。
+- `TextFragmentData` 携带 `spacing`/`leading_spacing`/`trailing_spacing`；
+  `TextShaper::shape_spaced` 默认实现把 spacing 累加到 glyph origin，绘制、命中和
+  测量一致。剩余：grapheme cluster（当前按 scalar）、`ex`/`ch`。
+
+## RTL、logical properties、flex/grid/table
+
+- block：over-constrained margin、auto margin 负空间、root direction、floats/clear、
+  relative/absolute inset 优先级、static position、float-shortened band 内对齐。
+- flex：`row`/`row-reverse`、`justify-content` start/end vs flex-start/end、
+  cross-axis start/end、auto margins、column wrap line box。
+- grid：逻辑列，RTL 下第一列最右；`grid-column:1` 仍为逻辑 start；span 宽度和
+  物理左边缘正确；容器 `justify-content`。
+- table：RTL 列从右开始，spanning cell 锚定逻辑列组的物理左边。
+- CSS logical properties：24 个 longhand + shorthands；physical/logical 在同一个
+  属性上按完整 cascade rank（origin/important/layer/specificity/scope/source order）
+  竞争；LTR/RTL 映射正确；百分比/calc/em/rem/vw 复用长度引擎。
+- 仍缺：vertical writing modes、logical sizing/corner/scroll properties、
+  table `<col>` 方向、flex/grid `justify-items/self`。
+
+## `@starting-style`
+
+- 解析并保留 top-level、style-rule 内、media/supports/container/layer/scope 内。
+- 普通 cascade 跳过；`compute_starting_styles` 只对进入 rendered set 的元素应用。
+- transition sampler 在 `transition-property` 覆盖且值不同时从 starting value 开始，
+  复用 document clock、reversal、run/start/end/cancel 事件。
+- 测试：首帧 opacity 0→1、嵌套 selector、无 transition、display:none、DOM 插入、
+  specificity/source order、静态样式隔离。
+
+## SVG filters
+
+- 有序 primitive chain，支持 `in`/`in2`/`result`、SourceGraphic/SourceAlpha、
+  filter/primitive units、百分比、subregion、transformed region。
+- 已实现：`feGaussianBlur`、`feColorMatrix`、`feOffset`、`feBlend`（全部 W3C
+  blend mode）、`feComposite`（over/in/out/atop/xor/arithmetic）、`feFlood`、
+  `feMerge`、`feDropShadow`、`feMorphology`。
+- 65 个 SVG 测试；未实现 turbulence/displacement/image/component-transfer/
+  convolve/tile/lighting、`linearRGB`、fractional feOffset。
+
+## 字体
+
+- `@font-face` 现在保留并评估 `@media`/`@supports` 条件（含嵌套、外部样式表）；
+  不匹配的 face 不 plan/fetch/install。`@container` 仍未评估。
+- `font-display`：auto/block 3s block + infinite swap；swap 0 + infinite；
+  fallback 3.1s；optional 100ms；到达失败边界即拒绝。block 期间仍用可见 fallback
+  度量/绘制（UA 策略，单表 + §4.8.1 可见文本）。过期 face 保持 §5.2 missing 状态。
+- 测试：4 个 webfont 集成测试、font_face 49 个、font_faces 25 个、可控时钟
+  边界测试、loopback late-arrival。
+
+## HTTP `Vary`
+
+- RFC 9111 §4.1：大小写不敏感字段名、每 URL 多 variant、lookup/stale/revalidation
+  只选匹配 variant、absent 与 present-empty 区分、重复 field line 按序合并、
+  `Vary: *` 不缓存。
+- 304 保留或重算 Vary，只刷新选中 variant；`merge_headers` 替换所有同名字段行。
+- 17 个 cache 测试。
+
+## test262
+
+- `Uint8Array` base64/hex 六个方法：完整 RFC 4648、allow/omit padding、
+  `lastChunkHandling`、read/written、prefix 写入后抛 SyntaxError、
+  detached buffer/option coercion 顺序。`built-ins/Uint8Array` 16/140 → **136/140**。
+- `Error.prototype.stack` accessor：hidden symbol 存储、no own stack、
+  setter 忽略 prototype 属性、proxy/non-extensible/non-writable 规则、
+  `%Error.prototype%` home check、realm-local TypeError；`AggregateError()` 无 new；
+  `GetPrototypeFromConstructor` realm fallback。`built-ins/Error` 114/186 → **186/186**。
+- 全量：90,765 → **90,965 / 103,199 = 88.15%**；264 buckets，8 timeout，0 crash；
+  剩余 Uint8Array 失败仅为 immutable ArrayBuffer 相关 4 个 variants。
+
+## 验证
+
+```text
+cargo test --workspace -- --test-threads=1
+  render-browser    230 lib + 115 app tests, 0 failed
+  render-core       502 passed, 0 failed
+  render-core       webfont integration 4 passed, 0 failed
+  render-core       RTL integration 2 passed, 0 failed
+  render-css        319 passed, 0 failed
+  render-js         1,214 passed, 0 failed
+  render-layout     389 passed, 1 ignored
+  all crates        passed, 0 failed
+
+cargo fmt --all --check                          clean
+cargo clippy ... --all-targets -- -D warnings    clean
+python tools/check_site_neutrality.py            0 blocking, 26 advisory (297 files)
+
+render-gpu-bench:
+{"frames":120,"adapter":"NVIDIA GeForce RTX 4060 Ti","backend":"Dx12",
+ "window":"1000x740","presented_frames":120,"all_presented":true,
+ "mean_present_us":3864.3,"median_present_us":4032.1,"max_present_us":4369.9,
+ "mean_compositor_us":2901.8}
+
+render-compositor-bench:
+{"frames":"120","frames_during_block":"120","presented_frames":"120",
+ "mean_latency_us":"1720.7","median_latency_us":"1650.3",
+ "mean_present_us":"253.0","max_present_us":"324.6"}
+
+render-scroll-bench:
+{"compositor_ms":"267.703","compositor_us_per_frame":"2230.9",
+ "full_raster_ms":"704.142","full_raster_us_per_frame":"5867.9",
+ "scroll_frames_without_new_bands":"116"}
+```
+
+真实 shell：
+
+```text
+render-browser GPU presenter: adapter=NVIDIA GeForce RTX 4060 Ti backend=Dx12
+render-browser compositor retained layers=5
+render-browser health page=file:///.../compositor-demo.html ready=Complete
+render-browser screenshot written to ...\gpu-final.png
+```
+
+截图 82,898 字节。
+
+## 已知缺口
+
+- GPU presenter 目前只在 Windows/DX12 启用；其他平台走 softbuffer。`GpuPresenter`
+  在窗口创建线程构造后移动到 compositor worker。
+- filter/mask 只支持顶层 effect surface；嵌套 filter、非 Normal blend、ambient
+  clip 跨 layer、nested sticky 仍回退。
+- vertical writing modes、logical sizing/corner/scroll、grid `justify-items/self`、
+  `<col>` 方向仍未实现。
+- `@starting-style` 的 pseudo-element、`content-visibility` rendered-state 精度、
+  CSSOM `CSSStartingStyleRule` 仍缺。
+- SVG 仍缺 turbulence/displacement/image/component-transfer/convolve/tile/lighting、
+  linearRGB、fractional offset。
+- `@container` 下 `@font-face`、WOFF2 hmtx、EOT/SVG 字体、variation descriptors、
+  pseudo-element starting fonts 仍缺。
+- `Vary` 不合成 transport 注入的常量默认头；字段值仅 OWS 归一化（安全 miss）。
+- test262 仍 88.15%，immutable ArrayBuffer、Temporal/Intl、更多 staged/sm 仍缺。
+- iframe painting、selection/caret、HTTP/2、service workers、wide-gamut GPU
+  compositing 仍是结构性缺口。
+
+## 下一步
+
+- 把 GPU presenter 推广到 Metal/Vulkan，并做 damage-only present。
+- 补齐 nested filter/mask、vertical writing modes、logical sizing/scroll。
+- iframe painting 与 selection API。
+- 继续 test262，优先 immutable ArrayBuffer、Temporal/Intl 与 staged/sm。
+
+---
+
 # 交接文档 (2026-11-01, 续六十六) — compositor worker 直接呈现平台 surface
 
 这一轮把上一轮的 compositor worker 从“返回 surface 给主线程”推进到“worker 直接
@@ -110,6 +296,8 @@ render-browser screenshot written to ...\compositor-present-demo.png
 
 - **不是 GPU swapchain。** 当前是 softbuffer 平台 surface；`PlatformPresenter`
   已经是 GPU 实现可以复用的边界，但还没有 wgpu/D3D 纹理与交换链。
+
+  > 续六十七已实现 wgpu/D3D12 `GpuPresenter`；softbuffer 现在只是回退路径。
 - softbuffer present 从 worker 线程调用；平台若要求主线程 present，会返回
   error 并回退到主线程 redraw。Windows 已验证可用，其他平台需逐平台验证。
 - `present_page` 复制完整窗口 base，而不是只 present 受损矩形；可优化为

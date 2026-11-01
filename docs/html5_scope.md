@@ -201,7 +201,7 @@
 
 | 适配项 | 说明 | 对应缺口 |
 |--------|------|---------|
-| 逻辑属性全部物理化 | 规范写 `margin-block` / `padding-inline-start` / `inset-inline-start` / `border-inline-width`，布局求解器只消费物理 longhand，故逐条写物理值 | 表因此是 LTR 的；block 方向与 RTL 镜像需要先给 layout 加 `direction`（见 4.5 的 `direction: rtl` 行） |
+| ?????????? | ?? **horizontal-tb ????** ??? `margin-block` / `padding-inline-start` / `inset-inline-start` / `border-inline-*` ?? shorthand ???? cascade rank ?????????? `direction` ???????`render-css` 24 ? longhand + shorthand?`render-layout` ???????? LTR/RTL????/calc/em/rem/vw??? vertical writing modes?logical sizing/corner/scroll?table `<col>` ????? |
 | 字体轴声明已接线 | `font-weight`/`font-style`/`font-family` 进入 `FontRequest` 并由字体后端消费；`small-caps`/`text-transform`/`letter-spacing`/`text-indent` 等仍未接线 | 见 4.5 的剩余 🟡/🔴 行 |
 | `q::before`/`q::after` 不生成 | 需要 generated content，引擎不建模 | `q` 规则只保留能兑现的排版提示 |
 | quirks 规则不应用 | §15.3.9 的 margin collapsing quirks、`li` 内 `list-style-position` 默认值、表格字体重置都没做 | 见 3.5 与 S7 |
@@ -329,9 +329,9 @@ Microdata、`is=""`、`<dialog>` 完整模态语义、Drag & Drop API、可访�
 | `text-decoration`（含组合与五种线型 Solid/Double/Dotted/Dashed/Wavy） | 🟡 **已接线。** 生产 `crates/render-core/src/paint/display_list.rs:1164-1232`，`PaintPhase::TextDecoration`（`:342`），沿格式化祖先传播 `:1232-1296`，光栅化 `crates/render-core/src/paint/raster.rs:797-840`（按 CSS Text Decoration 3 §3.1 分线型）。⚠️ **传播是绘制侧近似**，`display_list.rs:1232-1238` 自述：沿格式化祖先取第一个指定该线的元素，中间内联上的 `text-decoration-line: none` 还关不掉装饰；正确修法是把传播移进 `render-css` |
 | `text-shadow` | 🟡 **已接线。** 生产 `display_list.rs:1194-1207`、多层解析 `:2435-2450`、包围盒 `:2492`、光栅化 `raster.rs:756` |
 | `list-style-type` / `list-style-position`（marker 绘制） | 🟡 **已接线。** `display_list.rs:1298-1420`（marker 几何由绘制而非布局拥有，`list-style-position: outside` 放内容边 leading 侧、`inside` 放内容原点）、`ListMarkerPaint` / `ListMarkerShape`（`:254-270`）、光栅化 `raster.rs:953-1015`（disc/circle/square 实心与空心、有序标记走文本整形） |
-| `text-transform` / `letter-spacing` / `word-spacing` / `text-indent` / `text-overflow` / `word-break` / `overflow-wrap` | 🔴 零消费者（`text-indent` 仅初始值，`crates/render-css/src/computed.rs:77,80`） |
-| `direction: rtl` + `unicode-bidi` 显示级 BiDi | 🟡 `direction` 已是 typed、可继承属性，`render-layout` 用 `unicode-bidi` 跑 UAX#9，按行 L2 重排、奇数 level 反向绘制；`text-align:start/end`、RTL `text-indent`、`dir=ltr/rtl` UA 映射与 12 个精确几何测试已覆盖。🔴 UAX#9 L3/L4、`unicode-bidi: embed/isolate/override`、行内元素级 direction、块轴 RTL 镜像与 `dir=auto` 未实现 |
-| `@font-face` + WOFF/WOFF2 | 🟡 **描述符、HTTP(S) 与容器解码已接线。** `<style>` 与已取回的 `<link>` 样式表的规则在 `render-core` 中收集，布局前经安装钩子进入 `SystemFontBackend`；相对 `src` 按样式表 URL 解析（`crates/render-browser/src/font_faces.rs`）。render worker 用 computed `font-family` 与页面字符调用 `DocumentFonts::plan_fetches`，app 通过缓存的 fetch batch 提交 HTTP(S) URL，返回的 raw sfnt / WOFF 1.0 / WOFF2 在下一帧前解码并安装。`crates/render-core/tests/webfont_layout.rs` 与 `render-browser` 的 loopback HTTP 测试都用同一段文本从 24px 变为 48px 证明描述符→取回→解码→度量→几何的链路。🔴 `font-display` 时间线、`@media`/`@supports` 条件门控、EOT/SVG 与使用 `hmtx` transform 的 WOFF2 仍未实现 |
+| `text-transform` / `text-overflow` / `word-break` / `overflow-wrap` | ?? ?????`text-indent` / `letter-spacing` / `word-spacing` ?????????????????? 4.5 / ????????????? |
+| `direction: rtl` + `unicode-bidi` ??? BiDi | ?? `direction` ? typed???????UAX#9 ?? L2 ????? level ?????horizontal-tb ? block ????auto/over-constrained margin?root direction?float/clear?relative/absolute inset ????flex row/row-reverse?grid ????table ?/spanning cell ??????? 8 ? layout + 2 ? display-list/hit-test ??????? vertical writing modes?L3/L4?`unicode-bidi: embed/isolate/override`?????? direction?nested scroll ?????? |
+| `@font-face` + WOFF/WOFF2 | ?? **????HTTP(S)??????????? font-display ????** `<style>` ????? `<link>` ??? `@media`/`@supports` ???????? `src` ???? URL ???`auto`/`block` 3s block + infinite swap?`swap` 0+infinite?`fallback` 3.1s?`optional` 100ms??? face ?????? ?5.2 missing??? `@container` ???EOT/SVG?WOFF2 `hmtx`?variation descriptors ???? |
 | 复杂脚本整形（阿拉伯/印度系/泰文 cluster） | 🔵 PLANNED。⚠️ **上一版把它列为 ⛔ NON-GOAL，理由是"依赖 HarfBuzz，超出 PyQt 默认能力"。该理由随 Python/Qt 架构一同退役，本次删除整行理由。** 当前引擎的文本整形是自研的（`crates/render-core/src/paint/display_list.rs` 的 `TextShaper` trait + `ReferenceTextShaper` + `crates/render-browser/src/font_backend.rs` 的字形掩码），与 HarfBuzz 无关；缺口是真实的（无 cluster 成形、无 script run 分割），但它是**待实现项**，不是"外部库做不到因而放弃" |
 
 ### 4.6 视觉效果
@@ -383,7 +383,7 @@ Microdata、`is=""`、`<dialog>` 完整模态语义、Drag & Drop API、可访�
 | `@supports` | 🟡 **偏差。** 块被解析（`stylesheet.rs:244,539-551`），但条件被**丢弃**：`:548` 是 `let _ = query;`，嵌套规则无条件应用。源码注释自述"Property support is intentionally permissive until the computed-value registry grows a complete CSS.supports implementation"。这意味着 `@supports (display: none) { ... }` 也会生效 |
 | `@scope` | ✅ CSS Cascade 6 §3.5：根/限制、相对 prelude、`:scope`/`&`、嵌套作用域、作用域内直接声明与 scope proximity（见 `HANDOFF.md` 续五十三） |
 | `@import` | 🔴 不是"部分实现"：at-rule 分派只处理 `@layer`，其余走 `IgnoredAtRule` 并记一条 `@import is parsed but not evaluated yet` 诊断（`stylesheet.rs:180-191,561-566`） |
-| `@font-face` | 🟡 描述符已收集并在布局前安装；`local()`/`file:`/`data:` 与 HTTP(S) webfont 均可用，WOFF/WOFF2 已解码，见 4.5；`font-display` 时间线与条件门控仍缺 |
+| `@font-face` | ?? ???????? `@media`/`@supports` ?????????`local()`/`file:`/`data:`/HTTP(S) ???WOFF/WOFF2 ????`font-display` ???????`@container`?EOT/SVG ? `hmtx` ?? |
 | `@keyframes` | 🔴 丢弃，见 4.7 |
 | `@page` `@counter-style` `@font-feature-values` | 🔴 走 `IgnoredAtRule` + 诊断 |
 | CSS Nesting | 🔵（是否进入 scope 需在本文登记后再实现，见第 13 节） |
@@ -431,7 +431,7 @@ HTTP Range 与资源状态 → HTMLMediaElement 状态机 → MP4 解复用 → 
 > ⚠️ 上一版第 6.3 节写"实现层面绑定 Python `re`"、6.1 节把整个语言层标成
 > 🔵 PLANNED M2，并建议先不实现 JS 引擎。**这两条已随 Python 架构退役。**
 > rENDER 现在有自研 JS 引擎（`crates/render-js/`，无任何 JS 第三方运行时），
-> test262 门禁基线为 **90,765 / 103,199 变体通过（88.0%），264 桶，crash 0，timeout 6**
+> test262 门禁基线为 **90,965 / 103,199 变体通过（88.15%），264 桶，crash 0，timeout 6**
 > （`crates/render-core/tests/test262-baseline.tsv`，由 `crates/render-core/tests/test262.rs`
 > 的 `enforce_baseline` 把关，只查回退）。全量门禁以 release 运行；debug 下生成的
 > RegExp property-escape 用例会触发每文件超时。
@@ -662,7 +662,7 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 |----|------|
 | UTF-8 / GBK / GB18030 / Big5 / Shift_JIS / EUC-KR / ISO-8859-* / Windows-125x 解码 | ✅ `crates/render-html/src/encoding.rs`，经 `encoding_rs`，含 BOM + meta 预扫描 + 传输层 label + `windows-1252` 回退（`:36,45`）。⚠️ 上一版写"依赖 Python codecs"，该说法随 Python 架构退役 |
 | 中日韩换行（UAX#14 简化版） | 🔴 断行由自研测量器承担（`crates/render-browser/src/font_backend.rs` 的字形掩码 + `render-layout/src/solver/inline.rs` 的断行），❓ 是否实现 UAX#14 断点未核实 |
-| RTL 显示 BiDi（UAX#9） | 🟡 水平书写模式下的 L2 重排、奇数 level 反向、`direction`/`dir`/`text-align:start-end`/RTL `text-indent` 已实现（`render-layout/src/solver/bidi_tests.rs` 12 个几何测试）；L3/L4、inline embedding、块轴镜像、`dir=auto` 仍缺 |
+| RTL ?? BiDi?UAX#9 ????? | ?? ??????? L2 ?????????`direction`/`dir`/`text-align:start/end`?RTL text-indent?block/flex/grid/table ???? logical box properties ????vertical writing modes?L3/L4?`dir=auto` ? nested scroll ???? |
 | 复杂脚本整形 | 🔵 见 4.5；上一版的 "⛔ NON-GOAL（依赖 HarfBuzz，超出 PyQt 默认能力）" 已删除 |
 | ARIA 属性反射到 DOM | 🔴（`aria-*` 只是普通属性，无消费者） |
 | 可访问性树 / 屏幕阅读器对接 | ⛔ |
@@ -695,7 +695,7 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
    - `crates/render-net/tests/{connection_reuse,connect_budget,local_transport,proxy_transport}.rs`
    - 各 crate 内的 `#[cfg(test)]` 模块（如 `crates/render-layout/src/solver/table_tests.rs`）
 2. **test262 门禁**：`crates/render-core/tests/test262.rs` + `tests/test262-baseline.tsv`
-   （264 桶，90,765 / 103,199 变体通过，88.0%）。固定 revision 由
+   （264 桶，90,965 / 103,199 变体通过，88.15%）。固定 revision 由
    `tools/fetch-test262.sh` 取入 `third_party/test262`，CI 缓存。
    门禁语义是"桶内 pass 不得回退"，不是"全绿"。
    全量扫描以 release 运行，子集跑自动跳过门禁；`RENDER_TEST262_UPDATE_BASELINE=1` 重建基线。
@@ -767,7 +767,7 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 | Cascade / computed | `crates/render-css/src/{cascade,computed}.rs` | 🟡 origin + `@layer` + `revert-layer` 完整；CSS-wide keywords 逐项行为 ❓ 部分未核实 |
 | 布局求解 | `crates/render-layout/src/solver/{block,inline,flex,grid,table,resolve}.rs` | 🟡 block/inline/flex/grid/table 五套上下文齐备；**margin collapsing 🔴**、sticky 🟡（绘制与命中测试已位移；嵌套滚动偏移未实现）、multi-column 🟡（不含 `column-rule`）、RTL 🔴 |
 | 格式化结构 | `crates/render-layout/src/{tree,fragment,geometry}.rs` | 🟡 匿名块与 `display:contents` ✅；**伪元素盒 🔴** |
-| JS 引擎 | `crates/render-js/src/{lexer,parser,value,regex}.rs` + `runtime/` | 🟡 test262 88.0%；剩余失败簇见 `docs/test262.md` 与 `docs/capability_matrix.md` |
+| JS 引擎 | `crates/render-js/src/{lexer,parser,value,regex}.rs` + `runtime/` | 🟡 test262 88.15%；剩余失败簇见 `docs/test262.md` 与 `docs/capability_matrix.md` |
 | 事件循环 | `crates/render-core/src/event_loop.rs` | ✅ task/microtask/rendering opportunity 三段式齐备 |
 | DOM 与 Web API | `crates/render-js/src/runtime/builtins/*.rs` | 🟡 域覆盖广；事件 options、Shadow DOM、`localStorage`、`matchMedia`、CORS 已接入；剩余缺口见 `docs/capability_matrix.md` |
 | 网络 | `crates/render-net/src/{transport,batch,worker,cookie,diagnostics}.rs` | 🟡 有界并发、背压、代理、重定向、gzip；br 🔴、每地址回退 ❓、连接复用 ❓ |

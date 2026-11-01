@@ -14,20 +14,21 @@ says so. `docs/visual_fidelity_gaps.md` is the working register; this file is th
 
 | what | number | when |
 | --- | --- | --- |
-| `render-js` unit tests | 1,210 passed, 0 failed | 2026-11-01 |
-| `render-css` unit tests | 305 passed, 0 failed | 2026-11-01 |
-| `render-core` unit tests | 467 passed, 0 failed | 2026-11-01 |
-| `render-core` webfont integration tests | 2 passed, 0 failed | 2026-11-01 |
-| `render-layout` unit tests | 352 passed, 1 ignored | 2026-11-01 |
-| `render-browser` unit tests | 211 passed, 0 failed | 2026-11-01 |
+| `render-js` unit tests | 1,214 passed, 0 failed | 2026-11-01 |
+| `render-css` unit tests | 319 passed, 0 failed | 2026-11-01 |
+| `render-core` unit tests | 502 passed, 0 failed | 2026-11-01 |
+| `render-core` webfont integration tests | 4 passed, 0 failed | 2026-11-01 |
+| `render-core` RTL layout integration tests | 2 passed, 0 failed | 2026-11-01 |
+| `render-layout` unit tests | 389 passed, 1 ignored | 2026-11-01 |
+| `render-browser` unit tests | 230 passed, 0 failed | 2026-11-01 |
 | `render-browser` app tests (binary) | 115 passed, 0 failed | 2026-11-01 |
 | `render-html` unit tests | 149 passed, 0 failed | 2026-10-22 |
-| `render-net` unit tests | 32 passed, 0 failed | 2026-10-22 |
+| `render-net` unit tests | 34 passed, 0 failed | 2026-11-01 |
 | `render-dom` unit tests | 78 passed, 0 failed | 2026-11-01 |
 | real-site acceptance harness | 25 passed, 5 `#[ignore]`s each mapped to a named gap | last recorded |
 | Python static gate | 15 passed, 55 subtests | last recorded |
-| site-neutrality gate | **9 rules, 293 Rust source files, exit 0** with 26 advisory findings | 2026-11-01 |
-| **test262** | **90,765 / 103,199 = 88.0%**; 264 buckets, 6 timeout, 0 crash; checked-in baseline floor = 90,765 | **2026-10-22, release profile, pinned revision** |
+| site-neutrality gate | **9 rules, 297 Rust source files, exit 0** with 26 advisory findings | 2026-11-01 |
+| **test262** | **90,965 / 103,199 = 88.15%**; 264 buckets, 8 timeout, 0 crash; checked-in baseline floor = 90,765 | **2026-11-01, release profile, pinned revision** |
 | **html5lib tree construction** | **5,810 / 7,377 pairs = 78.75%**; 190 acceptable difference, 776 unimplemented, **601 engine defect (8.15%)** | last recorded, pinned |
 | html5lib parse-error count agreement | **4,784 / 6,601 = 72.47%** under `max`, **60.60%** under `sum` - the gap between those two is the choice of reading, not the parser | last recorded |
 | **WPT `dom/`** | **32 / 297 executable = 10.8%**, 0 vacuous passes | last recorded, pinned `c7fdee80f3f1` |
@@ -140,23 +141,92 @@ rotate and skew layers inverse-map the viewport into source-local coordinates an
 untransformed source through the affine matrix. A dedicated **compositor worker** owns scroll
 frames: the render worker keeps style, layout, display-list construction and the complete raster,
 while scroll jobs run on a separate thread and commit only the presentable surface. A scroll no
-longer waits behind a full render. Filters, masks, non-normal blending, ambient clips crossing a
-layer, and nested sticky still use the complete raster. Eight core tests compare composited pixels
-with a full raster, pin band reuse over twenty 16px scroll frames, and cover fixed content away
-from the origin, sticky displacement at five scroll offsets, and scale/rotation layers. One
-dedicated-worker test runs twenty scroll frames on a non-caller thread and records per-frame
-timing; a browser test blocks the render worker for the whole test and still commits a scroll
-frame. `cargo run --release -p render-browser --bin render-scroll-bench` reports
-**2.26ms/frame retained vs 5.97ms/frame full raster** with **116/120 frames rasterizing no new
-band** (800x600 viewport, 12,000px document, fixed header, sticky bar, translated opacity layer,
-scaled/rotated layer, 16px scroll steps). The compositor worker presents through a
-`PlatformPresenter` sink directly: the shell's softbuffer sink replaces the page rectangle in
-its last full-window frame and presents from the worker thread. `render-compositor-bench` blocks
-a simulated render worker for 500ms and still presents **120/120 scroll frames during the
-block**, with mean compositor latency **1.66ms** and mean platform present **250us**. A real
-shell page containing a fixed header, a sticky nav and a rotated card logs
+longer waits behind a full render. Top-level `filter` and `mask` layers are retained too: a
+filtered/masked layer becomes one effect surface (not independent bands) so blur/drop-shadow can
+cross band boundaries, and its filter, mask, transform and opacity are applied in complete-raster
+order. Non-normal blending, ambient clips crossing a layer, nested sticky, and effects beyond the
+8192x4096/4.2M-pixel safety ceiling still use the complete raster. Twelve core tests compare
+composited pixels with a full raster, pin band reuse over twenty 16px scroll frames, and cover
+fixed content away from the origin, sticky displacement at five scroll offsets, scale/rotation,
+blur across band boundaries, gradient masks, filter+opacity+transform, and viewport-space
+filter/mask layers. One dedicated-worker test runs twenty scroll frames on a non-caller thread and
+records per-frame timing; a browser test blocks the render worker for the whole test and still
+commits a scroll frame. `cargo run --release -p render-browser --bin render-scroll-bench` reports
+**2.23ms/frame retained vs 5.87ms/frame full raster** with **116/120 frames rasterizing no new
+band**. The compositor worker presents through a `PlatformPresenter` sink directly:
+`cargo run --release -p render-browser --bin render-compositor-bench` completes and presents
+**120/120 scroll frames during a 500ms simulated render-worker block** (mean 1.72ms, mean platform
+present 253us). A real shell page containing a fixed header, a sticky nav and a rotated card logs
 `render-browser compositor retained layers=5`, so the live display list takes the retained path
 rather than the fallback.
+
+**GPU presentation.** On Windows the shell now prefers a real wgpu/D3D12 swapchain:
+`GpuPresenter` creates a `wgpu::Surface` from the winit window, requests a DX12 adapter/device,
+uploads the composed ARGB frame into an `Rgba8UnormSrgb` texture with 256-byte row padding, draws a
+fullscreen triangle sampling that texture, and presents with `queue.present`. The compositor
+worker owns presentation after the surface is installed, so scroll frames reach the swapchain
+without returning through the event-loop thread. A hidden-window live benchmark reports the
+adapter and backend, and the observed machine is
+`NVIDIA GeForce RTX 4060 Ti / Dx12`: **120/120 frames presented**, mean GPU present **3.86ms**,
+median **4.03ms**, max **4.37ms**, mean compositor **2.90ms**. When no adapter/device is usable,
+the shell logs the failure and falls back to the softbuffer sink; `RENDER_FORCE_SOFTBUFFER=1`
+exercises that path explicitly.
+
+**CSS text spacing.** `text-indent`, `letter-spacing` and `word-spacing` now have real consumers
+in measurement, line breaking, intrinsic widths, glyph painting and hit testing. `text-indent`
+supports lengths, percentages, `calc()`, `em`/`rem`/viewport units, negative values, `hanging` and
+`each-line`, applies only to the first formatted line (or after a forced break with `each-line`),
+and mirrors the start edge under RTL. `letter-spacing` uses the CSS Text 3 §7.2 reading of
+`n - 1` gaps between character units, averages at inline boundaries, and is absent at line
+edges; `word-spacing` adds one separator advance per word separator. `TextFragmentData` carries
+the used spacing plus leading/trailing boundary values; `TextShaper::shape_spaced` keeps painting
+and hit-test character cells aligned with the measured run. Tests pin two-line indent, RTL indent,
+negative/cross-inline tracking, word-spacing line breaks, display-list glyph origins and hit-test
+caret boundaries. Grapheme-cluster spacing remains per-scalar, and `ex`/`ch` remain unresolved by
+the shared length context.
+
+**RTL and logical box properties.** Horizontal-tb RTL now mirrors block placement: over-constrained
+margins, auto margins with negative free space, root direction, floats/clear logical keywords,
+relative/absolute inset preference, static positions, and line alignment within a float-shortened
+band. Flex row/row-reverse order, `justify-content`, column cross-axis alignment and wrapping;
+grid logical columns with right-edge placement and `justify-content`; and table column order and
+spanning-cell anchoring all mirror under RTL while LTR is unchanged. Exact-geometry tests live in
+`rtl_layout_tests.rs`, with display-list and hit-test integration tests in
+`render-core/tests/rtl_layout.rs`. CSS logical properties are resolved end-to-end for
+horizontal-tb: 24 logical longhands (`margin/padding/inset/border-{inline,block}-{start,end}-*`),
+logical shorthands, percentage/calc/em/rem/viewport units, and physical-vs-logical cascade
+competition. Vertical writing modes, logical sizing/corner/scroll properties, table `<col>`
+direction and `justify-items`/`justify-self` remain open.
+
+**`@starting-style`.** CSS Transitions 2 entry transitions are implemented: the parser retains
+`@starting-style` at top level, nested in style rules, and inside conditional/layer/scope groups;
+the ordinary cascade skips it; `compute_starting_styles` applies it only for an element entering
+the rendered set (first style change, insertion, or `display:none` becoming rendered); the
+existing transition sampler starts from those values when `transition-property` covers the
+property, then emits the normal run/start/end/cancel events. Tests cover first render, nested
+selectors, no-transition properties, `display:none`, DOM insertion, specificity/source order and
+static-style exclusion. Pseudo-element starting styles, `content-visibility` rendered-state
+fidelity and CSSOM `CSSStartingStyleRule` remain open.
+
+**SVG filter primitive chains.** Inline SVG now parses an ordered filter chain with `in`/`in2`/
+`result`, `SourceGraphic`/`SourceAlpha`, named results, filter/primitive units, percentages,
+subregions and transformed regions. Implemented primitives: `feGaussianBlur` (premultiplied
+separable, SVG edge clamp), `feColorMatrix` (matrix/saturate/hueRotate/luminanceToAlpha),
+`feOffset`, `feBlend` (all W3C blend modes), `feComposite` (over/in/out/atop/xor/arithmetic),
+`feFlood`, `feMerge`/`feMergeNode`, `feDropShadow`, and existing `feMorphology`. Pixel tests cover
+edge falloff, exact matrices, offset coverage, blend/composite math, merge/flood, region and
+subregion clipping; unsupported primitives produce diagnostics and pass input through.
+`feTurbulence`, `feDisplacementMap`, `feImage`, `feComponentTransfer`, `feConvolveMatrix`,
+`feTile`, lighting primitives, `linearRGB` filter interpolation and fractional offsets remain
+open.
+
+**HTTP cache variants.** The private HTTP cache now implements RFC 9111 §4.1 `Vary`: field names
+are parsed case-insensitively, multiple variants per URL are stored side by side, lookup and
+revalidation select only a matching variant, absent differs from present-empty, repeated request
+field lines combine in order, and `Vary: *` is never stored or served. 304 updates preserve or
+recompute the variant and refresh only the selected one; `merge_headers` replaces every stored
+field line of an updated name. Transport-injected constant defaults are not synthesized into the
+key, so a mismatch is a safe miss rather than a wrong hit.
 
 **Table layout.** 47 tests. CSS 2.1 §17 including border-collapse conflict resolution, row groups,
 `colspan`/`rowspan`, `caption-side`, fixed layout, intrinsic widths. This is the single most-used
@@ -182,9 +252,16 @@ decoded from raw sfnt, WOFF 1.0 (zlib) or WOFF2 (Brotli) and installed before th
 measurement. The loader keeps decoded faces across a re-render but not across a document.
 `crates/render-core/tests/webfont_layout.rs` proves the geometry change (24px -> 48px for `HHH`
 at 16px) with an embedded sheet, and `render-browser` has a loopback HTTP test that fetches a
-WOFF2, decodes it, and measures the same 48px. Still open: §4.6/§4.7 variation descriptors,
-`font-display` timing, Embedded OpenType and SVG fonts, WOFF2 files using the decoder's
-unsupported `hmtx` transform, and evaluating conditions around a nested `@font-face`.
+WOFF2, decodes it, and measures the same 48px. `@font-face` rules now retain and evaluate their
+`@media`/`@supports` conditions against the render environment; a non-matching face is never
+planned, fetched or installed, including nested conditions and external sheets. `font-display` has
+a real document timeline: `auto`/`block` use a 3s block with infinite swap, `swap` uses no block
+with infinite swap, `fallback` allows arrival before 3.1s, `optional` before 100ms; an arrival at
+the failure boundary is too late, and expired sources remain missing under §5.2 shadowing. The
+engine deliberately measures/paints the visible fallback during the block period because it has a
+single measure/paint table and §4.8.1 requires visible text. Still open: §4.6/§4.7 variation
+descriptors, Embedded OpenType and SVG fonts, WOFF2 files using the decoder's unsupported `hmtx`
+transform, `@container`-gated `@font-face`, and pseudo-element starting styles for fonts.
 
 **Network transport.** 81 tests. HTTP/1.1 with connection reuse proven by measurement, a
 same-origin ceiling that is an explicit measured choice rather than a dependency default
@@ -222,7 +299,7 @@ Verified by grep, not inferred. Full discussion in the register's S30.
 | **Animations and transitions** | *Closed for the CSS surface.* `@keyframes`, `animation-*`, and CSS transitions are sampled by a browser-driven 16 ms timeline clock; keyframes inside `@media` are gated, while keyframes inside `@container` are global per CSS Conditional 5 §5.4. Multi-animation lists, reversing shortening and WAAPI edge cases remain partial. |
 | **Selection / Range** | Range is implemented (DOM §5): `Range`, `StaticRange`, `createRange`, the boundary-point and content algorithms, and live updates on every tree mutation. There is no `getSelection` selection state, so `getSelection()` reports an empty selection, and no caret position APIs |
 | **Shadow-scoped styling** | shadow trees, `attachShadow` and autonomous `customElements` exist; shadow-tree stylesheets are collected and isolated per tree, `:host`/`:host()`/`:host-context()`/`::slotted()` match, and `slotchange` fires. `::part()`, `:has-slotted()`, declarative shadow roots and `::slotted()::before/after` remain |
-| **Compositing** | **Partial.** `CompositorCache` builds a retained top-level layer tree from the display list: contiguous root segments preserve z-order and coordinate space, transform/opacity stacking contexts and top-level sticky scopes become layers, and every surface is cut into 512px bands. Scrolling composites cached bands through an integer-translation fast path and rasterizes only newly exposed bands. Fixed content lives in viewport space; sticky scopes are displaced at composite time; scale/rotate/skew layers inverse-map the viewport for band selection and composite the untransformed source through their matrix. A dedicated compositor worker runs scroll jobs independently of the render worker, so a scroll frame does not wait behind style/layout or a complete raster; the browser test blocks the render worker and still commits and presents a scroll frame. The worker calls a platform presenter directly; the current softbuffer sink writes the page into its last full-window frame and presents from the worker thread, with a shell redraw fallback if the platform rejects an off-thread present. Filters, masks, non-normal blend modes, ambient clips crossing a layer and nested sticky still fall back to the complete raster. There is no GPU swapchain yet. Benchmark: 120 sixteen-pixel scroll frames, 800x600 viewport, 12,000px document, fixed header, sticky bar and affine layer: 2.26ms/frame retained vs 5.97ms/frame full raster, 116/120 frames rasterizing no new band; a 500ms simulated render-worker block still presents 120/120 scroll frames (mean 1.66ms, mean present 250us). |
+| **Compositing** | **Partial.** `CompositorCache` builds a retained top-level layer tree: root segments preserve z-order and coordinate space, transform/opacity/sticky scopes become layers, and surfaces use 512px bands. A dedicated compositor worker runs scroll jobs independently of the render worker; fixed content lives in viewport space, sticky scopes displace at composite time, and scale/rotate/skew layers inverse-map the viewport for band selection. Top-level `filter` and `mask` layers are retained as single effect surfaces so blur/drop-shadow crosses band boundaries, with full-raster pixel equality. On Windows the worker presents through a wgpu/D3D12 swapchain (`GpuPresenter`): ARGB frame → texture upload → fullscreen triangle → `queue.present`; softbuffer remains the fallback. Non-normal blend modes, ambient clips crossing a layer, nested sticky and effects above the 8192x4096/4.2M-pixel ceiling still fall back. Live GPU benchmark: 120/120 frames, mean present 3.86ms (RTX 4060 Ti/Dx12); CPU compositor benchmark: 120/120 during a 500ms render-worker block. |
 | **Bidi** | UAX #9 has zero occurrences, so right-to-left scripts lay out left-to-right. Correctly lower priority given the corpus, but recorded rather than left to be rediscovered |
 | **HTTP/2** | structurally rejected: a pooled connection leaves the pool while in use and is held for the whole request, so one connection carries one in-flight request. Multiplexing is the inverse |
 | Multi-column layout | `column-count`, `column-width`, `columns`, `column-gap`, `column-fill` and `column-span: all`: the flow is cut at line boundaries, and a block that a break crosses is split with `box-decoration-break: slice` | `column-rule` is not implemented; `column-span` applies to direct block children only |
@@ -359,10 +436,10 @@ them would break more real pages than everything else combined:
 3. **Shadow-scoped styling** - stylesheets, `:host` and `::slotted` now work; `::part()`,
    declarative shadow roots and nested pseudo-elements on `::slotted()` remain
 4. **Selection, bidi, workers and compositing** - the remaining structural absences. The
-   retained compositor now has a dedicated scroll worker that presents through the platform
-   surface directly and handles fixed, sticky and affine layers, but there is no GPU swapchain
-   yet, animation sampling does not share the compositor timeline, and filters, masks and nested
-   sticky scopes still take the complete raster
+   retained compositor now has a dedicated scroll worker, a wgpu/D3D12 swapchain on Windows,
+   fixed/sticky/affine layers, filter/mask effect surfaces and RTL-aware axes, but animation
+   sampling does not share the compositor timeline, and non-normal blend modes, ambient clips
+   crossing a layer and nested sticky scopes still take the complete raster
 
 **Closed from this list:** dynamic interaction state is now wired through
 `InteractionState` and `Document::render_with_interaction`, so `:hover`, `:active`, `:focus`,
@@ -372,7 +449,7 @@ input. Tab/Shift-Tab walk the sequential focus order and every focus path fires
 history is exposed.
 
 **One measurement is deliberately not a claim.** The site-neutrality gate now has 9 rules, scans
-293 Rust source files, and **exits 0 with 26 advisory findings**. The blocking violations this
+297 Rust source files, and **exits 0 with 26 advisory findings**. The blocking violations this
 section used to record are gone; the advisories are site names in comments and diagnostic file
 names, and they are still reported so the vocabulary does not become invisible. A gate that reads
 as enforcement but has stopped detecting is worse than no gate, which is why the self-test runs

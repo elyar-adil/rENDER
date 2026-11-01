@@ -520,11 +520,16 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 mask can never outlive the table it was made against. A face that \
                 has not arrived is treated as not present in its family - §5.2's own \
                 rule - and because that is the whole of the state, measurement and \
-                painting cannot disagree about it. `font-display` is validated and \
-                recorded and changes nothing, because this engine has no font \
-                download timer and therefore no block, swap or failure period to act \
-                on. Author stylesheet discovery passes every eligible `<style>` and \
-                fetched `<link>` sheet's rules to a pre-layout installer, which resolves \
+                painting cannot disagree about it. `font-display` now has a document \
+                timeline: auto/block use a 3s block and infinite swap, swap uses no \
+                block and infinite swap, fallback accepts arrival before 3.1s, and \
+                optional before 100ms; an arrival at the failure boundary is too late. \
+                The block period deliberately measures/paints the visible fallback \
+                because the engine has one measure/paint table and §4.8.1 requires \
+                visible text. Author stylesheet discovery passes every eligible \
+                `<style>` and fetched `<link>` sheet's rules to a pre-layout installer \
+                after evaluating their `@media`/`@supports` conditions; non-matching \
+                faces are never planned, fetched or installed. The installer resolves \
                 §4.3.2 URLs and publishes the document table before the first \
                 measurement. The browser plans the HTTP(S) URLs §4.8.1 requires \
                 (`DocumentFonts::plan_fetches` narrowed by computed families and page \
@@ -534,9 +539,8 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 NOT implemented: §4.6's feature and variation settings, §4.7's \
                 `font-named-instance`, §4.11's `*-override` metrics descriptors, any \
                 font technology (a `tech()` item is skipped), Embedded OpenType and SVG \
-                fonts, and WOFF2 files whose `hmtx` transform the decoder does not \
-                support. A `@font-face` nested in `@media` or `@supports` is walked \
-                without evaluating that condition yet.",
+                fonts, WOFF2 files whose `hmtx` transform the decoder does not support, \
+                and `@container`-gated `@font-face`.",
         dependencies: &[CSS_SYNTAX],
         tests: &[],
     },
@@ -656,14 +660,24 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 CSS Writing Modes 3 `direction` and UAX #9 line reordering are implemented \
                 for horizontal writing modes: paragraph level, visual level runs, odd-run \
                 reversal, start/end alignment, RTL text-indent, and the HTML `dir` attribute. \
+                Horizontal-tb RTL now also mirrors block placement, over-constrained/auto \
+                margins, root direction, floats/clear, relative/absolute inset preference, \
+                flex row/row-reverse/justify-content/cross-axis/wrapping, grid logical \
+                columns and table column/spanning-cell order. CSS logical box properties \
+                (`margin/padding/inset/border-{inline,block}-{start,end}-*` and their \
+                shorthands) resolve to physical sides with full cascade competition. \
+                `text-indent`, `letter-spacing` and `word-spacing` affect measurement, line \
+                breaking, intrinsic widths, painting and hit-testing. \
                 `content-visibility: hidden` keeps the element's box, applies size, layout \
                 and paint containment, and omits every descendant fragment; `content-visibility: \
                 auto` currently lays its contents out normally, without off-screen skipping \
                 or `contain-intrinsic-size`. \
                 Not implemented: `column-rule`, `unicode-bidi` embeddings and isolates, \
                 per-inline-element `direction`, UAX #9 L3/L4 (combining marks and mirroring), \
-                Arabic/Indic shaping, `dir=auto`, block-axis RTL mirroring, and scrolling \
-                a nested scroll container. Each one has a scrollport geometry in the \
+                Arabic/Indic shaping, `dir=auto`, vertical writing modes, logical sizing/corner/\
+                scroll properties, flex/grid `justify-items`/`justify-self`, table `<col>` \
+                direction, grapheme-cluster text spacing, and scrolling a nested scroll \
+                container. Each one has a scrollport geometry in the \
                 fragment tree, but only the page viewport owns a scroll offset, so \
                 `overflow: auto` on a `div` clips its content with no way to reach it.",
         dependencies: &[DOM_TREE, CSS_USED_VALUES, CSS_FLEXBOX, CSS_GRID],
@@ -714,9 +728,14 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 stylesheet's fill. \
                 Not implemented: `use` and `symbol` indirection, which SVG 2 3.2.4 \
                 renders as a shadow tree cloned from its target; gradients; `text`; \
-                `clipPath`; `mask`; `filter`; `<image>`; and `foreignObject` \
-                positioning inside the SVG viewport coordinate system. An `<svg>` with \
-                a percentage or absent `width` is sized from its `viewBox` where a \
+                `clipPath`; `mask`; `<image>`; and `foreignObject` positioning inside \
+                the SVG viewport coordinate system. SVG filter chains are implemented \
+                for `feGaussianBlur`, `feColorMatrix`, `feOffset`, `feBlend`, \
+                `feComposite`, `feFlood`, `feMerge`, `feDropShadow` and `feMorphology`, \
+                with in/in2/result, units, subregions and region clipping; turbulence, \
+                displacement, image, component-transfer, convolve, tile, lighting, \
+                linearRGB interpolation and fractional offsets remain open. An `<svg>` \
+                with a percentage or absent `width` is sized from its `viewBox` where a \
                 browser would use the containing block, which is the safe direction and \
                 is documented as a difference.",
         dependencies: &[HTML_FOREIGN, LAYOUT, PAINT],
@@ -732,24 +751,22 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 gradients, solid, gradient and image content, borders including the \
                 collapsed-model ring, text glyph runs, text decoration, text shadow, \
                 list markers, clipping by `overflow` and `clip-path`-adjacent rect \
-                clips, and stacking contexts from `opacity` and `transform`. Five \
-                declared properties reach the computed style and no consumer: \
-                `filter`, `backdrop-filter`, `mask-image`, `mix-blend-mode` and \
-                `clip-path` as a *shape* rather than a rectangle. `z-index` sorts \
-                block siblings only: flex and grid children are not sorted and the \
-                paint layer has no other notion of stacking level. A retained \
-                banded compositor caches root segments, top-level translate/opacity \
-                and scale/rotate/skew layers, fixed viewport-space content and \
-                top-level sticky scopes; scrolling composites those bands, resolves \
-                sticky displacement at composite time, and only rasterizes newly \
-                exposed bands. A dedicated compositor worker runs scroll jobs off \
-                the render worker, so a scroll frame does not wait behind style, \
-                layout or a complete raster, and it presents through a platform \
-                sink directly; the softbuffer sink writes the page into its last \
-                full window frame from the worker thread. Filters, masks, \
-                non-normal blend modes, ambient clips crossing a layer and nested \
-                sticky still take the complete raster, and no GPU swapchain exists \
-                yet.",
+                clips, and stacking contexts from `opacity` and `transform`. The \
+                retained compositor caches root segments, top-level \
+                translate/opacity/scale-rotate-skew layers, fixed viewport-space \
+                content, top-level sticky scopes, and top-level `filter`/`mask` layers \
+                as single effect surfaces so blur can cross band boundaries; scrolling \
+                composites those bands, resolves sticky displacement at composite \
+                time, and only rasterizes newly exposed bands. A dedicated compositor \
+                worker runs scroll jobs off the render worker and presents through a \
+                platform sink directly; on Windows that sink is a wgpu/D3D12 swapchain \
+                that uploads the composed frame as a texture and presents through the \
+                GPU, with softbuffer as the fallback. `backdrop-filter`, `mix-blend-mode` \
+                and `clip-path` as an arbitrary shape still lack consumers; non-normal \
+                blend modes, ambient clips crossing a layer, nested sticky and effects \
+                above the effect-surface size ceiling still take the complete raster. \
+                `z-index` sorts block siblings only: flex and grid children are not \
+                sorted and the paint layer has no other notion of stacking level.",
         dependencies: &[LAYOUT],
         tests: PAINT_TESTS,
     },
