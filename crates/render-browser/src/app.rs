@@ -789,7 +789,8 @@ impl BrowserApp {
                     .committed_render
                     .is_none_or(|previous| completed.identity.generation > previous.generation)
                 && (page.frame.is_empty()
-                    || completed.identity.scroll_offset.y == page.scroll.offset_y())
+                    || completed.identity.scroll_offset.y.to_bits()
+                        == page.scroll.offset_y().to_bits())
         });
         if !accepted {
             if env::var_os("RENDER_DEBUG_FRAME").is_some() {

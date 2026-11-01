@@ -5194,6 +5194,8 @@ fn doctype_quirks_mode(doctype: &DoctypeToken) -> QuirksMode {
         .to_ascii_lowercase();
     // "The system identifier is set to:
     // 'http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd'".
+    // site-neutral: this system identifier is a standard quirks-mode trigger in
+    // HTML's quirks-mode table, not a branch for the hosting site.
     if system_id == "http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd" {
         return QuirksMode::Quirks;
     }

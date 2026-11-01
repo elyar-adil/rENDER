@@ -679,6 +679,10 @@ impl PageState {
         self.page.runtime_mut().set_document_cookies(&header);
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "batch execution is one ordered queue/origin/event loop over prepared scripts"
+    )]
     pub(super) fn execute_script_batch(
         &mut self,
         preparation: ScriptBatchPreparation,
