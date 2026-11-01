@@ -95,6 +95,12 @@ html, body { display: block; }
    tree children are the nodes assigned to it. */
 slot { display: contents; }
 body { margin-top: 8px; margin-right: 8px; margin-bottom: 8px; margin-left: 8px; }
+/* HTML §3.2.6.2 and §15.3.1: the `dir` attribute's `ltr` and `rtl` states are
+   presentational hints for `direction`. `dir=auto` needs the element's first
+   strong character and is not mapped yet, and `unicode-bidi: isolate` is not
+   implemented. */
+[dir="ltr" i] { direction: ltr; }
+[dir="rtl" i] { direction: rtl; }
 
 /* §15.3.3 Flow content. The block margins of the elements with default
    margins are declared through `:where` for the reason given at
@@ -2752,6 +2758,18 @@ mod tests {
             node_typed_css(&render, shadow_span, "background-color"),
             "rgb(0, 128, 0)"
         );
+    }
+
+    #[test]
+    fn the_dir_attribute_maps_to_direction_and_inherits() {
+        let document = Document::parse(
+            "<!doctype html><div id='rtl' dir='rtl'><span id='child'></span></div>\
+             <div id='ltr' dir='ltr'></div>",
+        );
+        let render = document.render_reference(DocumentRenderOptions::default());
+        assert_eq!(typed_css(&document, &render, "#rtl", "direction"), "rtl");
+        assert_eq!(typed_css(&document, &render, "#child", "direction"), "rtl");
+        assert_eq!(typed_css(&document, &render, "#ltr", "direction"), "ltr");
     }
 
     /// The used color scheme is one answer for the whole frame: it drives

@@ -12,6 +12,7 @@ name = "render_layout"
 [dependencies]
 render-dom = { path = "../render-dom" }
 render-css = { path = "../render-css" }
+unicode-bidi = "0.3.18"
 
 [dev-dependencies]
 render-html = { path = "../render-html" }

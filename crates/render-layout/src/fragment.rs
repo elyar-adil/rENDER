@@ -133,6 +133,9 @@ impl StoredFontRequest {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextFragmentData {
+    /// The run in display order for a left-to-right painter. An odd-level
+    /// bidirectional run has already been reversed by layout (UAX #9 L2), so
+    /// the painter must not apply bidi reordering a second time.
     pub text: String,
     pub baseline: f32,
     pub font_size: f32,

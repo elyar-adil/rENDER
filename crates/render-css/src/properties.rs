@@ -975,6 +975,11 @@ keyword_enum!(TextAlign {
     Center => "center",
     Justify => "justify",
 });
+// CSS Writing Modes 3 §2.1: the two-value grammar, `Inherited: yes`.
+keyword_enum!(Direction {
+    Ltr => "ltr",
+    Rtl => "rtl",
+});
 // CSS Text 3 §5.1. Every value is a keyword §5.1 names, and the grammar is a
 // single keyword, so the enum is the whole definition.
 keyword_enum!(WordBreak {
@@ -1429,6 +1434,7 @@ pub enum TypedPropertyValue {
     AlignSelf(AlignSelf),
     AlignContent(AlignContent),
     TextAlign(TextAlign),
+    Direction(Direction),
     WordBreak(WordBreak),
     LineBreak(LineBreak),
     Order(i32),
@@ -1489,6 +1495,7 @@ impl TypedPropertyValue {
             Self::AlignSelf(_) => "align-self",
             Self::AlignContent(_) => "align-content",
             Self::TextAlign(_) => "text-align",
+            Self::Direction(_) => "direction",
             Self::WordBreak(_) => "word-break",
             Self::LineBreak(_) => "line-break",
             Self::Order(_) => "order",
@@ -1548,6 +1555,7 @@ impl TypedPropertyValue {
             Self::AlignSelf(value) => value.as_str().to_owned(),
             Self::AlignContent(value) => value.as_str().to_owned(),
             Self::TextAlign(value) => value.as_str().to_owned(),
+            Self::Direction(value) => value.as_str().to_owned(),
             Self::WordBreak(value) => value.as_str().to_owned(),
             Self::LineBreak(value) => value.as_str().to_owned(),
             Self::Order(value) => value.to_string(),
@@ -1876,6 +1884,7 @@ pub const DECLARED_GRAMMARS: &[&str] = &[
     "align-self",
     "align-content",
     "text-align",
+    "direction",
     "word-break",
     "line-break",
     "order",
@@ -1975,6 +1984,7 @@ fn parse_property<'i>(
             parse_keyword(input, AlignContent::parse).map(TypedPropertyValue::AlignContent)
         }
         "text-align" => parse_keyword(input, TextAlign::parse).map(TypedPropertyValue::TextAlign),
+        "direction" => parse_keyword(input, Direction::parse).map(TypedPropertyValue::Direction),
         "word-break" => parse_keyword(input, WordBreak::parse).map(TypedPropertyValue::WordBreak),
         "line-break" => parse_keyword(input, LineBreak::parse).map(TypedPropertyValue::LineBreak),
         "order" => parse_integer(input).map(TypedPropertyValue::Order),
@@ -5041,6 +5051,20 @@ mod tests {
         assert_eq!(
             parse("color", "rgb(10 20 30 / 25%)").to_css(),
             "rgba(10, 20, 30, 0.25)"
+        );
+    }
+
+    #[test]
+    fn parses_direction_keywords() {
+        assert_eq!(
+            parse("direction", "rtl"),
+            TypedPropertyValue::Direction(super::Direction::Rtl)
+        );
+        assert_eq!(parse("direction", "ltr").to_css(), "ltr");
+        assert!(
+            parse_typed_property("direction", "sideways")
+                .expect("direction is supported")
+                .is_err()
         );
     }
 

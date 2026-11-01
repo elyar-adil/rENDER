@@ -36,6 +36,8 @@ pub(crate) mod resolve;
 mod table;
 
 #[cfg(test)]
+mod bidi_tests;
+#[cfg(test)]
 mod collapse_tests;
 #[cfg(test)]
 mod columns_tests;
@@ -409,6 +411,7 @@ fn run_reference_layout(
         images,
         containers,
         fragments: Vec::new(),
+        inline_bidi: BTreeMap::new(),
         diagnostics: Vec::new(),
         inline_characters: 0,
         fragment_limit_reported: false,
@@ -492,6 +495,11 @@ struct Solver<'a> {
     /// small-viewport fallback applies.
     containers: Option<&'a ContainerContext>,
     fragments: Vec<Fragment>,
+    /// The line and resolved bidi level of each inline fragment that can take
+    /// part in line reordering. Entries are removed by the pass that consumes
+    /// them; descendants of an atomic inline are not top-level inline content
+    /// and never appear here.
+    inline_bidi: BTreeMap<FragmentId, InlineBidiPlacement>,
     diagnostics: Vec<LayoutDiagnostic>,
     inline_characters: usize,
     fragment_limit_reported: bool,
@@ -680,6 +688,8 @@ pub(super) struct InlineAtom<'a> {
     line_breaking: LineBreakOptions,
     style: TextStyle<'a>,
     spacing: TextSpacing,
+    /// The resolved UAX #9 embedding level of this atom.
+    bidi_level: u8,
 }
 
 struct TextRun<'a> {
@@ -690,6 +700,20 @@ struct TextRun<'a> {
     y: f32,
     width: f32,
     typography: inline::InlineTextStyle<'a>,
+    /// The atom's resolved embedding level; a run never mixes levels.
+    bidi_level: u8,
+    /// The line box this run belongs to, which is what `BidiInfo::reorder_visual`
+    /// and line-local alignment need after every line has been filled.
+    line: usize,
+}
+
+/// Where an inline fragment was placed, so bidi reordering and line alignment
+/// can work on the fragments of one line rather than guessing from their y
+/// coordinate: an atomic inline's margin box can start above its line box.
+#[derive(Clone, Copy, Debug)]
+struct InlineBidiPlacement {
+    line: usize,
+    level: u8,
 }
 
 /// The typographic character unit immediately before the one being placed on

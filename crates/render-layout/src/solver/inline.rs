@@ -15,6 +15,7 @@ use crate::linebreak::LineBreakStrictness;
 use crate::linebreak::WordBreak;
 use crate::solver::FloatArea;
 use crate::solver::InlineAtom;
+use crate::solver::InlineBidiPlacement;
 use crate::solver::LayoutDiagnostic;
 use crate::solver::LayoutDiagnosticCode;
 use crate::solver::PreviousUnit;
@@ -33,6 +34,7 @@ use render_css::computed::ComputedStyle;
 use render_css::computed::ComputedValue;
 use render_css::properties::AlignItems;
 use render_css::properties::BoxSizing;
+use render_css::properties::Direction;
 use render_css::properties::Float;
 use render_css::properties::JustifyContent;
 use render_css::properties::LineBreak;
@@ -46,6 +48,8 @@ use render_dom::NodeId;
 use render_dom::NodeKind;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
+use unicode_bidi::BidiInfo;
+use unicode_bidi::Level;
 
 /// Whether the intrinsic-sizing trace is switched on.
 ///
@@ -273,9 +277,65 @@ fn indented_line_band(
     line_height: f32,
     min_width: f32,
     indent: f32,
+    rtl: bool,
 ) -> (f32, f32) {
     let (left, right) = inline_float_band(floats, containing, line_y, line_height, min_width);
-    (left + indent, right)
+    if rtl {
+        // `text-indent` is a margin on the *start* edge (CSS Text 3 §8.1),
+        // which is the right edge in an RTL paragraph.
+        (left, (right - indent).max(left))
+    } else {
+        (left + indent, right)
+    }
+}
+
+/// The paragraph base direction from the block container's `direction`.
+fn inline_direction(style: Option<&ComputedStyle>) -> bool {
+    matches!(
+        style.and_then(|style| style.typed("direction")),
+        Some(TypedPropertyValue::Direction(Direction::Rtl))
+    )
+}
+
+/// Assign every atom the embedding level UAX #9 resolves for it.
+///
+/// The text is built in logical order: an atomic inline contributes U+FFFC
+/// (OBJECT REPLACEMENT CHARACTER), which is what a replaced box is in the
+/// bidirectional algorithm, and a forced break contributes a paragraph
+/// separator. The CSS `direction` value is the paragraph embedding level even
+/// when the first strong character disagrees (CSS Writing Modes 3 §2.1).
+fn assign_bidi_levels(atoms: &mut [InlineAtom], base_rtl: bool) {
+    // The overwhelmingly common case is an LTR paragraph whose text is ASCII.
+    // It cannot contain a right-to-left character, so every level is zero and
+    // running the full algorithm would only allocate per-byte vectors for
+    // every paragraph on every page.
+    if !base_rtl
+        && atoms
+            .iter()
+            .all(|atom| atom.character.is_ascii() || atom.forced_break || atom.atomic.is_some())
+    {
+        for atom in atoms.iter_mut() {
+            atom.bidi_level = 0;
+        }
+        return;
+    }
+    let mut text = String::with_capacity(atoms.len());
+    let mut offsets = Vec::with_capacity(atoms.len());
+    for atom in atoms.iter() {
+        offsets.push(text.len());
+        if atom.forced_break {
+            text.push('\u{2028}');
+        } else if atom.atomic.is_some() {
+            text.push('\u{FFFC}');
+        } else {
+            text.push(atom.character);
+        }
+    }
+    let base = if base_rtl { Level::rtl() } else { Level::ltr() };
+    let info = BidiInfo::new(&text, Some(base));
+    for (atom, offset) in atoms.iter_mut().zip(offsets) {
+        atom.bidi_level = info.levels.get(offset).copied().unwrap_or(base).number();
+    }
 }
 
 /// The typography one inline atom contributes to measurement.
@@ -456,6 +516,12 @@ impl<'a> Solver<'a> {
         {
             return (Vec::new(), 0.0);
         }
+        let rtl = inline_direction(
+            source
+                .style_source
+                .and_then(|source| self.styles.get(&source)),
+        );
+        assign_bidi_levels(&mut atoms, rtl);
         // The UAX #14 opportunities for the whole sequence, which is what CSS
         // Text 3 §1.5 asks for: adjacency ignores the inline box boundaries
         // between the atoms. `break_before` is a field rather than a separate
@@ -492,6 +558,10 @@ impl<'a> Solver<'a> {
         let mut line_index = 0_usize;
         let mut after_forced_break = false;
         let mut line_indent = text.indent.for_line(line_index, after_forced_break);
+        // The indent of each line, for the alignment pass after bidi
+        // reordering. Text-indent is a start-edge margin, so alignment needs
+        // to know which edge the first line was shortened on.
+        let mut line_indents = vec![line_indent];
         let (mut line_left, mut line_right) = indented_line_band(
             floats,
             containing,
@@ -499,6 +569,7 @@ impl<'a> Solver<'a> {
             first_style.style.line_height,
             0.0,
             line_indent,
+            rtl,
         );
         // CSS Overflow 3 §3.1: an ellipsis marks overflow, so it is drawn only
         // when the content does not fit the line box. Without this test every
@@ -530,6 +601,7 @@ impl<'a> Solver<'a> {
                 after_forced_break = true;
                 current_line_height = atom.style.line_height;
                 line_indent = text.indent.for_line(line_index, after_forced_break);
+                line_indents.push(line_indent);
                 (line_left, line_right) = indented_line_band(
                     floats,
                     containing,
@@ -537,6 +609,7 @@ impl<'a> Solver<'a> {
                     current_line_height,
                     0.0,
                     line_indent,
+                    rtl,
                 );
                 line_x = line_left;
                 pending_space = None;
@@ -563,6 +636,7 @@ impl<'a> Solver<'a> {
                         line_x,
                         line_y,
                         width,
+                        line_index,
                     );
                     self.flush_text_run(&mut current_run, &mut fragments);
                     line_x += width;
@@ -598,6 +672,7 @@ impl<'a> Solver<'a> {
                             current_line_height,
                             outer.size.width,
                             line_indent,
+                            rtl,
                         );
                         line_x = line_left;
                         self.translate_fragment_subtree(
@@ -612,6 +687,7 @@ impl<'a> Solver<'a> {
                         after_forced_break = false;
                         current_line_height = atom.style.line_height;
                         line_indent = text.indent.for_line(line_index, after_forced_break);
+                        line_indents.push(line_indent);
                         (line_left, line_right) = indented_line_band(
                             floats,
                             containing,
@@ -619,6 +695,7 @@ impl<'a> Solver<'a> {
                             current_line_height,
                             0.0,
                             line_indent,
+                            rtl,
                         );
                         line_x = line_left;
                         self.translate_fragment_subtree(
@@ -637,6 +714,13 @@ impl<'a> Solver<'a> {
                         atomic: true,
                     });
                     fragments.push(fragment);
+                    self.inline_bidi.insert(
+                        fragment,
+                        InlineBidiPlacement {
+                            line: line_index,
+                            level: atom.bidi_level,
+                        },
+                    );
                 }
                 cursor += 1;
                 continue;
@@ -658,6 +742,7 @@ impl<'a> Solver<'a> {
                     current_line_height,
                     segment_width,
                     line_indent,
+                    rtl,
                 );
                 line_x = line_left;
             }
@@ -700,6 +785,7 @@ impl<'a> Solver<'a> {
                 after_forced_break = false;
                 current_line_height = segment[0].style.line_height;
                 line_indent = text.indent.for_line(line_index, after_forced_break);
+                line_indents.push(line_indent);
                 (line_left, line_right) = indented_line_band(
                     floats,
                     containing,
@@ -707,6 +793,7 @@ impl<'a> Solver<'a> {
                     current_line_height,
                     0.0,
                     line_indent,
+                    rtl,
                 );
                 line_x = line_left;
                 pending_space = None;
@@ -730,6 +817,7 @@ impl<'a> Solver<'a> {
                     line_x,
                     line_y,
                     width,
+                    line_index,
                 );
                 line_x += width;
                 previous_unit = Some(PreviousUnit {
@@ -779,6 +867,7 @@ impl<'a> Solver<'a> {
                     after_forced_break = false;
                     current_line_height = atom.style.line_height;
                     line_indent = text.indent.for_line(line_index, after_forced_break);
+                    line_indents.push(line_indent);
                     (line_left, line_right) = indented_line_band(
                         floats,
                         containing,
@@ -786,6 +875,7 @@ impl<'a> Solver<'a> {
                         current_line_height,
                         0.0,
                         line_indent,
+                        rtl,
                     );
                     line_x = line_left;
                     width = bare.max(0.0);
@@ -807,6 +897,7 @@ impl<'a> Solver<'a> {
                             line_x,
                             line_y,
                             ellipsis,
+                            line_index,
                         );
                         self.flush_text_run(&mut current_run, &mut fragments);
                         line_y += current_line_height;
@@ -814,6 +905,7 @@ impl<'a> Solver<'a> {
                         after_forced_break = false;
                         current_line_height = atom.style.line_height;
                         line_indent = text.indent.for_line(line_index, after_forced_break);
+                        line_indents.push(line_indent);
                         (line_left, line_right) = indented_line_band(
                             floats,
                             containing,
@@ -821,6 +913,7 @@ impl<'a> Solver<'a> {
                             current_line_height,
                             0.0,
                             line_indent,
+                            rtl,
                         );
                         line_x = line_left;
                         previous_unit = None;
@@ -838,6 +931,7 @@ impl<'a> Solver<'a> {
                     line_x,
                     line_y,
                     width,
+                    line_index,
                 );
                 line_x += width;
                 previous_unit = Some(PreviousUnit {
@@ -866,7 +960,17 @@ impl<'a> Solver<'a> {
             current_line_height
         };
         let height = line_y - containing.origin.y + trailing_line_height;
-        self.align_inline_fragments(&fragments, containing, self.text_align(source.style_source));
+        let text_align = match (self.text_align(source.style_source), rtl) {
+            // `start` is the right edge in RTL; `end` is the right edge in
+            // LTR; and `justify` has no justification pass yet, so it falls
+            // back to the paragraph's start edge.
+            (TextAlign::Start | TextAlign::Justify, true) | (TextAlign::End, false) => {
+                TextAlign::Right
+            }
+            (TextAlign::End, true) => TextAlign::Left,
+            (value, _) => value,
+        };
+        self.finish_inline_lines(&fragments, containing, text_align, &line_indents);
         (fragments, height)
     }
 
@@ -941,57 +1045,101 @@ impl<'a> Solver<'a> {
         }
     }
 
-    pub(super) fn align_inline_fragments(
+    /// Reorder each line's inline fragments with UAX #9 rule L2, then apply
+    /// `text-align` to the line box.
+    ///
+    /// The layout above fills every line in logical order. This pass is where
+    /// the paragraph's resolved levels become geometry: level runs are placed
+    /// in visual order, and a run at an odd level is displayed right-to-left
+    /// (its characters are reversed for the left-to-right painter). Atomic
+    /// inlines take part as single units, so an `inline-block` moves with the
+    /// surrounding run without its own content being reversed.
+    pub(super) fn finish_inline_lines(
         &mut self,
         fragments: &[FragmentId],
         containing: PhysicalRect,
         text_align: TextAlign,
+        line_indents: &[f32],
     ) {
-        if matches!(
-            text_align,
-            TextAlign::Start | TextAlign::Left | TextAlign::Justify
-        ) {
+        let needs_work = line_indents.iter().any(|indent| *indent != 0.0)
+            || matches!(
+                text_align,
+                TextAlign::Center | TextAlign::End | TextAlign::Right
+            )
+            || fragments.iter().any(|fragment| {
+                self.inline_bidi
+                    .get(fragment)
+                    .is_some_and(|placement| placement.level % 2 == 1)
+            });
+        if !needs_work {
+            for fragment in fragments {
+                self.inline_bidi.remove(fragment);
+            }
             return;
         }
-        let mut lines = Vec::<(f32, f32, f32, Vec<FragmentId>)>::new();
-        for fragment_id in fragments {
-            let Some(fragment) = self.fragments.get(
-                usize::try_from(fragment_id.as_u32())
-                    .ok()
-                    .unwrap_or(usize::MAX),
-            ) else {
-                continue;
-            };
-            if self.source_is_out_of_flow(fragment.source) {
-                continue;
+        let mut lines: BTreeMap<usize, Vec<(FragmentId, u8)>> = BTreeMap::new();
+        for fragment in fragments {
+            if let Some(placement) = self.inline_bidi.remove(fragment) {
+                lines
+                    .entry(placement.line)
+                    .or_default()
+                    .push((*fragment, placement.level));
             }
-            let rect = fragment.rect;
-            let Some((_, min_x, max_x, line_fragments)) = lines
-                .iter_mut()
-                .find(|(line_y, _, _, _)| (*line_y - rect.origin.y).abs() < 0.5)
+        }
+        for (line, units) in lines {
+            let Some(start_x) = units
+                .iter()
+                .filter_map(|(fragment, _)| self.inline_unit_rect(*fragment))
+                .map(|rect| rect.origin.x)
+                .reduce(f32::min)
             else {
-                lines.push((
-                    rect.origin.y,
-                    rect.origin.x,
-                    rect.right(),
-                    vec![*fragment_id],
-                ));
                 continue;
             };
-            *min_x = min_x.min(rect.origin.x);
-            *max_x = max_x.max(rect.right());
-            line_fragments.push(*fragment_id);
-        }
-        for (_, min_x, max_x, line_fragments) in lines {
-            let free = (containing.size.width - (max_x - min_x)).max(0.0);
+            let levels: Vec<Level> = units.iter().map(|(_, level)| Level::from(*level)).collect();
+            let order = BidiInfo::reorder_visual(&levels);
+            let mut cursor_x = start_x;
+            for index in order {
+                let (fragment_id, level) = units[index];
+                let Some(rect) = self.inline_unit_rect(fragment_id) else {
+                    continue;
+                };
+                if level % 2 == 1
+                    && let Some(fragment) = self.fragment_mut(fragment_id)
+                    && let FragmentKind::Text(data) = &mut fragment.kind
+                {
+                    // UAX #9 L2: the run's characters are displayed from the
+                    // right, so a left-to-right painter receives them in
+                    // reverse. L3 (combining marks) and L4 (mirroring) are
+                    // not applied yet.
+                    data.text = data.text.chars().rev().collect();
+                }
+                let dx = cursor_x - rect.origin.x;
+                if dx != 0.0 {
+                    self.translate_fragment_subtree(fragment_id, dx, 0.0);
+                }
+                cursor_x += rect.size.width;
+            }
+            let line_width = cursor_x - start_x;
+            let indent = line_indents.get(line).copied().unwrap_or(0.0);
+            let free = (containing.size.width - indent - line_width).max(0.0);
             let offset = match text_align {
+                TextAlign::Start | TextAlign::Left | TextAlign::Justify => 0.0,
                 TextAlign::End | TextAlign::Right => free,
                 TextAlign::Center => free / 2.0,
-                TextAlign::Start | TextAlign::Left | TextAlign::Justify => 0.0,
             };
-            for fragment in line_fragments {
-                self.translate_fragment_subtree(fragment, offset, 0.0);
+            if offset != 0.0 {
+                for (fragment, _) in &units {
+                    self.translate_fragment_subtree(*fragment, offset, 0.0);
+                }
             }
+        }
+    }
+
+    fn inline_unit_rect(&self, id: FragmentId) -> Option<PhysicalRect> {
+        let fragment = self.fragments.get(usize::try_from(id.as_u32()).ok()?)?;
+        match fragment.kind {
+            FragmentKind::Box(_) => self.fragment_outer_rect(id),
+            FragmentKind::Text(_) => Some(fragment.rect),
         }
     }
 
@@ -1286,6 +1434,7 @@ impl<'a> Solver<'a> {
                     line_breaking,
                     style: typography.style,
                     spacing: typography.spacing,
+                    bidi_level: 0,
                 });
             }
             return;
@@ -1308,6 +1457,7 @@ impl<'a> Solver<'a> {
                 line_breaking,
                 style: typography.style,
                 spacing: typography.spacing,
+                bidi_level: 0,
             });
             return;
         }
@@ -1322,6 +1472,7 @@ impl<'a> Solver<'a> {
                 line_breaking,
                 style: typography.style,
                 spacing: typography.spacing,
+                bidi_level: 0,
             });
             return;
         }
@@ -1785,6 +1936,7 @@ impl<'a> Solver<'a> {
                     line_breaking,
                     style: typography.style,
                     spacing: typography.spacing,
+                    bidi_level: 0,
                 });
             }
             return;
@@ -1800,6 +1952,7 @@ impl<'a> Solver<'a> {
                 line_breaking,
                 style: typography.style,
                 spacing: typography.spacing,
+                bidi_level: 0,
             });
             return;
         }
@@ -1817,6 +1970,7 @@ impl<'a> Solver<'a> {
                 line_breaking,
                 style: typography.style,
                 spacing: typography.spacing,
+                bidi_level: 0,
             });
             return;
         }
@@ -2023,15 +2177,19 @@ impl<'a> Solver<'a> {
         x: f32,
         y: f32,
         width: f32,
+        line: usize,
     ) {
         let typography = inline_typography(&atom);
         if run.as_ref().is_some_and(|run| {
             run.formatting_node != atom.formatting_node
                 || (run.y - y).abs() > f32::EPSILON
                 || run.typography != typography
+                || run.bidi_level != atom.bidi_level
+                || run.line != line
         }) {
             self.flush_text_run(run, fragments);
         }
+        let level = atom.bidi_level;
         let run = run.get_or_insert_with(|| TextRun {
             formatting_node: atom.formatting_node,
             source: atom.source,
@@ -2040,6 +2198,8 @@ impl<'a> Solver<'a> {
             y,
             width: 0.0,
             typography,
+            bidi_level: level,
+            line,
         });
         run.text.push(character);
         run.width += width;
@@ -2070,6 +2230,13 @@ impl<'a> Solver<'a> {
                 font: StoredFontRequest::new(run.typography.style.font),
             }),
         ) {
+            self.inline_bidi.insert(
+                fragment,
+                InlineBidiPlacement {
+                    line: run.line,
+                    level: run.bidi_level,
+                },
+            );
             fragments.push(fragment);
         }
     }
