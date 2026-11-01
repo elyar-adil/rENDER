@@ -529,10 +529,16 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 container. The last is what the corpus measures: 217 of the 223 \
                 `@font-face` blocks reference `woff2`, the rasteriser reads raw sfnt \
                 only, and so 218 of the 223 blocks name no format this engine can \
-                decode. NOT wired: the browser's network loop does not yet submit the \
-                URLs `DocumentFonts::plan_fetches` produces, so a document face is \
-                not yet fetched on a real page - the store's plan and install paths \
-                are implemented and tested, and what is missing is the submission.",
+                decode. Wired: author stylesheet discovery passes every eligible \
+                `<style>` and fetched `<link>` sheet's rules to a pre-layout installer, \
+                which resolves §4.3.2 URLs, loads `file:` and base64 `data:` resources, \
+                and publishes the document table before the first measurement. NOT \
+                wired: the browser's network loop does not yet submit the HTTP(S) URLs \
+                `DocumentFonts::plan_fetches` produces, so an http(s) webfont is \
+                declared but remains unavailable under §5.2's not-present rule on a \
+                real page; `local()`, `file:` and `data:` faces are usable. A \
+                `@font-face` nested in `@media` or `@supports` is walked without \
+                evaluating that condition yet.",
         dependencies: &[CSS_SYNTAX],
         tests: &[],
     },

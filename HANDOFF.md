@@ -1,3 +1,93 @@
+# 交接文档 (2026-11-01, 续六十一) — `@font-face` 收集与本地 webfont 加载
+
+这一轮把 `@font-face` 从“解析后丢弃”推进到“作者样式表发现 → 布局前安装 →
+真实度量/绘制”。没有站点特判。
+
+## 收集
+
+- `render-core/src/font_face.rs` 新增 `FontFaceSource { base_url, rules }`：
+  一个样式表的规则加上 §4.3.2 的解析基准。
+- `ExternalStyleSheets` 的 entry 现在同时保存 `StyleSheet`、`FontFaceSheet` 和
+  实际 serve URL（重定向后为 `response.final_url`）。`insert_css` 解析两份；
+  `insert_parsed_with_base` 供网络加载器复用已解析的 CSS；`insert_cloned_from`
+  让 `merge_current_style_sheets` 保留 font face，而不是只复制 style rules。
+- `collect_author_style_sheets` 新增 `font_faces: Vec<FontFaceSource>`：
+  - `<style>` 元素：从同一段 CSS 调用 `parse_font_faces`，base 为文档 URL；
+  - `<link>`：从 `ExternalStyleSheets` 取已保存的 `FontFaceSheet` 和 sheet URL；
+  - descriptor 语法错误进入 `DocumentDiagnosticCode::FontFaceProblem`，不再静默。
+- `DocumentBackends` 新增 `font_face_installer: Option<&dyn FontFaceInstaller>`。
+  `render_dom` 在 `collect_author_style_sheets` 之后、任何 `build_formatting_tree`
+  之前调用它，保证第一次度量就看到文档 face。
+
+## 加载与安装
+
+- `render-browser/src/font_faces.rs` 新增 `DocumentFontLoader`：
+  - 用当前 `FontFaceSource` 重建 `DocumentFonts`；
+  - `add_rules_at` 支持 `Option<&Url>`：没有 base 时仍接受绝对 URL；
+  - 复用上一轮的 `Arc<Font>`，不重复解码同一 URL；
+  - 同步读取 `file:` 和 base64 `data:`；`local()` 仍由 `SystemFontBackend`
+    的 installed face 查找处理；
+  - 调 `SystemFontBackend::set_document_faces` 发布整张文档表；
+  - 规则集未变化时不重装，避免每帧递增 generation。
+- `SystemFontFaceInstaller` 把 loader 和 backend 组合成 `FontFaceInstaller`，
+  `render_worker.rs` 在唯一的 `DocumentBackends` 构造点设置它。
+- `resources.rs` 用 `insert_parsed_with_base` 写入 fetch 结果，并转发
+  `@font-face` descriptor 诊断。
+
+## 测试与证据
+
+- 新增 `crates/render-core/tests/fixtures/render-test-webfont.ttf`：fontTools
+  生成的小 TTF，UPM 1000，`H` 的 advance 为 1000（1em）。
+- `crates/render-core/tests/webfont_layout.rs`：
+  - `a_local_font_face_changes_the_measured_width`：同一段 `HHH` 在 16px 下
+    无 face 为 24px（参考测量器 0.5em/字符），有 face 为 48px（fixture 1em/字符）；
+  - `an_external_stylesheet_keeps_its_font_faces_and_base_url`：`<link>` sheet 的
+    `FontFaceSource` 保留 sheet URL 和作者写的相对 `src`。
+- `render-browser/src/font_faces.rs` 的
+  `a_local_file_webfont_changes_the_platform_measurers_advance`：
+  通过真实 `SystemFontBackend` 从 fallback 变为 48px。
+- release shell 截图（`webfont-demo2.png`，72,149 字节）：fixture face 的行显示
+  1em advance 的宽 H 字形，fallback 行是普通窄 H，宽度明显不同；页面
+  `ready=Complete`、`css_errors=0`、`css_warnings=0`。
+
+## 验证
+
+```
+cargo test -p render-core --test webfont_layout  2 passed, 0 failed
+cargo test -p render-core --lib                  458 passed, 0 failed
+cargo test -p render-css --lib                   305 passed, 0 failed
+cargo test -p render-browser --lib               207 passed, 0 failed
+cargo test -p render-js --lib                    1,210 passed, 0 failed
+cargo test --workspace                           all crates passed, 0 failed
+cargo fmt --all --check                          clean
+cargo clippy ... --all-targets -- -D warnings    clean
+python tools/check_site_neutrality.py            0 blocking, 26 advisory
+```
+
+## 已知缺口
+
+- HTTP(S) `src` 仍未由网络循环提交；`DocumentFonts::plan_fetches` 有计划，
+  render worker 还没有把字体请求并入 fetch batch。当前 HTTP(S) face 按 §5.2
+  “not available”处理。
+- WOFF/WOFF2 仍未解码；rasteriser 只读 raw sfnt，corpus 的 223 个块里 218 个
+  因此不可用。
+- `@font-face` 嵌套在 `@media`/`@supports` 时只被walk，不评估条件；打印媒体
+  里的 face 目前也会被收集。
+- `font-display`、`font-feature-values`、`font-variation-settings`、metrics
+  override、`tech()` 与压缩容器仍未实现。
+- `@font-face` 的 `src` 列表里 `local()` 优先顺序由 matcher 处理，但 loader
+  仍会为同一规则的 URL 建立资源；如果 `local()` 命中，URL 不会被访问，因为
+  `DocumentFonts::plan_fetches` 只在真正需要时缩小 URL。当前 loader 对本地
+  URL 会先读取；后续可在 installed face 命中时跳过。
+
+## 下一步
+
+- 把字体请求并入浏览器 fetch batch，支持 HTTP(S) 与 WOFF/WOFF2。
+- 条件规则门控与 `font-display` 的失败/交换周期。
+- 继续 RTL 块轴镜像、scroll-state、`@starting-style`、compositor。
+
+---
+
 # 交接文档 (2026-11-01, 续六十) — per-element `color-scheme` 与 used scheme 绘制
 
 这一轮把上一轮的文档级 used color scheme 推进为 CSS Color Adjustment 1 的
