@@ -28,6 +28,7 @@ pub(super) mod dom_document;
 pub(super) mod dom_exception;
 pub(super) mod dom_forms;
 pub(super) mod dom_range;
+pub(super) mod dom_selection;
 pub(super) mod encoding;
 pub(super) mod events;
 pub(super) mod explicit_resource;

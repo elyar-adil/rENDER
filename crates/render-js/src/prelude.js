@@ -1644,23 +1644,6 @@
     })();
   }
 
-  // --------------------------------------------------------------- selection
-  // There is no way to select text, so the selection is always empty.
-  if (typeof getSelection === 'undefined') {
-    var emptySelection = {
-      anchorNode: null, anchorOffset: 0, focusNode: null, focusOffset: 0,
-      isCollapsed: true, rangeCount: 0, type: 'None',
-      toString: function () { return ''; },
-      removeAllRanges: function () {}, empty: function () {}, addRange: function () {},
-      removeRange: function () {}, collapse: function () {}, collapseToStart: function () {},
-      collapseToEnd: function () {}, selectAllChildren: function () {}, extend: function () {},
-      containsNode: function () { return false; }, getRangeAt: function () {
-        throw new DOMException('Index or size is negative or greater than the allowed amount', 'IndexSizeError');
-      }
-    };
-    define(global, 'getSelection', function getSelection() { return emptySelection; });
-    define(documentPrototype, 'getSelection', function getSelection() { return emptySelection; });
-  }
   // ------------------------------------------------------- performance observer
   // The engine exposes performance entries but has no observer scheduling.
   // Declaring an empty `supportedEntryTypes` lets feature-detecting pages

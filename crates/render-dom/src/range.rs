@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 use crate::{Dom, DomError, Node, NodeId, NodeKind};
 
 /// A range in its [`Dom`]. Ids are never reused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RangeId(usize);
 
 /// A node and an offset within it (DOM §5.2 "boundary point").
@@ -1280,6 +1280,519 @@ impl Dom {
             }
         }
         Ok(fragment)
+    }
+}
+
+/// The direction of a selection (Selection API): whether its focus is after,
+/// before, or (for a collapsed selection) at its anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionDirection {
+    Forwards,
+    Backwards,
+    Directionless,
+}
+
+/// One document's selection: the single live range it names, or none when the
+/// selection is empty, plus the direction that turns that range's ends into the
+/// selection's anchor and focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SelectionRecord {
+    pub(crate) range: Option<RangeId>,
+    pub(crate) direction: SelectionDirection,
+}
+
+impl Dom {
+    /// The live range a document's selection names, if the selection is not
+    /// empty and its boundary points are in the document tree. This is the
+    /// range `getRangeAt(0)` returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomErrorKind::NotFound`](crate::DomErrorKind::NotFound) for an
+    /// unknown document. A selection with no range, or one whose boundary
+    /// points left the document tree, is `None`.
+    pub fn selection_range(&self, document: NodeId) -> Result<Option<RangeId>, DomError> {
+        self.require_selection_document(document)?;
+        let Some(record) = self.selections.get(&document) else {
+            return Ok(None);
+        };
+        let Some(range) = record.range else {
+            return Ok(None);
+        };
+        let start = self.range_start(range)?;
+        let end = self.range_end(range)?;
+        if self.tree_root(start.node) == document && self.tree_root(end.node) == document {
+            Ok(Some(range))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The selection's anchor (Selection API), or `None` when the selection is
+    /// empty or its boundary point is outside the document tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomErrorKind::NotFound`](crate::DomErrorKind::NotFound) for an
+    /// unknown document.
+    pub fn selection_anchor(&self, document: NodeId) -> Result<Option<BoundaryPoint>, DomError> {
+        let Some(range) = self.selection_range(document)? else {
+            return Ok(None);
+        };
+        let start = self.range_start(range)?;
+        let end = self.range_end(range)?;
+        Ok(Some(self.selection_anchor_of(document, start, end)))
+    }
+
+    /// The selection's focus (Selection API), or `None` when the selection is
+    /// empty or its boundary point is outside the document tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomErrorKind::NotFound`](crate::DomErrorKind::NotFound) for an
+    /// unknown document.
+    pub fn selection_focus(&self, document: NodeId) -> Result<Option<BoundaryPoint>, DomError> {
+        let Some(range) = self.selection_range(document)? else {
+            return Ok(None);
+        };
+        let start = self.range_start(range)?;
+        let end = self.range_end(range)?;
+        let anchor = self.selection_anchor_of(document, start, end);
+        Ok(Some(if anchor == start { end } else { start }))
+    }
+
+    /// The selection's direction (Selection API): `"none"` when it is empty or
+    /// directionless, `"forward"` or `"backward"` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomErrorKind::NotFound`](crate::DomErrorKind::NotFound) for an
+    /// unknown document.
+    pub fn selection_direction_name(&self, document: NodeId) -> Result<&'static str, DomError> {
+        self.require_selection_document(document)?;
+        if self.selection_range(document)?.is_none() {
+            return Ok("none");
+        }
+        let direction = self
+            .selections
+            .get(&document)
+            .map_or(SelectionDirection::Directionless, |record| record.direction);
+        Ok(match direction {
+            SelectionDirection::Forwards => "forward",
+            SelectionDirection::Backwards => "backward",
+            SelectionDirection::Directionless => "none",
+        })
+    }
+
+    /// The selection's `type` (Selection API): `"None"`, `"Caret"` or
+    /// `"Range"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomErrorKind::NotFound`](crate::DomErrorKind::NotFound) for an
+    /// unknown document.
+    pub fn selection_type(&self, document: NodeId) -> Result<&'static str, DomError> {
+        let Some(range) = self.selection_range(document)? else {
+            return Ok("None");
+        };
+        Ok(if self.range_is_collapsed(range)? {
+            "Caret"
+        } else {
+            "Range"
+        })
+    }
+
+    /// The selection's `isCollapsed`: true when it has no range, or its range
+    /// is collapsed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomErrorKind::NotFound`](crate::DomErrorKind::NotFound) for an
+    /// unknown document.
+    pub fn selection_is_collapsed(&self, document: NodeId) -> Result<bool, DomError> {
+        let Some(range) = self.selection_range(document)? else {
+            return Ok(true);
+        };
+        self.range_is_collapsed(range)
+    }
+
+    /// The selection's `rangeCount`: one when it names a range, zero when it is
+    /// empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomErrorKind::NotFound`](crate::DomErrorKind::NotFound) for an
+    /// unknown document.
+    pub fn selection_range_count(&self, document: NodeId) -> Result<usize, DomError> {
+        Ok(usize::from(self.selection_range(document)?.is_some()))
+    }
+
+    /// `Selection.collapse(node, offset)` and `setPosition` (Selection API): a
+    /// new collapsed range. A `None` node empties the selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomErrorKind::InvalidNodeType`](crate::DomErrorKind::InvalidNodeType)
+    /// for a `DocumentType`, [`DomErrorKind::IndexSize`](crate::DomErrorKind::IndexSize)
+    /// for an offset past the node's length, and
+    /// [`DomErrorKind::NotFound`](crate::DomErrorKind::NotFound) for an unknown
+    /// document or node. A node the document does not contain aborts the
+    /// operation without an error, as the specification requires.
+    pub fn selection_collapse(
+        &mut self,
+        document: NodeId,
+        node: Option<NodeId>,
+        offset: usize,
+    ) -> Result<(), DomError> {
+        self.require_selection_document(document)?;
+        let Some(node) = node else {
+            self.selections.remove(&document);
+            return Ok(());
+        };
+        let point = self.checked_point(node, offset)?;
+        if !self.is_shadow_including_inclusive_ancestor(document, node) {
+            return Ok(());
+        }
+        let range = self.push_range(RangeKind::Live, point, point);
+        self.selections.insert(
+            document,
+            SelectionRecord {
+                range: Some(range),
+                direction: SelectionDirection::Forwards,
+            },
+        );
+        Ok(())
+    }
+
+    /// `Selection.collapseToStart()`: replace the selection's range with a
+    /// collapsed one at its start.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomErrorKind::InvalidState`](crate::DomErrorKind::InvalidState)
+    /// when the selection is empty.
+    pub fn selection_collapse_to_start(&mut self, document: NodeId) -> Result<(), DomError> {
+        self.selection_collapse_to(document, true)
+    }
+
+    /// `Selection.collapseToEnd()`: replace the selection's range with a
+    /// collapsed one at its end.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::selection_collapse_to_start`].
+    pub fn selection_collapse_to_end(&mut self, document: NodeId) -> Result<(), DomError> {
+        self.selection_collapse_to(document, false)
+    }
+
+    /// `Selection.extend(node, offset)` (Selection API): move the focus, keeping
+    /// the anchor, and replace the selection's range with the new span. The
+    /// direction becomes backwards when the focus moves before the anchor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomErrorKind::InvalidState`](crate::DomErrorKind::InvalidState)
+    /// when the selection is empty, the range errors of
+    /// [`Self::selection_collapse`] for the boundary point, and `NotFound` for
+    /// an unknown document.
+    pub fn selection_extend(
+        &mut self,
+        document: NodeId,
+        node: NodeId,
+        offset: usize,
+    ) -> Result<(), DomError> {
+        self.require_selection_document(document)?;
+        if !self.is_shadow_including_inclusive_ancestor(document, node) {
+            return Ok(());
+        }
+        let Some(range) = self.selection_range(document)? else {
+            return Err(DomError::invalid_state("cannot extend an empty selection"));
+        };
+        let point = self.checked_point(node, offset)?;
+        let start = self.range_start(range)?;
+        let end = self.range_end(range)?;
+        let anchor = self.selection_anchor_of(document, start, end);
+        let (new_start, new_end, direction) =
+            if self.tree_root(anchor.node) != self.tree_root(point.node) {
+                (point, point, SelectionDirection::Forwards)
+            } else if self.position(anchor, point) != Position::After {
+                (anchor, point, SelectionDirection::Forwards)
+            } else {
+                (point, anchor, SelectionDirection::Backwards)
+            };
+        let new_range = self.push_range(RangeKind::Live, new_start, new_end);
+        self.set_selection_range(document, new_range, direction);
+        Ok(())
+    }
+
+    /// `Selection.setBaseAndExtent(anchorNode, anchorOffset, focusNode,
+    /// focusOffset)` (Selection API). The selection keeps one normalized range;
+    /// the direction records which end is the anchor.
+    ///
+    /// # Errors
+    ///
+    /// Returns the boundary-point errors of [`Self::selection_collapse`] and
+    /// `NotFound` for an unknown document. A boundary point outside the
+    /// document aborts the operation without an error.
+    pub fn selection_set_base_and_extent(
+        &mut self,
+        document: NodeId,
+        anchor: BoundaryPoint,
+        focus: BoundaryPoint,
+    ) -> Result<(), DomError> {
+        self.require_selection_document(document)?;
+        let anchor = self.checked_point(anchor.node, anchor.offset)?;
+        let focus = self.checked_point(focus.node, focus.offset)?;
+        if !self.is_shadow_including_inclusive_ancestor(document, anchor.node)
+            || !self.is_shadow_including_inclusive_ancestor(document, focus.node)
+        {
+            return Ok(());
+        }
+        let (start, end, direction) = if self.tree_root(anchor.node) != self.tree_root(focus.node) {
+            (anchor, anchor, SelectionDirection::Forwards)
+        } else if self.position(anchor, focus) != Position::After {
+            (anchor, focus, SelectionDirection::Forwards)
+        } else {
+            (focus, anchor, SelectionDirection::Backwards)
+        };
+        let range = self.push_range(RangeKind::Live, start, end);
+        self.set_selection_range(document, range, direction);
+        Ok(())
+    }
+
+    /// `Selection.selectAllChildren(node)`: a new range from `(node, 0)` to the
+    /// node's length, with a forwards direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomErrorKind::InvalidNodeType`](crate::DomErrorKind::InvalidNodeType)
+    /// for a `DocumentType`, and `NotFound` for an unknown document or node. A
+    /// node outside the document aborts without an error.
+    pub fn selection_select_all_children(
+        &mut self,
+        document: NodeId,
+        node: NodeId,
+    ) -> Result<(), DomError> {
+        self.require_selection_document(document)?;
+        self.require_not_doctype(node)?;
+        if !self.is_shadow_including_inclusive_ancestor(document, node) {
+            return Ok(());
+        }
+        let length = self.node_length(node);
+        let range = self.push_range(
+            RangeKind::Live,
+            BoundaryPoint { node, offset: 0 },
+            BoundaryPoint {
+                node,
+                offset: length,
+            },
+        );
+        self.set_selection_range(document, range, SelectionDirection::Forwards);
+        Ok(())
+    }
+
+    /// `Selection.addRange(range)` (Selection API): adopt `range` when the
+    /// selection is empty and the range is in this document. A selection holds
+    /// one range, so a second call does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomErrorKind::NotFound`](crate::DomErrorKind::NotFound) for an
+    /// unknown document or range, and `InvalidNodeType` when `range` is static.
+    pub fn selection_add_range(
+        &mut self,
+        document: NodeId,
+        range: RangeId,
+    ) -> Result<(), DomError> {
+        self.require_selection_document(document)?;
+        if self.range_kind(range) != Some(RangeKind::Live) {
+            return Err(DomError::invalid_node_type(
+                "addRange requires a live Range",
+            ));
+        }
+        if self
+            .selections
+            .get(&document)
+            .is_some_and(|record| record.range.is_some())
+        {
+            return Ok(());
+        }
+        let start = self.range_start(range)?;
+        let end = self.range_end(range)?;
+        if self.tree_root(start.node) != document || self.tree_root(end.node) != document {
+            return Ok(());
+        }
+        self.set_selection_range(document, range, SelectionDirection::Forwards);
+        Ok(())
+    }
+
+    /// `Selection.removeRange(range)` (Selection API): empty the selection when
+    /// `range` is the selection's range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomErrorKind::NotFound`](crate::DomErrorKind::NotFound) when
+    /// the selection is empty or names another range.
+    pub fn selection_remove_range(
+        &mut self,
+        document: NodeId,
+        range: RangeId,
+    ) -> Result<(), DomError> {
+        self.require_selection_document(document)?;
+        if self
+            .selections
+            .get(&document)
+            .is_some_and(|record| record.range == Some(range))
+        {
+            self.selections.remove(&document);
+            Ok(())
+        } else {
+            Err(DomError::not_found(
+                "the range is not the selection's range",
+            ))
+        }
+    }
+
+    /// `Selection.removeAllRanges()` and `empty()`: make the selection empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomErrorKind::NotFound`](crate::DomErrorKind::NotFound) for an
+    /// unknown document.
+    pub fn selection_remove_all_ranges(&mut self, document: NodeId) -> Result<(), DomError> {
+        self.require_selection_document(document)?;
+        self.selections.remove(&document);
+        Ok(())
+    }
+
+    /// `Selection.deleteFromDocument()` (Selection API): delete the contents of
+    /// the selection's range, which collapses that same range. An empty or
+    /// collapsed selection does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of the delete operations.
+    pub fn selection_delete_from_document(&mut self, document: NodeId) -> Result<(), DomError> {
+        let Some(range) = self.selection_range(document)? else {
+            self.require_selection_document(document)?;
+            return Ok(());
+        };
+        if self.range_is_collapsed(range)? {
+            return Ok(());
+        }
+        self.range_delete_contents(range)
+    }
+
+    /// `Selection.containsNode(node, partial)` (Selection API).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomErrorKind::NotFound`](crate::DomErrorKind::NotFound) for an
+    /// unknown document or node.
+    pub fn selection_contains_node(
+        &self,
+        document: NodeId,
+        node: NodeId,
+        partial: bool,
+    ) -> Result<bool, DomError> {
+        self.require_selection_document(document)?;
+        self.require_node(node)?;
+        let Some(range) = self.selection_range(document)? else {
+            return Ok(false);
+        };
+        if self.tree_root(node) != document {
+            return Ok(false);
+        }
+        let start = self.range_start(range)?;
+        let end = self.range_end(range)?;
+        let first = BoundaryPoint { node, offset: 0 };
+        let last = BoundaryPoint {
+            node,
+            offset: self.node_length(node),
+        };
+        Ok(if partial {
+            self.position(start, last) != Position::After
+                && self.position(end, first) != Position::Before
+        } else {
+            self.position(start, first) != Position::After
+                && self.position(end, last) != Position::Before
+        })
+    }
+
+    /// `Selection.toString()`: the text of the selection's range, or the empty
+    /// string for an empty selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomErrorKind::NotFound`](crate::DomErrorKind::NotFound) for an
+    /// unknown document.
+    pub fn selection_to_string(&self, document: NodeId) -> Result<String, DomError> {
+        match self.selection_range(document)? {
+            Some(range) => self.range_to_string(range),
+            None => Ok(String::new()),
+        }
+    }
+
+    fn require_selection_document(&self, document: NodeId) -> Result<(), DomError> {
+        self.require_node(document)?;
+        if matches!(self.kind(document)?, NodeKind::Document) {
+            Ok(())
+        } else {
+            Err(DomError::invalid_node_type(
+                "a selection belongs to a Document",
+            ))
+        }
+    }
+
+    fn set_selection_range(
+        &mut self,
+        document: NodeId,
+        range: RangeId,
+        direction: SelectionDirection,
+    ) {
+        self.selections.insert(
+            document,
+            SelectionRecord {
+                range: Some(range),
+                direction,
+            },
+        );
+    }
+
+    fn selection_collapse_to(&mut self, document: NodeId, to_start: bool) -> Result<(), DomError> {
+        self.require_selection_document(document)?;
+        let Some(record) = self.selections.get(&document).copied() else {
+            return Err(DomError::invalid_state("the selection is empty"));
+        };
+        let Some(range) = record.range else {
+            return Err(DomError::invalid_state("the selection is empty"));
+        };
+        let point = if to_start {
+            self.range_start(range)?
+        } else {
+            self.range_end(range)?
+        };
+        let collapsed = self.push_range(RangeKind::Live, point, point);
+        self.set_selection_range(document, collapsed, SelectionDirection::Forwards);
+        Ok(())
+    }
+
+    /// The anchor of an existing selection range, from its direction. The
+    /// direction survives script mutations of an adopted range.
+    fn selection_anchor_of(
+        &self,
+        document: NodeId,
+        start: BoundaryPoint,
+        end: BoundaryPoint,
+    ) -> BoundaryPoint {
+        match self
+            .selections
+            .get(&document)
+            .map_or(SelectionDirection::Directionless, |record| record.direction)
+        {
+            SelectionDirection::Backwards => end,
+            SelectionDirection::Forwards | SelectionDirection::Directionless => start,
+        }
     }
 }
 

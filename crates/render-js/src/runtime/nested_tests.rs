@@ -62,6 +62,26 @@ fn settle(dom: &mut Dom, runtime: &mut JsRuntime) {
 }
 
 #[test]
+fn each_realm_has_its_own_selection() {
+    let html = "<body><iframe srcdoc=\"<p id=x>child text</p>\"></iframe></body>";
+    let (mut dom, mut runtime) = page(html, BTreeMap::new());
+    settle(&mut dom, &mut runtime);
+    assert_eq!(
+        run(
+            &mut dom,
+            &mut runtime,
+            "var f = document.querySelector('iframe'); var w = f.contentWindow; \
+             var s1 = getSelection(); var s2 = w.getSelection(); \
+             var t = w.document.getElementById('x').firstChild; s2.selectAllChildren(t); \
+             [s1 !== s2, s1.rangeCount, s1.type, s2.rangeCount, s2.toString(), \
+              s2 instanceof w.Selection, s2 instanceof Selection, w.getSelection() === s2, \
+              w.document.getSelection() === s2].join()"
+        ),
+        "true,0,None,1,child text,true,false,true,true"
+    );
+}
+
+#[test]
 fn an_inserted_iframe_has_its_own_window_and_document_at_once() {
     let (mut dom, mut runtime) = page("<body></body>", BTreeMap::new());
     run(

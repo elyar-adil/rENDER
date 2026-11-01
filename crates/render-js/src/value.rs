@@ -448,6 +448,36 @@ pub(crate) enum RangeOp {
     CreateRange,
 }
 
+/// The operations of `Selection` (Selection API): its getters, methods, and
+/// `Document.prototype.getSelection` / `Window.getSelection`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectionOp {
+    GetSelection,
+    AnchorNode,
+    AnchorOffset,
+    FocusNode,
+    FocusOffset,
+    IsCollapsed,
+    RangeCount,
+    Type,
+    Direction,
+    GetRangeAt,
+    AddRange,
+    RemoveRange,
+    RemoveAllRanges,
+    Empty,
+    Collapse,
+    SetPosition,
+    CollapseToStart,
+    CollapseToEnd,
+    Extend,
+    SetBaseAndExtent,
+    SelectAllChildren,
+    DeleteFromDocument,
+    ContainsNode,
+    ToString,
+}
+
 /// HTML element interfaces and the tag names they cover (HTML Standard §3.2.8,
 /// the elements that have an interface of their own).
 pub(crate) const HTML_ELEMENT_INTERFACES: &[(&str, &[&str])] = &[
@@ -932,6 +962,8 @@ pub(crate) enum NativeFunction {
     NodeNormalize,
     /// The `AbstractRange`, `Range` and `StaticRange` operations (DOM §5).
     Range(RangeOp),
+    /// The `Selection` operations and the two `getSelection` entry points.
+    Selection(SelectionOp),
     /// `DOMImplementation` methods (DOM §4.5).
     ImplementationCreateDocumentType,
     ImplementationCreateDocument,
@@ -2549,6 +2581,8 @@ pub(crate) enum ObjectHost {
     StaticRangeConstructor,
     /// A `Range` or `StaticRange` object: the range `RangeId` names in its document.
     Range(RangeId),
+    /// A document's `Selection`: the document `NodeId` whose selection it is.
+    Selection(NodeId),
     /// A generator object; the index names its coroutine.
     Generator(usize),
     /// The callback an `await` registers on a promise to continue its
@@ -3118,6 +3152,12 @@ pub struct RealmRecord {
     /// The `DOMImplementation` of each document, made when the document's
     /// `implementation` is first read, so each document has one.
     implementation_wrappers: BTreeMap<NodeId, ObjectId>,
+    /// The `Selection` of each document, made when `getSelection` first
+    /// returns it, so every call returns the same object (Selection API).
+    selection_wrappers: BTreeMap<NodeId, ObjectId>,
+    /// The wrapper of each range. `getRangeAt(0)` returns the selection's
+    /// range again and again, so the wrapper has to keep its identity.
+    range_wrappers: BTreeMap<RangeId, ObjectId>,
     class_list_wrappers: BTreeMap<NodeId, ObjectId>,
     style_declaration_wrappers: BTreeMap<NodeId, ObjectId>,
     dataset_wrappers: BTreeMap<NodeId, ObjectId>,
@@ -3608,6 +3648,8 @@ impl Realm {
             media_query_list_prototype,
             node_wrappers: BTreeMap::new(),
             implementation_wrappers: BTreeMap::new(),
+            selection_wrappers: BTreeMap::new(),
+            range_wrappers: BTreeMap::new(),
             class_list_wrappers: BTreeMap::new(),
             style_declaration_wrappers: BTreeMap::new(),
             dataset_wrappers: BTreeMap::new(),
@@ -3925,6 +3967,10 @@ impl Realm {
             &[
                 ("adoptNode", NativeFunction::AdoptNode),
                 ("importNode", NativeFunction::ImportNode),
+                (
+                    "getSelection",
+                    NativeFunction::Selection(SelectionOp::GetSelection),
+                ),
             ],
         );
         Self::install_location(
@@ -3959,6 +4005,12 @@ impl Realm {
             global,
             "getComputedStyle",
             NativeFunction::GetComputedStyle,
+        );
+        Self::define_global_function(
+            objects,
+            global,
+            "getSelection",
+            NativeFunction::Selection(SelectionOp::GetSelection),
         );
         for (name, function) in [
             ("atob", NativeFunction::GlobalAtob),
@@ -5178,6 +5230,112 @@ impl Realm {
                 );
             }
         }
+
+        // Selection API: one `Selection` per document, returned by
+        // `Document.getSelection()` and `Window.getSelection()`.
+        let selection = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        Self::dom_interface(
+            objects,
+            global,
+            function_prototype,
+            "Selection",
+            selection,
+            None,
+            ObjectHost::DomConstructor,
+        );
+        prototypes.insert("Selection", selection);
+        Self::install_getters(
+            objects,
+            function_prototype,
+            selection,
+            &[
+                (
+                    "anchorNode",
+                    NativeFunction::Selection(SelectionOp::AnchorNode),
+                ),
+                (
+                    "anchorOffset",
+                    NativeFunction::Selection(SelectionOp::AnchorOffset),
+                ),
+                (
+                    "focusNode",
+                    NativeFunction::Selection(SelectionOp::FocusNode),
+                ),
+                (
+                    "focusOffset",
+                    NativeFunction::Selection(SelectionOp::FocusOffset),
+                ),
+                (
+                    "isCollapsed",
+                    NativeFunction::Selection(SelectionOp::IsCollapsed),
+                ),
+                (
+                    "rangeCount",
+                    NativeFunction::Selection(SelectionOp::RangeCount),
+                ),
+                ("type", NativeFunction::Selection(SelectionOp::Type)),
+                (
+                    "direction",
+                    NativeFunction::Selection(SelectionOp::Direction),
+                ),
+            ],
+        );
+        Self::install_builtin_methods(
+            objects,
+            function_prototype,
+            selection,
+            &[
+                (
+                    "getRangeAt",
+                    NativeFunction::Selection(SelectionOp::GetRangeAt),
+                ),
+                ("addRange", NativeFunction::Selection(SelectionOp::AddRange)),
+                (
+                    "removeRange",
+                    NativeFunction::Selection(SelectionOp::RemoveRange),
+                ),
+                (
+                    "removeAllRanges",
+                    NativeFunction::Selection(SelectionOp::RemoveAllRanges),
+                ),
+                ("empty", NativeFunction::Selection(SelectionOp::Empty)),
+                ("collapse", NativeFunction::Selection(SelectionOp::Collapse)),
+                (
+                    "setPosition",
+                    NativeFunction::Selection(SelectionOp::SetPosition),
+                ),
+                (
+                    "collapseToStart",
+                    NativeFunction::Selection(SelectionOp::CollapseToStart),
+                ),
+                (
+                    "collapseToEnd",
+                    NativeFunction::Selection(SelectionOp::CollapseToEnd),
+                ),
+                ("extend", NativeFunction::Selection(SelectionOp::Extend)),
+                (
+                    "setBaseAndExtent",
+                    NativeFunction::Selection(SelectionOp::SetBaseAndExtent),
+                ),
+                (
+                    "selectAllChildren",
+                    NativeFunction::Selection(SelectionOp::SelectAllChildren),
+                ),
+                (
+                    "deleteFromDocument",
+                    NativeFunction::Selection(SelectionOp::DeleteFromDocument),
+                ),
+                (
+                    "containsNode",
+                    NativeFunction::Selection(SelectionOp::ContainsNode),
+                ),
+                ("toString", NativeFunction::Selection(SelectionOp::ToString)),
+            ],
+        );
 
         // `Text.prototype.splitText` (DOM §4.11.1).
         Self::install_builtin_methods(
@@ -11115,8 +11273,10 @@ impl RealmRecord {
     /// The identity roots of this realm (see [`Realm::gc_identity_roots`]).
     fn identity_roots(&self) -> Vec<ObjectId> {
         let mut roots = Vec::with_capacity(
-            4 + self.node_wrappers.len()
+            6 + self.node_wrappers.len()
                 + self.implementation_wrappers.len()
+                + self.selection_wrappers.len()
+                + self.range_wrappers.len()
                 + self.class_list_wrappers.len()
                 + self.style_declaration_wrappers.len()
                 + self.dataset_wrappers.len()
@@ -11130,6 +11290,11 @@ impl RealmRecord {
         roots.push(self.error_prototype);
         roots.push(self.throw_type_error);
         roots.push(self.array_prototype_values);
+        // The Selection object of each document, and every range a script can
+        // still reach through `getRangeAt`, keep their identity for the life
+        // of their document.
+        roots.extend(self.selection_wrappers.values().copied());
+        roots.extend(self.range_wrappers.values().copied());
         // The iterator prototypes are only reachable through helper objects,
         // which may all be garbage at collection time; keep them rooted.
         roots.push(self.iterator_prototype);
@@ -12023,15 +12188,38 @@ impl Realm {
         wrapper
     }
 
-    /// A new `Range` or `StaticRange` object for `range`, with the prototype of
-    /// `interface`. Each range has its own wrapper, so there is no cache.
+    /// The `Range` or `StaticRange` object for `range`, with the prototype of
+    /// `interface`. A range keeps one wrapper for its whole life, because
+    /// `Selection.getRangeAt(0)` returns its selection's range by reference
+    /// (Selection API), so two calls must hand back the same object.
     pub(crate) fn range_wrapper(&mut self, range: RangeId, interface: &str) -> ObjectId {
+        if let Some(wrapper) = self.range_wrappers.get(&range) {
+            return *wrapper;
+        }
         let prototype = self.dom_prototype(interface);
-        self.allocate(JsObject {
+        let wrapper = self.allocate(JsObject {
             prototype: Some(prototype),
             host: ObjectHost::Range(range),
             ..JsObject::default()
-        })
+        });
+        self.range_wrappers.insert(range, wrapper);
+        wrapper
+    }
+
+    /// The `Selection` object of `document` (Selection API): a document has one
+    /// selection, so every read returns the same object.
+    pub(crate) fn selection_wrapper(&mut self, document: NodeId) -> ObjectId {
+        if let Some(wrapper) = self.selection_wrappers.get(&document) {
+            return *wrapper;
+        }
+        let prototype = self.dom_prototype("Selection");
+        let wrapper = self.allocate(JsObject {
+            prototype: Some(prototype),
+            host: ObjectHost::Selection(document),
+            ..JsObject::default()
+        });
+        self.selection_wrappers.insert(document, wrapper);
+        wrapper
     }
 
     pub(crate) fn class_list_wrapper(&mut self, node: NodeId) -> ObjectId {

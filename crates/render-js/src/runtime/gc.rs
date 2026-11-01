@@ -247,6 +247,7 @@ pub(super) fn mark_host(
         | ObjectHost::RangeConstructor
         | ObjectHost::StaticRangeConstructor
         | ObjectHost::Range(_)
+        | ObjectHost::Selection(_)
         | ObjectHost::ImageConstructor
         | ObjectHost::AudioConstructor
         | ObjectHost::IntersectionObserverConstructor

@@ -175,17 +175,160 @@ fn a_range_constructor_without_new_is_refused() {
     );
 }
 
-// There is no Selection state. `getSelection()` is the prelude stub: one empty
-// object whose `addRange` does nothing, so a range added to it is not visible.
-// A Selection implementation must change this test on purpose.
 #[test]
-fn the_selection_stub_stays_empty_after_add_range() {
+fn get_selection_is_one_live_object_per_document() {
     assert_eq!(
         eval(
-            "var list = $('list'); var r = document.createRange(); r.selectNodeContents(list); \
-             var s = getSelection(); s.addRange(r); \
-             [s.rangeCount, s.type, s.isCollapsed, s === document.getSelection(), s.toString() === ''].join()"
+            "var s = getSelection(); \
+             [s === document.getSelection(), window.getSelection() === s, s instanceof Selection, \
+              Object.prototype.toString.call(s), s.rangeCount, s.type, s.isCollapsed, \
+              String(s.anchorNode), s.anchorOffset, String(s.focusNode), s.focusOffset, \
+              s.toString(), s.direction].join('|')"
         ),
-        "0,None,true,true,true"
+        "true|true|true|[object Selection]|0|None|true|null|0|null|0||none"
+    );
+}
+
+#[test]
+fn a_collapsed_selection_has_caret_geometry_and_to_string_names_the_text() {
+    assert_eq!(
+        eval(
+            "var t = $('para').firstChild; var w = $('bold').firstChild; \
+             var s = getSelection(); s.collapse(t, 2); \
+             var caret = [s.anchorNode === t, s.anchorOffset, s.focusNode === t, s.focusOffset, \
+                          s.isCollapsed, s.rangeCount, s.type, s.toString()].join('|'); \
+             s.setBaseAndExtent(t, 2, w, 3); \
+             caret + ' ' + [s.toString(), s.type, s.direction, s.isCollapsed].join('|')"
+        ),
+        "true|2|true|2|true|1|Caret| llo wor|Range|forward|false"
+    );
+}
+
+#[test]
+fn get_range_at_returns_the_selection_range_by_reference() {
+    assert_eq!(
+        eval(
+            "var t = $('para').firstChild; var w = $('bold').firstChild; var s = getSelection(); \
+             s.setBaseAndExtent(t, 2, w, 3); var r = s.getRangeAt(0); \
+             var same = [s.getRangeAt(0) === r, r.startContainer === t, r.startOffset, \
+                         r.endContainer === w, r.endOffset, r.collapsed, s.isCollapsed, s.rangeCount].join(); \
+             var failure = []; \
+             try { s.getRangeAt(1); } catch (e) { failure.push(e.name, e instanceof DOMException); } \
+             same + ' ' + failure.join()"
+        ),
+        "true,true,2,true,3,false,false,1 IndexSizeError,true"
+    );
+}
+
+#[test]
+fn add_range_keeps_only_the_first_range_and_remove_all_ranges_empties_it() {
+    assert_eq!(
+        eval(
+            "var one = $('one'); var three = $('three'); \
+             var r1 = document.createRange(); r1.selectNodeContents(one); \
+             var r2 = document.createRange(); r2.selectNodeContents(three); \
+             var s = getSelection(); s.addRange(r1); s.addRange(r2); \
+             var adopted = [s.rangeCount, s.getRangeAt(0) === r1, s.toString(), \
+                            s.anchorNode === one, s.focusNode === one, s.type].join(); \
+             r1.setStart(one.firstChild, 0); r1.setEnd(one.firstChild, 0); \
+             var mutated = [s.isCollapsed, s.type, s.toString()].join(); \
+             s.removeAllRanges(); \
+             adopted + ' ' + mutated + ' ' + [s.rangeCount, s.type, s.isCollapsed, \
+                                              String(s.anchorNode), s.toString()].join()"
+        ),
+        // The adopted range's own mutations are reflected, because the selection
+        // holds that range object rather than a copy.
+        "1,true,1,true,true,Range true,Caret, 0,None,true,null,"
+    );
+}
+
+#[test]
+fn remove_range_set_position_and_empty_operate_on_the_single_range() {
+    assert_eq!(
+        eval(
+            "var one = $('one'), two = $('two'); var r = document.createRange(); \
+             r.selectNodeContents(one); var s = getSelection(); s.addRange(r); \
+             var adopted = [s.rangeCount, s.getRangeAt(0) === r].join(); \
+             s.removeRange(r); var removed = [s.rangeCount, s.type].join(); \
+             var again = ''; \
+             try { s.removeRange(r); } catch (e) { again = e.name; } \
+             s.setPosition(two, 1); \
+             var position = [s.rangeCount, s.anchorNode === two, s.anchorOffset, s.type].join(); \
+             s.empty(); \
+             [adopted, removed, again, position, s.rangeCount].join(' ')"
+        ),
+        "1,true 0,None NotFoundError 1,true,1,Caret 0"
+    );
+}
+
+#[test]
+fn collapse_and_extend_follow_the_anchor_focus_direction() {
+    assert_eq!(
+        eval(
+            "var t = $('para').firstChild; var w = $('bold').firstChild; var s = getSelection(); \
+             s.setBaseAndExtent(w, 3, t, 1); \
+             var back = [s.direction, s.anchorNode === w, s.anchorOffset, s.focusNode === t, \
+                         s.focusOffset, s.getRangeAt(0).startContainer === t, \
+                         s.getRangeAt(0).endContainer === w].join(); \
+             s.extend(w, 2); \
+             var extended = [s.direction, s.anchorNode === w, s.anchorOffset, s.focusNode === w, \
+                             s.focusOffset, s.type].join(); \
+             s.collapseToEnd(); \
+             var end = [s.isCollapsed, s.anchorNode === w, s.anchorOffset, s.type].join(); \
+             s.setBaseAndExtent(t, 2, w, 3); s.collapseToStart(); \
+             var start = [s.isCollapsed, s.anchorNode === t, s.anchorOffset, s.type].join(); \
+             var empty = ''; \
+             try { s.removeAllRanges(); s.collapseToStart(); } catch (e) { empty = e.name; } \
+             [back, extended, end, start, empty].join(' ')"
+        ),
+        "backward,true,3,true,1,true,true backward,true,3,true,2,Range \
+         true,true,3,Caret true,true,2,Caret InvalidStateError"
+    );
+}
+
+#[test]
+fn select_all_children_and_delete_from_document_change_the_tree() {
+    assert_eq!(
+        eval(
+            "var p = $('para'); var s = getSelection(); s.selectAllChildren(p); \
+             var selected = s.toString(); \
+             var contains = [s.containsNode(p), s.containsNode(p, true), s.containsNode($('bold'))].join(); \
+             s.deleteFromDocument(); \
+             [selected, contains, p.childNodes.length, p.textContent.length, s.isCollapsed, \
+              s.type, s.toString(), s.rangeCount].join()"
+        ),
+        "hello world,true,true,true,0,0,true,Caret,,1"
+    );
+}
+
+#[test]
+fn removing_a_node_moves_the_selection_out_of_it_and_never_leaves_a_dangling_node() {
+    assert_eq!(
+        eval(
+            "var p = $('para'); var t = p.firstChild; var s = getSelection(); s.collapse(t, 2); \
+             p.removeChild(t); \
+             var text = [s.anchorNode === p, s.anchorOffset, s.focusNode === p, s.focusOffset, \
+                         s.isCollapsed, s.type, s.rangeCount].join(); \
+             var one = $('one'); s.selectAllChildren(one); $('list').removeChild(one); \
+             text + ' ' + [s.anchorNode === $('list'), s.anchorOffset, s.isCollapsed].join()"
+        ),
+        "true,0,true,0,true,Caret,1 true,0,true"
+    );
+}
+
+#[test]
+fn two_documents_have_independent_selections() {
+    assert_eq!(
+        eval(
+            "var d2 = document.implementation.createHTMLDocument('two'); \
+             d2.body.textContent = 'second'; \
+             var main = document.createElement('p'); main.textContent = 'first'; \
+             document.body.appendChild(main); \
+             var s1 = getSelection(); var s2 = d2.getSelection(); \
+             s1.selectAllChildren(main); s2.selectAllChildren(d2.body); \
+             [s1 !== s2, s1.rangeCount, s2.rangeCount, s1.toString(), s2.toString(), \
+              s2 instanceof Selection, d2.getSelection() === s2].join()"
+        ),
+        "true,1,1,first,second,true,true"
     );
 }

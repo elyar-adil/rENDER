@@ -274,8 +274,13 @@ impl JsRuntime {
         }
     }
 
-    /// The live range a wrapper object names, for the methods of `Range`.
-    fn live_range(&self, dom: &Dom, object: ObjectId) -> Result<RangeId, JsError> {
+    /// The live range a wrapper object names, for the methods of `Range` and
+    /// for the selection's `addRange`/`removeRange`.
+    pub(in crate::runtime) fn live_range(
+        &self,
+        dom: &Dom,
+        object: ObjectId,
+    ) -> Result<RangeId, JsError> {
         let range = self.any_range(object)?;
         if dom.range_kind(range) == Some(RangeKind::Live) {
             Ok(range)
@@ -334,7 +339,11 @@ impl JsRuntime {
         Ok(unsigned_short(number))
     }
 
-    fn offset_from_value(&mut self, dom: &mut Dom, value: &JsValue) -> Result<usize, JsError> {
+    pub(in crate::runtime) fn offset_from_value(
+        &mut self,
+        dom: &mut Dom,
+        value: &JsValue,
+    ) -> Result<usize, JsError> {
         let number = self.to_number_value(dom, value)?;
         Ok(usize::try_from(unsigned_long(number)).unwrap_or(usize::MAX))
     }

@@ -19,7 +19,7 @@ mod shadow;
 mod text;
 
 pub use focus::parse_html_integer;
-pub use range::{BoundaryPoint, RangeId, RangeKind};
+pub use range::{BoundaryPoint, RangeId, RangeKind, SelectionDirection};
 pub use shadow::{
     EventPathStep, ShadowRootData, ShadowRootMode, SlotAssignmentMode,
     is_valid_custom_element_name, is_valid_shadow_host_name,
@@ -567,6 +567,10 @@ pub struct Dom {
     /// Every range this document has created, live and static (DOM §5). A
     /// [`RangeId`] indexes this table. See the `range` module.
     ranges: Vec<range::RangeRecord>,
+    /// The selection of each document in this arena, keyed by the document
+    /// node. A selection is document state (Selection API), and the range it
+    /// names is a live range of this table, so mutations keep both in step.
+    selections: BTreeMap<NodeId, range::SelectionRecord>,
     /// The elements named by their `id` and `name` attributes. See
     /// [`Dom::named_elements`].
     named: named::NamedIndex,
@@ -604,6 +608,7 @@ impl Dom {
             focused_area: None,
             document_content_types: BTreeMap::new(),
             ranges: Vec::new(),
+            selections: BTreeMap::new(),
             named: named::NamedIndex::default(),
             image_states: BTreeMap::new(),
             shadow_roots: 0,
