@@ -15,7 +15,8 @@ Kept so the work is not repeated, and so the cost of the fix stays visible.
 
 | Gap | Closed by | Evidence |
 | --- | --- | --- |
-| **CSS 2.1 §8.3 vertical margin collapsing was absent.** Block layout resolved every box's `margin-top`/`margin-bottom` and added both, so adjacent siblings doubled their gap, a first/last child's margin never escaped its parent, and an empty block occupied its own margins instead of collapsing through. | `crates/render-layout/src/solver/{block,mod,resolve}.rs`, `crates/render-layout/src/solver/collapse_tests.rs` | A `MarginStrut` represents `max(positive) + min(negative)`; adjacent siblings, parent-first, parent-last and empty-block collapse-through are implemented, with floats, absolute boxes, flex/grid items, table cells, BFC roots and clearance kept out. 13 exact-geometry tests pin positive, negative, mixed, through, nested-through, border/padding-blocked, BFC and positioned-descendant cases. `render-layout`: **335 passed, 1 ignored**. |
+| **CSS 2.1 §8.3 vertical margin collapsing was absent.** Block layout resolved every box's `margin-top`/`margin-bottom` and added both, so adjacent siblings doubled their gap, a first/last child's margin never escaped its parent, and an empty block occupied its own margins instead of collapsing through. | `crates/render-layout/src/solver/{block,mod,resolve}.rs`, `crates/render-layout/src/solver/collapse_tests.rs` | A `MarginStrut` represents `max(positive) + min(negative)`; adjacent siblings, parent-first, parent-last and empty-block collapse-through are implemented, with floats, absolute boxes, flex/grid items, table cells, BFC roots and clearance kept out. 13 exact-geometry tests pin positive, negative, mixed, through, nested-through, border/padding-blocked, BFC and positioned-descendant cases. `render-layout`: **347 passed, 1 ignored**. |
+| **`direction: rtl` and bidi reordering were absent.** `direction` only had an initial value and no consumer, so right-to-left text was painted in logical left-to-right order and `text-align: start` always meant the left edge. | `crates/render-layout/src/solver/{inline,mod}.rs`, `crates/render-css/src/properties.rs`, `crates/render-core/src/document.rs` | `direction` is a typed inherited property; the UA sheet maps `dir=ltr/rtl`; UAX #9 levels are resolved with `unicode-bidi` and level runs are placed in visual order per line, with odd runs reversed for the painter. `text-align:start/end`, RTL `text-indent`, mixed LTR/RTL runs, European numbers, wrapping and atomic inlines are covered by 12 exact-geometry tests in `bidi_tests.rs`. |
 | **Shadow-tree styling was unreachable and `slotchange` never fired.** A `<style>` inside a shadow root applied nowhere, `:host`/`::slotted` matched nothing, and a script waiting for `slotchange` hung forever. | `crates/render-core/src/{document,page}.rs`, `crates/render-css/src/{cascade,selector,stylesheet}.rs`, `crates/render-dom/src/{lib,shadow}.rs` | Shadow-including style discovery with per-sheet `tree_root`, tree-isolated author sheets, Cascade Context ordering, `:host`/`:host()`/`:host-context()`/`::slotted()`, and a bounded `slotchange` dispatch after each microtask checkpoint. `render-core` **453 passed**, `render-css` **295 passed**, `render-dom` **78 passed**. |
 | **`none` components and perceptual gamut mapping were absent.** `none` was zero at parse time, out-of-gamut colours were clipped per channel, and canvas/transitions rejected non-sRGB colours. | `crates/render-css/src/{color,properties,animation}.rs`, `crates/render-core/src/{paint/color,canvas/style}.rs` | `SpaceColor` retains authored space and carries missing components to analogous ones; §14.2.2 Binary Search + Local MINDE maps to sRGB at the device boundary; missing components are zero in canvas and transitions. Known values pinned for P3 primaries, `oklch(0.7 0.4 150)` and the Colour 5 HSL/P3 example. |
 | **`--screenshot` could hang forever on a settled page.** The deadline was not part of `ControlFlow`, so the event loop slept with nothing to wake it. | `crates/render-browser/src/app.rs`, `main.rs` | Deadline joins the minimum wait; empty frame after a window exists is a reported error; loop stop with a pending request exits non-zero. Regression tests plus a real 122,219-byte PNG of the `@scope` demo. |
@@ -1060,8 +1061,16 @@ not mistake a default class for a decision:
 - The optional §5.2 tailorings (no break between `!`/`/`/`|` and a letter) are not taken, and
   there is no CLDR tailoring. `line-break: auto` is `normal`; it does not vary with line length.
 
-**Bidi (UAX #9) remains absent**, so right-to-left scripts still lay out left-to-right. That is a
-separate, larger algorithm and is recorded rather than approximated.
+**Bidi (UAX #9) is implemented for horizontal writing.** `solver/inline.rs` resolves the
+paragraph level from CSS `direction`, runs `unicode-bidi`'s UAX #9 implementation over the
+logical text (an atomic inline is U+FFFC), groups the placed fragments into lines and applies
+rule L2 in visual order; an odd-level run's characters are reversed for the left-to-right
+painter. CSS `text-align:start/end`, RTL `text-indent`, the UA sheet's `dir=ltr/rtl`
+mapping, mixed LTR/RTL runs, European numbers, wrapping and atomic inlines are tested.
+Still absent: L3 combining-mark and L4 mirroring rules; `unicode-bidi: embed/isolate/override`
+and per-inline-element direction embeddings; block-axis RTL mirroring (margins, floats,
+logical properties); `dir=auto`; and Arabic/Indic shaping, which is a separate text-shaping
+gap.
 
 **What is still not covered by a test**: the acceptance harness's fixtures do not include an
 unspaced CJK paragraph in an intrinsically-sized box, so the intrinsic-width path is pinned by

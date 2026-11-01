@@ -1,3 +1,96 @@
+# 交接文档 (2026-11-01, 续五十八) — `direction: rtl`、UAX #9 行级 BiDi 与 RTL 对齐
+
+这一轮补齐水平书写模式下的 RTL / 双向文本基础：`direction` 成为 typed 继承属性，
+HTML `dir=ltr/rtl` 进入 UA 样式表，inline 布局按 UAX #9 解析 levels 并按行执行 L2
+重排，同时修正 `text-align:start/end` 与 RTL `text-indent`。没有站点特判。
+
+## 依赖与属性
+
+- `render-layout` 新增 `unicode-bidi = "0.3.18"`（crates.io 缓存中已有；Cargo.lock
+  增加 7 行）。UAX #9 的数据和算法交给该 crate，避免手写不完整的 bidi 类表。
+- `render-css/src/properties.rs` 新增 `Direction::{Ltr,Rtl}`、
+  `TypedPropertyValue::Direction`、`direction` 的 grammar/serialization。
+  baseline registry 原本已把 `direction` 注册为 inherited + initial `ltr`，现在
+  初始值也能解析成 typed 值。
+- `crates/render-core/src/document.rs` 的 UA sheet 增加：
+  `[dir="ltr" i] { direction: ltr }`、`[dir="rtl" i] { direction: rtl }`。
+  `dir=auto` 与 `unicode-bidi: isolate` 仍未实现，代码注释中说明。
+
+## 行级 BiDi
+
+- `InlineAtom` 增加 `bidi_level: u8`。`assign_bidi_levels` 把逻辑文本拼成
+  UAX #9 输入：普通字符原样、atomic inline 用 U+FFFC、强制换行用 U+2028；
+  以 CSS `direction` 作为 paragraph level（`BidiInfo::new(..., Some(base))`）。
+  ASCII + LTR 的最常见路径直接全部 level 0，不分配 UAX #9 的逐字节表。
+- `TextRun` 记录 `bidi_level` 与 `line`，因此文本 run 在 level 变化处切开；
+  `Solver::inline_bidi` 记录每个 inline fragment 的 line/level。
+  atomic inline 也登记为一个 level 单元。
+- 每行布局完成后 `finish_inline_lines`：
+  - 按 line 分组 fragment（用显式 line，而不是猜 y；atomic 的 margin box 可能
+    高于/低于 line box）；
+  - 用 `BidiInfo::reorder_visual` 执行 L2，把 level runs 按视觉顺序放置；
+  - 奇数 level 的文本 run 反转字符，交给左到右 painter；atomic inline 作为整体
+    移动，不反转其内部内容；
+  - 最后按 `text-align` 平移整个行。`Start` 在 RTL 映射到右、`End` 在 RTL 映射
+    到左；`Justify` 尚无两端对齐，暂时落到段首边。
+- `text-indent`：`indented_line_band` 增加 `rtl` 参数，RTL 时从右边缘扣除 indent；
+  `line_indents` 按行保存，对齐时使用 `containing width - indent - line width`。
+- 纯 LTR、start 对齐、无 indent 的 inline context 走 fast path，只清理 side map，
+  不建立 BTreeMap 或跑 reorder。
+
+## 测试
+
+新增 `crates/render-layout/src/solver/bidi_tests.rs`，12 个精确几何测试：
+
+- 纯 RTL 希伯来文本：DOM 保持逻辑顺序，fragment 文本反向，右对齐 x=176；
+- RTL 段落中嵌入 LTR 短语，LTR run 保持内部顺序并位于左侧；
+- RTL 段落中的欧洲数字保持 LTR/level 2；
+- LTR 段落中只反转内嵌 RTL run；
+- RTL 段落按同一逻辑断点换行，两行都从右起；
+- RTL `text-indent` 从右边缘缩短；
+- RTL `text-align:end` 到左边、LTR `text-align:end` 到右边；
+- 同 level 的 span 边界随整段 RTL run 一起重排；
+- atomic inline 作为 U+FFFC 整体进入视觉顺序；
+- `dir=rtl` 属性 selector 驱动方向。
+
+另有 `render-css` 的 `parses_direction_keywords` 测试。
+
+## 验证
+
+```
+cargo test -p render-layout --lib                 347 passed, 1 ignored
+cargo test -p render-css --lib                    303 passed, 0 failed
+cargo test -p render-core --lib                   456 passed, 0 failed
+cargo test --workspace                            all crates passed, 0 failed
+cargo fmt --all --check                           clean
+cargo clippy -p render-css -p render-layout -p render-core \
+  --all-targets -- -D warnings                    clean
+python tools/check_site_neutrality.py             0 blocking, 26 advisory
+```
+
+## 已知缺口
+
+- UAX #9 L3（combining marks）和 L4（mirroring）未执行；反转字符对 Hebrew
+  简单文本正确，对组合标记/括号镜像不完整。
+- `unicode-bidi: embed/isolate/override/bidi-override` 未实现；行内元素自身的
+  `direction` 还没有 embedding 通路，目前只消费 block container 的 paragraph
+  direction。
+- `dir=auto` 未实现；UA 只映射 `dir=ltr/rtl`。
+- 块轴 RTL 镜像未实现：margin/padding 的 start/end、float、逻辑属性、滚动条位置
+  仍按物理左/右处理。
+- 复杂脚本整形（Arabic/Indic/Thai cluster、ligature）仍缺；反转 run 只是显示
+  顺序，不是 shaping。
+- 行尾空白的 L1 重置尚未按行执行；普通文本测试通过，但带尾随空格的极端行仍需补。
+
+## 下一步
+
+- `unicode-bidi` 的 inline embedding/isolate 与 `dir=auto`。
+- UAX #9 L3/L4 + 复杂脚本 shaping。
+- 块轴 RTL 镜像与 logical properties。
+- 继续 bidi 的行尾空白与多段落强制换行语义。
+
+---
+
 # 交接文档 (2026-11-01, 续五十七) — CSS 2.1 §8.3 垂直 margin collapsing
 
 这一轮补齐 block formatting context 的垂直 margin collapsing：相邻兄弟、父/首子、

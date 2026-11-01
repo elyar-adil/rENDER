@@ -15,9 +15,9 @@ says so. `docs/visual_fidelity_gaps.md` is the working register; this file is th
 | what | number | when |
 | --- | --- | --- |
 | `render-js` unit tests | 1,116 passed, 0 failed | 2026-10-22 |
-| `render-css` unit tests | 302 passed, 0 failed | 2026-11-01 |
-| `render-core` unit tests | 455 passed, 0 failed | 2026-11-01 |
-| `render-layout` unit tests | 335 passed, 1 ignored | 2026-11-01 |
+| `render-css` unit tests | 303 passed, 0 failed | 2026-11-01 |
+| `render-core` unit tests | 456 passed, 0 failed | 2026-11-01 |
+| `render-layout` unit tests | 347 passed, 1 ignored | 2026-11-01 |
 | `render-browser` unit tests | 206 passed, 0 failed | 2026-11-01 |
 | `render-browser` app tests (binary) | 114 passed, 0 failed | 2026-11-01 |
 | `render-html` unit tests | 149 passed, 0 failed | 2026-10-22 |
@@ -98,7 +98,7 @@ expand at parse time and serialization follows grammar order. `style` containmen
 counter/quote isolation is not yet observable. `scroll-state()` queries and `style()` shorthand
 features remain gaps.
 
-**Block flow and vertical margin collapsing.** CSS 2.1 §8.3 is implemented for the block
+**Block flow, vertical margin collapsing and bidi.** CSS 2.1 §8.3 is implemented for the block
 formatting context: adjoining sibling margins, a parent's first/last child margins, and an
 empty block's own top/bottom margins all collapse through a `MarginStrut` that keeps the
 largest positive and most negative components (`max(+) + min(-)`). Parent-first and
@@ -108,6 +108,16 @@ positioned boxes, flex and grid items, table cells, BFC roots (`overflow`, conta
 `container-type`, `flow-root`, multi-column) and clearance are excluded from the collapse,
 and positioned descendants whose containing block lies outside a shifted subtree keep their
 document position. Evidence: 13 exact-geometry tests in `solver/collapse_tests.rs`.
+
+**Bidirectional text.** CSS Writing Modes 3 `direction` is a typed inherited property, and the
+UA sheet maps the HTML `dir` attribute's `ltr`/`rtl` states. Inline layout runs UAX #9 through
+`unicode-bidi` with the CSS `direction` as paragraph level, then places level runs in visual
+order per line; odd-level runs are reversed for the left-to-right painter. `text-align:start`
+and `end` resolve against the paragraph direction, `text-indent` shortens the RTL right edge,
+and atomic inlines participate as U+FFFC objects. Evidence: 12 exact-geometry tests in
+`solver/bidi_tests.rs`. Not implemented: UAX #9 L3/L4 (combining marks and mirroring),
+`unicode-bidi` embeddings/isolates, per-inline-element `direction`, block-axis RTL mirroring,
+`dir=auto`, and complex-script shaping.
 
 **Table layout.** 47 tests. CSS 2.1 §17 including border-collapse conflict resolution, row groups,
 `colspan`/`rowspan`, `caption-side`, fixed layout, intrinsic widths. This is the single most-used

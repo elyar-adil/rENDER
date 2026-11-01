@@ -641,7 +641,12 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 box is displaced when it is painted and hit tested, against the page's \
                 scroll offset; a sticky box inside a nested scroll container uses that \
                 container's offset as zero, because nested containers have no offset yet. \
-                Not implemented: `column-rule`, `direction` and RTL mirroring, and scrolling \
+                CSS Writing Modes 3 `direction` and UAX #9 line reordering are implemented \
+                for horizontal writing modes: paragraph level, visual level runs, odd-run \
+                reversal, start/end alignment, RTL text-indent, and the HTML `dir` attribute. \
+                Not implemented: `column-rule`, `unicode-bidi` embeddings and isolates, \
+                per-inline-element `direction`, UAX #9 L3/L4 (combining marks and mirroring), \
+                Arabic/Indic shaping, `dir=auto`, block-axis RTL mirroring, and scrolling \
                 a nested scroll container. Each one has a scrollport geometry in the \
                 fragment tree, but only the page viewport owns a scroll offset, so \
                 `overflow: auto` on a `div` clips its content with no way to reach it.",

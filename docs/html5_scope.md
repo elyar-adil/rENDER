@@ -330,7 +330,7 @@ Microdata、`is=""`、`<dialog>` 完整模态语义、Drag & Drop API、可访�
 | `text-shadow` | 🟡 **已接线。** 生产 `display_list.rs:1194-1207`、多层解析 `:2435-2450`、包围盒 `:2492`、光栅化 `raster.rs:756` |
 | `list-style-type` / `list-style-position`（marker 绘制） | 🟡 **已接线。** `display_list.rs:1298-1420`（marker 几何由绘制而非布局拥有，`list-style-position: outside` 放内容边 leading 侧、`inside` 放内容原点）、`ListMarkerPaint` / `ListMarkerShape`（`:254-270`）、光栅化 `raster.rs:953-1015`（disc/circle/square 实心与空心、有序标记走文本整形） |
 | `text-transform` / `letter-spacing` / `word-spacing` / `text-indent` / `text-overflow` / `word-break` / `overflow-wrap` | 🔴 零消费者（`text-indent` 仅初始值，`crates/render-css/src/computed.rs:77,80`） |
-| `direction: rtl` + `unicode-bidi` 显示级 BiDi | 🔴 `direction` 只有初始值（`computed.rs:73`），`render-layout` 无消费者。`render-layout/src/geometry.rs:88-110` 有 `Direction` / `WritingMode` 类型与逻辑→物理换算，但**没有从 CSS `direction` 读入的通路** |
+| `direction: rtl` + `unicode-bidi` 显示级 BiDi | 🟡 `direction` 已是 typed、可继承属性，`render-layout` 用 `unicode-bidi` 跑 UAX#9，按行 L2 重排、奇数 level 反向绘制；`text-align:start/end`、RTL `text-indent`、`dir=ltr/rtl` UA 映射与 12 个精确几何测试已覆盖。🔴 UAX#9 L3/L4、`unicode-bidi: embed/isolate/override`、行内元素级 direction、块轴 RTL 镜像与 `dir=auto` 未实现 |
 | `@font-face` + WOFF/WOFF2 | 🔴 解析后直接丢弃（`crates/render-css/src/stylesheet.rs:558-559`）；`render-core` 内检索 `@font-face` 无命中 ⇒ **全站无 webfont** |
 | 复杂脚本整形（阿拉伯/印度系/泰文 cluster） | 🔵 PLANNED。⚠️ **上一版把它列为 ⛔ NON-GOAL，理由是"依赖 HarfBuzz，超出 PyQt 默认能力"。该理由随 Python/Qt 架构一同退役，本次删除整行理由。** 当前引擎的文本整形是自研的（`crates/render-core/src/paint/display_list.rs` 的 `TextShaper` trait + `ReferenceTextShaper` + `crates/render-browser/src/font_backend.rs` 的字形掩码），与 HarfBuzz 无关；缺口是真实的（无 cluster 成形、无 script run 分割），但它是**待实现项**，不是"外部库做不到因而放弃" |
 
@@ -662,7 +662,7 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 |----|------|
 | UTF-8 / GBK / GB18030 / Big5 / Shift_JIS / EUC-KR / ISO-8859-* / Windows-125x 解码 | ✅ `crates/render-html/src/encoding.rs`，经 `encoding_rs`，含 BOM + meta 预扫描 + 传输层 label + `windows-1252` 回退（`:36,45`）。⚠️ 上一版写"依赖 Python codecs"，该说法随 Python 架构退役 |
 | 中日韩换行（UAX#14 简化版） | 🔴 断行由自研测量器承担（`crates/render-browser/src/font_backend.rs` 的字形掩码 + `render-layout/src/solver/inline.rs` 的断行），❓ 是否实现 UAX#14 断点未核实 |
-| RTL 显示 BiDi（UAX#9） | 🔴 见 4.5 的 `direction` 条目 |
+| RTL 显示 BiDi（UAX#9） | 🟡 水平书写模式下的 L2 重排、奇数 level 反向、`direction`/`dir`/`text-align:start-end`/RTL `text-indent` 已实现（`render-layout/src/solver/bidi_tests.rs` 12 个几何测试）；L3/L4、inline embedding、块轴镜像、`dir=auto` 仍缺 |
 | 复杂脚本整形 | 🔵 见 4.5；上一版的 "⛔ NON-GOAL（依赖 HarfBuzz，超出 PyQt 默认能力）" 已删除 |
 | ARIA 属性反射到 DOM | 🔴（`aria-*` 只是普通属性，无消费者） |
 | 可访问性树 / 屏幕阅读器对接 | ⛔ |
