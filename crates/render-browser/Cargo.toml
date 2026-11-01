@@ -20,7 +20,9 @@ fontdue = "0.9.3"
 image-codec = { package = "image", version = "0.25.8", default-features = false, features = ["png"] }
 render-core = { path = "../render-core" }
 render-net = { path = "../render-net" }
+pollster = "1.0"
 softbuffer = { version = "0.4.8", default-features = false }
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
 winit = { version = "0.30.12", default-features = false, features = ["rwh_06"] }
 woff2 = { package = "woff2-patched", version = "0.4.0" }
 

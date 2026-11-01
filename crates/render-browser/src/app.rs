@@ -79,6 +79,7 @@ use render_browser::chrome::scrollbar_scroll_offset;
 use render_browser::compositor::CompositorFrame;
 use render_browser::compositor::CompositorScroll;
 use render_browser::compositor::CompositorWorker;
+use render_browser::compositor::PlatformPresenter;
 use render_browser::compositor::SharedPresenter;
 use render_browser::editor::AddressCommand;
 use render_browser::editor::AddressEditor;
@@ -87,6 +88,7 @@ use render_browser::editor::NativeClipboard;
 use render_browser::font_backend::SystemFontBackend;
 use render_browser::font_faces::FontFetchPlan;
 use render_browser::font_faces::apply_font_batch;
+use render_browser::gpu_presenter::GpuPresenter;
 use render_browser::images::ImageDiagnosticSeverity;
 use render_browser::images::apply_image_batch;
 use render_browser::images::plan_images_with_styles_and_context;
@@ -416,15 +418,42 @@ impl BrowserApp {
             .with_active(self.screenshot.is_none());
         let window = Arc::new(event_loop.create_window(attributes)?);
         self.theme = window.theme().map_or(ChromeTheme::Light, theme_from_winit);
-        let context = Context::new(window.clone())?;
-        let presenter =
-            SoftbufferPresenter::new(&context, window.clone()).map_err(io::Error::other)?;
+        // Prefer the GPU swapchain path. The compositor worker owns the
+        // presenter and presents scroll frames on its own thread; softbuffer is
+        // the explicit fallback when this process has no usable adapter,
+        // surface or device.
+        let gpu = if env::var_os("RENDER_FORCE_SOFTBUFFER").is_some() {
+            Err("RENDER_FORCE_SOFTBUFFER is set".to_owned())
+        } else {
+            GpuPresenter::new(window.clone())
+        };
+        let mut context = None;
+        let presenter: Box<dyn PlatformPresenter> = match gpu {
+            Ok(presenter) => {
+                eprintln!(
+                    "render-browser GPU presenter: adapter={} backend={}",
+                    presenter.adapter_name(),
+                    presenter.backend()
+                );
+                Box::new(presenter)
+            }
+            Err(error) => {
+                eprintln!(
+                    "render-browser GPU presenter unavailable ({error}); falling back to softbuffer"
+                );
+                let softbuffer_context = Context::new(window.clone())?;
+                let presenter = SoftbufferPresenter::new(&softbuffer_context, window.clone())
+                    .map_err(io::Error::other)?;
+                context = Some(softbuffer_context);
+                Box::new(presenter)
+            }
+        };
         *self
             .presenter
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(presenter));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(presenter);
         self.window = Some(window);
-        self.context = Some(context);
+        self.context = context;
         self.relayout_and_render(true);
         let initial_network_url = self
             .pages

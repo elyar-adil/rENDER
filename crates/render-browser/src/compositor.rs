@@ -8,10 +8,9 @@
 //! full render, which is exactly the coupling this module removes.
 //!
 //! The worker deliberately knows nothing about winit or a native surface. It
-//! returns a CPU [`Surface`]; the browser shell converts it to its presentable
-//! buffer and never re-enters layout. This is the CPU dedicated-surface
-//! implementation: there is no GPU context yet, but the scheduling boundary is
-//! the one a GPU compositor would use.
+//! returns a CPU [`Surface`] and hands it to an installed [`PlatformPresenter`],
+//! which may copy it to softbuffer or upload it to a wgpu swapchain. Layout is
+//! never re-entered from this path.
 //!
 //! One worker is created per browser process. Root segments, affine layers and
 //! the band cache are shared through `Arc<CompositorCache>`; the cache's own

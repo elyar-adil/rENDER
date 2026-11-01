@@ -7,6 +7,7 @@ pub mod editor;
 pub mod font_backend;
 pub mod font_faces;
 pub mod font_matching;
+pub mod gpu_presenter;
 pub mod home;
 pub mod images;
 pub mod model;

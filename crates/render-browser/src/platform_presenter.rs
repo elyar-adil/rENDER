@@ -1,11 +1,11 @@
-//! The native-window implementation of the compositor's platform presenter.
+//! The softbuffer fallback for the compositor's platform presenter.
 //!
-//! This shell still presents through `softbuffer`, which writes a CPU buffer to
-//! the window's platform surface. The important architectural property is the
-//! thread, not the raster API: the compositor worker calls this sink directly,
-//! so a scroll frame reaches the window without returning through the render
-//! worker or waiting for the event-loop thread. A GPU swapchain can implement
-//! the same [`PlatformPresenter`] contract later without changing the scheduler.
+//! The shell prefers the wgpu swapchain presenter. When no adapter, surface or
+//! device is available, this sink writes the CPU buffer to the window's
+//! platform surface instead. The important architectural property is the
+//! thread, not the raster API: the compositor worker calls the installed sink
+//! directly, so a scroll frame reaches the window without returning through the
+//! render worker or waiting for the event-loop thread.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
