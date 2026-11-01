@@ -5,6 +5,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 
+use render_browser::compositor::PlatformPresenter;
 use render_core::document::{Document, ExternalStyleSheets};
 use render_core::dom::Dom;
 use render_core::dom::NodeId;
@@ -1403,18 +1404,90 @@ fn second_document_source() -> PageSource {
     }
 }
 
+/// A platform sink used by the app tests to prove the compositor worker calls
+/// presentation directly while the render worker is blocked.
+struct RecordingPresenter {
+    base: Vec<u32>,
+    width: u32,
+    height: u32,
+    presents: Arc<Mutex<Vec<(u32, u32)>>>,
+}
+
+impl render_browser::compositor::PlatformPresenter for RecordingPresenter {
+    fn present_full(&mut self, frame: &[u32], width: u32, height: u32) -> Result<(), String> {
+        self.base = frame.to_vec();
+        self.width = width;
+        self.height = height;
+        Ok(())
+    }
+
+    fn present_page(
+        &mut self,
+        page: &Surface,
+        origin_x: u32,
+        origin_y: u32,
+    ) -> Result<Duration, String> {
+        let started = Instant::now();
+        if self.width == 0 || self.height == 0 {
+            return Err("no full window frame has been presented yet".to_owned());
+        }
+        for row in 0..page.height() {
+            for column in 0..page.width() {
+                let x = origin_x + column;
+                let y = origin_y + row;
+                if x >= self.width || y >= self.height {
+                    continue;
+                }
+                let color = page.pixel(column, row).unwrap_or(Color::TRANSPARENT);
+                let index = (y * self.width + x) as usize;
+                self.base[index] = (u32::from(color.red) << 16)
+                    | (u32::from(color.green) << 8)
+                    | u32::from(color.blue);
+            }
+        }
+        self.presents
+            .lock()
+            .expect("present log lock")
+            .push((origin_x, origin_y));
+        Ok(started.elapsed())
+    }
+}
+
+fn install_recording_presenter(
+    presenter: &render_browser::compositor::SharedPresenter,
+    presents: Arc<Mutex<Vec<(u32, u32)>>>,
+    width: u32,
+    height: u32,
+) {
+    let mut slot = presenter.lock().expect("presenter slot");
+    let mut sink = RecordingPresenter {
+        base: vec![0x00ff_ffff; (width * height) as usize],
+        width,
+        height,
+        presents,
+    };
+    let base = sink.base.clone();
+    sink.present_full(&base, width, height)
+        .expect("the test base frame is presentable");
+    *slot = Some(Box::new(sink));
+}
+
 /// A scroll frame is composed on the dedicated worker, not on the render
 /// worker's queue. The render worker is deliberately blocked on a full frame
-/// for the whole test; the scroll still commits, which is the scheduling
-/// property a browser compositor exists to provide.
+/// for the whole test; the scroll still commits and reaches the platform sink,
+/// which is the scheduling property a browser compositor exists to provide.
 #[test]
 fn a_scroll_frame_composites_while_the_render_worker_is_blocked() {
     let (worker, started, log, gate) = gated_render_worker();
     let fonts = Arc::new(SystemFontBackend::load().expect("system fonts load"));
     let (mut app, tab) =
         headless_app_with_render_worker("<main>scroll</main>", worker, Arc::clone(&fonts));
+    let presenter = render_browser::compositor::shared_presenter();
+    let presents = Arc::new(Mutex::new(Vec::new()));
+    install_recording_presenter(&presenter, Arc::clone(&presents), 800, 600);
+    app.presenter = Arc::clone(&presenter);
     app.compositor_worker = Some(
-        render_browser::compositor::start_compositor_worker(Arc::clone(&fonts), || {})
+        render_browser::compositor::start_compositor_worker(Arc::clone(&fonts), presenter, || {})
             .expect("compositor worker starts"),
     );
     {
@@ -1458,6 +1531,14 @@ fn a_scroll_frame_composites_while_the_render_worker_is_blocked() {
         app.pages[&tab].expected_compositor.is_none(),
         "the committed compositor frame clears its expected identity"
     );
+    let presents = presents.lock().expect("present log");
+    assert_eq!(presents.len(), 1, "the worker presented exactly one page");
+    assert_eq!(
+        presents[0],
+        (0, app.layout.as_ref().expect("layout").chrome_height),
+        "the page is presented below the browser chrome"
+    );
+    drop(presents);
 
     // Let the held full frame finish so its worker thread is clean.
     release_first_render(&gate);
@@ -2168,7 +2249,7 @@ fn headless_app_with_render_worker(
         clipboard: render_browser::editor::NativeClipboard::default(),
         window: None,
         context: None,
-        surface: None,
+        presenter: render_browser::compositor::shared_presenter(),
         layout: None,
         frame: Vec::new(),
         frame_size: WindowSize::new(800, 600),

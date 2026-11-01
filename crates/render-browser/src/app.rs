@@ -4,7 +4,6 @@ use crate::ACTIVE_PAGE_TURN_BUDGET;
 use crate::BACKGROUND_PAGE_TURN_BUDGET;
 use crate::INITIAL_HEIGHT;
 use crate::INITIAL_WIDTH;
-use crate::NativeSurface;
 use crate::SCROLL_LINE_PIXELS;
 use crate::UserEvent;
 use crate::content_interaction;
@@ -25,7 +24,6 @@ use crate::fetch_handles::CachedRequestState;
 use crate::frame::FrameDamage;
 use crate::frame::FrameRect;
 use crate::frame::blit_page;
-use crate::frame::copy_frame_regions;
 use crate::frame::surface_to_softbuffer;
 use crate::interaction_state::FocusSource;
 use crate::page_source::PageSource;
@@ -41,6 +39,7 @@ use crate::page_state::PendingFonts;
 use crate::page_state::PendingImages;
 use crate::page_state::PendingScripts;
 use crate::page_state::PendingStyleSheets;
+use crate::platform_presenter::SoftbufferPresenter;
 use crate::profile::ProfileCookies;
 use crate::profile::ProfileProxy;
 use crate::profile::ProfileStorage;
@@ -80,6 +79,7 @@ use render_browser::chrome::scrollbar_scroll_offset;
 use render_browser::compositor::CompositorFrame;
 use render_browser::compositor::CompositorScroll;
 use render_browser::compositor::CompositorWorker;
+use render_browser::compositor::SharedPresenter;
 use render_browser::editor::AddressCommand;
 use render_browser::editor::AddressEditor;
 use render_browser::editor::Clipboard;
@@ -253,7 +253,9 @@ pub(super) struct BrowserApp {
     pub(super) clipboard: NativeClipboard,
     pub(super) window: Option<Arc<Window>>,
     pub(super) context: Option<Context<Arc<Window>>>,
-    pub(super) surface: Option<NativeSurface>,
+    /// Platform sink shared with the compositor worker. The worker presents
+    /// scroll frames directly through it after the window is initialized.
+    pub(super) presenter: SharedPresenter,
     pub(super) layout: Option<ChromeLayout>,
     pub(super) frame: Vec<u32>,
     /// A pending `--screenshot` request: where to write the composed frame and
@@ -312,6 +314,7 @@ impl BrowserApp {
         network: NetworkWorker,
         render_worker: PageRenderWorker,
         compositor_worker: Option<CompositorWorker>,
+        presenter: SharedPresenter,
         proxy: ProfileProxy,
     ) -> Self {
         let tabs = TabModel::new(initial.title.clone(), initial.target.display_address());
@@ -359,7 +362,7 @@ impl BrowserApp {
             clipboard: NativeClipboard::default(),
             window: None,
             context: None,
-            surface: None,
+            presenter,
             layout: None,
             frame: Vec::new(),
             frame_size: WindowSize::new(0, 0),
@@ -414,10 +417,14 @@ impl BrowserApp {
         let window = Arc::new(event_loop.create_window(attributes)?);
         self.theme = window.theme().map_or(ChromeTheme::Light, theme_from_winit);
         let context = Context::new(window.clone())?;
-        let surface = NativeSurface::new(&context, window.clone())?;
+        let presenter =
+            SoftbufferPresenter::new(&context, window.clone()).map_err(io::Error::other)?;
+        *self
+            .presenter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(presenter));
         self.window = Some(window);
         self.context = Some(context);
-        self.surface = Some(surface);
         self.relayout_and_render(true);
         let initial_network_url = self
             .pages
@@ -532,6 +539,12 @@ impl BrowserApp {
                 images: page.images.clone(),
                 content_height: page.scroll.content_height(),
                 viewport_height: page.scroll.viewport_height(),
+                page_origin: (
+                    0,
+                    self.layout
+                        .as_ref()
+                        .map_or(0, |layout| layout.chrome_height),
+                ),
             };
             let source_snapshot = Arc::from(page.navigation.committed().html.as_str());
             page.expected_compositor = Some(identity);
@@ -677,13 +690,15 @@ impl BrowserApp {
             page.scroll.offset_y(),
         );
         let render_time = frame.render_time;
+        let present_time = frame.present_time;
         let active = id == self.tabs.active_id();
         if env::var_os("RENDER_DEBUG_FRAME").is_some() {
             eprintln!(
-                "render-browser composited scroll page={} generation={} render_time_us={}",
+                "render-browser composited scroll page={} generation={} render_time_us={} present_time_us={:?}",
                 completed.identity.tab_id,
                 completed.identity.generation,
-                render_time.as_micros()
+                render_time.as_micros(),
+                present_time.map(|time| time.as_micros())
             );
         }
         if active {
@@ -691,7 +706,12 @@ impl BrowserApp {
                 self.mark_page_damage(size);
                 self.compose_frame(size);
             }
-            self.request_redraw();
+            // A direct platform present already put the new scroll frame on
+            // screen. The composed CPU frame is still refreshed for the next
+            // chrome repaint, but no redraw is requested for this frame.
+            if present_time.is_none() {
+                self.request_redraw();
+            }
         } else {
             self.repaint_chrome();
         }
@@ -1593,36 +1613,22 @@ impl BrowserApp {
             .ok_or_else(|| io::Error::other("cannot present a zero-width frame"))?;
         let height = NonZeroU32::new(self.frame_size.height)
             .ok_or_else(|| io::Error::other("cannot present a zero-height frame"))?;
-        let surface = self
-            .surface
+        let mut presenter = self
+            .presenter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let presenter = presenter
             .as_mut()
             .ok_or_else(|| io::Error::other("native surface is not initialized"))?;
-        surface.resize(width, height)?;
-        let mut buffer = surface.buffer_mut()?;
-        if buffer.len() != self.frame.len() {
-            return Err(io::Error::other("CPU and native surface sizes differ").into());
-        }
-        if buffer.age() != 1 {
-            self.frame_damage.mark_full();
-        }
         let damage = self
             .frame_damage
             .take_for_present(self.frame_size.width, self.frame_size.height);
         if damage.is_empty() {
             return Ok(());
         }
-        let full_damage = damage.len() == 1
-            && damage[0].x == 0
-            && damage[0].y == 0
-            && damage[0].width.get() == self.frame_size.width
-            && damage[0].height.get() == self.frame_size.height;
-        if full_damage {
-            buffer.copy_from_slice(&self.frame);
-            buffer.present()?;
-        } else {
-            copy_frame_regions(&mut buffer, &self.frame, self.frame_size, &damage);
-            buffer.present_with_damage(&damage)?;
-        }
+        presenter
+            .present_full(&self.frame, width.get(), height.get())
+            .map_err(io::Error::other)?;
         Ok(())
     }
 

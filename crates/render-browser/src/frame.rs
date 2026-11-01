@@ -165,26 +165,6 @@ pub(crate) fn blit_page(
     }
 }
 
-pub(crate) fn copy_frame_regions(
-    destination: &mut [u32],
-    source: &[u32],
-    frame_size: PhysicalSize<u32>,
-    regions: &[SoftBufferRect],
-) {
-    let frame_width = frame_size.width as usize;
-    for region in regions {
-        let x = region.x as usize;
-        let y = region.y as usize;
-        let width = region.width.get() as usize;
-        let height = region.height.get() as usize;
-        for row in 0..height {
-            let offset = (y + row) * frame_width + x;
-            let end = offset + width;
-            destination[offset..end].copy_from_slice(&source[offset..end]);
-        }
-    }
-}
-
 #[allow(
     clippy::cast_precision_loss,
     reason = "native dimensions are bounded far below f32's exact integer range"

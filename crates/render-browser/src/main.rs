@@ -11,23 +11,23 @@ mod frame;
 mod interaction_state;
 mod page_source;
 mod page_state;
+mod platform_presenter;
 mod profile;
 mod render_worker;
 
 use crate::app::BrowserApp;
 use crate::page_source::load_initial_page;
 use crate::render_worker::start_render_worker;
+use render_browser::compositor::shared_presenter;
 use render_browser::compositor::start_compositor_worker;
 use render_browser::font_backend::SystemFontBackend;
 use render_net::FetchConfig;
 use render_net::HttpProxyConfig;
 use render_net::HttpTransport;
 use render_net::NetworkWorker;
-use softbuffer::Surface as WindowSurface;
 use std::sync::Arc;
 use winit::event_loop::ControlFlow;
 use winit::event_loop::EventLoop;
-use winit::window::Window;
 
 const INITIAL_WIDTH: u32 = 1_180;
 
@@ -38,8 +38,6 @@ const SCROLL_LINE_PIXELS: f32 = 40.0;
 const ACTIVE_PAGE_TURN_BUDGET: usize = 8;
 
 const BACKGROUND_PAGE_TURN_BUDGET: usize = 2;
-
-type NativeSurface = WindowSurface<Arc<Window>, Arc<Window>>;
 
 #[derive(Clone, Copy, Debug)]
 enum UserEvent {
@@ -127,24 +125,27 @@ fn browser_main() -> Result<(), String> {
     let network = NetworkWorker::start(transport).map_err(|error| error.to_string())?;
     let render_worker = start_render_worker(Arc::clone(&fonts), event_loop.create_proxy())
         .map_err(|error| error.to_string())?;
-    let compositor_worker = match start_compositor_worker(Arc::clone(&fonts), {
-        let proxy = event_loop.create_proxy();
-        move || {
-            let _event_loop_closed = proxy.send_event(UserEvent::CompositorReady);
-        }
-    }) {
-        Ok(worker) => Some(worker),
-        Err(error) => {
-            eprintln!("render-browser dedicated compositor disabled: {error}");
-            None
-        }
-    };
+    let presenter = shared_presenter();
+    let compositor_worker =
+        match start_compositor_worker(Arc::clone(&fonts), Arc::clone(&presenter), {
+            let proxy = event_loop.create_proxy();
+            move || {
+                let _event_loop_closed = proxy.send_event(UserEvent::CompositorReady);
+            }
+        }) {
+            Ok(worker) => Some(worker),
+            Err(error) => {
+                eprintln!("render-browser dedicated compositor disabled: {error}");
+                None
+            }
+        };
     let mut app = BrowserApp::new(
         initial,
         fonts,
         network,
         render_worker,
         compositor_worker,
+        presenter,
         proxy,
     );
     if let Some((path, delay)) = launch.screenshot {

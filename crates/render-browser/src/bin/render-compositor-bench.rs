@@ -21,7 +21,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use render_browser::compositor::{CompositorScroll, start_compositor_worker};
+use render_browser::compositor::{
+    CompositorScroll, PlatformPresenter, SharedPresenter, shared_presenter, start_compositor_worker,
+};
 use render_browser::font_backend::SystemFontBackend;
 use render_browser::worker::{RenderIdentity, RenderJob, RenderOffset, RenderViewport};
 use render_core::dom::DomRevision;
@@ -29,7 +31,7 @@ use render_core::image::ImageResources;
 use render_core::layout::{FragmentId, PhysicalRect, PhysicalSize};
 use render_core::paint::{
     Color, CompositorCache, DisplayCommand, DisplayItem, DisplayItemId, DisplayList, NoGlyphMasks,
-    PaintCoordinateSpace, PaintPhase,
+    PaintCoordinateSpace, PaintPhase, Surface,
 };
 
 const FRAMES: usize = 120;
@@ -39,6 +41,64 @@ const VIEWPORT: PhysicalSize = PhysicalSize {
     width: 800.0,
     height: 600.0,
 };
+
+/// An in-process platform sink. It performs the same page blit and full-window
+/// copy the softbuffer presenter performs, without requiring a window in a
+/// headless benchmark run. The measured `present_time` is therefore the CPU
+/// side of the platform-surface path.
+struct MemoryPresenter {
+    base: Vec<u32>,
+    width: u32,
+    height: u32,
+}
+
+impl PlatformPresenter for MemoryPresenter {
+    fn present_full(&mut self, frame: &[u32], width: u32, height: u32) -> Result<(), String> {
+        self.base.clear();
+        self.base.extend_from_slice(frame);
+        self.width = width;
+        self.height = height;
+        Ok(())
+    }
+
+    fn present_page(
+        &mut self,
+        page: &Surface,
+        origin_x: u32,
+        origin_y: u32,
+    ) -> Result<Duration, String> {
+        let started = Instant::now();
+        if self.width == 0 || self.height == 0 {
+            return Err("no base frame".to_owned());
+        }
+        let page_width = page.width() as usize;
+        let copy_width = page_width.min((self.width.saturating_sub(origin_x)) as usize);
+        let copy_height =
+            (page.height() as usize).min((self.height.saturating_sub(origin_y)) as usize);
+        let pixels = page.pixels();
+        for row in 0..copy_height {
+            let source_start = row * page_width;
+            let destination_start =
+                (origin_y as usize + row) * self.width as usize + origin_x as usize;
+            for column in 0..copy_width {
+                let color = pixels[source_start + column];
+                self.base[destination_start + column] = (u32::from(color.red) << 16)
+                    | (u32::from(color.green) << 8)
+                    | u32::from(color.blue);
+            }
+        }
+        Ok(started.elapsed())
+    }
+}
+
+fn install_presenter(presenter: &SharedPresenter) {
+    let mut slot = presenter.lock().expect("presenter slot");
+    *slot = Some(Box::new(MemoryPresenter {
+        base: Vec::new(),
+        width: 0,
+        height: 0,
+    }));
+}
 
 #[allow(
     clippy::too_many_lines,
@@ -131,7 +191,15 @@ fn main() {
     );
 
     let (sender, receiver) = mpsc::channel();
-    let worker = start_compositor_worker(Arc::clone(&fonts), move || {
+    let sink = shared_presenter();
+    install_presenter(&sink);
+    sink.lock()
+        .expect("presenter slot")
+        .as_mut()
+        .expect("presenter installed")
+        .present_full(&vec![0x00ff_ffff; 800 * 600], 800, 600)
+        .expect("the base window frame is presentable");
+    let worker = start_compositor_worker(Arc::clone(&fonts), Arc::clone(&sink), move || {
         let _ = sender.send(());
     })
     .expect("the compositor worker starts");
@@ -154,6 +222,7 @@ fn main() {
     let block_end = block_begin + Duration::from_millis(BLOCK_MILLIS);
 
     let mut latencies = Vec::with_capacity(FRAMES);
+    let mut present_durations = Vec::with_capacity(FRAMES);
     let mut frames_during_block = 0_usize;
     for frame in 0..FRAMES {
         let started = Instant::now();
@@ -166,6 +235,7 @@ fn main() {
                     images: ImageResources::default(),
                     content_height: 12_000.0,
                     viewport_height: VIEWPORT.height,
+                    page_origin: (0, 60),
                 },
             })
             .expect("the compositor worker accepts a scroll job");
@@ -185,6 +255,9 @@ fn main() {
             }
         }
         let completed_at = Instant::now();
+        if let Some(present_time) = completed_frame.expect("a frame was produced").present_time {
+            present_durations.push(present_time);
+        }
         latencies.push(started.elapsed());
         if completed_at <= block_end {
             frames_during_block += 1;
@@ -200,6 +273,18 @@ fn main() {
     let mean = total.as_secs_f64() * 1_000_000.0 / FRAMES as f64;
     let median = latencies[FRAMES / 2].as_secs_f64() * 1_000_000.0;
     let worst = latencies[FRAMES - 1].as_secs_f64() * 1_000_000.0;
+    present_durations.sort_unstable();
+    let presented = present_durations.len();
+    let mean_present = present_durations
+        .iter()
+        .copied()
+        .sum::<Duration>()
+        .as_secs_f64()
+        * 1_000_000.0
+        / presented.max(1) as f64;
+    let max_present = present_durations
+        .last()
+        .map_or(0.0, |time| time.as_secs_f64() * 1_000_000.0);
 
     let mut json = HashMap::new();
     json.insert("frames", FRAMES.to_string());
@@ -210,18 +295,24 @@ fn main() {
     );
     json.insert("render_worker_block_ms", BLOCK_MILLIS.to_string());
     json.insert("frames_during_block", frames_during_block.to_string());
+    json.insert("presented_frames", presented.to_string());
     json.insert("mean_latency_us", format!("{mean:.1}"));
     json.insert("median_latency_us", format!("{median:.1}"));
     json.insert("max_latency_us", format!("{worst:.1}"));
+    json.insert("mean_present_us", format!("{mean_present:.1}"));
+    json.insert("max_present_us", format!("{max_present:.1}"));
     let keys = [
         "frames",
         "scroll_step_px",
         "viewport",
         "render_worker_block_ms",
         "frames_during_block",
+        "presented_frames",
         "mean_latency_us",
         "median_latency_us",
         "max_latency_us",
+        "mean_present_us",
+        "max_present_us",
     ];
     let fields = keys
         .iter()
