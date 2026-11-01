@@ -331,7 +331,7 @@ Microdata、`is=""`、`<dialog>` 完整模态语义、Drag & Drop API、可访�
 | `list-style-type` / `list-style-position`（marker 绘制） | 🟡 **已接线。** `display_list.rs:1298-1420`（marker 几何由绘制而非布局拥有，`list-style-position: outside` 放内容边 leading 侧、`inside` 放内容原点）、`ListMarkerPaint` / `ListMarkerShape`（`:254-270`）、光栅化 `raster.rs:953-1015`（disc/circle/square 实心与空心、有序标记走文本整形） |
 | `text-transform` / `letter-spacing` / `word-spacing` / `text-indent` / `text-overflow` / `word-break` / `overflow-wrap` | 🔴 零消费者（`text-indent` 仅初始值，`crates/render-css/src/computed.rs:77,80`） |
 | `direction: rtl` + `unicode-bidi` 显示级 BiDi | 🟡 `direction` 已是 typed、可继承属性，`render-layout` 用 `unicode-bidi` 跑 UAX#9，按行 L2 重排、奇数 level 反向绘制；`text-align:start/end`、RTL `text-indent`、`dir=ltr/rtl` UA 映射与 12 个精确几何测试已覆盖。🔴 UAX#9 L3/L4、`unicode-bidi: embed/isolate/override`、行内元素级 direction、块轴 RTL 镜像与 `dir=auto` 未实现 |
-| `@font-face` + WOFF/WOFF2 | 🟡 **描述符已收集、局部资源已加载。** `<style>` 与已取回的 `<link>` 样式表的 `@font-face` 规则在 `render-core` 中收集，布局前经安装钩子进入 `SystemFontBackend`；相对 `src` 按样式表 URL 解析（`crates/render-browser/src/font_faces.rs`），`local()`、`file:` 与 base64 `data:` 可用。`crates/render-core/tests/webfont_layout.rs` 用同一段文本从 24px 变为 48px 证明描述符→度量→几何的链路。🔴 HTTP(S) 网络提交、WOFF/WOFF2 解码、`@media`/`@supports` 条件门控仍未实现 |
+| `@font-face` + WOFF/WOFF2 | 🟡 **描述符、HTTP(S) 与容器解码已接线。** `<style>` 与已取回的 `<link>` 样式表的规则在 `render-core` 中收集，布局前经安装钩子进入 `SystemFontBackend`；相对 `src` 按样式表 URL 解析（`crates/render-browser/src/font_faces.rs`）。render worker 用 computed `font-family` 与页面字符调用 `DocumentFonts::plan_fetches`，app 通过缓存的 fetch batch 提交 HTTP(S) URL，返回的 raw sfnt / WOFF 1.0 / WOFF2 在下一帧前解码并安装。`crates/render-core/tests/webfont_layout.rs` 与 `render-browser` 的 loopback HTTP 测试都用同一段文本从 24px 变为 48px 证明描述符→取回→解码→度量→几何的链路。🔴 `font-display` 时间线、`@media`/`@supports` 条件门控、EOT/SVG 与使用 `hmtx` transform 的 WOFF2 仍未实现 |
 | 复杂脚本整形（阿拉伯/印度系/泰文 cluster） | 🔵 PLANNED。⚠️ **上一版把它列为 ⛔ NON-GOAL，理由是"依赖 HarfBuzz，超出 PyQt 默认能力"。该理由随 Python/Qt 架构一同退役，本次删除整行理由。** 当前引擎的文本整形是自研的（`crates/render-core/src/paint/display_list.rs` 的 `TextShaper` trait + `ReferenceTextShaper` + `crates/render-browser/src/font_backend.rs` 的字形掩码），与 HarfBuzz 无关；缺口是真实的（无 cluster 成形、无 script run 分割），但它是**待实现项**，不是"外部库做不到因而放弃" |
 
 ### 4.6 视觉效果
@@ -383,7 +383,7 @@ Microdata、`is=""`、`<dialog>` 完整模态语义、Drag & Drop API、可访�
 | `@supports` | 🟡 **偏差。** 块被解析（`stylesheet.rs:244,539-551`），但条件被**丢弃**：`:548` 是 `let _ = query;`，嵌套规则无条件应用。源码注释自述"Property support is intentionally permissive until the computed-value registry grows a complete CSS.supports implementation"。这意味着 `@supports (display: none) { ... }` 也会生效 |
 | `@scope` | ✅ CSS Cascade 6 §3.5：根/限制、相对 prelude、`:scope`/`&`、嵌套作用域、作用域内直接声明与 scope proximity（见 `HANDOFF.md` 续五十三） |
 | `@import` | 🔴 不是"部分实现"：at-rule 分派只处理 `@layer`，其余走 `IgnoredAtRule` 并记一条 `@import is parsed but not evaluated yet` 诊断（`stylesheet.rs:180-191,561-566`） |
-| `@font-face` | 🟡 描述符已收集并在布局前安装；`local()`/`file:`/`data:` 可用，见 4.5；HTTP(S) 与 WOFF/WOFF2 未接线 |
+| `@font-face` | 🟡 描述符已收集并在布局前安装；`local()`/`file:`/`data:` 与 HTTP(S) webfont 均可用，WOFF/WOFF2 已解码，见 4.5；`font-display` 时间线与条件门控仍缺 |
 | `@keyframes` | 🔴 丢弃，见 4.7 |
 | `@page` `@counter-style` `@font-feature-values` | 🔴 走 `IgnoredAtRule` + 诊断 |
 | CSS Nesting | 🔵（是否进入 scope 需在本文登记后再实现，见第 13 节） |

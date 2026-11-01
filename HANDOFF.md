@@ -1,3 +1,100 @@
+# 交接文档 (2026-11-01, 续六十二) — HTTP(S) webfont 取回、WOFF/WOFF2 解码与加载循环
+
+这一轮把上一轮的本地 webfont 路径推进到真正的网络循环：render worker 规划
+HTTP(S) 字体 URL，app 用缓存的 fetch batch 取回，字节在下一帧度量前解码
+（raw sfnt / WOFF 1.0 / WOFF2）并安装。没有站点特判。
+
+## 取回循环
+
+- `render-worker` 在每次完整渲染结束后，用 `output.styles` 的 computed
+  `font-family` 和 DOM 文本字符调用 `DocumentFontLoader::plan_fetches`；
+  `DocumentFonts::plan_fetches` 仍按 §4.8.1 只选页面实际命名 family 且
+  `unicode-range` 命中的 URL，并跳过已缓存/已解码的 URL。
+- `PageRenderFrame` 新增 `font_plan: Option<FontFetchPlan>` 和
+  `installed_fonts: Vec<Url>`。
+- app 端 `start_font_fetches`：按 `attempted_fonts` 去重，带 cookie 交给
+  `submit_cached_batch`，结果进 `PageState.pending_fonts`。
+- `finish_font_fetches`：`apply_font_batch` 保留成功 body、报告 HTTP/transport
+  失败；body 存入 `PageState.font_resources`（`Arc<HashMap<Url, Arc<[u8]>>>`，
+  payload clone 只增引用计数），并强制调度下一次完整渲染。
+- `FullPageRenderPayload` 携带 `font_resources`；render worker 在
+  `document.render...` 之前调用 `install_fetched_map`，解码后把 `Arc<Font>`
+  放进 loader 的跨规则缓存。`install` 的 dirty 标志保证同一次渲染的安装钩子
+  会重建字体表。
+- app 收到帧后只删除 `installed_fonts` 对应的原始 body，未消费/失败的 body
+  保留；导航时清空并取消 pending batch。
+- `poll_network`、`has_pending_work`、`report_stalled_batches` 都纳入
+  `pending_fonts`，字体传输不会让事件循环提前休眠。
+
+## WOFF / WOFF2
+
+- `decode_font_container`：
+  - `wOF2` → `woff2-patched 0.4.0` 的 Brotli 解码器；
+  - `wOFF` → 自研 WOFF 1.0 inflater：读取 44 字节 header 和 20 字节 table
+    directory，按 `compLength < origLength` 用 `flate2` zlib 解压，重建 sfnt
+    header/directory、四字节对齐和 `head.checkSumAdjustment`；
+  - raw sfnt（`0x00010000` / `OTTO` / `true` / `typ1`）直接通过。
+- `FontFormat::Woff` / `Woff2` 现在都是 `is_decodable()`，因此 `@font-face`
+  的 `format('woff2')` 不再被 §4.3.3 丢掉。
+- 修复了一个真实生产 bug：`url("...") format("woff2")` 的 quoted URL 是
+  `Function` token，旧解析器拒绝其后的 `format()`/`tech()`；现在 quoted 和
+  unquoted URL 共用同一个后缀解析器，并有回归测试。
+- 依赖说明：`woff2-patched` 使用的 `safer-bytes 0.2` 不能与 bytes 1.6+ 的
+  inherent `try_get_*` 共存，`render-browser` 固定 `bytes = "=1.10.0"`；注释
+  写在 `Cargo.toml`。
+
+## 测试与证据
+
+- `crates/render-core/tests/fixtures/` 新增同一 fixture 的 `.woff` 和
+  `.woff2`。
+- `woff_and_woff2_decode_to_the_fixture_face`：三种容器解码后 `H` 的
+  advance 都是 16px。
+- `a_fetched_woff2_body_changes_the_platform_measurers_advance`：WOFF2 body
+  经 `install_fetched` 后 `HHH` 为 48px。
+- `an_http_fetched_woff2_changes_the_measured_advance`：loopback HTTP server
+  提供 WOFF2，`FontFetchPlan::requests` → `HttpTransport::fetch_batch` →
+  `apply_font_batch` → `install_fetched` → `SystemFontBackend::measure`，
+  测出 48px；同时断言请求的 `Accept` 和失败列表为空。
+- `a_quoted_url_takes_the_same_format_suffix_as_an_unquoted_one`：quoted
+  `url("a.woff2") format("woff2")` 保留 `FontFormat::Woff2`。
+- release shell 用本地 HTTP 服务加载 `webfont-http-demo.html`，截图
+  `webfont-http-final.png`（62,151 字节）：@font-face 行是 1em 宽 H，fallback
+  行明显更窄，`ready=Complete`、`css_errors=0`、`css_warnings=0`。
+
+## 验证
+
+```
+cargo test -p render-core --lib                  459 passed, 0 failed
+cargo test -p render-core --test webfont_layout  2 passed, 0 failed
+cargo test -p render-css --lib                   305 passed, 0 failed
+cargo test -p render-browser --lib               210 passed, 0 failed
+cargo test -p render-js --lib                    1,210 passed, 0 failed
+cargo test --workspace                           all crates passed, 0 failed
+cargo fmt --all --check                          clean
+cargo clippy ... --all-targets -- -D warnings    clean
+python tools/check_site_neutrality.py            0 blocking, 26 advisory
+```
+
+## 已知缺口
+
+- `@font-face` 嵌套在 `@media`/`@supports` 仍只 walk，不评估条件。
+- `font-display` 仍无 block/swap/failure 时间线；字体到达前按 §5.2
+  “not present”走 fallback，到达后重排一次。
+- WOFF2 的 `hmtx` transform、EOT、SVG 字体仍未支持；`woff2-patched` 对
+  这些 face 会返回 undecodable。
+- `font-variation-settings`、`font-feature-values`、`font-named-instance`、
+  metrics override 与 `tech()` 仍未实现。
+- 网络字体下载失败只打印诊断，不进入 DevTools 式 resource timing；没有
+  `font-display` 的阶段状态。
+
+## 下一步
+
+- 条件门控与 `font-display` 时间线。
+- WOFF2 `hmtx` transform / EOT / SVG（或明确记为不支持）。
+- 继续 RTL 块轴镜像、scroll-state、`@starting-style`、compositor。
+
+---
+
 # 交接文档 (2026-11-01, 续六十一) — `@font-face` 收集与本地 webfont 加载
 
 这一轮把 `@font-face` 从“解析后丢弃”推进到“作者样式表发现 → 布局前安装 →

@@ -16,7 +16,8 @@ Kept so the work is not repeated, and so the cost of the fix stays visible.
 | Gap | Closed by | Evidence |
 | --- | --- | --- |
 | **CSS 2.1 §8.3 vertical margin collapsing was absent.** Block layout resolved every box's `margin-top`/`margin-bottom` and added both, so adjacent siblings doubled their gap, a first/last child's margin never escaped its parent, and an empty block occupied its own margins instead of collapsing through. | `crates/render-layout/src/solver/{block,mod,resolve}.rs`, `crates/render-layout/src/solver/collapse_tests.rs` | A `MarginStrut` represents `max(positive) + min(negative)`; adjacent siblings, parent-first, parent-last and empty-block collapse-through are implemented, with floats, absolute boxes, flex/grid items, table cells, BFC roots and clearance kept out. 13 exact-geometry tests pin positive, negative, mixed, through, nested-through, border/padding-blocked, BFC and positioned-descendant cases. `render-layout`: **352 passed, 1 ignored**. |
-| **`@font-face` descriptors were discarded, so no webfont could reach layout.** A rule could not change the face, the advances, or any line box, and its `src` was never requested. | `crates/render-core/src/{font_face,document}.rs`, `crates/render-browser/src/{font_faces,resources,render_worker}.rs`, `crates/render-core/tests/webfont_layout.rs` | Every eligible `<style>` and fetched `<link>` sheet contributes its `@font-face` rules to a pre-layout installer. Relative `src` URLs resolve against the sheet, `local()`, `file:` and base64 `data:` resources load, and the document table is published before the first measurement. Two tests pin the fixture's `HHH` at **24px -> 48px** at 16px, one through a fontdue measurer and one through `SystemFontBackend`; a local-page screenshot shows the fixture face in the shell. HTTP(S) submission, WOFF/WOFF2 and conditional-rule gating remain open. |\n| **`color-scheme` was absent; `light-dark()` and system colors were document-wide only.** An element could not opt its subtree into light or dark, and `Canvas`/`CanvasText` stayed the same everywhere. | `crates/render-css/src/{properties,computed}.rs`, `crates/render-core/src/paint/{color,display_list}.rs`, `crates/render-core/src/document.rs` | `color-scheme` is a typed inherited property (`normal`, `light`, `dark`, custom idents, `only`); normal follows the page scheme, explicit support resolves per element. Paint selects `SystemPalette::for_scheme`, so `light-dark()`, gradients, shadows, borders, markers and `Canvas`/`CanvasText` all use the element's used scheme. Numeric tests pin light/dark arms and white/black system colors; a document test covers an inherited dark subtree. |
+| **`@font-face` descriptors were discarded, so no webfont could reach layout.** A rule could not change the face, the advances, or any line box, and its `src` was never requested. | `crates/render-core/src/{font_face,document}.rs`, `crates/render-browser/src/{font_faces,resources,render_worker}.rs`, `crates/render-core/tests/webfont_layout.rs` | Every eligible `<style>` and fetched `<link>` sheet contributes its `@font-face` rules to a pre-layout installer. Relative `src` URLs resolve against the sheet, `local()`, `file:` and base64 `data:` resources load synchronously, HTTP(S) URLs are planned from computed families and page characters and fetched through the browser's cached batch, and WOFF/WOFF2 bodies are decoded to sfnt before the next measurement. Tests pin the fixture's `HHH` at **24px -> 48px** at 16px and a loopback HTTP test fetches a WOFF2 and measures the same 48px. Conditional-rule gating and `font-display` timing remain open. |
+| **`color-scheme` was absent; `light-dark()` and system colors were document-wide only.** An element could not opt its subtree into light or dark, and `Canvas`/`CanvasText` stayed the same everywhere. | `crates/render-css/src/{properties,computed}.rs`, `crates/render-core/src/paint/{color,display_list}.rs`, `crates/render-core/src/document.rs` | `color-scheme` is a typed inherited property (`normal`, `light`, `dark`, custom idents, `only`); normal follows the page scheme, explicit support resolves per element. Paint selects `SystemPalette::for_scheme`, so `light-dark()`, gradients, shadows, borders, markers and `Canvas`/`CanvasText` all use the element's used scheme. Numeric tests pin light/dark arms and white/black system colors; a document test covers an inherited dark subtree. |
 | **`content-visibility` was unparsed and absent.** Hidden subtrees were laid out and painted like any other content, and the property could not even reach the cascade. | `crates/render-css/src/{properties,computed}.rs`, `crates/render-layout/src/solver/{block,inline}.rs`, `crates/render-layout/src/solver/content_visibility_tests.rs` | `content-visibility: hidden` now keeps the element's own box, applies size/layout/paint containment, skips all in-flow and positioned descendants, and produces no child fragments. `auto` is parsed and currently renders its contents (off-screen skipping is the remaining optimization). 5 exact-geometry tests cover border/padding-only height, specified height, inline text removal, positioned descendants, and `auto` preserving content. |
 | **`direction: rtl` and bidi reordering were absent.** `direction` only had an initial value and no consumer, so right-to-left text was painted in logical left-to-right order and `text-align: start` always meant the left edge. | `crates/render-layout/src/solver/{inline,mod}.rs`, `crates/render-css/src/properties.rs`, `crates/render-core/src/document.rs` | `direction` is a typed inherited property; the UA sheet maps `dir=ltr/rtl`; UAX #9 levels are resolved with `unicode-bidi` and level runs are placed in visual order per line, with odd runs reversed for the painter. `text-align:start/end`, RTL `text-indent`, mixed LTR/RTL runs, European numbers, wrapping and atomic inlines are covered by 12 exact-geometry tests in `bidi_tests.rs`. |
 | **Shadow-tree styling was unreachable and `slotchange` never fired.** A `<style>` inside a shadow root applied nowhere, `:host`/`::slotted` matched nothing, and a script waiting for `slotchange` hung forever. | `crates/render-core/src/{document,page}.rs`, `crates/render-css/src/{cascade,selector,stylesheet}.rs`, `crates/render-dom/src/{lib,shadow}.rs` | Shadow-including style discovery with per-sheet `tree_root`, tree-isolated author sheets, Cascade Context ordering, `:host`/`:host()`/`:host-context()`/`::slotted()`, and a bounded `slotchange` dispatch after each microtask checkpoint. `render-core` **453 passed**, `render-css` **295 passed**, `render-dom` **78 passed**. |
@@ -182,9 +183,10 @@ the oblique-angle rules, `font-synthesis: none`, and
 `the_face_measured_is_the_face_painted`.
 
 What this does not mean: every `@font-face` source is usable. Author stylesheets
-now hand their rules to a pre-layout installer and `local()`, `file:` and base64
-`data:` resources load, but the browser still does not submit HTTP(S) font URLs,
-decode WOFF/WOFF2, or gate a face inside `@media`/`@supports`. Those are tracked
+now hand their rules to a pre-layout installer, HTTP(S) URLs are fetched through the
+browser's cached batch, and WOFF/WOFF2 bodies are decoded. A face inside
+`@media`/`@supports` is still collected without evaluating the condition, `font-display`
+has no timeline, and Embedded OpenType/SVG fonts remain unsupported. Those are tracked
 under the webfont gaps, not under S1.
 
 The historical audit that found this gap is kept in git history; the old claim
@@ -327,11 +329,16 @@ same table `font_matching` searches, and publishes them through
 pins the end-to-end geometry change: the fixture's `HHH` is 24px without the
 face and 48px with it at 16px.
 
-Still open: the browser's network loop does not submit the HTTP(S) URLs
-`DocumentFonts::plan_fetches` produces, the rasteriser reads raw sfnt only (so
-WOFF/WOFF2 and 218 of the corpus's 223 blocks remain undecodable), and a
-`@font-face` nested inside `@media`/`@supports` is collected without evaluating
-the condition. Those are the remaining webfont work, not a reason to treat the
+The network half is closed too: `render-browser` plans the §4.8.1 subset of HTTP(S)
+URLs from the frame's computed families and page characters, submits them through the
+same cached network batch as stylesheets and images, and decodes raw sfnt, WOFF 1.0
+and WOFF2 before the next render. A loopback HTTP test fetches a WOFF2 body and pins
+the measured 48px advance.
+
+Still open: a `@font-face` nested inside `@media`/`@supports` is collected without
+evaluating the condition, `font-display` has no timeline, WOFF2 files using the
+decoder's unsupported `hmtx` transform are rejected, and Embedded OpenType/SVG fonts
+still have no decoder. Those are the remaining webfont work, not a reason to treat the
 feature as absent.
 
 ## S4b - Closed: `@supports` is evaluated, and it was lying in a way that looked fine
@@ -743,12 +750,12 @@ constructed only inside `src/spec/`, so no other crate breaks.
 accident**: no WPT area is imported, so the bar cannot be met. `Missing` where the engine has
 nothing, `Partial` where something works.
 
-`css.font-face` is registered as **`Partial`**: descriptor collection and local
-resource loading are implemented and the feature has end-to-end geometry tests,
-while HTTP(S) submission, WOFF/WOFF2 decoding and conditional-rule gating remain
-open. The acceptance harness asserts the registry *declares* such a feature, so
-moving the status from `Missing` to `Partial` records what changed rather than
-making a test pass by editing it.
+`css.font-face` is registered as **`Partial`**: descriptor collection, HTTP(S)
+fetching, local/data loading, WOFF/WOFF2 decoding and end-to-end geometry tests are
+implemented, while conditional-rule gating, `font-display` timing, variation
+descriptors and Embedded OpenType/SVG fonts remain open. The acceptance harness
+asserts the registry *declares* such a feature, so moving the status from `Missing` to
+`Partial` records what changed rather than making a test pass by editing it.
 
 The diagnostic half of the `css.font-face` and `css.animations` notes was updated
 when S4 landed; the font-face note now records the wired local/data path and the

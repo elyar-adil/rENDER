@@ -19,7 +19,7 @@ capabilities that are parsed but never consumed, or computed and then dropped.
 | --- | ---: | --- |
 | HTML parsing and encoding | 55% | Tokenization, tree construction, recovery, and common Chinese encodings work; full HTML5 edge cases remain. |
 | DOM, events, and forms | 40% | Tree mutation, selectors, common events, inputs, and GET submission work; broad Web APIs and event options remain. |
-| CSS syntax, selectors, and cascade | 45% | Common selectors, specificity, inheritance, custom properties, major value grammars, modern color functions, `light-dark()`, per-element `color-scheme`, and `@font-face` collection with local/data webfont loading work; HTTP(S) font submission, WOFF/WOFF2, and full CSS syntax coverage remain. |
+| CSS syntax, selectors, and cascade | 45% | Common selectors, specificity, inheritance, custom properties, major value grammars, modern color functions, `light-dark()`, per-element `color-scheme`, and `@font-face` collection with HTTP(S)/local webfont loading and WOFF/WOFF2 decoding work; full CSS syntax coverage remains. |
 | Layout | 48% | Block/inline, floats, positioned boxes, flex, grid, table, overflow, common sizing, CSS 2.1 §8.3 vertical margin collapsing, horizontal RTL/bidi line layout, and `content-visibility: hidden` work; intrinsic, multi-axis, off-screen `content-visibility: auto`, and RTL block-axis mirroring remain. |
 | Painting and images | 42% | CPU display lists, backgrounds, borders, clipping, opacity, transforms, and common raster images work; stacking, replaced-element, and SVG coverage remain. |
 | JavaScript runtime | 15% | Common script execution, DOM mutation, promises, timers, and events work; the latest full test262 run passed 90,765/103,199 variants (88.0%), recorded 2026-10-22 in release. |

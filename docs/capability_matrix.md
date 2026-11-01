@@ -16,10 +16,10 @@ says so. `docs/visual_fidelity_gaps.md` is the working register; this file is th
 | --- | --- | --- |
 | `render-js` unit tests | 1,210 passed, 0 failed | 2026-11-01 |
 | `render-css` unit tests | 305 passed, 0 failed | 2026-11-01 |
-| `render-core` unit tests | 458 passed, 0 failed | 2026-11-01 |
+| `render-core` unit tests | 459 passed, 0 failed | 2026-11-01 |
 | `render-core` webfont integration tests | 2 passed, 0 failed | 2026-11-01 |
 | `render-layout` unit tests | 352 passed, 1 ignored | 2026-11-01 |
-| `render-browser` unit tests | 207 passed, 0 failed | 2026-11-01 |
+| `render-browser` unit tests | 210 passed, 0 failed | 2026-11-01 |
 | `render-browser` app tests (binary) | 114 passed, 0 failed | 2026-11-01 |
 | `render-html` unit tests | 149 passed, 0 failed | 2026-10-22 |
 | `render-net` unit tests | 32 passed, 0 failed | 2026-10-22 |
@@ -143,15 +143,20 @@ synthesise italic (the specification forbids it for engines that treat italic an
 distinctly, and this one does), and variable-font axes (the rasteriser exposes no axis accessors
 and the corpus has no variable font).
 
-**`@font-face` collection and local webfont loading.** Author stylesheet discovery now hands every
-eligible `<style>` and fetched `<link>` sheet's `@font-face` rules to a `FontFaceInstaller` before
-the first layout pass. `crates/render-browser/src/font_faces.rs` resolves §4.3.2 URLs against the
-sheet, loads `local()`, `file:` and base64 `data:` faces, and publishes the document table through
-`SystemFontBackend::set_document_faces`; the loader keeps decoded faces across a re-render but
-not across a document. `crates/render-core/tests/webfont_layout.rs` proves the geometry change
-(24px -> 48px for `HHH` at 16px) with an embedded sheet, and an external-sheet test pins the base
-URL and descriptor retention. Still open: HTTP(S) font submission, WOFF/WOFF2 decoding, and
-evaluating conditions around a nested `@font-face`.
+**`@font-face` collection, network loading and WOFF decoding.** Author stylesheet discovery
+hands every eligible `<style>` and fetched `<link>` sheet's `@font-face` rules to a
+`FontFaceInstaller` before the first layout pass. `crates/render-browser/src/font_faces.rs`
+resolves §4.3.2 URLs against the sheet, loads `local()`, `file:` and base64 `data:` faces
+synchronously, and publishes the document table through `SystemFontBackend::set_document_faces`.
+The render worker plans the HTTP(S) URLs §4.8.1 requires from the frame's computed families and
+page characters; the app submits them through its cached network batch; the returned bodies are
+decoded from raw sfnt, WOFF 1.0 (zlib) or WOFF2 (Brotli) and installed before the next
+measurement. The loader keeps decoded faces across a re-render but not across a document.
+`crates/render-core/tests/webfont_layout.rs` proves the geometry change (24px -> 48px for `HHH`
+at 16px) with an embedded sheet, and `render-browser` has a loopback HTTP test that fetches a
+WOFF2, decodes it, and measures the same 48px. Still open: §4.6/§4.7 variation descriptors,
+`font-display` timing, Embedded OpenType and SVG fonts, WOFF2 files using the decoder's
+unsupported `hmtx` transform, and evaluating conditions around a nested `@font-face`.
 
 **Network transport.** 81 tests. HTTP/1.1 with connection reuse proven by measurement, a
 same-origin ceiling that is an explicit measured choice rather than a dependency default

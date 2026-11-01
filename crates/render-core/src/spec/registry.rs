@@ -523,22 +523,20 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 painting cannot disagree about it. `font-display` is validated and \
                 recorded and changes nothing, because this engine has no font \
                 download timer and therefore no block, swap or failure period to act \
-                on. NOT implemented: §4.6's feature and variation settings, §4.7's \
+                on. Author stylesheet discovery passes every eligible `<style>` and \
+                fetched `<link>` sheet's rules to a pre-layout installer, which resolves \
+                §4.3.2 URLs and publishes the document table before the first \
+                measurement. The browser plans the HTTP(S) URLs §4.8.1 requires \
+                (`DocumentFonts::plan_fetches` narrowed by computed families and page \
+                characters), submits them through its cached network batch, and decodes \
+                the returned bytes - raw sfnt, WOFF 1.0 zlib, or WOFF2 Brotli - before \
+                the next render. `file:` and base64 `data:` resources load synchronously. \
+                NOT implemented: §4.6's feature and variation settings, §4.7's \
                 `font-named-instance`, §4.11's `*-override` metrics descriptors, any \
-                font technology (a `tech()` item is skipped), and any compressed font \
-                container. The last is what the corpus measures: 217 of the 223 \
-                `@font-face` blocks reference `woff2`, the rasteriser reads raw sfnt \
-                only, and so 218 of the 223 blocks name no format this engine can \
-                decode. Wired: author stylesheet discovery passes every eligible \
-                `<style>` and fetched `<link>` sheet's rules to a pre-layout installer, \
-                which resolves §4.3.2 URLs, loads `file:` and base64 `data:` resources, \
-                and publishes the document table before the first measurement. NOT \
-                wired: the browser's network loop does not yet submit the HTTP(S) URLs \
-                `DocumentFonts::plan_fetches` produces, so an http(s) webfont is \
-                declared but remains unavailable under §5.2's not-present rule on a \
-                real page; `local()`, `file:` and `data:` faces are usable. A \
-                `@font-face` nested in `@media` or `@supports` is walked without \
-                evaluating that condition yet.",
+                font technology (a `tech()` item is skipped), Embedded OpenType and SVG \
+                fonts, and WOFF2 files whose `hmtx` transform the decoder does not \
+                support. A `@font-face` nested in `@media` or `@supports` is walked \
+                without evaluating that condition yet.",
         dependencies: &[CSS_SYNTAX],
         tests: &[],
     },
