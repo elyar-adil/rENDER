@@ -17,6 +17,7 @@ mod render_worker;
 use crate::app::BrowserApp;
 use crate::page_source::load_initial_page;
 use crate::render_worker::start_render_worker;
+use render_browser::compositor::start_compositor_worker;
 use render_browser::font_backend::SystemFontBackend;
 use render_net::FetchConfig;
 use render_net::HttpProxyConfig;
@@ -43,6 +44,7 @@ type NativeSurface = WindowSurface<Arc<Window>, Arc<Window>>;
 #[derive(Clone, Copy, Debug)]
 enum UserEvent {
     RenderReady,
+    CompositorReady,
 }
 
 fn main() {
@@ -125,7 +127,26 @@ fn browser_main() -> Result<(), String> {
     let network = NetworkWorker::start(transport).map_err(|error| error.to_string())?;
     let render_worker = start_render_worker(Arc::clone(&fonts), event_loop.create_proxy())
         .map_err(|error| error.to_string())?;
-    let mut app = BrowserApp::new(initial, fonts, network, render_worker, proxy);
+    let compositor_worker = match start_compositor_worker(Arc::clone(&fonts), {
+        let proxy = event_loop.create_proxy();
+        move || {
+            let _event_loop_closed = proxy.send_event(UserEvent::CompositorReady);
+        }
+    }) {
+        Ok(worker) => Some(worker),
+        Err(error) => {
+            eprintln!("render-browser dedicated compositor disabled: {error}");
+            None
+        }
+    };
+    let mut app = BrowserApp::new(
+        initial,
+        fonts,
+        network,
+        render_worker,
+        compositor_worker,
+        proxy,
+    );
     if let Some((path, delay)) = launch.screenshot {
         app.schedule_screenshot(path, delay);
     }

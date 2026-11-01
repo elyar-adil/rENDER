@@ -161,6 +161,10 @@ pub(super) struct PageState {
     pub(super) external_styles_generation: u64,
     pub(super) render_generation: u64,
     pub(super) expected_render: Option<RenderIdentity>,
+    /// A scroll frame submitted to the dedicated compositor worker. This is
+    /// separate from `expected_render`, so a slow full render can stay in
+    /// flight while independently composed scroll frames commit.
+    pub(super) expected_compositor: Option<RenderIdentity>,
     /// Wall-clock anchor for the page's virtual event-loop clock.
     pub(super) created_at: Instant,
 }
@@ -349,6 +353,7 @@ impl PageState {
             external_styles_generation: 0,
             render_generation: 0,
             expected_render: None,
+            expected_compositor: None,
             created_at: Instant::now(),
         }
     }
@@ -472,6 +477,7 @@ impl PageState {
         self.dom_revision = self.page.document().dom().revision().as_u64();
         self.external_styles_generation = 0;
         self.expected_render = None;
+        self.expected_compositor = None;
         self.created_at = Instant::now();
     }
 

@@ -1207,9 +1207,6 @@ const RENDER_TEST_VIEWPORT: WindowSize<u32> = WindowSize::new(800, 560);
 struct SubmittedRender {
     generation: u64,
     carried_style_batch: bool,
-    /// Whether the job used the retained compositor rather than layout or the
-    /// complete raster path.
-    composited_scroll: bool,
     /// Interaction state the frame's cascade saw, when the job was a full frame.
     interaction: Option<render_core::css::selector::InteractionState>,
     /// Whether the job observed that its work was superseded before it
@@ -1244,13 +1241,11 @@ fn gated_render_worker() -> (
             move |job: RenderJob<PageRenderPayload>, cancellation: &RenderCancellation| {
                 let carried_style_batch = match &job.payload {
                     PageRenderPayload::Full(full) => full.style_batch.is_some(),
-                    PageRenderPayload::RetainedRaster { .. }
-                    | PageRenderPayload::CompositedScroll { .. } => false,
+                    PageRenderPayload::RetainedRaster { .. } => false,
                 };
                 let interaction = match &job.payload {
                     PageRenderPayload::Full(full) => Some(full.interaction.clone()),
-                    PageRenderPayload::RetainedRaster { .. }
-                    | PageRenderPayload::CompositedScroll { .. } => None,
+                    PageRenderPayload::RetainedRaster { .. } => None,
                 };
                 // Only the first job is gated: the resubmission under test must
                 // be free to run so the test can observe the outcome.
@@ -1267,10 +1262,6 @@ fn gated_render_worker() -> (
                 log.lock().expect("render log lock").push(SubmittedRender {
                     generation: job.identity.generation,
                     carried_style_batch,
-                    composited_scroll: matches!(
-                        &job.payload,
-                        PageRenderPayload::CompositedScroll { .. }
-                    ),
                     interaction,
                     cancelled: cancellation.is_cancelled(),
                 });
@@ -1412,15 +1403,20 @@ fn second_document_source() -> PageSource {
     }
 }
 
-/// A retained compositor turns a scroll repaint into a `CompositedScroll` job,
-/// not a full layout or complete raster. This is the browser-level wiring test
-/// for the core band cache.
+/// A scroll frame is composed on the dedicated worker, not on the render
+/// worker's queue. The render worker is deliberately blocked on a full frame
+/// for the whole test; the scroll still commits, which is the scheduling
+/// property a browser compositor exists to provide.
 #[test]
-fn a_scroll_with_a_retained_compositor_uses_the_composited_payload() {
+fn a_scroll_frame_composites_while_the_render_worker_is_blocked() {
     let (worker, started, log, gate) = gated_render_worker();
     let fonts = Arc::new(SystemFontBackend::load().expect("system fonts load"));
     let (mut app, tab) =
         headless_app_with_render_worker("<main>scroll</main>", worker, Arc::clone(&fonts));
+    app.compositor_worker = Some(
+        render_browser::compositor::start_compositor_worker(Arc::clone(&fonts), || {})
+            .expect("compositor worker starts"),
+    );
     {
         let page = app.pages.get_mut(&tab).expect("page state");
         page.viewport = RENDER_TEST_VIEWPORT;
@@ -1428,17 +1424,44 @@ fn a_scroll_with_a_retained_compositor_uses_the_composited_payload() {
         page.scroll.update_metrics(2_000.0, 600.0);
     }
 
-    app.schedule_page_render(tab, RENDER_TEST_VIEWPORT, true);
+    // Hold the render worker inside a full frame.
+    app.schedule_page_render(tab, RENDER_TEST_VIEWPORT, false);
     wait_for_renders(&started, 1);
+    assert!(
+        app.render_worker.is_tab_busy(tab.as_u64()),
+        "the full render must still be running"
+    );
+
+    let scroll_started = Instant::now();
+    app.schedule_page_render(tab, RENDER_TEST_VIEWPORT, true);
+    let pixels = RENDER_TEST_VIEWPORT.width as usize * RENDER_TEST_VIEWPORT.height as usize;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.pages[&tab].frame.len() != pixels {
+        app.poll_compositor_worker();
+        assert!(
+            Instant::now() < deadline,
+            "the scroll frame never reached the page"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let latency = scroll_started.elapsed();
+    assert!(
+        latency < Duration::from_secs(5),
+        "a scroll frame took {latency:?} while the render worker was blocked"
+    );
+    assert_eq!(app.pages[&tab].frame[0], 0x00ff_ffff);
+    assert!(
+        submitted_renders(&log).is_empty(),
+        "the blocked render worker must not have received a scroll job"
+    );
+    assert!(
+        app.pages[&tab].expected_compositor.is_none(),
+        "the committed compositor frame clears its expected identity"
+    );
+
+    // Let the held full frame finish so its worker thread is clean.
     release_first_render(&gate);
     commit_until_logged(&mut app, &log, 1);
-
-    let renders = submitted_renders(&log);
-    assert_eq!(renders.len(), 1);
-    assert!(
-        renders[0].composited_scroll,
-        "the compositor cache should be preferred over the complete raster"
-    );
 }
 
 fn simple_compositor() -> Arc<CompositorCache> {
@@ -2129,6 +2152,7 @@ fn headless_app_with_render_worker(
         pages: HashMap::new(),
         fonts,
         render_worker,
+        compositor_worker: None,
         network,
         http_cache: render_browser::cache::HttpCache::default(),
         cookies: crate::profile::ProfileCookies::open(None),

@@ -65,15 +65,6 @@ pub(super) enum PageRenderPayload {
         content_height: f32,
         viewport_height: f32,
     },
-    /// Scroll/composite path: reuse the retained layer tree and bands instead
-    /// of replaying the whole display list.
-    CompositedScroll {
-        compositor: Arc<CompositorCache>,
-        images: ImageResources,
-        raster_background: Color,
-        content_height: f32,
-        viewport_height: f32,
-    },
 }
 
 #[derive(Clone, Debug)]
@@ -424,43 +415,6 @@ pub(super) fn process_page_render(
             Ok(PageRenderFrame {
                 viewport: WindowSize::new(raster.surface.width(), raster.surface.height()),
                 frame: surface_to_softbuffer(&raster.surface),
-                display_list: None,
-                paint_scene: None,
-                compositor: None,
-                raster_background,
-                content_height,
-                viewport_height,
-                applied_style_sheets: None,
-                style_plan: None,
-                style_diagnostics: Vec::new(),
-                font_plan: None,
-                installed_fonts: Vec::new(),
-                computed_styles: None,
-                geometry: None,
-                document_revision: job.identity.dom_revision,
-                transition_state: None,
-                transition_events: Vec::new(),
-            })
-        }
-        PageRenderPayload::CompositedScroll {
-            compositor,
-            images,
-            raster_background,
-            content_height,
-            viewport_height,
-        } => {
-            let output = compositor.render(
-                PhysicalPoint {
-                    x: job.identity.scroll_offset.x,
-                    y: job.identity.scroll_offset.y,
-                },
-                fonts,
-                Some(&images),
-                Some(&BrowserRasterControl { cancellation }),
-            );
-            Ok(PageRenderFrame {
-                viewport: WindowSize::new(output.surface.width(), output.surface.height()),
-                frame: surface_to_softbuffer(&output.surface),
                 display_list: None,
                 paint_scene: None,
                 compositor: None,

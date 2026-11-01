@@ -2,6 +2,7 @@
 
 pub mod cache;
 pub mod chrome;
+pub mod compositor;
 pub mod editor;
 pub mod font_backend;
 pub mod font_faces;

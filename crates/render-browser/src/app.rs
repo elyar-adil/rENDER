@@ -26,6 +26,7 @@ use crate::frame::FrameDamage;
 use crate::frame::FrameRect;
 use crate::frame::blit_page;
 use crate::frame::copy_frame_regions;
+use crate::frame::surface_to_softbuffer;
 use crate::interaction_state::FocusSource;
 use crate::page_source::PageSource;
 use crate::page_source::error_source;
@@ -76,6 +77,9 @@ use render_browser::chrome::paint_chrome;
 use render_browser::chrome::paint_scrollbar;
 use render_browser::chrome::scrollbar_geometry;
 use render_browser::chrome::scrollbar_scroll_offset;
+use render_browser::compositor::CompositorFrame;
+use render_browser::compositor::CompositorScroll;
+use render_browser::compositor::CompositorWorker;
 use render_browser::editor::AddressCommand;
 use render_browser::editor::AddressEditor;
 use render_browser::editor::Clipboard;
@@ -225,6 +229,10 @@ pub(super) struct BrowserApp {
     pub(super) pages: HashMap<TabId, PageState>,
     pub(super) fonts: Arc<SystemFontBackend>,
     pub(super) render_worker: PageRenderWorker,
+    /// Dedicated scroll compositor. `None` (a headless test, or a platform
+    /// whose worker failed to start) keeps scrolling on the retained-raster or
+    /// complete-render path instead.
+    pub(super) compositor_worker: Option<CompositorWorker>,
     pub(super) network: NetworkWorker,
     pub(super) http_cache: HttpCache,
     /// One cookie jar for every tab, persisted to the profile directory.
@@ -303,6 +311,7 @@ impl BrowserApp {
         fonts: Arc<SystemFontBackend>,
         network: NetworkWorker,
         render_worker: PageRenderWorker,
+        compositor_worker: Option<CompositorWorker>,
         proxy: ProfileProxy,
     ) -> Self {
         let tabs = TabModel::new(initial.title.clone(), initial.target.display_address());
@@ -331,6 +340,7 @@ impl BrowserApp {
             pages: HashMap::from([(active, PageState::new(initial))]),
             fonts,
             render_worker,
+            compositor_worker,
             network,
             http_cache: HttpCache::default(),
             cookies: ProfileCookies::open(profile_directory()),
@@ -450,6 +460,10 @@ impl BrowserApp {
         self.update_window_title();
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "submission policy reads as one ordered decision over compositor, retained raster and full render"
+    )]
     pub(super) fn schedule_page_render(
         &mut self,
         id: TabId,
@@ -464,17 +478,29 @@ impl BrowserApp {
             page.frame.clear();
             page.viewport = viewport;
             page.expected_render = None;
+            page.expected_compositor = None;
             self.forget_dirty_render(id);
             self.render_worker.cancel_tab(id.as_u64());
+            if let Some(worker) = &self.compositor_worker {
+                worker.cancel_tab(id.as_u64());
+            }
             return;
         }
+        // Scroll frames are composed on a dedicated worker, so they do not
+        // wait behind a full render. The older render stays committable; a
+        // composited frame only replaces the page surface.
+        let can_composite = self.compositor_worker.is_some()
+            && prefer_retained_raster
+            && page.viewport == viewport
+            && page.style_batch.is_none()
+            && page.compositor.is_some();
         // A render for this tab is still running and its result stays
         // committable. Superseding it on every DOM mutation would starve
         // commits whenever mutations arrive faster than renders finish
         // (the classic live-page stall); instead the running render wins,
         // the mutation is remembered, and the coordinator resubmits right
         // after the commit lands.
-        if self.render_worker.is_tab_busy(id.as_u64()) {
+        if !can_composite && self.render_worker.is_tab_busy(id.as_u64()) {
             page.render_dirty = true;
             page.render_dirty_viewport = Some(viewport);
             return;
@@ -496,27 +522,44 @@ impl BrowserApp {
             animation_time_millis: u32::try_from(page.created_at.elapsed().as_millis())
                 .unwrap_or(u32::MAX),
         };
-        let can_composite = prefer_retained_raster
-            && page.viewport == viewport
-            && page.style_batch.is_none()
-            && page.compositor.is_some();
-        let can_raster_retained = prefer_retained_raster
-            && page.viewport == viewport
-            && page.style_batch.is_none()
-            && page.paint_scene.is_some();
-        let payload = if can_composite {
-            PageRenderPayload::CompositedScroll {
+        if can_composite {
+            let payload = CompositorScroll {
                 compositor: Arc::clone(
                     page.compositor
                         .as_ref()
                         .expect("retained compositor was checked"),
                 ),
-                raster_background: page.raster_background,
                 images: page.images.clone(),
                 content_height: page.scroll.content_height(),
                 viewport_height: page.scroll.viewport_height(),
+            };
+            let source_snapshot = Arc::from(page.navigation.committed().html.as_str());
+            page.expected_compositor = Some(identity);
+            let worker = self
+                .compositor_worker
+                .as_ref()
+                .expect("compositor worker was checked");
+            if let Err(error) = worker.submit(RenderJob {
+                identity,
+                source_snapshot,
+                payload,
+            }) {
+                page.expected_compositor = None;
+                eprintln!("render-browser could not submit a compositor job: {error}");
             }
-        } else if can_raster_retained {
+            return;
+        }
+        // A full or complete-raster frame supersedes any scroll frame still
+        // using the previous layer tree.
+        page.expected_compositor = None;
+        if let Some(worker) = &self.compositor_worker {
+            worker.cancel_tab(id.as_u64());
+        }
+        let can_raster_retained = prefer_retained_raster
+            && page.viewport == viewport
+            && page.style_batch.is_none()
+            && page.paint_scene.is_some();
+        let payload = if can_raster_retained {
             PageRenderPayload::RetainedRaster {
                 scene: Arc::clone(
                     page.paint_scene
@@ -564,6 +607,93 @@ impl BrowserApp {
     pub(super) fn poll_render_worker(&mut self) {
         for completed in self.render_worker.drain_latest() {
             self.commit_render(completed);
+        }
+    }
+
+    pub(super) fn poll_compositor_worker(&mut self) {
+        let Some(worker) = &self.compositor_worker else {
+            return;
+        };
+        for completed in worker.drain_latest() {
+            self.commit_compositor_frame(completed);
+        }
+    }
+
+    /// Commits a scroll frame produced by the dedicated compositor.
+    ///
+    /// The only page state this touches is the presentable surface, its
+    /// dimensions and the scroll metrics. Layout, computed styles, the display
+    /// list and the retained layer tree are all owned by the full-render path,
+    /// so a scroll cannot block behind or invalidate them.
+    fn commit_compositor_frame(&mut self, completed: CompletedRender<CompositorFrame>) {
+        let Some(id) = self
+            .pages
+            .keys()
+            .copied()
+            .find(|id| id.as_u64() == completed.identity.tab_id)
+        else {
+            return;
+        };
+        let frame = match completed.result {
+            Ok(frame) => frame,
+            Err(error) => {
+                if self
+                    .pages
+                    .get(&id)
+                    .is_some_and(|page| page.expected_compositor == Some(completed.identity))
+                {
+                    eprintln!("render-browser scroll composite failed: {error}");
+                }
+                if let Some(page) = self.pages.get_mut(&id)
+                    && page.expected_compositor == Some(completed.identity)
+                {
+                    page.expected_compositor = None;
+                }
+                return;
+            }
+        };
+        let Some(page) = self.pages.get_mut(&id) else {
+            return;
+        };
+        if page.expected_compositor != Some(completed.identity) {
+            if env::var_os("RENDER_DEBUG_FRAME").is_some() {
+                eprintln!(
+                    "render-browser discarding superseded composited frame page={} generation={}",
+                    completed.identity.tab_id, completed.identity.generation
+                );
+            }
+            return;
+        }
+        page.expected_compositor = None;
+        let viewport = WindowSize::new(frame.surface.width(), frame.surface.height());
+        page.frame = surface_to_softbuffer(&frame.surface);
+        page.viewport = viewport;
+        page.scroll
+            .update_metrics(frame.content_height, frame.viewport_height);
+        page.page.runtime_mut().install_viewport(
+            viewport.width as f32,
+            viewport.height as f32,
+            0.0,
+            page.scroll.offset_y(),
+        );
+        let render_time = frame.render_time;
+        let active = id == self.tabs.active_id();
+        if env::var_os("RENDER_DEBUG_FRAME").is_some() {
+            eprintln!(
+                "render-browser composited scroll page={} generation={} render_time_us={}",
+                completed.identity.tab_id,
+                completed.identity.generation,
+                render_time.as_micros()
+            );
+        }
+        if active {
+            if let Some(size) = self.window.as_ref().map(|window| window.inner_size()) {
+                self.mark_page_damage(size);
+                self.compose_frame(size);
+            }
+            self.request_redraw();
+        } else {
+            self.repaint_chrome();
         }
     }
 
@@ -620,6 +750,12 @@ impl BrowserApp {
                 return;
             };
             page.expected_render = None;
+            // The full frame owns the new layer tree. Any scroll job still
+            // using the previous tree must not paint over it when it lands.
+            page.expected_compositor = None;
+            if let Some(worker) = &self.compositor_worker {
+                worker.cancel_tab(id.as_u64());
+            }
             page.frame = frame.frame;
             page.viewport = frame.viewport;
             if let Some(display_list) = frame.display_list {
@@ -1504,6 +1640,9 @@ impl BrowserApp {
             }
             TabIntent::Close(id) => {
                 self.render_worker.cancel_tab(id.as_u64());
+                if let Some(worker) = &self.compositor_worker {
+                    worker.cancel_tab(id.as_u64());
+                }
                 if let Some(mut page) = self.pages.remove(&id) {
                     page.sync_local_storage(&mut self.storage);
                     page.sync_indexed_db(&mut self.storage);
@@ -2053,6 +2192,9 @@ impl BrowserApp {
         // render identity, so without this the old job would finish, fail the
         // commit gate, and leave the tab showing the previous document.
         self.render_worker.cancel_tab(id.as_u64());
+        if let Some(worker) = &self.compositor_worker {
+            worker.cancel_tab(id.as_u64());
+        }
         let fallback_title = source.title.clone();
         let mut title = fallback_title;
         let mut address = source.target.display_address();
@@ -5179,6 +5321,7 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::RenderReady => self.poll_render_worker(),
+            UserEvent::CompositorReady => self.poll_compositor_worker(),
         }
     }
 
@@ -5187,6 +5330,7 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
         reason = "the event-loop turn reads as one ordered pass over network, scripts, animation and wakeups"
     )]
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.poll_compositor_worker();
         self.poll_network();
         self.recover_unresolved_render_requests();
         self.poll_disk_cache();
@@ -5283,6 +5427,10 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
         let pending_work = self.has_pending_network()
             || self.has_pending_script_work()
             || self.has_unresolved_render_request()
+            || self
+                .pages
+                .values()
+                .any(|page| page.expected_compositor.is_some())
             || animating;
         let page_wake = self
             .pages
