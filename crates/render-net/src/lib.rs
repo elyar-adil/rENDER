@@ -25,6 +25,7 @@
 mod batch;
 mod cookie;
 mod diagnostics;
+pub mod h2;
 mod transport;
 mod worker;
 
