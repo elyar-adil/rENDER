@@ -7,6 +7,7 @@ use render_dom::{DomRevision, NodeId};
 use super::font::{FontRequest, FontStyle, FontSynthesis};
 use super::geometry::{EdgeSizes, PhysicalRect, PhysicalSize};
 use super::scrollport::ScrollportGeometry;
+use super::solver::TextSpacing;
 use super::sticky::StickyConstraint;
 use super::tree::FormattingNodeId;
 
@@ -143,6 +144,34 @@ pub struct TextFragmentData {
     /// from. The painter selects a face from exactly this value, which is what
     /// keeps a measure/draw mismatch from being possible.
     pub font: StoredFontRequest,
+    /// The CSS Text 3 §7 `letter-spacing` and `word-spacing` used values the
+    /// solver measured this run with.
+    ///
+    /// Painting and hit testing need the same numbers the line breaker used:
+    /// a run's fragment rect is already wide enough for the spacing, so a
+    /// painter that shapes the text without it would draw the last glyph short
+    /// of the box and a click near the end of a word would land past the text.
+    /// Carrying the used values on the fragment is what keeps those consumers
+    /// from re-reading (and possibly re-interpreting) the cascade.
+    pub spacing: TextSpacing,
+    /// Spacing before the run's first typographic character unit because the
+    /// run continues after a previous inline unit.
+    ///
+    /// CSS Text 3 §7.2 inserts tracking between adjacent units, half on each
+    /// side, so the gap at an inline boundary is the average of the two runs'
+    /// `letter-spacing`. Layout puts that gap at the start of the later run;
+    /// this is the used value it recorded, and it is zero at the start of a
+    /// line, where §7.2 excludes tracking.
+    pub leading_spacing: f32,
+    /// Spacing after the run's last typographic character unit that belongs to
+    /// the run box rather than to the next one.
+    ///
+    /// This is normally zero. UAX #9 L2 reverses the characters of an odd-level
+    /// run for the left-to-right painter, and that reversal moves the gap at
+    /// the logical start of the run to its visual end; `trailing_spacing` is
+    /// where the solver records that move so the painted glyphs and the run's
+    /// fragment rect still describe the same interval.
+    pub trailing_spacing: f32,
 }
 
 #[derive(Clone, Debug, PartialEq)]

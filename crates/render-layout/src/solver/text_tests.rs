@@ -26,6 +26,7 @@ use crate::solver::LayoutOptions;
 use crate::solver::LayoutOutput;
 use crate::solver::SimpleTextMeasurer;
 use crate::solver::TextMeasurer;
+use crate::solver::TextSpacing;
 use crate::solver::TextStyle;
 use crate::solver::layout_formatting_tree;
 use crate::tree::{FormattingLimits, build_formatting_tree};
@@ -176,6 +177,34 @@ fn an_em_text_indent_resolves_against_the_elements_own_font_size() {
 }
 
 #[test]
+fn text_indent_calc_uses_the_shared_length_resolver() {
+    // `calc()` is a single length expression even though it contains spaces;
+    // the property's keywords are removed before it is resolved.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><p id='p' style='font-size:10px'>aaa</p></body>",
+        &format!("{RESET} p {{ text-indent: calc(10px + 2em) }}"),
+        400.0,
+    );
+    let runs = text_runs(&layout);
+    assert_eq!(runs[0].1.origin.x, 30.0, "{runs:?}");
+    let _ = find(&output.dom, "#p");
+}
+
+#[test]
+fn a_rem_text_indent_resolves_against_the_root_font_size() {
+    // `em` follows the element's 40px font, but `rem` follows the root 16px
+    // font, so 2rem is 32 rather than 80.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><p id='p' style='font-size:40px'>aaa</p></body>",
+        &format!("{RESET} p {{ text-indent: 2rem }}"),
+        400.0,
+    );
+    let runs = text_runs(&layout);
+    assert_eq!(runs[0].1.origin.x, 32.0, "{runs:?}");
+    let _ = find(&output.dom, "#p");
+}
+
+#[test]
 fn only_the_first_childs_anonymous_block_is_indented() {
     // §8.1: "the first line of an anonymous block box is only affected if it
     // is the first child of its parent element". A container that already has
@@ -209,6 +238,21 @@ fn only_the_first_childs_anonymous_block_is_indented() {
 }
 
 #[test]
+fn text_indent_keywords_may_precede_the_length() {
+    // CSS Text 3 §8.1's `&&` does not prescribe an order between the length
+    // and `hanging`/`each-line`.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><p id='p'>aaa bbb ccc</p></body>",
+        &format!("{RESET} p {{ width: 60px; text-indent: hanging 20px }}"),
+        400.0,
+    );
+    let runs = text_runs(&layout);
+    assert_eq!(runs[0].1.origin.x, 0.0, "{runs:?}");
+    assert_eq!(runs[1].1.origin.x, 20.0, "{runs:?}");
+    let _ = find(&output.dom, "#p");
+}
+
+#[test]
 fn hanging_inverts_which_lines_the_indent_applies_to() {
     // §8.1 `hanging`: "Inverts which lines are affected", so the first line
     // hangs out into the margin and the body of the text is indented. In a
@@ -238,6 +282,22 @@ fn a_negative_text_indent_hangs_the_first_line_out() {
     assert_eq!(runs.len(), 2, "{runs:?}");
     assert_eq!(runs[0].1.origin.x, -20.0, "{runs:?}");
     assert_eq!(runs[0].1.size.width, 52.0, "{runs:?}");
+    assert_eq!(runs[1].1.origin.x, 0.0, "{runs:?}");
+    let _ = find(&output.dom, "#p");
+}
+
+#[test]
+fn a_forced_break_does_not_earn_a_text_indent_without_each_line() {
+    // CSS Text 3 §8.1: without `each-line`, only "the first formatted line"
+    // is indented, so the line after `<br>` starts at the content edge.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><p id='p'>aaa<br>bbb</p></body>",
+        &format!("{RESET} p {{ width: 200px; text-indent: 20px }}"),
+        400.0,
+    );
+    let runs = text_runs(&layout);
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert_eq!(runs[0].1.origin.x, 20.0, "{runs:?}");
     assert_eq!(runs[1].1.origin.x, 0.0, "{runs:?}");
     let _ = find(&output.dom, "#p");
 }
@@ -304,6 +364,94 @@ fn letter_spacing_widens_every_gap_and_nothing_else() {
         "four gaps of 4px"
     );
     let _ = (find(&output.dom, "#p"), find(&plain.dom, "#p"));
+}
+
+#[test]
+fn letter_spacing_uses_one_gap_fewer_than_the_character_count() {
+    // CSS Text 3 §7.2: "letter-spacing ... specifies additional spacing
+    // between adjacent typographic character units", and "it is not applied at
+    // the beginning or end of a line". Three characters therefore carry two
+    // gaps: 3 * 8 + 2 * 2 = 28, not 30.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><p id='p'>abc</p></body>",
+        &format!("{RESET} p {{ width: 200px; letter-spacing: 2px }}"),
+        400.0,
+    );
+    let runs = text_runs(&layout);
+    assert_eq!(runs[0].0, "abc");
+    assert_eq!(runs[0].1.size.width, 28.0, "{runs:?}");
+    let _ = find(&output.dom, "#p");
+}
+
+#[test]
+fn run_spacing_is_visible_to_paint_and_hit_testing() {
+    // Paint and hit testing no longer re-read the cascade; they consume the
+    // used values and the boundary gap layout recorded on the run. The gap
+    // before the second run is the average of its 2px tracking and the 6px
+    // tracking of the run before it, which is the same 4px the line breaking
+    // used.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><p id='p'>aa<span id='s'>bb</span>cc</p></body>",
+        &format!("{RESET} p {{ width: 200px; letter-spacing: 2px }} #s {{ letter-spacing: 6px }}"),
+        400.0,
+    );
+    let runs: Vec<_> = layout
+        .fragments
+        .iter()
+        .filter_map(|fragment| match &fragment.kind {
+            FragmentKind::Text(data) => {
+                Some((data.spacing, data.leading_spacing, data.trailing_spacing))
+            }
+            FragmentKind::Box(_) => None,
+        })
+        .collect();
+    assert_eq!(runs.len(), 3, "{runs:?}");
+    assert_eq!(
+        runs[0],
+        (
+            TextSpacing {
+                letter_spacing: 2.0,
+                word_spacing: 0.0,
+            },
+            0.0,
+            0.0,
+        )
+    );
+    assert_eq!(
+        runs[1],
+        (
+            TextSpacing {
+                letter_spacing: 6.0,
+                word_spacing: 0.0,
+            },
+            4.0,
+            0.0,
+        )
+    );
+    assert_eq!(
+        runs[2],
+        (
+            TextSpacing {
+                letter_spacing: 2.0,
+                word_spacing: 0.0,
+            },
+            4.0,
+            0.0,
+        )
+    );
+    let _ = find(&output.dom, "#p");
+}
+
+#[test]
+fn letter_spacing_across_inline_boundaries_reaches_the_intrinsic_width() {
+    // CSS Text 3 §1.5 ignores inline box boundaries, so the tracking gap
+    // between the two spans is part of the shrink-to-fit width: 8 + 2 + 8.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='d'><span>a</span><span>b</span></div></body>",
+        &format!("{RESET} #d {{ float: left; letter-spacing: 2px }}"),
+        400.0,
+    );
+    assert_eq!(box_rect(&layout, find(&output.dom, "#d")).size.width, 18.0);
 }
 
 #[test]
@@ -430,6 +578,46 @@ fn negative_letter_spacing_tightens_the_line() {
 }
 
 #[test]
+fn a_rem_letter_spacing_uses_the_root_font_size_not_the_elements_own() {
+    // Three 20px glyphs at font-size:40px plus two 1rem gaps of 16px.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><p id='p' style='font-size:40px'>abc</p></body>",
+        &format!("{RESET} p {{ letter-spacing: 1rem }}"),
+        400.0,
+    );
+    let runs = text_runs(&layout);
+    assert_eq!(runs[0].1.size.width, 92.0, "{runs:?}");
+    let _ = find(&output.dom, "#p");
+}
+
+#[test]
+fn letter_spacing_calc_uses_the_shared_length_resolver() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><p id='p'>abc</p></body>",
+        &format!("{RESET} p {{ letter-spacing: calc(1px + 1px) }}"),
+        400.0,
+    );
+    let runs = text_runs(&layout);
+    assert_eq!(runs[0].1.size.width, 28.0, "{runs:?}");
+    let _ = find(&output.dom, "#p");
+}
+
+#[test]
+fn letter_and_word_spacing_inherit_into_inline_text() {
+    // Both properties inherit (CSS Text 3 §7), so the span's text carries the
+    // div's 2px tracking and 6px word advance: 8 + 4 + 8 + 2 + 6 + 2 = 30.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='d'><span id='s'>a b</span></div></body>",
+        &format!("{RESET} #d {{ letter-spacing: 2px; word-spacing: 6px }}"),
+        400.0,
+    );
+    let runs = text_runs(&layout);
+    assert_eq!(runs[0].0, "a b");
+    assert_eq!(runs[0].1.size.width, 30.0, "{runs:?}");
+    let _ = (find(&output.dom, "#d"), find(&output.dom, "#s"));
+}
+
+#[test]
 fn letter_spacing_normal_computes_to_no_extra_spacing() {
     let (output, _, layout) = pipeline(
         "<!doctype html><body><p id='p'>abcde</p></body>",
@@ -480,6 +668,34 @@ fn word_spacing_adds_one_advance_per_separator() {
         26.0 + 18.0,
         "two separators"
     );
+}
+
+#[test]
+fn word_spacing_changes_where_a_line_breaks() {
+    // Without tracking "a b c" is 8 + 4 + 8 + 4 + 8 = 32 and fits a 40px
+    // line. With 10px word spacing each separator cell is 14, so the second
+    // one no longer fits and `c` moves to the next line.
+    let (plain, _, plain_layout) = pipeline(
+        "<!doctype html><body><p id='p'>a b c</p></body>",
+        &format!("{RESET} p {{ width: 40px }}"),
+        400.0,
+    );
+    let plain_runs = text_runs(&plain_layout);
+    assert_eq!(plain_runs.len(), 1, "{plain_runs:?}");
+    assert_eq!(plain_runs[0].1.size.width, 32.0, "{plain_runs:?}");
+
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><p id='p'>a b c</p></body>",
+        &format!("{RESET} p {{ width: 40px; word-spacing: 10px }}"),
+        400.0,
+    );
+    let runs = text_runs(&layout);
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert_eq!(runs[0].0, "a b");
+    assert_eq!(runs[0].1.size.width, 30.0, "{runs:?}");
+    assert_eq!(runs[1].0, "c");
+    assert_eq!(runs[1].1.origin.x, 0.0, "{runs:?}");
+    let _ = (find(&plain.dom, "#p"), find(&output.dom, "#p"));
 }
 
 #[test]

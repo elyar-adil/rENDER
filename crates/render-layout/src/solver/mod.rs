@@ -46,6 +46,8 @@ mod content_visibility_tests;
 #[cfg(test)]
 mod linebreak_tests;
 #[cfg(test)]
+mod rtl_layout_tests;
+#[cfg(test)]
 mod scrollport_tests;
 #[cfg(test)]
 mod sticky_tests;
@@ -120,6 +122,13 @@ impl TextSpacing {
     /// line, so a run of `n` units carries `n - 1` gaps. §7.1 adds one extra
     /// advance per word separator, on top of the tracking that separator
     /// already receives as a character unit in its own right.
+    ///
+    /// The engine's line breaker indexes text by Unicode scalar value and its
+    /// reference shaper emits one glyph per scalar, so that is the unit counted
+    /// here. A combining sequence or emoji ZWJ cluster therefore receives the
+    /// spacing of each of its scalars rather than one typographic character
+    /// unit's worth; grapheme segmentation is the remaining gap for those
+    /// scripts.
     #[must_use]
     pub fn extra_advance(&self, text: &str) -> f32 {
         let mut units = 0.0_f32;
@@ -425,6 +434,7 @@ fn run_reference_layout(
         sticky_boxes: Vec::new(),
         clipping_boxes: Vec::new(),
         fixed_positioning_containing: None,
+        initial_containing_rtl: false,
     };
     let viewport_rect = PhysicalRect::new(
         0.0,
@@ -450,14 +460,31 @@ fn run_reference_layout(
         .get(formatting.root())
         .map(|node| node.children.clone())
         .unwrap_or_default();
+    // CSS 2 §10.1: the initial containing block has the root element's
+    // direction. That decides the static position of a top-level absolutely
+    // positioned child and the over-constrained margin of a top-level box.
+    let viewport_rtl = root_children
+        .first()
+        .and_then(|child| formatting.get(*child))
+        .and_then(|node| node.style_source)
+        .and_then(|source| styles.get(&source))
+        .is_some_and(|style| resolve::is_rtl(Some(style)));
+    solver.initial_containing_rtl = viewport_rtl;
     let mut cursor_y = viewport_rect.origin.y;
     let mut children = Vec::new();
     for child in root_children {
         // The viewport is the root containing block: its height is definite,
         // so top-level percentage heights resolve against it (CSS 2 §10.5).
-        if let Some(result) =
-            solver.layout_block_like(child, viewport_rect, viewport_rect, cursor_y, 0, true)
-        {
+        if let Some(result) = solver.layout_block_like(
+            child,
+            viewport_rect,
+            viewport_rtl,
+            viewport_rect,
+            viewport_rtl,
+            cursor_y,
+            0,
+            true,
+        ) {
             cursor_y += result.outer_height;
             children.push(result.fragment);
         }
@@ -530,8 +557,12 @@ struct Solver<'a> {
     clipping_boxes: Vec<(FragmentId, Option<NodeId>)>,
     /// The padding box of the nearest ancestor that establishes a fixed
     /// positioning containing block (CSS Position 3 §2.1). `None` means the
-    /// viewport is the containing block.
-    fixed_positioning_containing: Option<PhysicalRect>,
+    /// viewport is the containing block. The flag is that containing block's
+    /// used `direction`.
+    fixed_positioning_containing: Option<(PhysicalRect, bool)>,
+    /// The initial containing block's direction, which is the root element's
+    /// used `direction` (CSS 2 §10.1).
+    initial_containing_rtl: bool,
 }
 
 /// The used border and padding of a box whose edges the table algorithm has
@@ -702,6 +733,10 @@ struct TextRun<'a> {
     y: f32,
     width: f32,
     typography: inline::InlineTextStyle<'a>,
+    /// CSS Text 3 §7 spacing before the run's first unit, recorded when the
+    /// run is opened. Interior spacing is derived from `typography.spacing`
+    /// when the run is painted, because it is the same for every character.
+    leading_spacing: f32,
     /// The atom's resolved embedding level; a run never mixes levels.
     bidi_level: u8,
     /// The line box this run belongs to, which is what `BidiInfo::reorder_visual`

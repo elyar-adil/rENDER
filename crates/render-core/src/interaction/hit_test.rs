@@ -15,7 +15,7 @@ use url::Url;
 use crate::dom::{Dom, DomRevision, Namespace, NodeId, NodeKind};
 use crate::layout::{
     FragmentId, FragmentKind, FragmentTree, PhysicalPoint, PhysicalRect, StoredFontRequest,
-    TextMeasurer, TextStyle,
+    TextMeasurer, TextStyle, is_word_separator,
 };
 use crate::paint::sticky::sticky_displacements;
 
@@ -565,22 +565,46 @@ impl<'a> InteractionScene<'a> {
             let source = &source_characters[&node];
             let cursor = source_cursors.entry(node).or_default();
             let mut characters = Vec::with_capacity(rendered_count);
-            for rendered in text_fragment.text.chars() {
+            for (index, rendered) in text_fragment.text.chars().enumerate() {
                 let Some((source_start, source_end)) =
                     match_rendered_character(source, cursor, rendered)
                 else {
                     continue;
                 };
+                // Every unit carries the CSS Text 3 §7 spacing that precedes
+                // it, exactly as the line breaker measured it. The first unit
+                // starts with the gap the run inherited from the inline unit
+                // before it, and an odd-level bidi run has already moved that
+                // gap to its visual end (see `TextFragmentData`).
+                let mut spacing = if index == 0 {
+                    text_fragment.leading_spacing
+                } else {
+                    text_fragment.spacing.letter_spacing
+                        + if is_word_separator(rendered) {
+                            text_fragment.spacing.word_spacing
+                        } else {
+                            0.0
+                        }
+                };
+                if index + 1 == rendered_count {
+                    spacing += text_fragment.trailing_spacing;
+                }
+                let base = measure_character(
+                    self.text_measurer,
+                    rendered,
+                    &text_fragment.font,
+                    text_fragment.font_size,
+                    fragment.rect.size.height,
+                );
+                let advance = (base + spacing).max(0.0);
                 characters.push(MappedCharacter {
                     dom_start: source_start,
                     dom_end: source_end,
-                    advance: measure_character(
-                        self.text_measurer,
-                        rendered,
-                        &text_fragment.font,
-                        text_fragment.font_size,
-                        fragment.rect.size.height,
-                    ),
+                    // A clamped character box carries only the spacing that
+                    // actually survived the clamp, so normalisation cannot
+                    // reintroduce a gap the line breaker discarded.
+                    spacing: advance - base,
+                    advance,
                 });
             }
             normalize_advances(&mut characters, fragment.rect.size.width);
@@ -824,6 +848,11 @@ struct MappedCharacter {
     dom_start: usize,
     dom_end: usize,
     advance: f32,
+    /// The part of `advance` that is CSS Text 3 §7 spacing rather than glyph
+    /// advance. [`normalize_advances`] rescales only the glyph part, so a
+    /// measurer that disagrees with the shape of the painted glyphs cannot
+    /// move the spacing the line breaker used.
+    spacing: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -930,18 +959,24 @@ fn measure_character(
 }
 
 fn normalize_advances(characters: &mut [MappedCharacter], fragment_width: f32) {
-    let measured_width: f32 = characters.iter().map(|character| character.advance).sum();
     let fragment_width = finite_non_negative(fragment_width);
-    if measured_width > 0.0 {
-        let scale = fragment_width / measured_width;
+    let spacing: f32 = characters.iter().map(|character| character.spacing).sum();
+    let measured_base: f32 = characters
+        .iter()
+        .map(|character| (character.advance - character.spacing).max(0.0))
+        .sum();
+    let target_base = (fragment_width - spacing).max(0.0);
+    if measured_base > 0.0 {
+        let scale = target_base / measured_base;
         for character in characters {
-            character.advance *= scale;
+            let base = (character.advance - character.spacing).max(0.0);
+            character.advance = (base * scale + character.spacing).max(0.0);
         }
     } else if !characters.is_empty() {
         #[allow(clippy::cast_precision_loss)]
-        let equal_advance = fragment_width / characters.len() as f32;
+        let equal_base = target_base / characters.len() as f32;
         for character in characters {
-            character.advance = equal_advance;
+            character.advance = (equal_base + character.spacing).max(0.0);
         }
     }
 }
@@ -1362,6 +1397,98 @@ mod tests {
             (map.rect.size.width - cell * 4.0).abs() < 1e-3,
             "and the fragment is four cells wide, not four proportional advances"
         );
+    }
+
+    #[test]
+    fn letter_and_word_spacing_align_caret_boundaries_with_the_painted_glyphs() {
+        for (body, id, css, painted, cells) in [
+            (
+                "<p id='c'>abcd</p>",
+                "c",
+                "#c { letter-spacing: 4px }",
+                vec![0.0_f32, 12.0, 24.0, 36.0],
+                vec![8.0_f32, 12.0, 12.0, 12.0],
+            ),
+            (
+                "<p id='p'>a b</p>",
+                "p",
+                "#p { word-spacing: 10px }",
+                vec![0.0, 18.0, 22.0],
+                vec![8.0, 14.0, 8.0],
+            ),
+        ] {
+            let (document, output) = render(
+                &format!(
+                    "<!doctype html><style>html, body, p {{ display:block; margin:0 }} \
+                     {css}</style><body>{body}</body>"
+                ),
+                PhysicalSize {
+                    width: 320.0,
+                    height: 100.0,
+                },
+            );
+            let text = first_text(document.dom(), find_by_id(document.dom(), id));
+            let scene = InteractionScene::new(
+                document.dom(),
+                &output.layout.fragments,
+                &SimpleTextMeasurer,
+                PhysicalPoint::default(),
+                InteractionLimits::default(),
+            )
+            .unwrap();
+            let order = scene.paint_order().unwrap();
+            let maps = scene.text_maps(&order).unwrap();
+            let map = maps.iter().find(|map| map.node == text).unwrap();
+            let runs: Vec<_> = output
+                .display
+                .list
+                .items()
+                .iter()
+                .filter_map(|item| match &item.command {
+                    crate::paint::DisplayCommand::GlyphRun(run) => Some(run),
+                    _ => None,
+                })
+                .collect();
+            let run = runs
+                .iter()
+                .find(|run| run.glyphs.len() == painted.len())
+                .unwrap_or_else(|| panic!("no run for {css}: {runs:?}"));
+            let origins: Vec<f32> = run.glyphs.iter().map(|glyph| glyph.position.x).collect();
+            assert_eq!(origins, painted, "{css}");
+            let advances: Vec<f32> = map
+                .characters
+                .iter()
+                .map(|character| character.advance)
+                .collect();
+            assert_eq!(
+                advances, cells,
+                "{css}: hit testing must use the same spaced character boxes as layout"
+            );
+            for (index, glyph) in run.glyphs.iter().enumerate() {
+                // A word separator's box begins before its painted origin
+                // because §7.1 puts the word advance on the separator itself;
+                // the glyph therefore starts part-way through its own box. The
+                // caret has no ink to align with, so a click on that origin is
+                // after the separator, exactly as the character box says.
+                let expected = if char::from_u32(glyph.glyph.0).is_some_and(char::is_whitespace) {
+                    index + 1
+                } else {
+                    index
+                };
+                assert_eq!(
+                    map.caret_at(glyph.position.x),
+                    BoundaryPoint::new(text, expected),
+                    "{css}: glyph {index} starts at {}",
+                    glyph.position.x
+                );
+            }
+            let last = run.glyphs.last().expect("run has glyphs");
+            assert_eq!(
+                last.position.x + last.advance,
+                map.rect.right(),
+                "{css}: painted run must end at its fragment rect"
+            );
+        }
     }
 
     #[test]

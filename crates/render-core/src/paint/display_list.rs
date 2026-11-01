@@ -15,7 +15,8 @@ use crate::image::ImageResources;
 use crate::image::svg::parse_css_path_contours;
 use crate::layout::{
     EdgeSizes, FontRequest, FormattingNodeId, FormattingTree, Fragment, FragmentId, FragmentKind,
-    FragmentTree, PhysicalPoint, PhysicalRect, PhysicalSize, StickyConstraint, nominal_face,
+    FragmentTree, PhysicalPoint, PhysicalRect, PhysicalSize, StickyConstraint, TextSpacing,
+    is_word_separator, nominal_face,
 };
 
 use super::color::{Color, SystemPalette};
@@ -691,6 +692,79 @@ pub trait TextShaper: Sync {
         color: Color,
     ) -> GlyphRun {
         self.shape(text, font_size, origin, color)
+    }
+
+    /// Shape `text` with the CSS Text 3 §7 spacing the solver measured it with.
+    ///
+    /// `spacing` is the run's used `letter-spacing`/`word-spacing` and
+    /// `leading_spacing` is the tracking the run inherited from the unit before
+    /// it (zero at the start of a line). The default body shapes the run as
+    /// usual and then moves each glyph by the spacing that precedes it, which
+    /// is exact for every shaper whose glyphs are one per typographic character
+    /// unit - the contract every backend in this engine implements. A backend
+    /// that shapes clusters can override this and fold the spacing into its
+    /// shaping pass instead.
+    ///
+    /// The advances are left as the face's own advances and the tracking is
+    /// expressed in the distance between successive glyph positions, which is
+    /// the geometry the rasterizer places each mask with. The run's fragment
+    /// rect is already wide enough for those gaps, so the painted run ends
+    /// exactly at the rect's end.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the signature mirrors `shape_font` plus the two CSS Text 3 §7 \
+                  used values, and a wrapper struct would make the default body \
+                  harder to read at every call site"
+    )]
+    fn shape_spaced(
+        &self,
+        text: &str,
+        font: &FontRequest<'_>,
+        font_size: f32,
+        origin: PhysicalPoint,
+        color: Color,
+        spacing: TextSpacing,
+        leading_spacing: f32,
+    ) -> GlyphRun {
+        let mut run = self.shape_font(text, font, font_size, origin, color);
+        apply_run_spacing(&mut run, text, spacing, leading_spacing);
+        run
+    }
+}
+
+/// Move every glyph in `run` by the CSS Text 3 §7 spacing that precedes it.
+///
+/// Layout assigns each typographic character unit a box whose width is the
+/// glyph's advance plus the spacing before that unit. The glyph sits at the end
+/// of its box's leading gap, so glyph `i` moves by the sum of the gaps before
+/// units `0..=i`. That places the last glyph's advance exactly at the end of
+/// the measured run: no tracking is inserted after the final unit of a line
+/// (§7.2), and the run rect was measured with the same rule.
+///
+/// Word spacing belongs to the separator unit that follows a word (§7.1), so
+/// it is part of the gap before that separator, exactly where the layout's
+/// per-unit measurement put it.
+fn apply_run_spacing(run: &mut GlyphRun, text: &str, spacing: TextSpacing, leading_spacing: f32) {
+    let mut characters = text.chars().peekable();
+    let mut shift = leading_spacing;
+    for glyph in &mut run.glyphs {
+        glyph.position.x += shift;
+        // The gap before the *next* glyph is determined by the next character:
+        // tracking before every unit after the first, plus word spacing when
+        // that unit is a word separator. Gaps accumulate because the shaper's
+        // own positions are a running sum of glyph advances.
+        characters.next();
+        shift += match characters.peek() {
+            Some(character) => {
+                spacing.letter_spacing
+                    + if is_word_separator(*character) {
+                        spacing.word_spacing
+                    } else {
+                        0.0
+                    }
+            }
+            None => 0.0,
+        };
     }
 }
 
@@ -1592,7 +1666,7 @@ impl<'a> Builder<'a> {
         coordinate_space: PaintCoordinateSpace,
     ) {
         let palette = self.palette_for(style);
-        let run = self.shaper.shape_font(
+        let run = self.shaper.shape_spaced(
             &text.text,
             &text.font.request(),
             text.font_size,
@@ -1601,6 +1675,8 @@ impl<'a> Builder<'a> {
                 y: text.baseline,
             },
             current_color,
+            text.spacing,
+            text.leading_spacing,
         );
         self.glyphs = self.glyphs.saturating_add(run.glyphs.len());
         if self.glyphs > self.options.limits.max_glyphs {
@@ -6367,6 +6443,113 @@ mod tests {
             .map(run_text)
             .filter(|text| text.ends_with('.'))
             .collect()
+    }
+
+    #[test]
+    fn letter_spacing_moves_each_glyph_origin_not_just_the_run_width() {
+        let (_, display) = paint_body(
+            "<p id=t>abcde</p>",
+            "html, body, p { display:block; margin:0 } \
+             #t { letter-spacing:4px }",
+        );
+        let runs = text_runs(&display);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(run_text(&runs[0]), "abcde");
+        let positions: Vec<f32> = runs[0]
+            .glyphs
+            .iter()
+            .map(|glyph| glyph.position.x)
+            .collect();
+        // Each 8px glyph starts after the tracking of the units before it:
+        // 0, 8+4, 16+8, 24+12, 32+16. No tracking follows the last glyph.
+        assert_eq!(positions, [0.0, 12.0, 24.0, 36.0, 48.0]);
+        assert!(
+            runs[0]
+                .glyphs
+                .iter()
+                .all(|glyph| (glyph.advance - 8.0).abs() < 1e-4),
+            "the tracking belongs to the gaps, not to the glyph advances: {:?}",
+            runs[0].glyphs
+        );
+        let last = runs[0].glyphs.last().expect("run has glyphs");
+        assert_eq!(last.position.x + last.advance, 56.0);
+    }
+
+    #[test]
+    fn negative_letter_spacing_moves_glyphs_left_and_keeps_the_run_end_exact() {
+        let (_, display) = paint_body(
+            "<p id=t>abc</p>",
+            "html, body, p { display:block; margin:0 } \
+             #t { letter-spacing:-3px }",
+        );
+        let runs = text_runs(&display);
+        let positions: Vec<f32> = runs[0]
+            .glyphs
+            .iter()
+            .map(|glyph| glyph.position.x)
+            .collect();
+        assert_eq!(positions, [0.0, 5.0, 10.0]);
+        let last = runs[0].glyphs.last().expect("run has glyphs");
+        assert_eq!(last.position.x + last.advance, 18.0);
+    }
+
+    #[test]
+    fn tracking_at_an_inline_boundary_moves_the_following_runs_first_glyph() {
+        let (_, display) = paint_body(
+            "<p id=t>aa<span id=s>bb</span>cc</p>",
+            "html, body, p { display:block; margin:0 } span { display:inline } \
+             #t { letter-spacing:2px } #s { letter-spacing:6px }",
+        );
+        let runs = text_runs(&display);
+        assert_eq!(runs.len(), 3, "{runs:?}");
+        let starts: Vec<f32> = runs.iter().map(|run| run.glyphs[0].position.x).collect();
+        // The 4px boundary gap is the average of 2px and 6px, and layout puts
+        // it at the start of the run that follows the boundary.
+        assert_eq!(starts, [0.0, 22.0, 48.0]);
+        let ends: Vec<f32> = runs
+            .iter()
+            .map(|run| {
+                let last = run.glyphs.last().expect("run has glyphs");
+                last.position.x + last.advance
+            })
+            .collect();
+        assert_eq!(ends, [18.0, 44.0, 66.0]);
+    }
+
+    #[test]
+    fn word_spacing_moves_the_separator_and_the_word_after_it() {
+        let (_, display) = paint_body(
+            "<p id=t>a b</p>",
+            "html, body, p { display:block; margin:0 } \
+             #t { word-spacing:10px }",
+        );
+        let runs = text_runs(&display);
+        let positions: Vec<f32> = runs[0]
+            .glyphs
+            .iter()
+            .map(|glyph| glyph.position.x)
+            .collect();
+        // `a` is 8 wide, the separator is 4 + 10, and `b` follows at 22. The
+        // 10px sits in the gap before the separator, exactly where layout put
+        // it when it measured the separator's box.
+        assert_eq!(positions, [0.0, 18.0, 22.0]);
+        let last = runs[0].glyphs.last().expect("run has glyphs");
+        assert_eq!(last.position.x + last.advance, 30.0);
+    }
+
+    #[test]
+    fn text_indent_reaches_the_glyph_origins_of_the_first_line_only() {
+        let (_, display) = paint_body(
+            "<p id=t>aaa bbb ccc</p>",
+            "html, body, p { display:block; margin:0 } \
+             #t { width:100px; text-indent:40px }",
+        );
+        let runs = text_runs(&display);
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        assert_eq!(run_text(&runs[0]), "aaa bbb");
+        assert_eq!(runs[0].glyphs[0].position.x, 40.0, "{runs:?}");
+        assert_eq!(run_text(&runs[1]), "ccc");
+        assert_eq!(runs[1].glyphs[0].position.x, 0.0, "{runs:?}");
     }
 
     #[test]

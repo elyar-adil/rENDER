@@ -7,6 +7,7 @@ use crate::solver::Solver;
 use crate::solver::inline::align_offset;
 use crate::solver::inline::justify_offsets;
 use crate::solver::resolve::count_as_f32;
+use crate::solver::resolve::is_rtl;
 use crate::solver::resolve::length_depends_on_percentage;
 use crate::tree::FormattingContextKind;
 use crate::tree::FormattingNodeId;
@@ -32,6 +33,7 @@ impl Solver<'_> {
         children: &[FormattingNodeId],
         containing: PhysicalRect,
         positioning_containing: PhysicalRect,
+        positioning_containing_rtl: bool,
         specified_height: Option<f32>,
         depth: usize,
         container_style: Option<&ComputedStyle>,
@@ -53,6 +55,7 @@ impl Solver<'_> {
                 children,
                 containing,
                 positioning_containing,
+                positioning_containing_rtl,
                 specified_height,
                 depth,
                 container_style,
@@ -72,6 +75,7 @@ impl Solver<'_> {
                 children,
                 containing,
                 positioning_containing,
+                positioning_containing_rtl,
                 height,
                 depth,
                 container_style,
@@ -83,6 +87,7 @@ impl Solver<'_> {
             children,
             containing,
             positioning_containing,
+            positioning_containing_rtl,
             specified_height,
             depth,
             container_style,
@@ -96,6 +101,7 @@ impl Solver<'_> {
         children: &[FormattingNodeId],
         containing: PhysicalRect,
         positioning_containing: PhysicalRect,
+        positioning_containing_rtl: bool,
         specified_height: Option<f32>,
         depth: usize,
         container_style: Option<&ComputedStyle>,
@@ -171,6 +177,7 @@ impl Solver<'_> {
                 line,
                 containing,
                 positioning_containing,
+                positioning_containing_rtl,
                 None,
                 depth,
                 container_style,
@@ -236,6 +243,7 @@ impl Solver<'_> {
         children: &[FormattingNodeId],
         containing: PhysicalRect,
         positioning_containing: PhysicalRect,
+        positioning_containing_rtl: bool,
         specified_height: f32,
         depth: usize,
         container_style: Option<&ComputedStyle>,
@@ -335,6 +343,7 @@ impl Solver<'_> {
                 &column,
                 PhysicalRect::new(x, containing.origin.y, width, specified_height),
                 positioning_containing,
+                positioning_containing_rtl,
                 Some(specified_height),
                 depth,
                 container_style,
@@ -372,6 +381,7 @@ impl Solver<'_> {
         children: &[FormattingNodeId],
         containing: PhysicalRect,
         positioning_containing: PhysicalRect,
+        positioning_containing_rtl: bool,
         specified_height: Option<f32>,
         depth: usize,
         container_style: Option<&ComputedStyle>,
@@ -381,6 +391,7 @@ impl Solver<'_> {
             Some(TypedPropertyValue::FlexDirection(value)) => *value,
             _ => FlexDirection::Row,
         };
+        let container_rtl = is_rtl(container_style);
         let horizontal = matches!(direction, FlexDirection::Row | FlexDirection::RowReverse);
         let reverse = matches!(
             direction,
@@ -572,7 +583,9 @@ impl Solver<'_> {
                             outer_width,
                             specified_height.unwrap_or(0.0),
                         ),
+                        container_rtl,
                         positioning_containing,
+                        positioning_containing_rtl,
                         containing.origin.y,
                         depth,
                         Some(forced_content_width),
@@ -593,7 +606,9 @@ impl Solver<'_> {
                         outer_width,
                         specified_height.unwrap_or(0.0),
                     ),
+                    container_rtl,
                     positioning_containing,
+                    positioning_containing_rtl,
                     containing.origin.y,
                     depth,
                 ),

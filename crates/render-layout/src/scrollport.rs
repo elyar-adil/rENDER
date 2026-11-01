@@ -17,6 +17,15 @@
 //! and paint scheduling (the shell), the same split sticky positioning makes:
 //! layout produces the rectangle and the range, and the consumer supplies the
 //! offset and translates the content by it.
+//!
+//! The range itself is a physical, end-direction extent from the clip's
+//! top-left origin, so it models LTR scrolling only. CSS Overflow 3 puts an RTL
+//! scrollport's initial scroll position at its inline-start (right) edge and
+//! measures offsets from there; representing that needs a direction/origin on
+//! this value *and* the shell's scroll-offset convention to change together.
+//! Until that consumer-side convention is defined, layout reports the physical
+//! reachable extent and does not claim RTL scroll-origin mirroring. That is the
+//! remaining RTL sub-case for overflow, kept explicit rather than approximated.
 
 use crate::geometry::{PhysicalPoint, PhysicalRect, PhysicalSize};
 
@@ -42,9 +51,10 @@ pub struct ScrollportGeometry {
     /// origin. Never smaller than the clip itself, so a box with nothing to
     /// scroll has a zero range.
     ///
-    /// Only the end direction is reachable: content above or to the left of the
-    /// padding box is clipped away and cannot be scrolled to, which is why this
-    /// is an extent from the origin rather than a rectangle.
+    /// Only the physical end direction is reachable in this model: content
+    /// above or to the left of the padding box is clipped away and cannot be
+    /// scrolled to, which is why this is an extent from the origin rather than
+    /// a rectangle. See the module comment for the unmodelled RTL start edge.
     pub scrollable: PhysicalSize,
 }
 

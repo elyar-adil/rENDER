@@ -13,6 +13,7 @@ use crate::solver::LayoutDiagnostic;
 use crate::solver::LayoutDiagnosticCode;
 use crate::solver::Solver;
 use crate::solver::resolve::count_as_f32;
+use crate::solver::resolve::is_rtl;
 use crate::solver::resolve::length_depends_on_percentage;
 use crate::tree::FormattingNodeId;
 use crate::tree::FormattingNodeKind;
@@ -42,11 +43,13 @@ impl Solver<'_> {
         children: &[FormattingNodeId],
         containing: PhysicalRect,
         positioning_containing: PhysicalRect,
+        positioning_containing_rtl: bool,
         specified_height: Option<f32>,
         depth: usize,
         container_style: Option<&ComputedStyle>,
         container_source: Option<NodeId>,
     ) -> (Vec<FragmentId>, f32) {
+        let container_rtl = is_rtl(container_style);
         let column_gap = self.resolve_gap(
             container_style,
             "column-gap",
@@ -229,7 +232,9 @@ impl Solver<'_> {
                             track_width,
                             specified_height.unwrap_or(0.0),
                         ),
+                        container_rtl,
                         positioning_containing,
+                        positioning_containing_rtl,
                         containing.origin.y,
                         depth,
                         Some(forced_content_width),
@@ -250,7 +255,9 @@ impl Solver<'_> {
                         track_width,
                         specified_height.unwrap_or(0.0),
                     ),
+                    container_rtl,
                     positioning_containing,
+                    positioning_containing_rtl,
                     containing.origin.y,
                     depth,
                 ),

@@ -13,7 +13,7 @@ use crate::solver::MarginStrut;
 use crate::solver::Solver;
 use crate::solver::columns::ColumnFlow;
 use crate::solver::inline::InlineTextContextSource;
-use crate::solver::resolve::position;
+use crate::solver::resolve::{is_rtl, position};
 use crate::tree::FormattingContextKind;
 use crate::tree::FormattingNodeId;
 use crate::tree::FormattingNodeKind;
@@ -238,11 +238,17 @@ pub(super) fn float_line_band(
 }
 
 impl Solver<'_> {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "containing-block rectangles and their directions are independent geometry inputs"
+    )]
     pub(super) fn layout_block_like(
         &mut self,
         node_id: FormattingNodeId,
         containing: PhysicalRect,
+        containing_rtl: bool,
         positioning_containing: PhysicalRect,
+        positioning_containing_rtl: bool,
         margin_box_y: f32,
         depth: usize,
         containing_height_definite: bool,
@@ -262,7 +268,9 @@ impl Solver<'_> {
             | FormattingNodeKind::Text(_) => self.layout_anonymous_block(
                 node_id,
                 containing,
+                containing_rtl,
                 positioning_containing,
+                positioning_containing_rtl,
                 margin_box_y,
                 depth,
             ),
@@ -285,7 +293,9 @@ impl Solver<'_> {
                 self.layout_block_with_containing_height(
                     node_id,
                     containing,
+                    containing_rtl,
                     positioning_containing,
+                    positioning_containing_rtl,
                     margin_box_y,
                     depth,
                     None,
@@ -296,7 +306,9 @@ impl Solver<'_> {
             FormattingNodeKind::AtomicInline { .. } => self.layout_block_with_containing_height(
                 node_id,
                 containing,
+                containing_rtl,
                 positioning_containing,
+                positioning_containing_rtl,
                 margin_box_y,
                 depth,
                 None,
@@ -312,11 +324,17 @@ impl Solver<'_> {
     /// heights take the CSS 2 §10.5 conservative default: an auto-height
     /// inline formatting context is indefinite, so the height computes to
     /// `auto`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the inline solver passes the full containing and positioning geometry through"
+    )]
     pub(super) fn layout_block(
         &mut self,
         node_id: FormattingNodeId,
         containing: PhysicalRect,
+        containing_rtl: bool,
         positioning_containing: PhysicalRect,
+        positioning_containing_rtl: bool,
         margin_box_y: f32,
         depth: usize,
         forced_content_width: Option<f32>,
@@ -324,7 +342,9 @@ impl Solver<'_> {
         self.layout_block_with_containing_height(
             node_id,
             containing,
+            containing_rtl,
             positioning_containing,
+            positioning_containing_rtl,
             margin_box_y,
             depth,
             forced_content_width,
@@ -335,12 +355,19 @@ impl Solver<'_> {
 
     // Keep the CSS block constraint algorithm in specification order so each
     // sizing and auto-margin step remains directly auditable against CSS 2.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::fn_params_excessive_bools,
+        reason = "the bools are independent direction, height-definiteness and margin-collapsing inputs"
+    )]
     pub(super) fn layout_block_with_containing_height(
         &mut self,
         node_id: FormattingNodeId,
         containing: PhysicalRect,
+        containing_rtl: bool,
         positioning_containing: PhysicalRect,
+        positioning_containing_rtl: bool,
         margin_box_y: f32,
         depth: usize,
         forced_content_width: Option<f32>,
@@ -364,6 +391,10 @@ impl Solver<'_> {
         }
         let position = position(style);
         let out_of_flow = matches!(position, Position::Absolute | Position::Fixed);
+        // CSS Writing Modes 3 §2.1: `direction` is inherited and is the
+        // inline-axis start edge of this box's own contents. It also becomes
+        // the containing-block direction of every child laid out inside it.
+        let self_rtl = is_rtl(style);
         // CSS Containment 2 §3.3/§3.5: layout and paint containment each make
         // the principal box a containing block for absolutely and fixed
         // positioned descendants. `container-type` only establishes an
@@ -372,20 +403,27 @@ impl Solver<'_> {
         let positioning_contained = establishes_positioning_containing_block(style);
         let establishes_fixed_containing = establishes_fixed_positioning_containing_block(style);
         let saved_fixed_containing = self.fixed_positioning_containing;
-        let (containing, containing_height_definite) = match position {
-            Position::Fixed => (
-                self.fixed_positioning_containing.unwrap_or_else(|| {
-                    PhysicalRect::new(
-                        0.0,
-                        0.0,
-                        self.options.viewport.width,
-                        self.options.viewport.height,
+        let (containing, containing_rtl, containing_height_definite) = match position {
+            // A fixed box resolves against the nearest transform/containment
+            // ancestor's padding box, or the initial containing block. The
+            // latter takes the root element's direction (CSS 2 §10.1).
+            Position::Fixed => self.fixed_positioning_containing.map_or_else(
+                || {
+                    (
+                        PhysicalRect::new(
+                            0.0,
+                            0.0,
+                            self.options.viewport.width,
+                            self.options.viewport.height,
+                        ),
+                        self.initial_containing_rtl,
+                        true,
                     )
-                }),
-                true,
+                },
+                |(rect, rtl)| (rect, rtl, true),
             ),
-            Position::Absolute => (positioning_containing, true),
-            _ => (containing, containing_height_definite),
+            Position::Absolute => (positioning_containing, positioning_containing_rtl, true),
+            _ => (containing, containing_rtl, containing_height_definite),
         };
         let margin_box_y = if out_of_flow {
             containing.origin.y
@@ -533,11 +571,17 @@ impl Solver<'_> {
                     margin_left.value = remaining / 2.0;
                     margin_right.value = remaining / 2.0;
                 }
-                // Equal auto margins would go negative, so the left margin
-                // (ltr) is zeroed and the right margin solves the equation.
+                // Equal auto margins would go negative. CSS 2 §10.3.7 makes
+                // the start margin zero and solves the end margin; the start
+                // margin is the left one in LTR and the right one in RTL.
                 (true, true) => {
-                    margin_left.value = 0.0;
-                    margin_right.value = remaining;
+                    if containing_rtl {
+                        margin_right.value = 0.0;
+                        margin_left.value = remaining;
+                    } else {
+                        margin_left.value = 0.0;
+                        margin_right.value = remaining;
+                    }
                 }
                 (true, false) => margin_left.value = remaining,
                 (false, true) => margin_right.value = remaining,
@@ -556,13 +600,27 @@ impl Solver<'_> {
                 }
                 (true, false) if remaining > 0.0 => margin_left.value = remaining,
                 (false, true) if remaining > 0.0 => margin_right.value = remaining,
-                // §10.3.7 only solves the equation by adjusting a margin when the
-                // values are over-constrained. With no auto margin and space
-                // left over, the box sits at its start margin and the rest of
-                // the containing block stays empty, so the used margin is the
-                // specified one.
-                _ if remaining < 0.0 => margin_right.value += remaining,
-                _ => {}
+                _ => {
+                    // CSS 2.1 §10.3.3: when the box is over-constrained, the
+                    // ignored margin is the one on the direction-selected
+                    // side: `margin-right` in LTR and `margin-left` in RTL.
+                    // Positive free space in LTR is deliberately left as
+                    // empty space at the end, which is the reference solver's
+                    // established geometry; RTL has to move the box to the
+                    // right edge, so its used start margin absorbs the same
+                    // remainder even when positive.
+                    if margin_left.auto {
+                        margin_left.value = 0.0;
+                    }
+                    if margin_right.auto {
+                        margin_right.value = 0.0;
+                    }
+                    if containing_rtl {
+                        margin_left.value += remaining;
+                    } else if remaining < 0.0 {
+                        margin_right.value += remaining;
+                    }
+                }
             }
         }
 
@@ -646,16 +704,29 @@ impl Solver<'_> {
         // positioning containing block before recursing. The height is
         // updated once the used content height is known.
         if establishes_fixed_containing {
-            self.fixed_positioning_containing = Some(PhysicalRect::new(
-                content_x - padding.left,
-                content_y - padding.top,
-                content_width + padding.horizontal(),
-                child_containing_height + padding.vertical(),
+            self.fixed_positioning_containing = Some((
+                PhysicalRect::new(
+                    content_x - padding.left,
+                    content_y - padding.top,
+                    content_width + padding.horizontal(),
+                    child_containing_height + padding.vertical(),
+                ),
+                self_rtl,
             ));
         }
         let relative_offset = if position == Position::Relative {
+            // CSS 2 §9.4.3: with both insets specified, `direction` decides
+            // which one is ignored. In RTL the right inset wins and the left
+            // one is the negative of it.
             let horizontal = match (left, right) {
-                (Some(left), _) => left,
+                (Some(left), Some(right)) => {
+                    if self_rtl {
+                        -right
+                    } else {
+                        left
+                    }
+                }
+                (Some(left), None) => left,
                 (None, Some(right)) => -right,
                 (None, None) => 0.0,
             };
@@ -704,6 +775,12 @@ impl Solver<'_> {
                 specified_content_height.unwrap_or(0.0) + padding.vertical(),
             )
         };
+        let positioned_child_containing_rtl =
+            if position == Position::Static && !positioning_contained {
+                positioning_containing_rtl
+            } else {
+                self_rtl
+            };
         let content_hidden = content_visibility_hidden(style);
         let (flow_children, positioned_children): (Vec<_>, Vec<_>) = if content_hidden {
             // CSS Containment 2 §4.1: `content-visibility: hidden` skips the
@@ -757,6 +834,7 @@ impl Solver<'_> {
                         flex_height.unwrap_or(0.0),
                     ),
                     positioned_child_containing,
+                    positioned_child_containing_rtl,
                     flex_height,
                     depth.saturating_add(1),
                     style,
@@ -767,6 +845,7 @@ impl Solver<'_> {
                 &flow_children,
                 PhysicalRect::new(content_x, content_y, content_width, 0.0),
                 positioned_child_containing,
+                positioned_child_containing_rtl,
                 specified_content_height,
                 depth.saturating_add(1),
                 style,
@@ -778,6 +857,7 @@ impl Solver<'_> {
                 &flow_children,
                 PhysicalRect::new(content_x, content_y, content_width, 0.0),
                 positioned_child_containing,
+                positioned_child_containing_rtl,
                 specified_content_height,
                 depth.saturating_add(1),
             ),
@@ -868,7 +948,9 @@ impl Solver<'_> {
                                     child_width,
                                     child_containing_height,
                                 ),
+                                self_rtl,
                                 positioned_child_containing,
+                                positioned_child_containing_rtl,
                                 cursor_y,
                                 depth.saturating_add(1),
                                 &floats,
@@ -884,7 +966,9 @@ impl Solver<'_> {
                                     (band.1 - band.0).max(0.0),
                                     child_containing_height,
                                 ),
+                                self_rtl,
                                 positioned_child_containing,
+                                positioned_child_containing_rtl,
                                 cursor_y,
                                 depth.saturating_add(1),
                                 child_containing_height_definite,
@@ -937,7 +1021,9 @@ impl Solver<'_> {
                                 child_width,
                                 child_containing_height,
                             ),
+                            self_rtl,
                             positioned_child_containing,
+                            positioned_child_containing_rtl,
                             cursor_y,
                             &floats,
                             depth.saturating_add(1),
@@ -1110,11 +1196,14 @@ impl Solver<'_> {
         if establishes_fixed_containing {
             // Now that the used content height is known, expose the final
             // padding box to positioned children and descendants.
-            self.fixed_positioning_containing = Some(PhysicalRect::new(
-                content_x - padding.left,
-                content_y - padding.top,
-                content_width + padding.horizontal(),
-                content_height + padding.vertical(),
+            self.fixed_positioning_containing = Some((
+                PhysicalRect::new(
+                    content_x - padding.left,
+                    content_y - padding.top,
+                    content_width + padding.horizontal(),
+                    content_height + padding.vertical(),
+                ),
+                self_rtl,
             ));
         }
         let positioned_child_containing = if position == Position::Static && !positioning_contained
@@ -1160,7 +1249,9 @@ impl Solver<'_> {
             if let Some(result) = self.layout_block_like(
                 child,
                 PhysicalRect::new(content_x, content_y, content_width, content_height),
+                self_rtl,
                 positioned_child_containing,
+                positioned_child_containing_rtl,
                 content_y,
                 depth.saturating_add(1),
                 // Positioned children resolve against used heights: the
@@ -1198,14 +1289,29 @@ impl Solver<'_> {
             self.clipping_boxes.push((fragment, node.source));
         }
         if out_of_flow && let Some(outer) = self.fragment_outer_rect(fragment) {
-            let target_x = left.map_or_else(
-                || {
-                    right.map_or(outer.origin.x, |right| {
+            // CSS 2 §10.3.7: a definite left/right pair is over-constrained,
+            // so the direction-selected inset is the one that wins - `left`
+            // in LTR and `right` in RTL. With neither inset specified the
+            // static position is on the start edge of the static-position
+            // containing block, which is its right edge under RTL.
+            let target_x = match (left, right) {
+                (Some(left), Some(right)) => {
+                    if containing_rtl {
                         containing.right() - right - outer.size.width
-                    })
-                },
-                |left| containing.origin.x + left,
-            );
+                    } else {
+                        containing.origin.x + left
+                    }
+                }
+                (Some(left), None) => containing.origin.x + left,
+                (None, Some(right)) => containing.right() - right - outer.size.width,
+                (None, None) => {
+                    if containing_rtl {
+                        containing.right() - outer.size.width
+                    } else {
+                        outer.origin.x
+                    }
+                }
+            };
             let target_y = top.map_or_else(
                 || {
                     bottom.map_or(outer.origin.y, |bottom| {
@@ -1239,29 +1345,43 @@ impl Solver<'_> {
         })
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "anonymous boxes need both containing-block rectangles and their directions"
+    )]
     pub(super) fn layout_anonymous_block(
         &mut self,
         node_id: FormattingNodeId,
         containing: PhysicalRect,
+        containing_rtl: bool,
         positioning_containing: PhysicalRect,
+        positioning_containing_rtl: bool,
         y: f32,
         depth: usize,
     ) -> Option<BlockResult> {
         self.layout_anonymous_block_with_floats(
             node_id,
             containing,
+            containing_rtl,
             positioning_containing,
+            positioning_containing_rtl,
             y,
             depth,
             &[],
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "anonymous boxes need both containing-block rectangles and their directions"
+    )]
     pub(super) fn layout_anonymous_block_with_floats(
         &mut self,
         node_id: FormattingNodeId,
         containing: PhysicalRect,
+        containing_rtl: bool,
         positioning_containing: PhysicalRect,
+        positioning_containing_rtl: bool,
         y: f32,
         depth: usize,
         floats: &[FloatArea],
@@ -1291,7 +1411,9 @@ impl Solver<'_> {
             return self.layout_block_with_containing_height(
                 *inline_root,
                 containing,
+                containing_rtl,
                 positioning_containing,
+                positioning_containing_rtl,
                 y,
                 depth,
                 None,
@@ -1314,6 +1436,7 @@ impl Solver<'_> {
             &inline_roots,
             PhysicalRect::new(containing.origin.x, y, containing.size.width, 0.0),
             positioning_containing,
+            positioning_containing_rtl,
             InlineTextContextSource {
                 // An anonymous block borrows its parent's style source, so
                 // `text-indent`, `overflow` and `text-overflow` all resolve on
@@ -1367,9 +1490,27 @@ impl Solver<'_> {
             return Float::None;
         };
         let style = self.styles.get(&source);
+        let rtl = is_rtl(style);
         match style.and_then(|style| style.typed("float")) {
-            Some(TypedPropertyValue::Float(Float::Left | Float::InlineStart)) => Float::Left,
-            Some(TypedPropertyValue::Float(Float::Right | Float::InlineEnd)) => Float::Right,
+            // `left` and `right` are physical (CSS 2.1 §9.5.1). The logical
+            // values are CSS Logical Properties' inline edges, so they follow
+            // the declaring element's used `direction`.
+            Some(TypedPropertyValue::Float(Float::Left)) => Float::Left,
+            Some(TypedPropertyValue::Float(Float::Right)) => Float::Right,
+            Some(TypedPropertyValue::Float(Float::InlineStart)) => {
+                if rtl {
+                    Float::Right
+                } else {
+                    Float::Left
+                }
+            }
+            Some(TypedPropertyValue::Float(Float::InlineEnd)) => {
+                if rtl {
+                    Float::Left
+                } else {
+                    Float::Right
+                }
+            }
             _ => Float::None,
         }
     }
@@ -1387,11 +1528,16 @@ impl Solver<'_> {
             Some(TypedPropertyValue::Clear(value)) => *value,
             _ => Clear::None,
         };
+        let rtl = is_rtl(style);
         floats
             .iter()
             .filter(|area| match clear {
-                Clear::Left | Clear::InlineStart => area.side == Float::Left,
-                Clear::Right | Clear::InlineEnd => area.side == Float::Right,
+                Clear::Left => area.side == Float::Left,
+                Clear::Right => area.side == Float::Right,
+                // `inline-start`/`inline-end` are logical: they clear the
+                // physical side that is the start/end edge of this element.
+                Clear::InlineStart => area.side == if rtl { Float::Right } else { Float::Left },
+                Clear::InlineEnd => area.side == if rtl { Float::Left } else { Float::Right },
                 Clear::Both => true,
                 Clear::None => false,
             })
@@ -1405,7 +1551,9 @@ impl Solver<'_> {
         node: FormattingNodeId,
         side: Float,
         containing: PhysicalRect,
+        containing_rtl: bool,
         positioning_containing: PhysicalRect,
+        positioning_containing_rtl: bool,
         mut y: f32,
         floats: &[FloatArea],
         depth: usize,
@@ -1418,7 +1566,9 @@ impl Solver<'_> {
             let result = self.layout_block_with_containing_height(
                 node,
                 PhysicalRect::new(left, containing.origin.y, available, containing.size.height),
+                containing_rtl,
                 positioning_containing,
+                positioning_containing_rtl,
                 y,
                 depth,
                 Some(forced_content_width),

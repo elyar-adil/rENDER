@@ -15,6 +15,7 @@ use render_css::properties::AutoLengthPercentage;
 use render_css::properties::BorderStyle;
 use render_css::properties::BorderWidth;
 use render_css::properties::BoxSizing;
+use render_css::properties::Direction;
 use render_css::properties::Gap;
 use render_css::properties::LengthPercentage;
 use render_css::properties::LengthResolutionContext;
@@ -30,6 +31,19 @@ pub(crate) fn position(style: Option<&ComputedStyle>) -> Position {
         Some(TypedPropertyValue::Position(position)) => *position,
         _ => Position::Static,
     }
+}
+
+/// CSS Writing Modes 3 §2.1: the used `direction` of a box.
+///
+/// `direction` is inherited and its initial value is `ltr`, so a missing or
+/// unparsed declaration is left-to-right. Every consumer that needs the start
+/// edge of a horizontal flow goes through this one reading rather than each
+/// looking for a different spelling of the keyword.
+pub(super) fn is_rtl(style: Option<&ComputedStyle>) -> bool {
+    matches!(
+        style.and_then(|style| style.typed("direction")),
+        Some(TypedPropertyValue::Direction(Direction::Rtl))
+    )
 }
 
 /// `true` when the used value of `value` depends on the percentage basis and

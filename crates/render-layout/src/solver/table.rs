@@ -336,9 +336,15 @@ impl Solver<'_> {
         children: &[FormattingNodeId],
         containing: PhysicalRect,
         positioning_containing: PhysicalRect,
+        positioning_containing_rtl: bool,
         used_height: Option<f32>,
         depth: usize,
     ) -> (Vec<FragmentId>, f32) {
+        // CSS Writing Modes 3 §2.1: the table's own `direction` is the
+        // containing-block direction of its cells and captions. Column
+        // placement itself still follows physical order in this solver; that
+        // is a table-axis RTL gap recorded separately from cell content.
+        let table_rtl = crate::solver::resolve::is_rtl(style);
         // §17.2.1: the table structure.
         let structure = self.table_structure(children);
         let columns = structure.columns;
@@ -412,7 +418,9 @@ impl Solver<'_> {
                 let Some(result) = self.layout_block_with_containing_height(
                     placement.node,
                     PhysicalRect::new(offsets[placement.column], 0.0, content_width, 0.0),
+                    table_rtl,
                     positioning_containing,
+                    positioning_containing_rtl,
                     0.0,
                     depth.saturating_add(1),
                     Some(content_width),
@@ -464,7 +472,9 @@ impl Solver<'_> {
             let Some(result) = self.layout_block_like(
                 *caption,
                 PhysicalRect::new(containing.origin.x, 0.0, containing.size.width, 0.0),
+                table_rtl,
                 positioning_containing,
+                positioning_containing_rtl,
                 0.0,
                 depth.saturating_add(1),
                 false,
