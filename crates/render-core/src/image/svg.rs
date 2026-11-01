@@ -22,15 +22,20 @@
 //!   luminance compositing, `maskUnits` and `maskContentUnits`;
 //! - `filter` references with `feGaussianBlur`, `feColorMatrix`, `feOffset`,
 //!   `feBlend`, `feComposite`, `feFlood`, `feMerge`, `feDropShadow` and
-//!   `feMorphology`, composited through offscreen buffers;
+//!   `feMorphology`, composited through offscreen buffers, with
+//!   `filterUnits`, `primitiveUnits`, filter-region percentages/primitive
+//!   subregions, CSS blend modes, and Porter-Duff plus arithmetic
+//!   compositing. Unsupported primitives and units use a documented visible
+//!   fallback and are reported by [`decode_svg_with_diagnostics`];
 //! - root sizing by `width`/`height` (percentages resolve against the
 //!   `viewBox`), falling back to `viewBox`, then the spec default 300×150.
 //!
-//! Everything outside the subset (text, filter primitives other than those
-//! listed above, embedded images, scripting, external-document `<use>`
-//! references, gradient `xlink:href` inheritance and spread modes other than
-//! `pad`) contributes nothing, matching how an `<img>`-loaded SVG must
-//! render: static and script-free.
+//! Everything else outside the subset (text, embedded images, scripting,
+//! external-document `<use>` references, gradient `xlink:href` inheritance
+//! and spread modes other than `pad`) contributes nothing, matching how an
+//! `<img>`-loaded SVG must render: static and script-free. Unknown filter
+//! primitives are the exception: their input is passed through and reported,
+//! so the rest of the filter chain stays visible.
 //!
 //! Two things about the document are easy to get wrong and are pinned by
 //! tests: it is XML, so an attribute name is case-sensitive and `viewBox` is
@@ -332,6 +337,21 @@ fn point_in_contours(
     }
 }
 
+/// One filter feature the rasteriser could not honour.
+///
+/// The rasteriser keeps rendering the document around the unsupported
+/// feature, and reports that feature here instead of silently claiming to
+/// have applied it. The returned pixels are therefore a visible fallback:
+/// an unknown filter primitive passes its input through, an unknown blend
+/// mode uses `normal`, and an unknown unit falls back to the SVG default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SvgRenderDiagnostic {
+    /// The filter element or primitive the diagnostic belongs to.
+    pub element: String,
+    /// What could not be honoured and the fallback that was used.
+    pub message: String,
+}
+
 /// Decode an SVG document into an RGBA image.
 ///
 /// # Errors
@@ -339,6 +359,19 @@ fn point_in_contours(
 /// Returns [`ImageDecodeError`] when the bytes are not valid UTF-8, no root
 /// `<svg>` element exists, or the target size violates `limits`.
 pub fn decode_svg(bytes: &[u8], limits: ImageLimits) -> Result<DecodedImage, ImageDecodeError> {
+    decode_svg_with_diagnostics(bytes, limits).map(|(image, _)| image)
+}
+
+/// Decode an SVG document and report filter features outside the supported
+/// subset.
+///
+/// # Errors
+///
+/// Returns [`ImageDecodeError`] under the same conditions as [`decode_svg`].
+pub fn decode_svg_with_diagnostics(
+    bytes: &[u8],
+    limits: ImageLimits,
+) -> Result<(DecodedImage, Vec<SvgRenderDiagnostic>), ImageDecodeError> {
     let text = str::from_utf8(bytes)
         .map_err(|_| ImageDecodeError::Codec("svg document is not valid UTF-8".to_owned()))?;
     // image/svg+xml is an XML document type, so the tree is parsed as XML:
@@ -383,6 +416,23 @@ pub fn decode_svg_viewport(
     current_color: Color,
     limits: ImageLimits,
 ) -> Result<DecodedImage, ImageDecodeError> {
+    decode_svg_viewport_with_diagnostics(bytes, width, height, current_color, limits)
+        .map(|(image, _)| image)
+}
+
+/// [`decode_svg_viewport`] with the filter diagnostics from the raster.
+///
+/// # Errors
+///
+/// Returns [`ImageDecodeError`] under the same conditions as
+/// [`decode_svg_viewport`].
+pub fn decode_svg_viewport_with_diagnostics(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    current_color: Color,
+    limits: ImageLimits,
+) -> Result<(DecodedImage, Vec<SvgRenderDiagnostic>), ImageDecodeError> {
     let text = str::from_utf8(bytes)
         .map_err(|_| ImageDecodeError::Codec("svg document is not valid UTF-8".to_owned()))?;
     let root = parse_xml(text).ok_or_else(|| {
@@ -416,14 +466,23 @@ fn decode_viewport(
     height_f: f32,
     current_color: Color,
     limits: ImageLimits,
-) -> Result<DecodedImage, ImageDecodeError> {
+) -> Result<(DecodedImage, Vec<SvgRenderDiagnostic>), ImageDecodeError> {
     let width = width_f.round().max(1.0) as u32;
     let height = height_f.round().max(1.0) as u32;
     enforce_dimensions(width, height, limits)?;
 
+    // Filter lengths in `filterUnits="userSpaceOnUse"` resolve percentages
+    // against the viewport in user units. A viewBox supplies it directly;
+    // otherwise the requested device size is the user-space size because no
+    // root transform exists.
+    let viewport = view_box.map_or((width_f, height_f), |(_, _, view_width, view_height)| {
+        (view_width, view_height)
+    });
+    let mut diagnostics = Vec::new();
     let mut raster = Raster {
         width,
         height,
+        viewport,
         pixels: vec![Color::rgba(0, 0, 0, 0); width as usize * height as usize],
         clip: ClipStack::default(),
         use_depth: 0,
@@ -491,13 +550,17 @@ fn decode_viewport(
         &filter_paths,
         &ids,
         &mut raster,
+        &mut diagnostics,
     );
-    DecodedImage::from_pixels(width, height, raster.pixels)
+    let image = DecodedImage::from_pixels(width, height, raster.pixels)?;
+    Ok((image, diagnostics))
 }
 
 struct Raster {
     width: u32,
     height: u32,
+    /// Viewport size in user units, used by filter percentage lengths.
+    viewport: (f32, f32),
     pixels: Vec<Color>,
     clip: ClipStack,
     use_depth: usize,
@@ -635,6 +698,7 @@ fn walk(
     filter_paths: &BTreeMap<String, &XmlNode>,
     ids: &BTreeMap<String, &XmlNode>,
     raster: &mut Raster,
+    diagnostics: &mut Vec<SvgRenderDiagnostic>,
 ) {
     let clipped = push_element_clip(raster, element, transform, None, clip_paths);
     for child_node in &element.children {
@@ -668,6 +732,7 @@ fn walk(
             mask_paths,
             filter_paths,
             ids,
+            diagnostics,
         ) {
             continue;
         }
@@ -685,6 +750,7 @@ fn walk(
             mask_paths,
             filter_paths,
             ids,
+            diagnostics,
         ) {
             continue;
         }
@@ -702,6 +768,7 @@ fn walk(
             mask_paths,
             filter_paths,
             ids,
+            diagnostics,
         ) {
             continue;
         }
@@ -995,6 +1062,7 @@ fn walk(
                     filter_paths,
                     ids,
                     raster,
+                    diagnostics,
                 );
                 raster.use_depth -= 1;
             }
@@ -1015,6 +1083,7 @@ fn walk(
                     filter_paths,
                     ids,
                     raster,
+                    diagnostics,
                 );
             }
             _ => {
@@ -1032,6 +1101,7 @@ fn walk(
                     filter_paths,
                     ids,
                     raster,
+                    diagnostics,
                 );
             }
         }
@@ -1058,6 +1128,7 @@ fn paint_opacity_group(
     mask_paths: &BTreeMap<String, &XmlNode>,
     filter_paths: &BTreeMap<String, &XmlNode>,
     ids: &BTreeMap<String, &XmlNode>,
+    diagnostics: &mut Vec<SvgRenderDiagnostic>,
 ) -> bool {
     let Some(opacity) = element_opacity(element) else {
         return false;
@@ -1074,6 +1145,7 @@ fn paint_opacity_group(
     let mut content = Raster {
         width: raster.width,
         height: raster.height,
+        viewport: raster.viewport,
         pixels: vec![Color::TRANSPARENT; raster.width as usize * raster.height as usize],
         clip: raster.clip.clone(),
         use_depth: raster.use_depth,
@@ -1108,6 +1180,7 @@ fn paint_opacity_group(
         filter_paths,
         ids,
         &mut content,
+        diagnostics,
     );
     for y in 0..raster.height {
         for x in 0..raster.width {
@@ -1181,6 +1254,7 @@ fn paint_masked_element(
     mask_paths: &BTreeMap<String, &XmlNode>,
     filter_paths: &BTreeMap<String, &XmlNode>,
     ids: &BTreeMap<String, &XmlNode>,
+    diagnostics: &mut Vec<SvgRenderDiagnostic>,
 ) -> bool {
     let Some(reference) = attribute(element, "mask") else {
         return false;
@@ -1201,6 +1275,7 @@ fn paint_masked_element(
     let mut content = Raster {
         width: raster.width,
         height: raster.height,
+        viewport: raster.viewport,
         pixels: vec![Color::TRANSPARENT; raster.width as usize * raster.height as usize],
         clip: raster.clip.clone(),
         use_depth: raster.use_depth,
@@ -1228,6 +1303,7 @@ fn paint_masked_element(
         filter_paths,
         ids,
         &mut content,
+        diagnostics,
     );
 
     let object_content = attribute(mask, "maskContentUnits")
@@ -1249,6 +1325,7 @@ fn paint_masked_element(
     let mut mask_raster = Raster {
         width: raster.width,
         height: raster.height,
+        viewport: raster.viewport,
         pixels: vec![Color::TRANSPARENT; raster.width as usize * raster.height as usize],
         clip: ClipStack::default(),
         use_depth: 0,
@@ -1269,6 +1346,7 @@ fn paint_masked_element(
         filter_paths,
         ids,
         &mut mask_raster,
+        diagnostics,
     );
 
     let object_units = !attribute(mask, "maskUnits")
@@ -1368,6 +1446,12 @@ fn paint_masked_element(
     true
 }
 
+/// A filter region in the element's user space and in device pixels.
+struct FilterRegion {
+    local: Bounds,
+    polygon: Vec<(f32, f32)>,
+}
+
 /// Render one element through an SVG filter.
 ///
 /// Like masks, the element is painted into an offscreen buffer with its
@@ -1377,7 +1461,12 @@ fn paint_masked_element(
 /// Supported primitives are `feGaussianBlur`, `feColorMatrix`, `feOffset`,
 /// `feBlend`, `feComposite`, `feFlood`, `feMerge`, `feDropShadow` and
 /// `feMorphology`; a chain is processed in document order, with `result`
-/// names and `in`/`in2` references.
+/// names and `in`/`in2` references. `filterUnits`, `primitiveUnits` and
+/// percentage lengths are resolved against the object bounding box or the
+/// viewport; each primitive's `x`/`y`/`width`/`height` subregion clips its
+/// output. Features outside that subset are reported as
+/// [`SvgRenderDiagnostic`]s and use a visible fallback instead of being
+/// silently dropped.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -1397,6 +1486,7 @@ fn paint_filtered_element(
     mask_paths: &BTreeMap<String, &XmlNode>,
     filter_paths: &BTreeMap<String, &XmlNode>,
     ids: &BTreeMap<String, &XmlNode>,
+    diagnostics: &mut Vec<SvgRenderDiagnostic>,
 ) -> bool {
     let Some(reference) = attribute(element, "filter") else {
         return false;
@@ -1417,6 +1507,7 @@ fn paint_filtered_element(
     let mut content = Raster {
         width: raster.width,
         height: raster.height,
+        viewport: raster.viewport,
         pixels: vec![Color::TRANSPARENT; raster.width as usize * raster.height as usize],
         clip: raster.clip.clone(),
         use_depth: raster.use_depth,
@@ -1444,8 +1535,18 @@ fn paint_filtered_element(
         filter_paths,
         ids,
         &mut content,
+        diagnostics,
     );
 
+    let Some(region) = filter_region(
+        filter,
+        bounds,
+        raster.viewport,
+        element_transform,
+        diagnostics,
+    ) else {
+        return true;
+    };
     let source = content.pixels;
     let source_alpha: Vec<Color> = source
         .iter()
@@ -1453,30 +1554,65 @@ fn paint_filtered_element(
         .collect();
     let mut results: BTreeMap<String, Vec<Color>> = BTreeMap::new();
     let mut pixels = source.clone();
-    let object_primitives = attribute(filter, "primitiveUnits")
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("objectBoundingBox"));
-    let transform_scale = affine_scale(element_transform);
+    let object_primitives = filter_units(filter, "primitiveUnits", false, diagnostics);
+    let scale_x = element_transform.a.hypot(element_transform.b).max(0.0001);
+    let scale_y = element_transform.c.hypot(element_transform.d).max(0.0001);
     for primitive in &filter.children {
-        let input = filter_input(primitive, "in", &source, &source_alpha, &results, &pixels);
-        let input2 = filter_input(primitive, "in2", &source, &source_alpha, &results, &pixels);
-        let output = match primitive.name.as_str() {
+        if matches!(primitive.name.as_str(), "title" | "desc" | "metadata") {
+            continue;
+        }
+        let input = filter_input(
+            primitive,
+            "in",
+            &source,
+            &source_alpha,
+            &results,
+            &pixels,
+            diagnostics,
+        );
+        let input2 = filter_input(
+            primitive,
+            "in2",
+            &source,
+            &source_alpha,
+            &results,
+            &pixels,
+            diagnostics,
+        );
+        let mut output = match primitive.name.as_str() {
             "feGaussianBlur" => {
-                let (mut sigma_x, mut sigma_y) =
+                let (sigma_x, sigma_y) =
                     parse_number_pair(attribute(primitive, "stdDeviation").unwrap_or("0"));
-                if object_primitives {
-                    sigma_x *= bounds.width;
-                    sigma_y *= bounds.height;
+                if sigma_x < 0.0 || sigma_y < 0.0 {
+                    filter_diagnostic(
+                        diagnostics,
+                        primitive,
+                        "negative stdDeviation is invalid; the primitive was disabled",
+                    );
                 }
+                let sigma_x = sigma_x.max(0.0);
+                let sigma_y = sigma_y.max(0.0);
+                let (sigma_x, sigma_y) = if object_primitives {
+                    (sigma_x * bounds.width, sigma_y * bounds.height)
+                } else {
+                    (sigma_x, sigma_y)
+                };
                 blur_pixels(
                     &input,
                     raster.width,
                     raster.height,
-                    sigma_x * transform_scale,
-                    sigma_y * transform_scale,
+                    sigma_x * scale_x,
+                    sigma_y * scale_y,
                 )
             }
             "feColorMatrix" => {
-                let matrix = parse_color_matrix(primitive);
+                let matrix = parse_color_matrix(primitive).unwrap_or_else(|message| {
+                    filter_diagnostic(diagnostics, primitive, message);
+                    [
+                        1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+                        0.0, 0.0, 0.0, 1.0, 0.0,
+                    ]
+                });
                 let mut output = input;
                 for pixel in &mut output {
                     *pixel = apply_color_matrix(*pixel, &matrix);
@@ -1484,16 +1620,24 @@ fn paint_filtered_element(
                 output
             }
             "feOffset" => {
-                let mut dx = attribute(primitive, "dx")
-                    .and_then(parse_length)
-                    .unwrap_or(0.0);
-                let mut dy = attribute(primitive, "dy")
-                    .and_then(parse_length)
-                    .unwrap_or(0.0);
-                if object_primitives {
-                    dx *= bounds.width;
-                    dy *= bounds.height;
-                }
+                let dx = primitive_length(
+                    primitive,
+                    "dx",
+                    object_primitives,
+                    bounds,
+                    raster.viewport.0,
+                    0.0,
+                    diagnostics,
+                );
+                let dy = primitive_length(
+                    primitive,
+                    "dy",
+                    object_primitives,
+                    bounds,
+                    raster.viewport.1,
+                    0.0,
+                    diagnostics,
+                );
                 let translated_x = element_transform.a * dx + element_transform.c * dy;
                 let translated_y = element_transform.b * dx + element_transform.d * dy;
                 offset_pixels(
@@ -1504,31 +1648,74 @@ fn paint_filtered_element(
                     translated_y,
                 )
             }
-            "feBlend" => blend_pixels(
-                &input2,
-                &input,
-                attribute(primitive, "mode").unwrap_or("normal"),
-            ),
-            "feComposite" => composite_pixels(
-                &input2,
-                &input,
-                attribute(primitive, "operator").unwrap_or("over"),
-            ),
-            "feDropShadow" => {
-                let mut dx = attribute(primitive, "dx")
-                    .and_then(parse_length)
-                    .unwrap_or(2.0);
-                let mut dy = attribute(primitive, "dy")
-                    .and_then(parse_length)
-                    .unwrap_or(2.0);
-                let (mut sigma_x, mut sigma_y) =
-                    parse_number_pair(attribute(primitive, "stdDeviation").unwrap_or("2"));
-                if object_primitives {
-                    dx *= bounds.width;
-                    dy *= bounds.height;
-                    sigma_x *= bounds.width;
-                    sigma_y *= bounds.height;
+            "feBlend" => {
+                let mode = attribute(primitive, "mode").unwrap_or("normal").trim();
+                if !supported_blend_mode(mode) {
+                    filter_diagnostic(
+                        diagnostics,
+                        primitive,
+                        format!("unsupported blend mode `{mode}`; used `normal`"),
+                    );
                 }
+                blend_pixels(&input2, &input, mode)
+            }
+            "feComposite" => {
+                let operator = attribute(primitive, "operator")
+                    .unwrap_or("over")
+                    .trim()
+                    .to_ascii_lowercase();
+                if !matches!(
+                    operator.as_str(),
+                    "over" | "in" | "out" | "atop" | "xor" | "arithmetic"
+                ) {
+                    filter_diagnostic(
+                        diagnostics,
+                        primitive,
+                        format!("unsupported composite operator `{operator}`; used `over`"),
+                    );
+                }
+                let coefficients = ["k1", "k2", "k3", "k4"].map(|name| {
+                    attribute(primitive, name)
+                        .and_then(|raw| raw.trim().parse::<f32>().ok())
+                        .unwrap_or(0.0)
+                });
+                composite_pixels(&input, &input2, &operator, coefficients)
+            }
+            "feDropShadow" => {
+                let dx = primitive_length(
+                    primitive,
+                    "dx",
+                    object_primitives,
+                    bounds,
+                    raster.viewport.0,
+                    2.0,
+                    diagnostics,
+                );
+                let dy = primitive_length(
+                    primitive,
+                    "dy",
+                    object_primitives,
+                    bounds,
+                    raster.viewport.1,
+                    2.0,
+                    diagnostics,
+                );
+                let (sigma_x, sigma_y) =
+                    parse_number_pair(attribute(primitive, "stdDeviation").unwrap_or("2"));
+                if sigma_x < 0.0 || sigma_y < 0.0 {
+                    filter_diagnostic(
+                        diagnostics,
+                        primitive,
+                        "negative stdDeviation is invalid; the primitive was disabled",
+                    );
+                }
+                let sigma_x = sigma_x.max(0.0);
+                let sigma_y = sigma_y.max(0.0);
+                let (sigma_x, sigma_y) = if object_primitives {
+                    (sigma_x * bounds.width, sigma_y * bounds.height)
+                } else {
+                    (sigma_x, sigma_y)
+                };
                 let color = attribute(primitive, "flood-color")
                     .and_then(parse_color)
                     .unwrap_or(Color::BLACK);
@@ -1542,7 +1729,7 @@ fn paint_filtered_element(
                         element_transform.a * dx + element_transform.c * dy,
                         element_transform.b * dx + element_transform.d * dy,
                     ),
-                    (sigma_x * transform_scale, sigma_y * transform_scale),
+                    (sigma_x * scale_x, sigma_y * scale_y),
                     color.with_opacity(opacity),
                 )
             }
@@ -1561,102 +1748,85 @@ fn paint_filtered_element(
                     if node.name != "feMergeNode" {
                         continue;
                     }
-                    let layer = filter_input(node, "in", &source, &source_alpha, &results, &merged);
-                    merged = composite_pixels(&merged, &layer, "over");
+                    let layer = filter_input(
+                        node,
+                        "in",
+                        &source,
+                        &source_alpha,
+                        &results,
+                        &pixels,
+                        diagnostics,
+                    );
+                    merged = composite_pixels(&layer, &merged, "over", [0.0; 4]);
                 }
                 merged
             }
             "feMorphology" => {
-                let (mut radius_x, mut radius_y) =
+                let (radius_x, radius_y) =
                     parse_number_pair(attribute(primitive, "radius").unwrap_or("0"));
-                if object_primitives {
-                    radius_x *= bounds.width;
-                    radius_y *= bounds.height;
+                if radius_x < 0.0 || radius_y < 0.0 {
+                    filter_diagnostic(
+                        diagnostics,
+                        primitive,
+                        "negative morphology radius is invalid; the primitive was disabled",
+                    );
                 }
-                let dilate = attribute(primitive, "operator")
-                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("dilate"));
+                let radius_x = radius_x.max(0.0);
+                let radius_y = radius_y.max(0.0);
+                let (radius_x, radius_y) = if object_primitives {
+                    (radius_x * bounds.width, radius_y * bounds.height)
+                } else {
+                    (radius_x, radius_y)
+                };
+                let operator = attribute(primitive, "operator").unwrap_or("erode").trim();
+                if !operator.eq_ignore_ascii_case("erode")
+                    && !operator.eq_ignore_ascii_case("dilate")
+                {
+                    filter_diagnostic(
+                        diagnostics,
+                        primitive,
+                        format!("unsupported morphology operator `{operator}`; used `erode`"),
+                    );
+                }
                 morphology_pixels(
                     &input,
                     raster.width,
                     raster.height,
-                    radius_x * transform_scale,
-                    radius_y * transform_scale,
-                    dilate,
+                    radius_x * scale_x,
+                    radius_y * scale_y,
+                    operator.eq_ignore_ascii_case("dilate"),
                 )
             }
-            _ => input,
+            name => {
+                filter_diagnostic(
+                    diagnostics,
+                    primitive,
+                    format!("unsupported filter primitive `{name}`; its input passed through"),
+                );
+                input
+            }
         };
+        let subregion = primitive_region(
+            primitive,
+            &region,
+            bounds,
+            raster.viewport,
+            object_primitives,
+            element_transform,
+            diagnostics,
+        );
+        if let Some(subregion) = subregion {
+            clip_to_polygon(&mut output, &subregion, raster.width, raster.height);
+        }
         if let Some(result) = attribute(primitive, "result") {
             results.insert(result.trim().to_owned(), output.clone());
         }
         pixels = output;
     }
 
-    let object_units = !attribute(filter, "filterUnits")
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("userSpaceOnUse"));
-    let (x, y, width, height) = if object_units {
-        (
-            attribute(filter, "x")
-                .and_then(parse_fraction)
-                .unwrap_or(-0.1),
-            attribute(filter, "y")
-                .and_then(parse_fraction)
-                .unwrap_or(-0.1),
-            attribute(filter, "width")
-                .and_then(parse_fraction)
-                .unwrap_or(1.2),
-            attribute(filter, "height")
-                .and_then(parse_fraction)
-                .unwrap_or(1.2),
-        )
-    } else {
-        (
-            attribute(filter, "x")
-                .and_then(parse_length)
-                .unwrap_or(bounds.x - 0.1 * bounds.width),
-            attribute(filter, "y")
-                .and_then(parse_length)
-                .unwrap_or(bounds.y - 0.1 * bounds.height),
-            attribute(filter, "width")
-                .and_then(parse_length)
-                .unwrap_or(1.2 * bounds.width),
-            attribute(filter, "height")
-                .and_then(parse_length)
-                .unwrap_or(1.2 * bounds.height),
-        )
-    };
-    if width <= 0.0 || height <= 0.0 {
-        return true;
-    }
-    let (region_x, region_y, region_width, region_height) = if object_units {
-        (
-            bounds.x + x * bounds.width,
-            bounds.y + y * bounds.height,
-            width * bounds.width,
-            height * bounds.height,
-        )
-    } else {
-        (x, y, width, height)
-    };
-    let region = [
-        (region_x, region_y),
-        (region_x + region_width, region_y),
-        (region_x + region_width, region_y + region_height),
-        (region_x, region_y + region_height),
-    ]
-    .map(|(x, y)| element_transform.apply(x, y));
-    let region_contours = [region.to_vec()];
-
+    clip_to_polygon(&mut pixels, &region.polygon, raster.width, raster.height);
     for y in 0..raster.height {
         for x in 0..raster.width {
-            if !point_in_contours(
-                &region_contours,
-                ClipFillRule::NonZero,
-                x as f32 + 0.5,
-                y as f32 + 0.5,
-            ) {
-                continue;
-            }
             let index = y as usize * raster.width as usize + x as usize;
             let pixel = pixels[index];
             if pixel.alpha > 0 {
@@ -1667,6 +1837,297 @@ fn paint_filtered_element(
     true
 }
 
+fn filter_diagnostic(
+    diagnostics: &mut Vec<SvgRenderDiagnostic>,
+    element: &XmlNode,
+    message: impl Into<String>,
+) {
+    diagnostics.push(SvgRenderDiagnostic {
+        element: element.name.clone(),
+        message: message.into(),
+    });
+}
+
+/// Parse `filterUnits`/`primitiveUnits`, whose only valid values are
+/// `objectBoundingBox` and `userSpaceOnUse`.
+fn filter_units(
+    filter: &XmlNode,
+    name: &str,
+    object_bounding_box_by_default: bool,
+    diagnostics: &mut Vec<SvgRenderDiagnostic>,
+) -> bool {
+    let Some(raw) = attribute(filter, name) else {
+        return object_bounding_box_by_default;
+    };
+    let value = raw.trim();
+    if value.eq_ignore_ascii_case("objectBoundingBox") {
+        true
+    } else if value.eq_ignore_ascii_case("userSpaceOnUse") {
+        false
+    } else {
+        filter_diagnostic(
+            diagnostics,
+            filter,
+            format!(
+                "unsupported {name} `{value}`; used {}",
+                if object_bounding_box_by_default {
+                    "objectBoundingBox"
+                } else {
+                    "userSpaceOnUse"
+                }
+            ),
+        );
+        object_bounding_box_by_default
+    }
+}
+
+fn parse_length_with_basis(raw: &str, percentage_basis: f32) -> Option<f32> {
+    let trimmed = raw.trim();
+    let value = parse_length(trimmed)?;
+    Some(if trimmed.ends_with('%') {
+        value * 0.01 * percentage_basis
+    } else {
+        value
+    })
+}
+
+fn length_attribute(
+    element: &XmlNode,
+    name: &str,
+    percentage_basis: f32,
+    default: f32,
+    diagnostics: &mut Vec<SvgRenderDiagnostic>,
+) -> f32 {
+    let Some(raw) = attribute(element, name) else {
+        return default;
+    };
+    parse_length_with_basis(raw, percentage_basis).unwrap_or_else(|| {
+        filter_diagnostic(
+            diagnostics,
+            element,
+            format!(
+                "unsupported length `{}` for `{name}`; used {default}",
+                raw.trim()
+            ),
+        );
+        default
+    })
+}
+
+fn fraction_attribute(
+    element: &XmlNode,
+    name: &str,
+    default: f32,
+    diagnostics: &mut Vec<SvgRenderDiagnostic>,
+) -> f32 {
+    let Some(raw) = attribute(element, name) else {
+        return default;
+    };
+    parse_fraction(raw).unwrap_or_else(|| {
+        filter_diagnostic(
+            diagnostics,
+            element,
+            format!(
+                "invalid fraction `{}` for `{name}`; used {default}",
+                raw.trim()
+            ),
+        );
+        default
+    })
+}
+
+/// Resolve one primitive distance in the filter's primitive units, then in
+/// the element's user space. `objectBoundingBox` distances are fractions of
+/// the corresponding bounding-box axis; user-space percentages use the
+/// viewport axis.
+fn primitive_length(
+    primitive: &XmlNode,
+    name: &str,
+    object_bounding_box: bool,
+    bounds: Bounds,
+    viewport_basis: f32,
+    default: f32,
+    diagnostics: &mut Vec<SvgRenderDiagnostic>,
+) -> f32 {
+    if object_bounding_box {
+        let fraction = fraction_attribute(primitive, name, default, diagnostics);
+        fraction
+            * if name == "dy" || name == "y" || name == "height" {
+                bounds.height
+            } else {
+                bounds.width
+            }
+    } else {
+        length_attribute(primitive, name, viewport_basis, default, diagnostics)
+    }
+}
+
+fn filter_region(
+    filter: &XmlNode,
+    bounds: Bounds,
+    viewport: (f32, f32),
+    transform: Affine,
+    diagnostics: &mut Vec<SvgRenderDiagnostic>,
+) -> Option<FilterRegion> {
+    let object_units = filter_units(filter, "filterUnits", true, diagnostics);
+    let (x, y, width, height) = if object_units {
+        (
+            fraction_attribute(filter, "x", -0.1, diagnostics),
+            fraction_attribute(filter, "y", -0.1, diagnostics),
+            fraction_attribute(filter, "width", 1.2, diagnostics),
+            fraction_attribute(filter, "height", 1.2, diagnostics),
+        )
+    } else {
+        (
+            length_attribute(filter, "x", viewport.0, -0.1 * viewport.0, diagnostics),
+            length_attribute(filter, "y", viewport.1, -0.1 * viewport.1, diagnostics),
+            length_attribute(filter, "width", viewport.0, 1.2 * viewport.0, diagnostics),
+            length_attribute(filter, "height", viewport.1, 1.2 * viewport.1, diagnostics),
+        )
+    };
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let local = if object_units {
+        Bounds {
+            x: x.mul_add(bounds.width, bounds.x),
+            y: y.mul_add(bounds.height, bounds.y),
+            width: width * bounds.width,
+            height: height * bounds.height,
+        }
+    } else {
+        Bounds {
+            x,
+            y,
+            width,
+            height,
+        }
+    };
+    let polygon = [
+        (local.x, local.y),
+        (local.x + local.width, local.y),
+        (local.x + local.width, local.y + local.height),
+        (local.x, local.y + local.height),
+    ]
+    .map(|(x, y)| transform.apply(x, y))
+    .to_vec();
+    Some(FilterRegion { local, polygon })
+}
+
+/// Resolve a primitive's `x`/`y`/`width`/`height` subregion. Missing values
+/// inherit the filter region, and an empty subregion produces transparent
+/// output, as the specification requires.
+fn primitive_region(
+    primitive: &XmlNode,
+    filter_region: &FilterRegion,
+    bounds: Bounds,
+    viewport: (f32, f32),
+    object_units: bool,
+    transform: Affine,
+    diagnostics: &mut Vec<SvgRenderDiagnostic>,
+) -> Option<Vec<(f32, f32)>> {
+    let has_subregion = ["x", "y", "width", "height"]
+        .iter()
+        .any(|name| attribute(primitive, name).is_some());
+    if !has_subregion {
+        return None;
+    }
+    let (x, y, width, height) = if object_units {
+        // In objectBoundingBox units every component is a fraction of the
+        // element's box, including defaults inherited from a filter region
+        // that may itself be expressed in userSpaceOnUse units.
+        let default_x = (filter_region.local.x - bounds.x) / bounds.width;
+        let default_y = (filter_region.local.y - bounds.y) / bounds.height;
+        let default_width = filter_region.local.width / bounds.width;
+        let default_height = filter_region.local.height / bounds.height;
+        (
+            fraction_attribute(primitive, "x", default_x, diagnostics),
+            fraction_attribute(primitive, "y", default_y, diagnostics),
+            fraction_attribute(primitive, "width", default_width, diagnostics),
+            fraction_attribute(primitive, "height", default_height, diagnostics),
+        )
+    } else {
+        (
+            length_attribute(
+                primitive,
+                "x",
+                viewport.0,
+                filter_region.local.x,
+                diagnostics,
+            ),
+            length_attribute(
+                primitive,
+                "y",
+                viewport.1,
+                filter_region.local.y,
+                diagnostics,
+            ),
+            length_attribute(
+                primitive,
+                "width",
+                viewport.0,
+                filter_region.local.width,
+                diagnostics,
+            ),
+            length_attribute(
+                primitive,
+                "height",
+                viewport.1,
+                filter_region.local.height,
+                diagnostics,
+            ),
+        )
+    };
+    let local = if object_units {
+        Bounds {
+            x: x.mul_add(bounds.width, bounds.x),
+            y: y.mul_add(bounds.height, bounds.y),
+            width: width * bounds.width,
+            height: height * bounds.height,
+        }
+    } else {
+        Bounds {
+            x,
+            y,
+            width,
+            height,
+        }
+    };
+    if local.width <= 0.0 || local.height <= 0.0 {
+        return Some(Vec::new());
+    }
+    Some(
+        [
+            (local.x, local.y),
+            (local.x + local.width, local.y),
+            (local.x + local.width, local.y + local.height),
+            (local.x, local.y + local.height),
+        ]
+        .map(|(x, y)| transform.apply(x, y))
+        .to_vec(),
+    )
+}
+
+fn clip_to_polygon(pixels: &mut [Color], polygon: &[(f32, f32)], width: u32, height: u32) {
+    if polygon.is_empty() {
+        pixels.fill(Color::TRANSPARENT);
+        return;
+    }
+    let contours = [polygon.to_vec()];
+    for y in 0..height {
+        for x in 0..width {
+            if !point_in_contours(
+                &contours,
+                ClipFillRule::NonZero,
+                x as f32 + 0.5,
+                y as f32 + 0.5,
+            ) {
+                pixels[y as usize * width as usize + x as usize] = Color::TRANSPARENT;
+            }
+        }
+    }
+}
+
 fn filter_input(
     primitive: &XmlNode,
     name: &str,
@@ -1674,15 +2135,28 @@ fn filter_input(
     source_alpha: &[Color],
     results: &BTreeMap<String, Vec<Color>>,
     previous: &[Color],
+    diagnostics: &mut Vec<SvgRenderDiagnostic>,
 ) -> Vec<Color> {
-    match attribute(primitive, name).map(str::trim) {
-        Some("SourceGraphic") => source.to_vec(),
-        Some("SourceAlpha") => source_alpha.to_vec(),
-        Some(result) => results
-            .get(result)
-            .cloned()
-            .unwrap_or_else(|| previous.to_vec()),
-        None => previous.to_vec(),
+    let Some(raw) = attribute(primitive, name) else {
+        return previous.to_vec();
+    };
+    match raw.trim() {
+        "SourceGraphic" => source.to_vec(),
+        "SourceAlpha" => source_alpha.to_vec(),
+        reference => {
+            if let Some(result) = results.get(reference) {
+                result.clone()
+            } else {
+                filter_diagnostic(
+                    diagnostics,
+                    primitive,
+                    format!(
+                        "unknown `{name}` reference `{reference}`; its previous-input fallback was used"
+                    ),
+                );
+                previous.to_vec()
+            }
+        }
     }
 }
 
@@ -1730,17 +2204,47 @@ fn drop_shadow_pixels(
     let blurred = blur_pixels(&alpha, width, height, sigma.0, sigma.1);
     let shifted = offset_pixels(&blurred, width, height, offset.0, offset.1);
     let flood = vec![color; shifted.len()];
-    let shadow = composite_pixels(&shifted, &flood, "in");
+    let shadow = composite_pixels(&flood, &shifted, "in", [0.0; 4]);
     blend_pixels(&shadow, source, "normal")
 }
 
+fn supported_blend_mode(mode: &str) -> bool {
+    matches!(
+        mode.trim().to_ascii_lowercase().as_str(),
+        "normal"
+            | "multiply"
+            | "screen"
+            | "overlay"
+            | "darken"
+            | "lighten"
+            | "color-dodge"
+            | "color-burn"
+            | "hard-light"
+            | "soft-light"
+            | "difference"
+            | "exclusion"
+            | "hue"
+            | "saturation"
+            | "color"
+            | "luminosity"
+    )
+}
+
+/// Composite `source` over `backdrop` with a CSS/SVG blend mode.
+///
+/// The separable modes use the W3C compositing formula
+/// `co = Cs·as·(1-ab) + B(Cb,Cs)·as·ab + Cb·ab·(1-as)`, which keeps the
+/// source visible where the backdrop is transparent. The four non-separable
+/// modes use the W3C `SetLum`/`SetSat` construction on the whole colour
+/// triple.
 fn blend_pixels(backdrop: &[Color], source: &[Color], mode: &str) -> Vec<Color> {
     let mode = mode.trim().to_ascii_lowercase();
+    let non_separable = matches!(mode.as_str(), "hue" | "saturation" | "color" | "luminosity");
     backdrop
         .iter()
         .zip(source)
         .map(|(backdrop, source)| {
-            if mode == "normal" {
+            if !supported_blend_mode(&mode) || mode == "normal" {
                 return source_over(*source, *backdrop);
             }
             let sa = f32::from(source.alpha) / 255.0;
@@ -1749,61 +2253,230 @@ fn blend_pixels(backdrop: &[Color], source: &[Color], mode: &str) -> Vec<Color> 
             if output_alpha <= 0.0001 {
                 return Color::TRANSPARENT;
             }
-            let channel = |source: u8, backdrop: u8| -> u8 {
-                let source = f32::from(source) / 255.0;
-                let backdrop = f32::from(backdrop) / 255.0;
-                let blended = match mode.as_str() {
-                    "multiply" => source * backdrop,
-                    "screen" => 1.0 - (1.0 - source) * (1.0 - backdrop),
-                    "darken" => source.min(backdrop),
-                    "lighten" => source.max(backdrop),
-                    "difference" => (source - backdrop).abs(),
-                    "exclusion" => source + backdrop - 2.0 * source * backdrop,
-                    _ => source,
-                };
-                let value = (blended * sa + backdrop * da * (1.0 - sa)) / output_alpha;
+            let source_rgb = [
+                f32::from(source.red) / 255.0,
+                f32::from(source.green) / 255.0,
+                f32::from(source.blue) / 255.0,
+            ];
+            let backdrop_rgb = [
+                f32::from(backdrop.red) / 255.0,
+                f32::from(backdrop.green) / 255.0,
+                f32::from(backdrop.blue) / 255.0,
+            ];
+            let blended = if non_separable {
+                non_separable_blend(&mode, backdrop_rgb, source_rgb)
+            } else {
+                std::array::from_fn(|index| {
+                    separable_blend(&mode, backdrop_rgb[index], source_rgb[index])
+                })
+            };
+            let channel = |index: usize| -> u8 {
+                let value = (source_rgb[index] * sa * (1.0 - da)
+                    + blended[index] * sa * da
+                    + backdrop_rgb[index] * da * (1.0 - sa))
+                    / output_alpha;
                 (value.clamp(0.0, 1.0) * 255.0).round() as u8
             };
             Color::rgba(
-                channel(source.red, backdrop.red),
-                channel(source.green, backdrop.green),
-                channel(source.blue, backdrop.blue),
+                channel(0),
+                channel(1),
+                channel(2),
                 (output_alpha * 255.0).round().clamp(0.0, 255.0) as u8,
             )
         })
         .collect()
 }
 
-fn composite_pixels(backdrop: &[Color], source: &[Color], operator: &str) -> Vec<Color> {
+fn separable_blend(mode: &str, backdrop: f32, source: f32) -> f32 {
+    match mode {
+        "multiply" => source * backdrop,
+        "screen" => 1.0 - (1.0 - source) * (1.0 - backdrop),
+        "overlay" => hard_light(source, backdrop),
+        "darken" => source.min(backdrop),
+        "lighten" => source.max(backdrop),
+        "color-dodge" => {
+            if backdrop <= 0.0 {
+                0.0
+            } else if source >= 1.0 {
+                1.0
+            } else {
+                (backdrop / (1.0 - source)).min(1.0)
+            }
+        }
+        "color-burn" => {
+            if backdrop >= 1.0 {
+                1.0
+            } else if source <= 0.0 {
+                0.0
+            } else {
+                1.0 - ((1.0 - backdrop) / source).min(1.0)
+            }
+        }
+        "hard-light" => hard_light(backdrop, source),
+        "soft-light" => {
+            if source <= 0.5 {
+                backdrop - (1.0 - 2.0 * source) * backdrop * (1.0 - backdrop)
+            } else {
+                let d = if backdrop <= 0.25 {
+                    ((16.0 * backdrop - 12.0) * backdrop + 4.0) * backdrop
+                } else {
+                    backdrop.sqrt()
+                };
+                backdrop + (2.0 * source - 1.0) * (d - backdrop)
+            }
+        }
+        "difference" => (source - backdrop).abs(),
+        "exclusion" => source + backdrop - 2.0 * source * backdrop,
+        _ => source,
+    }
+}
+
+fn hard_light(backdrop: f32, source: f32) -> f32 {
+    if source <= 0.5 {
+        2.0 * source * backdrop
+    } else {
+        1.0 - 2.0 * (1.0 - source) * (1.0 - backdrop)
+    }
+}
+
+fn non_separable_blend(mode: &str, backdrop: [f32; 3], source: [f32; 3]) -> [f32; 3] {
+    let backdrop_luminosity = luminosity(backdrop);
+    let source_luminosity = luminosity(source);
+    match mode {
+        "hue" => set_luminosity(
+            set_saturation(source, saturation(backdrop)),
+            backdrop_luminosity,
+        ),
+        "saturation" => set_luminosity(
+            set_saturation(backdrop, saturation(source)),
+            backdrop_luminosity,
+        ),
+        "color" => set_luminosity(source, backdrop_luminosity),
+        "luminosity" => set_luminosity(backdrop, source_luminosity),
+        _ => source,
+    }
+}
+
+fn luminosity(color: [f32; 3]) -> f32 {
+    0.3 * color[0] + 0.59 * color[1] + 0.11 * color[2]
+}
+
+fn saturation(color: [f32; 3]) -> f32 {
+    color[0].max(color[1]).max(color[2]) - color[0].min(color[1]).min(color[2])
+}
+
+fn set_luminosity(mut color: [f32; 3], target: f32) -> [f32; 3] {
+    let delta = target - luminosity(color);
+    for channel in &mut color {
+        *channel += delta;
+    }
+    let luminosity = luminosity(color);
+    let minimum = color[0].min(color[1]).min(color[2]);
+    let maximum = color[0].max(color[1]).max(color[2]);
+    if minimum < 0.0 && luminosity - minimum > 0.0001 {
+        for channel in &mut color {
+            *channel = luminosity + (*channel - luminosity) * luminosity / (luminosity - minimum);
+        }
+    }
+    if maximum > 1.0 && maximum - luminosity > 0.0001 {
+        for channel in &mut color {
+            *channel =
+                luminosity + (*channel - luminosity) * (1.0 - luminosity) / (maximum - luminosity);
+        }
+    }
+    color.map(|channel| channel.clamp(0.0, 1.0))
+}
+
+fn set_saturation(color: [f32; 3], target: f32) -> [f32; 3] {
+    let mut order = [0, 1, 2];
+    order.sort_by(|left, right| {
+        color[*left]
+            .partial_cmp(&color[*right])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let [minimum, middle, maximum] = order;
+    let span = color[maximum] - color[minimum];
+    if span <= 0.0001 {
+        return [0.0; 3];
+    }
+    let mut result = [0.0; 3];
+    result[middle] = (color[middle] - color[minimum]) * target / span;
+    result[maximum] = target;
+    result
+}
+
+/// Apply an SVG compositing operator.
+///
+/// `first` is the `in` input and `second` is the `in2` input. The Porter-Duff
+/// operators are evaluated on premultiplied colours, so `in`/`out`/`atop`
+/// keep the first input's straight colour when coverage is partial.
+/// `arithmetic` uses the specification's
+/// `k1·i1·i2 + k2·i1 + k3·i2 + k4` on every channel, including alpha.
+fn composite_pixels(
+    first: &[Color],
+    second: &[Color],
+    operator: &str,
+    coefficients: [f32; 4],
+) -> Vec<Color> {
     let operator = operator.trim().to_ascii_lowercase();
-    backdrop
+    first
         .iter()
-        .zip(source)
-        .map(|(backdrop, source)| {
-            let sa = f32::from(source.alpha) / 255.0;
-            let da = f32::from(backdrop.alpha) / 255.0;
-            let (out_alpha, source_weight, backdrop_weight) = match operator.as_str() {
-                "in" => (sa * da, 1.0, 0.0),
-                "out" => (sa * (1.0 - da), 1.0, 0.0),
-                "atop" => (da, da, 1.0 - sa),
-                "xor" => (sa + da - 2.0 * sa * da, 1.0 - da, 1.0 - sa),
-                "arithmetic" => (sa + da - sa * da, 1.0, 1.0),
-                _ => (sa + da * (1.0 - sa), 1.0, 1.0 - sa),
+        .zip(second)
+        .map(|(first, second)| {
+            let first_rgb = [
+                f32::from(first.red) / 255.0,
+                f32::from(first.green) / 255.0,
+                f32::from(first.blue) / 255.0,
+            ];
+            let second_rgb = [
+                f32::from(second.red) / 255.0,
+                f32::from(second.green) / 255.0,
+                f32::from(second.blue) / 255.0,
+            ];
+            let first_alpha = f32::from(first.alpha) / 255.0;
+            let second_alpha = f32::from(second.alpha) / 255.0;
+            if operator == "arithmetic" {
+                let [k1, k2, k3, k4] = coefficients;
+                let channel = |first: f32, second: f32| -> u8 {
+                    ((k1 * first * second + k2 * first + k3 * second + k4).clamp(0.0, 1.0) * 255.0)
+                        .round() as u8
+                };
+                return Color::rgba(
+                    channel(first_rgb[0], second_rgb[0]),
+                    channel(first_rgb[1], second_rgb[1]),
+                    channel(first_rgb[2], second_rgb[2]),
+                    channel(first_alpha, second_alpha),
+                );
+            }
+            let (output_alpha, first_weight, second_weight) = match operator.as_str() {
+                "in" => (first_alpha * second_alpha, 1.0, 0.0),
+                "out" => (first_alpha * (1.0 - second_alpha), 1.0, 0.0),
+                "atop" => (second_alpha, 1.0, 1.0 - first_alpha),
+                "xor" => (
+                    first_alpha + second_alpha - 2.0 * first_alpha * second_alpha,
+                    1.0 - second_alpha,
+                    1.0 - first_alpha,
+                ),
+                _ => (
+                    first_alpha + second_alpha * (1.0 - first_alpha),
+                    1.0,
+                    1.0 - first_alpha,
+                ),
             };
-            if out_alpha <= 0.0001 {
+            if output_alpha <= 0.0001 {
                 return Color::TRANSPARENT;
             }
-            let channel = |source: u8, backdrop: u8| -> u8 {
-                let value = (f32::from(source) * sa * source_weight
-                    + f32::from(backdrop) * da * backdrop_weight)
-                    / (out_alpha * 255.0);
+            let channel = |first: f32, second: f32| -> u8 {
+                let value = (first * first_alpha * first_weight
+                    + second * second_alpha * second_weight)
+                    / output_alpha;
                 (value.clamp(0.0, 1.0) * 255.0).round() as u8
             };
             Color::rgba(
-                channel(source.red, backdrop.red),
-                channel(source.green, backdrop.green),
-                channel(source.blue, backdrop.blue),
-                (out_alpha * 255.0).round().clamp(0.0, 255.0) as u8,
+                channel(first_rgb[0], second_rgb[0]),
+                channel(first_rgb[1], second_rgb[1]),
+                channel(first_rgb[2], second_rgb[2]),
+                (output_alpha * 255.0).round().clamp(0.0, 255.0) as u8,
             )
         })
         .collect()
@@ -1839,12 +2512,6 @@ fn parse_number_pair(raw: &str) -> (f32, f32) {
         .collect();
     let first = values.first().copied().unwrap_or(0.0);
     (first, values.get(1).copied().unwrap_or(first))
-}
-
-fn affine_scale(transform: Affine) -> f32 {
-    let scale_x = transform.a.hypot(transform.b);
-    let scale_y = transform.c.hypot(transform.d);
-    scale_x.midpoint(scale_y).max(0.0001)
 }
 
 fn blur_pixels(
@@ -1933,13 +2600,11 @@ fn blur_axis(
                 } else {
                     (x, y + offset)
                 };
-                if sample_x < 0
-                    || sample_y < 0
-                    || sample_x >= width as i32
-                    || sample_y >= height as i32
-                {
-                    continue;
-                }
+                // SVG filters extend the input's edge pixels indefinitely,
+                // rather than treating the outside as transparent. Clamping
+                // keeps a blur of a full-region shape opaque at that edge.
+                let sample_x = sample_x.clamp(0, width as i32 - 1);
+                let sample_y = sample_y.clamp(0, height as i32 - 1);
                 let pixel = source[sample_y as usize * width as usize + sample_x as usize];
                 let weight = weights[index];
                 for channel in 0..4 {
@@ -2041,26 +2706,38 @@ fn morphology_axis(
     output
 }
 
-fn parse_color_matrix(element: &XmlNode) -> [f32; 20] {
-    let values: Vec<f32> = attribute(element, "values")
+fn parse_color_matrix(element: &XmlNode) -> Result<[f32; 20], String> {
+    let raw_values: Vec<&str> = attribute(element, "values")
         .unwrap_or("")
         .split(|character: char| character == ',' || character.is_whitespace())
         .filter(|part| !part.is_empty())
-        .filter_map(|part| part.parse::<f32>().ok())
         .collect();
+    let values = raw_values
+        .iter()
+        .map(|part| {
+            part.parse::<f32>()
+                .map_err(|_| format!("invalid feColorMatrix value `{part}`; used identity"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let kind = attribute(element, "type")
         .unwrap_or("matrix")
         .trim()
         .to_ascii_lowercase();
     match kind.as_str() {
-        "matrix" if values.len() >= 20 => {
+        "matrix" => {
+            if values.len() != 20 {
+                return Err(format!(
+                    "feColorMatrix type=\"matrix\" needs 20 values, found {}; used identity",
+                    values.len()
+                ));
+            }
             let mut matrix = [0.0; 20];
-            matrix.copy_from_slice(&values[..20]);
-            matrix
+            matrix.copy_from_slice(&values);
+            Ok(matrix)
         }
         "saturate" => {
             let saturation = values.first().copied().unwrap_or(1.0);
-            [
+            Ok([
                 0.213 + 0.787 * saturation,
                 0.715 - 0.715 * saturation,
                 0.072 - 0.072 * saturation,
@@ -2081,12 +2758,12 @@ fn parse_color_matrix(element: &XmlNode) -> [f32; 20] {
                 0.0,
                 1.0,
                 0.0,
-            ]
+            ])
         }
         "huerotate" => {
             let radians = values.first().copied().unwrap_or(0.0).to_radians();
             let (sin, cos) = radians.sin_cos();
-            [
+            Ok([
                 0.213 + cos * 0.787 - sin * 0.213,
                 0.715 - cos * 0.715 - sin * 0.715,
                 0.072 - cos * 0.072 + sin * 0.928,
@@ -2107,16 +2784,15 @@ fn parse_color_matrix(element: &XmlNode) -> [f32; 20] {
                 0.0,
                 1.0,
                 0.0,
-            ]
+            ])
         }
-        "luminancetoalpha" => [
+        "luminancetoalpha" => Ok([
             0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2126,
             0.7152, 0.0722, 0.0, 0.0,
-        ],
-        _ => [
-            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0,
-        ],
+        ]),
+        other => Err(format!(
+            "unsupported feColorMatrix type `{other}`; used identity"
+        )),
     }
 }
 
@@ -3611,7 +4287,10 @@ fn flush_number(number: &mut String, tokens: &mut Vec<PathToken>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Color, ImageLimits, decode_svg, decode_svg_viewport, parse_path};
+    use super::{
+        Color, ImageLimits, decode_svg, decode_svg_viewport, decode_svg_with_diagnostics,
+        parse_path,
+    };
 
     const T5_MEDAL: &str = r#"<svg class="medal-newlevel-circled" xmlns="http://www.w3.org/2000/svg" data-priority="2" width="32" height="32" viewBox="0 0 32 32" fill="none">
   <g clip-path="url(#clip0_5048_100697)">
@@ -4030,6 +4709,18 @@ mod tests {
     }
 
     #[test]
+    fn a_blur_duplicates_the_input_edge_instead_of_fading_to_transparent() {
+        let svg = br#"<svg width="12" height="12"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="12" height="12">
+              <feGaussianBlur stdDeviation="2"/></filter></defs>
+            <rect width="12" height="12" fill="red" filter="url(#f)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(0, 0), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(6, 6), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(11, 11), Some(Color::rgb(255, 0, 0)));
+    }
+
+    #[test]
     fn a_saturate_color_matrix_desaturates_the_source() {
         let svg = br#"<svg width="10" height="10"><defs>
             <filter id="f"><feColorMatrix type="saturate" values="0"/></filter></defs>
@@ -4050,6 +4741,26 @@ mod tests {
             <rect x="2" y="2" width="6" height="6" fill="red" filter="url(#f)"/></svg>"#;
         let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
         assert_eq!(image.pixel(4, 4), Some(Color::rgb(0, 255, 0)));
+    }
+
+    #[test]
+    fn a_grayscale_color_matrix_produces_exact_luminance_pixels() {
+        let svg = br#"<svg width="10" height="10"><defs>
+            <filter id="f"><feColorMatrix type="saturate" values="0"/></filter></defs>
+            <rect x="2" y="2" width="6" height="6" fill="red" filter="url(#f)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(4, 4), Some(Color::rgb(54, 54, 54)));
+    }
+
+    #[test]
+    fn an_invert_color_matrix_produces_exact_known_pixels() {
+        let svg = br#"<svg width="10" height="10"><defs>
+            <filter id="f"><feColorMatrix type="matrix"
+              values="-1 0 0 0 1  0 -1 0 0 1  0 0 -1 0 1  0 0 0 1 0"/></filter></defs>
+            <rect x="2" y="2" width="6" height="6" fill="red" filter="url(#f)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(4, 4), Some(Color::rgb(0, 255, 255)));
+        assert_eq!(image.pixel(1, 1), Some(Color::TRANSPARENT));
     }
 
     #[test]
@@ -4151,6 +4862,49 @@ mod tests {
     }
 
     #[test]
+    fn fe_offset_moves_a_shape_without_changing_its_coverage() {
+        let plain = br#"<svg width="20" height="20">
+            <rect x="2" y="2" width="5" height="5" fill="red"/></svg>"#;
+        let filtered = br#"<svg width="20" height="20"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="20" height="20">
+              <feOffset dx="5" dy="2"/></filter></defs>
+            <rect x="2" y="2" width="5" height="5" fill="red" filter="url(#f)"/></svg>"#;
+        let plain = decode_svg(plain, ImageLimits::default()).expect("decodes");
+        let filtered = decode_svg(filtered, ImageLimits::default()).expect("decodes");
+        let covered = |image: &super::DecodedImage| {
+            image
+                .pixels()
+                .iter()
+                .filter(|pixel| pixel.alpha > 0)
+                .count()
+        };
+        assert_eq!(covered(&plain), 25);
+        assert_eq!(covered(&filtered), covered(&plain));
+        assert_eq!(filtered.pixel(3, 3), Some(Color::TRANSPARENT));
+        assert_eq!(filtered.pixel(8, 5), Some(Color::rgb(255, 0, 0)));
+    }
+
+    #[test]
+    fn primitive_units_object_bounding_box_scales_offset_distances() {
+        let svg = br#"<svg width="20" height="20"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="20" height="20"
+              primitiveUnits="objectBoundingBox">
+              <feOffset dx="0.5" dy="0.25"/></filter></defs>
+            <rect x="2" y="2" width="8" height="8" fill="red" filter="url(#f)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(5, 4), Some(Color::TRANSPARENT));
+        assert_eq!(image.pixel(6, 4), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(
+            image
+                .pixels()
+                .iter()
+                .filter(|pixel| pixel.alpha > 0)
+                .count(),
+            64
+        );
+    }
+
+    #[test]
     fn fe_composite_over_combines_named_offset_and_source() {
         let svg = br#"<svg width="20" height="20"><defs>
             <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="20" height="20">
@@ -4179,6 +4933,33 @@ mod tests {
     }
 
     #[test]
+    fn fe_blend_multiply_uses_the_two_inputs_and_keeps_the_backdrop_elsewhere() {
+        let svg = br##"<svg width="10" height="10"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="10" height="10">
+              <feFlood flood-color="#808080" result="backdrop"/>
+              <feBlend in="SourceGraphic" in2="backdrop" mode="multiply"/>
+            </filter></defs>
+            <rect x="2" y="2" width="2" height="2" fill="red" filter="url(#f)"/></svg>"##;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(2, 2), Some(Color::rgb(128, 0, 0)));
+        assert_eq!(image.pixel(0, 0), Some(Color::rgb(128, 128, 128)));
+    }
+
+    #[test]
+    fn fe_composite_arithmetic_honours_all_four_coefficients() {
+        let svg = br##"<svg width="8" height="8"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="8" height="8">
+              <feFlood flood-color="#ff0000" result="red"/>
+              <feFlood flood-color="#0000ff" result="blue"/>
+              <feComposite in="red" in2="blue" operator="arithmetic"
+                k1="0" k2="0.5" k3="0.5" k4="0"/>
+            </filter></defs>
+            <rect width="8" height="8" fill="white" filter="url(#f)"/></svg>"##;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(4, 4), Some(Color::rgb(128, 0, 128)));
+    }
+
+    #[test]
     fn stroke_only_line_draws_its_pixels() {
         let svg = br#"<svg width="6" height="6"><line x1="1" y1="1" x2="5" y2="1" stroke="black" stroke-width="1"/></svg>"#;
         let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
@@ -4197,6 +4978,50 @@ mod tests {
     }
 
     #[test]
+    fn a_user_space_filter_region_resolves_percentage_geometry() {
+        let svg = br##"<svg width="20" height="20" viewBox="0 0 20 20"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse"
+              x="25%" y="25%" width="50%" height="50%">
+              <feFlood flood-color="#ff0000"/>
+            </filter></defs>
+            <rect width="20" height="20" fill="#0000ff" filter="url(#f)"/></svg>"##;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(4, 4), Some(Color::TRANSPARENT));
+        assert_eq!(image.pixel(5, 5), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(14, 14), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(15, 15), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn a_primitive_subregion_clips_that_primitive_to_its_own_rectangle() {
+        let svg = br#"<svg width="12" height="12"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="12" height="12">
+              <feFlood x="4" y="4" width="4" height="4" flood-color="red"/>
+            </filter></defs>
+            <rect width="12" height="12" fill="white" filter="url(#f)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(3, 3), Some(Color::TRANSPARENT));
+        assert_eq!(image.pixel(4, 4), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(7, 7), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(8, 8), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn an_object_bounding_box_primitive_subregion_maps_to_the_element_bounds() {
+        let svg = br#"<svg width="20" height="20"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="20" height="20"
+              primitiveUnits="objectBoundingBox">
+              <feFlood x="0" y="0" width="0.5" height="0.5" flood-color="red"/>
+            </filter></defs>
+            <rect x="5" y="5" width="10" height="10" fill="white" filter="url(#f)"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(4, 4), Some(Color::TRANSPARENT));
+        assert_eq!(image.pixel(5, 5), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(9, 9), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(10, 10), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
     fn fe_merge_layers_named_results_in_order() {
         let svg = br#"<svg width="20" height="20"><defs>
             <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="20" height="20">
@@ -4210,6 +5035,39 @@ mod tests {
         let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
         assert_eq!(image.pixel(3, 3), Some(Color::rgb(255, 0, 0)));
         assert_eq!(image.pixel(8, 5), Some(Color::rgb(255, 0, 0)));
+    }
+
+    #[test]
+    fn fe_merge_can_layer_a_flood_under_an_offset_shape() {
+        let svg = br##"<svg width="12" height="12"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="12" height="12">
+              <feFlood flood-color="#0000ff" result="background"/>
+              <feOffset in="SourceGraphic" dx="4" result="moved"/>
+              <feMerge>
+                <feMergeNode in="background"/>
+                <feMergeNode in="moved"/>
+              </feMerge>
+            </filter></defs>
+            <rect x="1" y="1" width="2" height="2" fill="red" filter="url(#f)"/></svg>"##;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(0, 0), Some(Color::rgb(0, 0, 255)));
+        assert_eq!(image.pixel(1, 1), Some(Color::rgb(0, 0, 255)));
+        assert_eq!(image.pixel(5, 1), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(image.pixel(11, 11), Some(Color::rgb(0, 0, 255)));
+    }
+
+    #[test]
+    fn unsupported_filter_primitives_keep_their_input_and_are_reported() {
+        let svg = br#"<svg width="10" height="10"><defs>
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="10" height="10">
+              <feTurbulence baseFrequency="0.5"/>
+            </filter></defs>
+            <rect x="2" y="2" width="6" height="6" fill="red" filter="url(#f)"/></svg>"#;
+        let (image, diagnostics) =
+            decode_svg_with_diagnostics(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(4, 4), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].element, "feTurbulence");
     }
 
     #[test]

@@ -33,13 +33,18 @@
 //!
 //! # What is deliberately not done
 //!
-//! * `text`, `<image>` and filter primitives other than `feGaussianBlur`,
-//!   `feColorMatrix`, `feOffset`, `feBlend`, `feComposite`, `feFlood`,
-//!   `feMerge`, `feDropShadow` and `feMorphology`: outside the rasteriser's
-//!   documented subset, so they contribute nothing there either.
-//!   Gradients, attribute `clip-path`, `mask` and those filter primitives are
-//!   supported, but `xlink:href` inheritance between gradient definitions and
-//!   spread modes other than `pad` are not.
+//! * `text` and `<image>`: outside the rasteriser's documented subset, so
+//!   they contribute nothing.
+//! * Filter primitives other than `feGaussianBlur`, `feColorMatrix`,
+//!   `feOffset`, `feBlend`, `feComposite`, `feFlood`, `feMerge`,
+//!   `feDropShadow` and `feMorphology`: an unsupported primitive is skipped
+//!   with its input passed through and is reported as
+//!   [`InlineSvgDiagnosticCode::UnsupportedFilter`], rather than silently
+//!   claiming the filter ran. Gradients, attribute `clip-path`, `mask` and
+//!   those filter primitives are supported, including `filterUnits`,
+//!   `primitiveUnits`, filter-region percentages and primitive subregions,
+//!   but `xlink:href` inheritance between gradient definitions and spread
+//!   modes other than `pad` are not.
 //! * `foreignObject`: its HTML subtree is laid out by render-layout as
 //!   ordinary in-flow HTML rather than in the SVG viewport coordinate system,
 //!   so it is positioned correctly only for `x=0 y=0` with no viewBox
@@ -106,6 +111,9 @@ pub enum InlineSvgDiagnosticCode {
     EncodedBytesLimit,
     /// The rasteriser could not produce an image from the serialised subtree.
     DecodeFailed,
+    /// A filter primitive or unit outside the rasteriser's subset was
+    /// skipped, and its documented visible fallback was used.
+    UnsupportedFilter,
     /// The image store refused the decoded raster.
     StoreLimit,
 }
@@ -253,7 +261,10 @@ pub fn discover_inline_svgs_with_colors(
         if is_svg_root(element) {
             let color = current_color(node_id);
             match rasterise(dom, node_id, element, color, limits, selection_context) {
-                Ok(raster) => resources.push(raster),
+                Ok((raster, warnings)) => {
+                    resources.push(raster);
+                    diagnostics.extend(warnings);
+                }
                 Err(diagnostic) => diagnostics.push(diagnostic),
             }
         }
@@ -311,7 +322,7 @@ fn rasterise(
     current_color: Color,
     limits: ImageLimits,
     selection_context: ImageSelectionContext,
-) -> Result<InlineSvgRaster, InlineSvgDiagnostic> {
+) -> Result<(InlineSvgRaster, Vec<InlineSvgDiagnostic>), InlineSvgDiagnostic> {
     let source = serialize_html_node(dom, owner);
     if source.len() > limits.max_encoded_bytes {
         return Err(InlineSvgDiagnostic {
@@ -325,29 +336,48 @@ fn rasterise(
         });
     }
     let (width, height) = svg_geometry(element).raster_size();
-    let image = svg::decode_svg_viewport(source.as_bytes(), width, height, current_color, limits)
-        .map_err(|error| InlineSvgDiagnostic {
+    let (image, filter_diagnostics) = svg::decode_svg_viewport_with_diagnostics(
+        source.as_bytes(),
+        width,
+        height,
+        current_color,
+        limits,
+    )
+    .map_err(|error| InlineSvgDiagnostic {
         node: Some(owner),
         code: InlineSvgDiagnosticCode::DecodeFailed,
         message: format!("inline SVG did not rasterise: {error}"),
     })?;
     let identity = raster_identity(&source, current_color);
-    Ok(InlineSvgRaster {
-        owner,
-        key: ImageResourceKey {
+    Ok((
+        InlineSvgRaster {
             owner,
-            requested_url: inline_svg_url(owner, &identity),
-            // The identity is the source snapshot, so editing the subtree, or
-            // changing the colour `currentColor` resolves to, produces a
-            // different key and a fresh resource id. That is what makes the
-            // display-list diff see the change.
-            source_snapshot: identity,
-            source: ImageSource::Element,
-            selection_context,
+            key: ImageResourceKey {
+                owner,
+                requested_url: inline_svg_url(owner, &identity),
+                // The identity is the source snapshot, so editing the subtree, or
+                // changing the colour `currentColor` resolves to, produces a
+                // different key and a fresh resource id. That is what makes the
+                // display-list diff see the change.
+                source_snapshot: identity,
+                source: ImageSource::Element,
+                selection_context,
+            },
+            source,
+            image,
         },
-        source,
-        image,
-    })
+        filter_diagnostics
+            .into_iter()
+            .map(|diagnostic| InlineSvgDiagnostic {
+                node: Some(owner),
+                code: InlineSvgDiagnosticCode::UnsupportedFilter,
+                message: format!(
+                    "inline SVG filter `<{}>`: {}",
+                    diagnostic.element, diagnostic.message
+                ),
+            })
+            .collect(),
+    ))
 }
 
 /// What decides an inline `svg`'s pixels: its serialised markup and the colour
@@ -572,6 +602,47 @@ mod tests {
         // The serialised subtree is what went to the rasteriser, with the
         // case-adjusted local names the parser produced.
         assert!(raster.source.contains("<rect"), "{}", raster.source);
+    }
+
+    #[test]
+    fn an_inline_svg_filter_changes_the_raster_pixels() {
+        let dom = parse(
+            "<!doctype html><body><svg width=12 height=12 viewBox='0 0 12 12'>\
+             <defs><filter id='f'><feGaussianBlur stdDeviation='1'/></filter></defs>\
+             <rect x='4' y='4' width='4' height='4' fill='#ff0000' filter='url(#f)'/></svg>",
+        );
+        let discovery = discover_inline_svgs(&dom, ImageLimits::default());
+
+        assert_eq!(discovery.resources.len(), 1);
+        assert!(discovery.diagnostics.is_empty());
+        let image = &discovery.resources[0].image;
+        let centre = image.pixel(6, 6).expect("centre pixel");
+        let edge = image.pixel(4, 6).expect("blurred edge pixel");
+        assert_eq!(centre.red, 255);
+        assert!(centre.alpha > 180, "{centre:?}");
+        assert!(edge.alpha > 0 && edge.alpha < 255, "{edge:?}");
+        assert_eq!(image.pixel(9, 9).map(|pixel| pixel.alpha), Some(0));
+    }
+
+    #[test]
+    fn an_unsupported_inline_svg_filter_is_reported_not_silently_faked() {
+        let dom = parse(
+            "<!doctype html><body><svg width=8 height=8 viewBox='0 0 8 8'>\
+             <defs><filter id='f'><feTurbulence baseFrequency='0.5'/></filter></defs>\
+             <rect width='8' height='8' fill='#00ff00' filter='url(#f)'/></svg>",
+        );
+        let discovery = discover_inline_svgs(&dom, ImageLimits::default());
+
+        assert_eq!(discovery.resources.len(), 1);
+        assert_eq!(discovery.diagnostics.len(), 1);
+        assert_eq!(
+            discovery.diagnostics[0].code,
+            super::InlineSvgDiagnosticCode::UnsupportedFilter
+        );
+        assert_eq!(
+            discovery.resources[0].image.pixel(4, 4),
+            Some(Color::rgb(0, 255, 0))
+        );
     }
 
     #[test]
