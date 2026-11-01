@@ -21,10 +21,18 @@
 //! source-local coordinates when choosing bands, then compositing the
 //! untransformed source through the affine matrix.
 //!
-//! The compositor is deliberately conservative. A filter, a mask, a
-//! non-normal blend mode, an ambient clip crossing a layer boundary, nested
-//! sticky, or a layer wider than the 8192px raster ceiling returns `None` and
-//! the caller keeps the complete-raster path.
+//! A top-level stacking context with a `filter` or `mask` is retained as one
+//! effect surface instead of independent bands: filters move pixels (a blur
+//! reaches across band boundaries and a drop shadow shifts them), so the
+//! effect must see the layer's whole input and run exactly once before the
+//! surface is composited. The surface is the layer's content bounds expanded
+//! by the filter's reach, which costs more memory than a band but keeps the
+//! result pixel-identical to the complete raster's offscreen pass.
+//!
+//! The compositor is deliberately conservative. A non-normal blend mode, an
+//! ambient clip crossing a layer boundary, nested sticky, a layer wider than
+//! the 8192px raster ceiling, or an effect surface above the retained-effect
+//! limits returns `None` and the caller keeps the complete-raster path.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -34,17 +42,48 @@ use crate::layout::{PhysicalPoint, PhysicalRect, PhysicalSize, StickyConstraint}
 
 use super::color::Color;
 use super::display_list::{
-    BlendMode, DisplayCommand, DisplayItem, DisplayList, PaintCoordinateSpace, Transform2D,
+    BlendMode, DisplayCommand, DisplayItem, DisplayList, FilterEffect, MaskLayer,
+    PaintCoordinateSpace, Transform2D,
 };
 use super::raster::{
-    CpuRasterOutput, CpuRasterizer, GlyphMaskProvider, RasterControl, Surface, composite_surface,
+    CpuRasterOutput, CpuRasterizer, FilterOutset, GlyphMaskProvider, RasterControl, Surface,
+    apply_layer_effects, composite_surface, filter_outset,
 };
 use super::sticky::sticky_displacement;
 
 /// The physical height of one retained compositor band.
 pub const DEFAULT_COMPOSITOR_BAND_HEIGHT: u32 = 512;
 
-/// A transformed, transparent or sticky top-level scope.
+/// The widest effect surface the retained compositor will allocate.
+///
+/// This matches the rasterizer's general layer ceiling: a layer this wide is
+/// already too expensive to retain as one offscreen surface.
+const MAX_EFFECT_SURFACE_WIDTH: f32 = 8192.0;
+
+/// The tallest effect surface the retained compositor will allocate.
+///
+/// A filtered or masked layer cannot be cut into bands without either
+/// duplicating the effect work or getting the pixels wrong, so a very tall
+/// layer would need one large surface. Falling back to the complete raster at
+/// this point keeps peak memory bounded.
+const MAX_EFFECT_SURFACE_HEIGHT: f32 = 4096.0;
+
+/// The total pixel budget for one cached effect surface.
+///
+/// A 4M-pixel layer is about 16 MiB of `Color` pixels; the blur scratch
+/// buffers are the larger cost because they store four `f32` channels.
+const MAX_EFFECT_SURFACE_PIXELS: f32 = 4_194_304.0;
+
+/// Cache key component reserved for the single effect surface of a layer.
+///
+/// Band indices are physical band numbers and can never reach `u32::MAX`.
+const EFFECT_SURFACE_BAND: u32 = u32::MAX;
+
+/// Transparent padding that keeps bilinear layer-edge sampling identical to
+/// the complete raster's viewport-sized offscreen surface.
+const EFFECT_SURFACE_MARGIN: f32 = 1.0;
+
+/// A transformed, transparent, filtered, masked or sticky top-level scope.
 #[derive(Clone, Debug, PartialEq)]
 struct CompositedLayer {
     /// The display-list range, excluding the push/pop commands themselves.
@@ -60,6 +99,12 @@ struct CompositedLayer {
     /// A sticky scope's displacement is resolved from the current scroll
     /// offset at composite time; the source bands stay fixed.
     sticky: Option<StickyConstraint>,
+    /// A top-level `filter`, applied once to the whole effect surface before
+    /// it is composited.
+    filter: Option<FilterEffect>,
+    /// A top-level `mask-image`, sampled in document or viewport coordinates
+    /// and applied after the filter.
+    mask: Option<MaskLayer>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -198,7 +243,7 @@ impl CompositorCache {
                         &mut ops,
                     )?;
                     let bounds = item_bounds(&items[index + 1..end])?;
-                    if bounds.size.width > 8192.0 {
+                    if bounds.size.width > MAX_EFFECT_SURFACE_WIDTH {
                         return None;
                     }
                     let layer = layers.len();
@@ -210,6 +255,8 @@ impl CompositorCache {
                         opacity: 1.0,
                         space: PaintCoordinateSpace::Document,
                         sticky: Some(**constraint),
+                        filter: None,
+                        mask: None,
                     });
                     ops.push(LayerOp::Layer(layer));
                     index = end + 1;
@@ -220,11 +267,7 @@ impl CompositorCache {
                     // A context inside an ambient clip would need that clip
                     // copied into its layer and removed from the root segment.
                     // The conservative answer is the complete raster path.
-                    if clip_depth != 0
-                        || context.filter.is_some()
-                        || context.mask.is_some()
-                        || context.blend_mode != BlendMode::Normal
-                    {
+                    if clip_depth != 0 || context.blend_mode != BlendMode::Normal {
                         return None;
                     }
                     let start = index + 1;
@@ -251,7 +294,15 @@ impl CompositorCache {
                     } else {
                         item_bounds(&items[start..end])?
                     };
-                    if bounds.size.width > 8192.0 {
+                    let has_effect = context.filter.is_some() || context.mask.is_some();
+                    if has_effect {
+                        // The effect surface must be one allocation: a banded
+                        // filter would either clip a blur at a band edge or
+                        // repeat the effect over overlapping inputs. Reject a
+                        // layer that would exceed the retention budget so the
+                        // caller keeps the complete-raster path.
+                        effect_surface_bounds(bounds, space, context.filter.as_ref(), viewport)?;
+                    } else if bounds.size.width > MAX_EFFECT_SURFACE_WIDTH {
                         return None;
                     }
                     push_segment(
@@ -272,6 +323,8 @@ impl CompositorCache {
                         opacity: context.opacity.clamp(0.0, 1.0),
                         space,
                         sticky: None,
+                        filter: context.filter.clone(),
+                        mask: context.mask.clone(),
                     });
                     ops.push(LayerOp::Layer(layer));
                     index = end + 1;
@@ -387,24 +440,38 @@ impl CompositorCache {
                 }
                 LayerOp::Layer(index) => {
                     let layer = &self.layers[index];
-                    last_frame_bands += self.composite_surface(
-                        &mut output,
-                        &mut state,
-                        layer.start,
-                        layer.end,
-                        layer.bounds,
-                        layer.transform,
-                        layer.opacity,
-                        layer.space,
-                        layer.sticky,
-                        viewport_origin,
-                        glyphs,
-                        images,
-                        control,
-                        1,
-                        index,
-                        &mut diagnostics,
-                    );
+                    if layer.filter.is_some() || layer.mask.is_some() {
+                        last_frame_bands += self.composite_effect_layer(
+                            &mut output,
+                            &mut state,
+                            index,
+                            layer,
+                            viewport_origin,
+                            glyphs,
+                            images,
+                            control,
+                            &mut diagnostics,
+                        );
+                    } else {
+                        last_frame_bands += self.composite_surface(
+                            &mut output,
+                            &mut state,
+                            layer.start,
+                            layer.end,
+                            layer.bounds,
+                            layer.transform,
+                            layer.opacity,
+                            layer.space,
+                            layer.sticky,
+                            viewport_origin,
+                            glyphs,
+                            images,
+                            control,
+                            1,
+                            index,
+                            &mut diagnostics,
+                        );
+                    }
                 }
             }
         }
@@ -447,11 +514,14 @@ impl CompositorCache {
         if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
             return 0;
         }
-        let scroll = if space == PaintCoordinateSpace::Document {
-            viewport_origin
-        } else {
-            PhysicalPoint::default()
-        };
+        // The complete raster paints a top-level context into a viewport-sized
+        // offscreen surface whose paint offset is `-viewport_origin` in both
+        // coordinate spaces. Its pop warps that surface through
+        // `T(offset) * transform * T(-offset)`, so a fixed transformed layer is
+        // conjugated by the scroll offset even though its items never scroll.
+        // The retained source is anchored differently, but the same conjugation
+        // reproduces the reference pixels.
+        let scroll = viewport_origin;
         let sticky_offset = sticky.map_or_else(PhysicalPoint::default, |constraint| {
             sticky_displacement(&constraint, PhysicalPoint::default(), viewport_origin)
         });
@@ -485,14 +555,19 @@ impl CompositorCache {
             translate_y: -scroll.y,
             ..Transform2D::default()
         };
+        // Source pixels are document coordinates for document layers and
+        // viewport coordinates for fixed layers. The reference surface is
+        // anchored at `-scroll` in both cases, so a viewport source contributes
+        // `T(scroll)` before the transform and `T(-scroll)` after it; the two
+        // cancel for the identity matrix and leave fixed content in place.
         let to_band = Transform2D {
             translate_x: if space == PaintCoordinateSpace::Viewport {
-                0.0
+                scroll.x
             } else {
                 bounds.origin.x
             },
             translate_y: if space == PaintCoordinateSpace::Viewport {
-                0.0
+                scroll.y
             } else {
                 bounds.origin.y
             },
@@ -569,14 +644,18 @@ impl CompositorCache {
             let Some(source) = state.bands.get(&key) else {
                 continue;
             };
-            let band_origin = if space == PaintCoordinateSpace::Viewport {
-                Transform2D::default()
-            } else {
-                Transform2D {
-                    translate_x: bounds.origin.x,
-                    translate_y: bounds.origin.y + local_y,
-                    ..Transform2D::default()
-                }
+            let band_origin = Transform2D {
+                translate_x: if space == PaintCoordinateSpace::Viewport {
+                    scroll.x
+                } else {
+                    bounds.origin.x
+                },
+                translate_y: if space == PaintCoordinateSpace::Viewport {
+                    scroll.y
+                } else {
+                    bounds.origin.y + local_y
+                },
+                ..Transform2D::default()
             };
             let mapped = to_viewport.then(&transform.then(&band_origin));
             let clip = Some(viewport_rect);
@@ -586,6 +665,232 @@ impl CompositorCache {
         }
         rasterized
     }
+
+    /// Rasterizes and composites a top-level layer that carries a filter or a
+    /// mask.
+    ///
+    /// The layer is one surface, not a set of bands: a filter can move pixels
+    /// across any band boundary, and applying it to each band in isolation
+    /// would clip the blur or repeat the border. The surface is cached exactly
+    /// like a band, so scrolling still reuses the finished effect.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::cast_precision_loss,
+        reason = "the effect path carries the same layer context as the band path; cache dimensions are bounded physical pixels"
+    )]
+    fn composite_effect_layer(
+        &self,
+        output: &mut Surface,
+        state: &mut CompositorState,
+        layer_index: usize,
+        layer: &CompositedLayer,
+        viewport_origin: PhysicalPoint,
+        glyphs: &dyn GlyphMaskProvider,
+        images: Option<&ImageResources>,
+        control: Option<&dyn RasterControl>,
+        diagnostics: &mut Vec<super::raster::RasterDiagnostic>,
+    ) -> u32 {
+        let Some(surface_bounds) = effect_surface_bounds(
+            layer.bounds,
+            layer.space,
+            layer.filter.as_ref(),
+            self.viewport,
+        ) else {
+            return 0;
+        };
+        if surface_bounds.size.width <= 0.0 || surface_bounds.size.height <= 0.0 {
+            return 0;
+        }
+        let sticky_offset = layer
+            .sticky
+            .map_or_else(PhysicalPoint::default, |constraint| {
+                sticky_displacement(&constraint, PhysicalPoint::default(), viewport_origin)
+            });
+        let transform = Transform2D {
+            translate_x: sticky_offset.x,
+            translate_y: sticky_offset.y,
+            ..Transform2D::default()
+        }
+        .then(&layer.transform);
+        let viewport_rect = viewport_rect(self.viewport);
+        // Document source pixels are anchored at the surface origin; viewport
+        // source pixels use the reference offscreen surface's imaginary
+        // `-scroll` anchor, which the two scroll translations cancel around
+        // the identity transform.
+        let source_anchor = match layer.space {
+            PaintCoordinateSpace::Document => surface_bounds.origin,
+            PaintCoordinateSpace::Viewport => viewport_origin,
+        };
+        let to_source = Transform2D {
+            translate_x: source_anchor.x,
+            translate_y: source_anchor.y,
+            ..Transform2D::default()
+        };
+        let to_viewport = Transform2D {
+            translate_x: -viewport_origin.x,
+            translate_y: -viewport_origin.y,
+            ..Transform2D::default()
+        };
+        let base_mapped = to_viewport.then(&transform.then(&to_source));
+        let Some(inverse) = base_mapped.inverse() else {
+            return 0;
+        };
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for (x, y) in [
+            (0.0, 0.0),
+            (viewport_rect.size.width, 0.0),
+            (0.0, viewport_rect.size.height),
+            (viewport_rect.size.width, viewport_rect.size.height),
+        ] {
+            let (source_x, source_y) = inverse.apply(x, y);
+            min_x = min_x.min(source_x);
+            min_y = min_y.min(source_y);
+            max_x = max_x.max(source_x);
+            max_y = max_y.max(source_y);
+        }
+        let source_rect = PhysicalRect::new(
+            0.0,
+            0.0,
+            surface_bounds.size.width,
+            surface_bounds.size.height,
+        );
+        if intersect_rect(
+            PhysicalRect::new(min_x, min_y, max_x - min_x, max_y - min_y),
+            source_rect,
+        )
+        .is_none()
+        {
+            return 0;
+        }
+        let key = (2_u8, layer_index, EFFECT_SURFACE_BAND);
+        let mut rasterized = 0_u32;
+        if let std::collections::hash_map::Entry::Vacant(entry) = state.bands.entry(key) {
+            let raster = CpuRasterizer.rasterize_item_slice(
+                &self.display_list.items()[layer.start..layer.end],
+                PhysicalSize {
+                    width: surface_bounds.size.width,
+                    height: surface_bounds.size.height,
+                },
+                Color::TRANSPARENT,
+                glyphs,
+                surface_bounds.origin,
+                images,
+            );
+            diagnostics.extend(raster.diagnostics);
+            let mut surface = raster.surface;
+            let mask_offset = match layer.space {
+                // `apply_mask_image` recovers the coordinate of pixel `(0, 0)`
+                // as `-offset`, so the retained surface feeds its own origin.
+                PaintCoordinateSpace::Document => PhysicalPoint {
+                    x: -surface_bounds.origin.x,
+                    y: -surface_bounds.origin.y,
+                },
+                PaintCoordinateSpace::Viewport => PhysicalPoint::default(),
+            };
+            apply_layer_effects(
+                &mut surface,
+                layer.filter.as_ref(),
+                layer.mask.as_ref(),
+                mask_offset,
+                images,
+            );
+            entry.insert(surface);
+            state.stats.bands_rasterized = state.stats.bands_rasterized.saturating_add(1);
+            rasterized = 1;
+        }
+        let Some(source) = state.bands.get(&key) else {
+            return rasterized;
+        };
+        let mapped = to_viewport.then(&transform.then(&to_source));
+        if !composite_surface(
+            output,
+            source,
+            mapped,
+            layer.opacity,
+            Some(viewport_rect),
+            control,
+        ) {
+            return rasterized;
+        }
+        rasterized
+    }
+}
+
+/// The single surface a filtered or masked layer is rasterized into.
+///
+/// Document layers use their content union grown by the filter's reach and
+/// aligned to the physical pixel grid. The left/top edge is also clamped to
+/// the document origin: the complete raster paints document layers into a
+/// viewport-sized surface, so content left of or above the origin is clipped
+/// before the effect runs.
+///
+/// Viewport layers keep the viewport rectangle. Their complete-raster
+/// offscreen surface is exactly the viewport, so expanding it would both waste
+/// memory and change a filter's edge samples.
+///
+/// `None` means the surface would exceed the retention budget and the caller
+/// must use the complete-raster path.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "filter reaches and layer sizes are small bounded pixel counts"
+)]
+fn effect_surface_bounds(
+    bounds: PhysicalRect,
+    space: PaintCoordinateSpace,
+    filter: Option<&FilterEffect>,
+    viewport: PhysicalSize,
+) -> Option<PhysicalRect> {
+    if space == PaintCoordinateSpace::Viewport {
+        let viewport_rect = viewport_rect(viewport);
+        if viewport_rect.size.width <= 0.0 || viewport_rect.size.height <= 0.0 {
+            return None;
+        }
+        if !within_effect_budget(viewport_rect.size.width, viewport_rect.size.height) {
+            return None;
+        }
+        return Some(viewport_rect);
+    }
+    let outset = filter.map_or_else(FilterOutset::default, filter_outset);
+    // One transparent pixel of margin reproduces the reference surface's
+    // sampling at a transformed layer edge: bilinear warping may sample just
+    // outside the content bounds, and the complete raster's viewport-sized
+    // offscreen surface supplies a transparent neighbor there instead of
+    // rejecting the whole sample.
+    let left = (bounds.origin.x - outset.left as f32 - EFFECT_SURFACE_MARGIN)
+        .floor()
+        .max(0.0);
+    let top = (bounds.origin.y - outset.top as f32 - EFFECT_SURFACE_MARGIN)
+        .floor()
+        .max(0.0);
+    let right = (bounds.right() + outset.right as f32 + EFFECT_SURFACE_MARGIN).ceil();
+    let bottom = (bounds.bottom() + outset.bottom as f32 + EFFECT_SURFACE_MARGIN).ceil();
+    if !left.is_finite()
+        || !top.is_finite()
+        || !right.is_finite()
+        || !bottom.is_finite()
+        || right <= left
+        || bottom <= top
+    {
+        return None;
+    }
+    let width = right - left;
+    let height = bottom - top;
+    if !within_effect_budget(width, height) {
+        return None;
+    }
+    Some(PhysicalRect::new(left, top, width, height))
+}
+
+fn within_effect_budget(width: f32, height: f32) -> bool {
+    width > 0.0
+        && height > 0.0
+        && width <= MAX_EFFECT_SURFACE_WIDTH
+        && height <= MAX_EFFECT_SURFACE_HEIGHT
+        && width * height <= MAX_EFFECT_SURFACE_PIXELS
 }
 
 fn matching_pop(items: &[DisplayItem], push: usize) -> Option<usize> {
@@ -729,6 +1034,9 @@ mod tests {
     use super::CompositorCache;
     use crate::dom::DomRevision;
     use crate::layout::{PhysicalPoint, PhysicalRect, PhysicalSize};
+    use crate::paint::display_list::{
+        FilterEffect, FilterOperation, GradientStop, LinearGradient, MaskImage, MaskLayer,
+    };
     use crate::paint::{
         BlendMode, Color, CompositingReason, CpuRasterizer, DisplayCommand, DisplayItem,
         DisplayItemId, DisplayList, NoGlyphMasks, PaintCoordinateSpace, PaintPhase,
@@ -759,19 +1067,103 @@ mod tests {
     }
 
     fn context(transform: Transform2D, opacity: f32) -> StackingContext {
+        context_with_effects(transform, opacity, None, None)
+    }
+
+    fn context_with_effects(
+        transform: Transform2D,
+        opacity: f32,
+        filter: Option<FilterEffect>,
+        mask: Option<MaskLayer>,
+    ) -> StackingContext {
         StackingContext {
             opacity,
             transform,
             blend_mode: BlendMode::Normal,
             isolated: true,
             reason: CompositingReason::Transform,
-            filter: None,
-            mask: None,
+            filter,
+            mask,
         }
     }
 
     fn list(viewport: PhysicalSize, items: Vec<DisplayItem>) -> DisplayList {
         DisplayList::from_items(DomRevision::default(), viewport, items)
+    }
+
+    fn linear_alpha_mask(rect: PhysicalRect) -> MaskLayer {
+        MaskLayer {
+            image: MaskImage::Linear(LinearGradient {
+                rect,
+                start: PhysicalPoint {
+                    x: rect.origin.x,
+                    y: rect.origin.y,
+                },
+                end: PhysicalPoint {
+                    x: rect.origin.x,
+                    y: rect.bottom(),
+                },
+                stops: vec![
+                    GradientStop {
+                        offset: 0.0,
+                        color: Color::rgba(0, 0, 0, 0),
+                    },
+                    GradientStop {
+                        offset: 1.0,
+                        color: Color::rgba(0, 0, 0, 255),
+                    },
+                ],
+                repeating: false,
+            }),
+            tile: rect,
+            clip: rect,
+            repeat_x: true,
+            repeat_y: true,
+        }
+    }
+
+    fn blur_filter(sigma: f32) -> FilterEffect {
+        FilterEffect {
+            operations: vec![FilterOperation::Blur(sigma)],
+        }
+    }
+
+    fn assert_matches_complete_raster(
+        cache: &CompositorCache,
+        display: &std::sync::Arc<DisplayList>,
+        background: Color,
+        offset: PhysicalPoint,
+        label: &str,
+    ) {
+        let composited = cache.render(offset, &NoGlyphMasks, None, None);
+        let complete =
+            CpuRasterizer.rasterize_viewport(display.as_ref(), background, &NoGlyphMasks, offset);
+        assert_eq!(
+            composited.surface.width(),
+            complete.surface.width(),
+            "{label} width differs at scroll ({}, {})",
+            offset.x,
+            offset.y
+        );
+        assert_eq!(
+            composited.surface.height(),
+            complete.surface.height(),
+            "{label} height differs at scroll ({}, {})",
+            offset.x,
+            offset.y
+        );
+        for y in 0..complete.surface.height() {
+            for x in 0..complete.surface.width() {
+                let actual = composited.surface.pixel(x, y);
+                let expected = complete.surface.pixel(x, y);
+                assert_eq!(
+                    actual, expected,
+                    "{label} differs at pixel ({x}, {y}) for scroll ({}, {})",
+                    offset.x, offset.y
+                );
+            }
+        }
+        assert!(composited.diagnostics.is_empty());
     }
 
     #[test]
@@ -1181,5 +1573,242 @@ mod tests {
         let composited = cache.render(PhysicalPoint { x: 0.0, y: 50.0 }, &NoGlyphMasks, None, None);
         assert_eq!(composited.surface.pixel(5, 5), Some(Color::rgb(255, 0, 0)));
         assert_eq!(composited.surface.pixel(5, 55), Some(Color::rgb(0, 0, 255)));
+    }
+
+    #[test]
+    fn a_blurred_layer_matches_the_complete_raster_across_band_boundaries() {
+        // The layer is taller than one 512px band. A banded filter would blur
+        // each half against transparent pixels at the split; the retained
+        // effect surface filters the whole layer once.
+        let viewport = PhysicalSize {
+            width: 120.0,
+            height: 700.0,
+        };
+        let items = vec![
+            item(
+                0,
+                PhysicalRect::new(0.0, 0.0, 120.0, 700.0),
+                rect(0.0, 0.0, 120.0, 700.0, Color::WHITE),
+            ),
+            item(
+                1,
+                PhysicalRect::new(0.0, 0.0, 120.0, 700.0),
+                DisplayCommand::PushStackingContext(context_with_effects(
+                    Transform2D::default(),
+                    1.0,
+                    Some(blur_filter(3.0)),
+                    None,
+                )),
+            ),
+            item(
+                2,
+                PhysicalRect::new(30.0, 50.0, 60.0, 600.0),
+                rect(30.0, 50.0, 60.0, 600.0, Color::rgb(220, 30, 30)),
+            ),
+            item(
+                3,
+                PhysicalRect::new(30.0, 470.0, 60.0, 80.0),
+                rect(30.0, 470.0, 60.0, 80.0, Color::rgb(30, 60, 220)),
+            ),
+            item(
+                4,
+                PhysicalRect::new(0.0, 0.0, 120.0, 700.0),
+                DisplayCommand::PopStackingContext,
+            ),
+        ];
+        let display = std::sync::Arc::new(list(viewport, items));
+        let cache =
+            CompositorCache::from_display_list(std::sync::Arc::clone(&display), Color::WHITE)
+                .expect("a filtered top-level layer is retainable");
+        assert_eq!(cache.layer_count(), 2, "one root segment and one layer");
+        let blur_reach = (3.0_f32 * 3.0).ceil();
+        for offset in [PhysicalPoint::default(), PhysicalPoint { x: 0.0, y: 16.0 }] {
+            // Keep the fixture's whole blur support inside the complete
+            // raster's viewport-sized offscreen surface so the reference does
+            // not clip effect input at its own edge.
+            assert!(50.0 - blur_reach >= offset.y);
+            assert!(650.0 + blur_reach <= offset.y + viewport.height);
+            assert_matches_complete_raster(&cache, &display, Color::WHITE, offset, "blurred layer");
+        }
+        let stats = cache.stats();
+        assert!(
+            stats.cached_bands >= 1,
+            "the effect surface must be retained"
+        );
+    }
+
+    #[test]
+    fn a_gradient_masked_layer_matches_the_complete_raster() {
+        let viewport = PhysicalSize {
+            width: 120.0,
+            height: 120.0,
+        };
+        let masked = PhysicalRect::new(20.0, 20.0, 60.0, 60.0);
+        let items = vec![
+            item(
+                0,
+                PhysicalRect::new(0.0, 0.0, 120.0, 120.0),
+                rect(0.0, 0.0, 120.0, 120.0, Color::WHITE),
+            ),
+            item(
+                1,
+                masked,
+                DisplayCommand::PushStackingContext(context_with_effects(
+                    Transform2D::default(),
+                    1.0,
+                    None,
+                    Some(linear_alpha_mask(masked)),
+                )),
+            ),
+            item(
+                2,
+                masked,
+                rect(
+                    masked.origin.x,
+                    masked.origin.y,
+                    masked.size.width,
+                    masked.size.height,
+                    Color::rgb(220, 40, 40),
+                ),
+            ),
+            item(3, masked, DisplayCommand::PopStackingContext),
+        ];
+        let display = std::sync::Arc::new(list(viewport, items));
+        let cache =
+            CompositorCache::from_display_list(std::sync::Arc::clone(&display), Color::WHITE)
+                .expect("a masked top-level layer is retainable");
+        for offset in [PhysicalPoint::default(), PhysicalPoint { x: 0.0, y: 37.0 }] {
+            assert_matches_complete_raster(
+                &cache,
+                &display,
+                Color::WHITE,
+                offset,
+                "gradient-masked layer",
+            );
+        }
+        let output = cache.render(PhysicalPoint::default(), &NoGlyphMasks, None, None);
+        let middle = output.surface.pixel(50, 50).expect("inside the mask");
+        assert_ne!(middle, Color::rgb(220, 40, 40), "the mask alpha must apply");
+        assert_ne!(
+            middle,
+            Color::WHITE,
+            "the masked rect still covers the pixel"
+        );
+    }
+
+    #[test]
+    fn a_filtered_layer_with_opacity_and_transform_matches_the_complete_raster() {
+        let viewport = PhysicalSize {
+            width: 160.0,
+            height: 160.0,
+        };
+        let filter = FilterEffect {
+            operations: vec![
+                FilterOperation::Brightness(1.3),
+                FilterOperation::Grayscale(0.4),
+            ],
+        };
+        let transform = Transform2D {
+            scale_x: 1.25,
+            scale_y: 1.25,
+            translate_x: 3.0,
+            translate_y: 2.0,
+            ..Transform2D::default()
+        };
+        let items = vec![
+            item(
+                0,
+                PhysicalRect::new(0.0, 0.0, 160.0, 160.0),
+                rect(0.0, 0.0, 160.0, 160.0, Color::WHITE),
+            ),
+            item(
+                1,
+                PhysicalRect::new(30.0, 30.0, 40.0, 40.0),
+                DisplayCommand::PushStackingContext(context_with_effects(
+                    transform,
+                    0.55,
+                    Some(filter),
+                    None,
+                )),
+            ),
+            item(
+                2,
+                PhysicalRect::new(30.0, 30.0, 40.0, 40.0),
+                rect(30.0, 30.0, 40.0, 40.0, Color::rgb(210, 60, 30)),
+            ),
+            item(
+                3,
+                PhysicalRect::new(48.0, 38.0, 18.0, 24.0),
+                rect(48.0, 38.0, 18.0, 24.0, Color::rgb(20, 80, 200)),
+            ),
+            item(
+                4,
+                PhysicalRect::new(30.0, 30.0, 40.0, 40.0),
+                DisplayCommand::PopStackingContext,
+            ),
+        ];
+        let display = std::sync::Arc::new(list(viewport, items));
+        let cache =
+            CompositorCache::from_display_list(std::sync::Arc::clone(&display), Color::WHITE)
+                .expect("a filtered transformed layer is retainable");
+        for offset in [PhysicalPoint::default(), PhysicalPoint { x: 0.0, y: 16.0 }] {
+            assert_matches_complete_raster(
+                &cache,
+                &display,
+                Color::WHITE,
+                offset,
+                "filtered transformed layer",
+            );
+        }
+    }
+
+    #[test]
+    fn a_viewport_space_filter_and_mask_match_the_complete_raster() {
+        let viewport = PhysicalSize {
+            width: 120.0,
+            height: 80.0,
+        };
+        let masked = PhysicalRect::new(10.0, 10.0, 70.0, 50.0);
+        let mut items = vec![
+            item(
+                0,
+                PhysicalRect::new(0.0, 0.0, 120.0, 400.0),
+                rect(0.0, 0.0, 120.0, 400.0, Color::WHITE),
+            ),
+            item(
+                1,
+                masked,
+                DisplayCommand::PushStackingContext(context_with_effects(
+                    Transform2D::default(),
+                    1.0,
+                    Some(FilterEffect {
+                        operations: vec![FilterOperation::Brightness(0.8)],
+                    }),
+                    Some(linear_alpha_mask(masked)),
+                )),
+            ),
+            item(
+                2,
+                masked,
+                rect(10.0, 10.0, 70.0, 50.0, Color::rgb(40, 160, 60)),
+            ),
+            item(3, masked, DisplayCommand::PopStackingContext),
+        ];
+        for fixed in &mut items {
+            fixed.coordinate_space = PaintCoordinateSpace::Viewport;
+        }
+        let display = std::sync::Arc::new(list(viewport, items));
+        let cache =
+            CompositorCache::from_display_list(std::sync::Arc::clone(&display), Color::WHITE)
+                .expect("a fixed filtered/masked layer is retainable");
+        for offset in [PhysicalPoint::default(), PhysicalPoint { x: 0.0, y: 41.0 }] {
+            assert_matches_complete_raster(
+                &cache,
+                &display,
+                Color::WHITE,
+                offset,
+                "viewport-space filter and mask",
+            );
+        }
     }
 }

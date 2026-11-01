@@ -1238,16 +1238,11 @@ impl<'a> RasterState<'a> {
         mask: Option<&MaskLayer>,
     ) {
         let mut layer = self.layers.pop().expect("layer frame has a surface");
-        if let Some(filter) = filter {
-            apply_filter_effect(&mut layer, filter);
-        }
-        if let Some(mask) = mask {
-            let mask_offset = match coordinate_space {
-                PaintCoordinateSpace::Document => offset,
-                PaintCoordinateSpace::Viewport => PhysicalPoint::default(),
-            };
-            apply_mask_image(&mut layer, mask, mask_offset, self.images);
-        }
+        let mask_offset = match coordinate_space {
+            PaintCoordinateSpace::Document => offset,
+            PaintCoordinateSpace::Viewport => PhysicalPoint::default(),
+        };
+        apply_layer_effects(&mut layer, filter, mask, mask_offset, self.images);
         let into_layer = Transform2D {
             translate_x: -offset.x,
             translate_y: -offset.y,
@@ -2517,6 +2512,130 @@ fn paint_image(
         }
     }
     true
+}
+
+/// The number of physical pixels a filter can add on each side of its input.
+///
+/// A retained layer rasterizes only the element's content, so the surface has
+/// to grow by this outset before the effect runs; otherwise a blur or shadow
+/// would be clipped at the content edge where the complete raster leaves
+/// transparent space.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct FilterOutset {
+    pub(super) left: u32,
+    pub(super) right: u32,
+    pub(super) top: u32,
+    pub(super) bottom: u32,
+}
+
+/// The greatest distance a blur can move a nonzero pixel.
+///
+/// This mirrors [`blur_surface`] and [`blur_axis`]: a sigma below `0.05` is a
+/// no-op, the sigma is clamped to 64, and the kernel radius is
+/// `ceil(3 * sigma)` clamped to `1..=64`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the radius is a bounded whole-pixel count"
+)]
+fn blur_reach(sigma: f32) -> u32 {
+    let sigma = sigma.clamp(0.0, 64.0);
+    if sigma < 0.05 {
+        return 0;
+    }
+    (sigma * 3.0).ceil().clamp(1.0, 64.0) as u32
+}
+
+/// The integer boundary shift a drop shadow applies, matching
+/// [`apply_drop_shadow`]'s rounding.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the shift is rounded to whole pixels; non-finite values saturate exactly as the paint pass does"
+)]
+fn drop_shadow_shift(offset: f32) -> i64 {
+    offset.round() as i64
+}
+
+/// Returns how far each side of the input can gain nonzero pixels after
+/// `effect` runs.
+///
+/// Sequential operations compose: a blur adds its kernel radius to every
+/// side, and a drop shadow adds its shift in the direction it moves plus the
+/// blur radius. Non-spatial operations (brightness, grayscale, saturation)
+/// cannot move pixels and add nothing.
+pub(super) fn filter_outset(effect: &FilterEffect) -> FilterOutset {
+    let mut outset = FilterOutset::default();
+    for operation in &effect.operations {
+        match operation {
+            FilterOperation::Blur(sigma) => {
+                let reach = blur_reach(*sigma);
+                outset.left = outset.left.saturating_add(reach);
+                outset.right = outset.right.saturating_add(reach);
+                outset.top = outset.top.saturating_add(reach);
+                outset.bottom = outset.bottom.saturating_add(reach);
+            }
+            FilterOperation::DropShadow {
+                offset_x,
+                offset_y,
+                blur,
+                ..
+            } => {
+                let shift_x = drop_shadow_shift(*offset_x);
+                let shift_y = drop_shadow_shift(*offset_y);
+                let reach = i64::from(blur_reach(*blur));
+                // The shadow occupies the input shifted by `shift` and then
+                // blurred by `reach`; its union with the unshifted input adds
+                // this much on each side.
+                outset.left = outset
+                    .left
+                    .saturating_add(u32_from_i64(reach.saturating_sub(shift_x).max(0)));
+                outset.right = outset
+                    .right
+                    .saturating_add(u32_from_i64(reach.saturating_add(shift_x).max(0)));
+                outset.top = outset
+                    .top
+                    .saturating_add(u32_from_i64(reach.saturating_sub(shift_y).max(0)));
+                outset.bottom = outset
+                    .bottom
+                    .saturating_add(u32_from_i64(reach.saturating_add(shift_y).max(0)));
+            }
+            FilterOperation::Brightness(_)
+            | FilterOperation::Grayscale(_)
+            | FilterOperation::Saturate(_) => {}
+        }
+    }
+    outset
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "non-negative pixel distances are clamped to u32"
+)]
+fn u32_from_i64(value: i64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+/// Applies a stacking context's filter and then its mask to a finished layer
+/// surface.
+///
+/// Both the complete-raster offscreen pass and the retained effect layer use
+/// this function so the operation order and coordinate handling cannot drift.
+/// `mask_offset` is the document/viewport coordinate of surface pixel `(0, 0)`
+/// negated, matching [`apply_mask_image`]'s sampling contract.
+pub(super) fn apply_layer_effects(
+    surface: &mut Surface,
+    filter: Option<&FilterEffect>,
+    mask: Option<&MaskLayer>,
+    mask_offset: PhysicalPoint,
+    images: Option<&ImageResources>,
+) {
+    if let Some(filter) = filter {
+        apply_filter_effect(surface, filter);
+    }
+    if let Some(mask) = mask {
+        apply_mask_image(surface, mask, mask_offset, images);
+    }
 }
 
 /// Blends `source` into `destination` through `transform`, which maps source
