@@ -509,6 +509,7 @@ impl BrowserApp {
         let Some(page) = self.pages.get_mut(&id) else {
             return;
         };
+        page.requested_viewport = viewport;
         if viewport.width == 0 || viewport.height == 0 {
             page.render_generation = page.render_generation.saturating_add(1);
             page.frame.clear();
@@ -545,6 +546,7 @@ impl BrowserApp {
         let identity = RenderIdentity {
             tab_id: id.as_u64(),
             generation: page.render_generation,
+            document_serial: page.document_serial,
             dom_revision: page.dom_revision,
             viewport: RenderViewport {
                 width: viewport.width,
@@ -774,20 +776,25 @@ impl BrowserApp {
                 return;
             }
         };
-        // A newer render owns the tab, so this frame is discarded. The pending
-        // repaint request must be honoured on this path too: it used to be
-        // consumed only after a successful commit, which meant a discarded
-        // frame also stranded the request and froze the tab on whatever it had
-        // painted before. Reporting the frame here (before the gate) made a
-        // discarded frame look like a commit in the frame log.
-        if !self
-            .pages
-            .get(&id)
-            .is_some_and(|page| page.expected_render == Some(completed.identity))
-        {
+        // A completed frame is safe to present when it still belongs to the
+        // document on screen, was built for the viewport and scroll position
+        // currently requested, and is newer than the last frame installed.
+        // It does not have to be the newest *submitted* generation: waiting for
+        // that frame is what left heavy sites frozen on a pre-hydration image.
+        let accepted = self.pages.get(&id).is_some_and(|page| {
+            completed.identity.document_serial == page.document_serial
+                && completed.identity.viewport.width == page.requested_viewport.width
+                && completed.identity.viewport.height == page.requested_viewport.height
+                && page
+                    .committed_render
+                    .is_none_or(|previous| completed.identity.generation > previous.generation)
+                && (page.frame.is_empty()
+                    || completed.identity.scroll_offset.y == page.scroll.offset_y())
+        });
+        if !accepted {
             if env::var_os("RENDER_DEBUG_FRAME").is_some() {
                 eprintln!(
-                    "render-browser discarding superseded frame page={} generation={}",
+                    "render-browser discarding stale frame page={} generation={}",
                     completed.identity.tab_id, completed.identity.generation
                 );
             }
@@ -799,7 +806,10 @@ impl BrowserApp {
             let Some(page) = self.pages.get_mut(&id) else {
                 return;
             };
-            page.expected_render = None;
+            if page.expected_render == Some(completed.identity) {
+                page.expected_render = None;
+            }
+            page.committed_render = Some(completed.identity);
             // The full frame owns the new layer tree. Any scroll job still
             // using the previous tree must not paint over it when it lands.
             page.expected_compositor = None;
@@ -5366,6 +5376,10 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
         reason = "the event-loop turn reads as one ordered pass over network, scripts, animation and wakeups"
     )]
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Drain completed full frames before recovery decides the tab is idle.
+        // Recovery used to submit a newer job in this window, which made
+        // `drain_latest` drop the frame that was ready to present.
+        self.poll_render_worker();
         self.poll_compositor_worker();
         self.poll_network();
         self.recover_unresolved_render_requests();

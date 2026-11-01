@@ -76,9 +76,123 @@ use render_browser::settings::CacheClearUiState;
 use render_browser::worker::CompletedRender;
 use render_browser::worker::RenderCancellation;
 use render_browser::worker::RenderFailure;
+use render_browser::worker::RenderIdentity;
 use render_browser::worker::RenderJob;
+use render_browser::worker::RenderOffset;
+use render_browser::worker::RenderViewport;
 use render_browser::worker::RenderWorkerOptions;
 use render_core::js::ElementRect;
+
+fn empty_render_frame(viewport: WindowSize<u32>, pixel: u32, revision: u64) -> PageRenderFrame {
+    PageRenderFrame {
+        frame: vec![pixel],
+        viewport,
+        display_list: None,
+        paint_scene: None,
+        compositor: None,
+        raster_background: Color::WHITE,
+        content_height: 600.0,
+        viewport_height: 600.0,
+        applied_style_sheets: None,
+        style_plan: None,
+        style_diagnostics: Vec::new(),
+        font_plan: None,
+        installed_fonts: Vec::new(),
+        computed_styles: None,
+        geometry: None,
+        document_revision: revision,
+        transition_state: None,
+        transition_events: Vec::new(),
+    }
+}
+
+fn test_render_identity(
+    tab: TabId,
+    document_serial: u64,
+    generation: u64,
+    viewport: WindowSize<u32>,
+    scroll_y: f32,
+) -> RenderIdentity {
+    RenderIdentity {
+        tab_id: tab.as_u64(),
+        generation,
+        document_serial,
+        dom_revision: generation,
+        viewport: RenderViewport {
+            width: viewport.width,
+            height: viewport.height,
+        },
+        scroll_offset: RenderOffset {
+            x: 0.0,
+            y: scroll_y,
+        },
+        external_styles_generation: 0,
+        animation_time_millis: 0,
+    }
+}
+
+#[test]
+fn completed_frames_commit_progressively_but_never_go_backwards() {
+    let (mut app, tab) = headless_app_with("<p>progress</p>");
+    let viewport = WindowSize::new(800, 600);
+    let document_serial = {
+        let page = app.pages.get_mut(&tab).expect("page state");
+        page.requested_viewport = viewport;
+        page.committed_render = None;
+        page.document_serial
+    };
+    let first = test_render_identity(tab, document_serial, 1, viewport, 0.0);
+    let second = test_render_identity(tab, document_serial, 2, viewport, 0.0);
+
+    app.commit_render(CompletedRender {
+        identity: first,
+        result: Ok(empty_render_frame(viewport, 0x0000_00ff, 1)),
+    });
+    assert_eq!(
+        app.pages[&tab].committed_render,
+        Some(first),
+        "the first completed frame must reach the screen"
+    );
+    assert_eq!(app.pages[&tab].frame, [0x0000_00ff]);
+
+    app.commit_render(CompletedRender {
+        identity: second,
+        result: Ok(empty_render_frame(viewport, 0x0000_ff00, 2)),
+    });
+    assert_eq!(app.pages[&tab].committed_render, Some(second));
+    assert_eq!(app.pages[&tab].frame, [0x0000_ff00]);
+
+    // An out-of-order completion for the older generation must not replace
+    // the newer frame already on screen.
+    app.commit_render(CompletedRender {
+        identity: first,
+        result: Ok(empty_render_frame(viewport, 0x00ff_0000, 1)),
+    });
+    assert_eq!(app.pages[&tab].committed_render, Some(second));
+    assert_eq!(app.pages[&tab].frame, [0x0000_ff00]);
+}
+
+#[test]
+fn a_frame_from_a_replaced_document_never_commits() {
+    let (mut app, tab) = headless_app_with("<p>document</p>");
+    let viewport = WindowSize::new(800, 600);
+    let document_serial = {
+        let page = app.pages.get_mut(&tab).expect("page state");
+        page.requested_viewport = viewport;
+        page.committed_render = None;
+        page.document_serial
+    };
+    let old = test_render_identity(tab, document_serial.wrapping_sub(1), 1, viewport, 0.0);
+
+    app.commit_render(CompletedRender {
+        identity: old,
+        result: Ok(empty_render_frame(viewport, 0x0000_00ff, 1)),
+    });
+    assert!(
+        app.pages[&tab].committed_render.is_none(),
+        "a frame from the previous document must not be installed"
+    );
+}
 
 #[test]
 fn screenshot_deadline_wakes_a_settled_event_loop() {

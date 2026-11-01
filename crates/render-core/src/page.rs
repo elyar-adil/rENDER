@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use url::Url;
 
@@ -1289,6 +1289,26 @@ impl Page {
         now: Duration,
         turn_budget: usize,
     ) -> Result<PagePumpOutcome, PageError> {
+        self.pump_at_most_without_render_until(now, turn_budget, None)
+    }
+
+    /// Pump at most `turn_budget` turns, stopping between turns when `deadline`
+    /// has passed.
+    ///
+    /// The deadline is a scheduler budget, not a script timeout: a turn already
+    /// running is never interrupted. It bounds how many independent tasks one
+    /// event-loop pass can execute when a page queues a long chain of small
+    /// scripts, so painting and input cannot wait behind an unbounded chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalidation lineage error from one of the turns.
+    pub fn pump_at_most_without_render_until(
+        &mut self,
+        now: Duration,
+        turn_budget: usize,
+        deadline: Option<Instant>,
+    ) -> Result<PagePumpOutcome, PageError> {
         self.event_loop.advance_time_to(now)?;
         // Presentation clocks advance even without a raster; the frame store
         // marks itself dirty for the next rendering pass.
@@ -1300,6 +1320,9 @@ impl Page {
         let mut rendered_turns = 0;
         let mut task_results = Vec::new();
         while executed_turns < turn_budget {
+            if executed_turns > 0 && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                break;
+            }
             let Some(outcome) = self.run_one_turn_without_render()? else {
                 break;
             };

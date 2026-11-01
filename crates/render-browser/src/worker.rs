@@ -19,6 +19,10 @@ const MAX_QUEUE_CAPACITY: usize = 64;
 pub struct RenderIdentity {
     pub tab_id: u64,
     pub generation: u64,
+    /// The document serial this frame was rendered from. A navigation bumps it,
+    /// so a frame that finished after the document was replaced can never be
+    /// installed into the new document just because its generation is newer.
+    pub document_serial: u64,
     pub dom_revision: u64,
     pub viewport: RenderViewport,
     pub scroll_offset: RenderOffset,
@@ -188,7 +192,6 @@ struct Shared<P, R> {
     queue: Mutex<QueueState<P>>,
     available: Condvar,
     completed: Mutex<VecDeque<CompletedRender<R>>>,
-    latest: Mutex<HashMap<u64, RenderIdentity>>,
     queue_capacity: usize,
 }
 
@@ -241,7 +244,6 @@ where
             completed: Mutex::new(VecDeque::with_capacity(
                 options.queue_capacity.saturating_add(options.worker_count),
             )),
-            latest: Mutex::new(HashMap::new()),
             queue_capacity: options.queue_capacity,
         });
         let process = Arc::new(process);
@@ -303,11 +305,6 @@ where
         {
             evicted.cancellation.cancel();
         }
-        self.shared
-            .latest
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(identity.tab_id, identity);
         queue.jobs.push_back(Queued { job, cancellation });
         drop(queue);
         self.shared.available.notify_one();
@@ -322,12 +319,31 @@ where
     /// resubmit after the commit instead of superseding the active job.
     #[must_use]
     pub fn is_tab_busy(&self, tab_id: u64) -> bool {
+        let queued = {
+            let queue = self
+                .shared
+                .queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            queue.active.contains_key(&tab_id)
+                || queue
+                    .jobs
+                    .iter()
+                    .any(|queued| queued.job.identity.tab_id == tab_id)
+        };
+        if queued {
+            return true;
+        }
+        // A completed frame is still the tab's newest committable state until
+        // the event loop drains it. Treating that window as idle lets recovery
+        // submit a newer job, which used to make `drain_latest` discard the
+        // frame the user needed to see.
         self.shared
-            .queue
+            .completed
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .active
-            .contains_key(&tab_id)
+            .iter()
+            .any(|completed| completed.identity.tab_id == tab_id)
     }
 
     /// Cancel and forget all work for a closed or zero-sized tab.
@@ -351,15 +367,17 @@ where
             }
         });
         drop(queue);
-        self.shared
-            .latest
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&tab_id);
     }
 
-    /// Drain only commit-safe results. Superseded identities and cancelled
-    /// results are discarded here, before application code can install them.
+    /// Drain the newest completed frame for each tab.
+    ///
+    /// A newer job may already be queued or running: it does not make an
+    /// earlier completed frame unsafe. That frame is a valid, newer-than-screen
+    /// state and committing it is what keeps a page from freezing on its
+    /// pre-hydration pixels while the next frame is still being built. The
+    /// application still rejects a frame whose document, viewport or scroll
+    /// position no longer applies, and never lets generation move backwards.
+    /// Cancelled results are not published at all.
     #[must_use]
     pub fn drain_latest(&self) -> Vec<CompletedRender<R>> {
         let mut completed = self
@@ -367,18 +385,23 @@ where
             .completed
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let latest = self
-            .shared
-            .latest
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        completed
-            .drain(..)
-            .filter(|completed| {
-                latest.get(&completed.identity.tab_id) == Some(&completed.identity)
-                    && !matches!(completed.result, Err(RenderFailure::Cancelled))
-            })
-            .collect()
+        let mut newest: HashMap<u64, CompletedRender<R>> = HashMap::new();
+        for completed in completed.drain(..) {
+            if matches!(completed.result, Err(RenderFailure::Cancelled)) {
+                continue;
+            }
+            match newest.entry(completed.identity.tab_id) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(completed);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if completed.identity.generation > slot.get().identity.generation {
+                        slot.insert(completed);
+                    }
+                }
+            }
+        }
+        newest.into_values().collect()
     }
 
     /// Stop accepting new work. Running stages observe cancellation at their
@@ -486,6 +509,23 @@ where
                 }),
             }
         };
+        let published = !queued.cancellation.is_cancelled()
+            || matches!(result, Err(RenderFailure::Panicked { .. }));
+        if published {
+            let mut completed = shared
+                .completed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let completion_capacity = shared.queue_capacity.saturating_add(MAX_WORKERS);
+            if completed.len() == completion_capacity {
+                completed.pop_front();
+            }
+            completed.push_back(CompletedRender { identity, result });
+        }
+        // Remove the active marker only after the completion is visible. If it
+        // were removed first, `is_tab_busy` would briefly report an idle tab
+        // and recovery would submit a replacement before the committed frame
+        // could be drained.
         {
             let mut queue = shared.queue.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(active) = queue.active.get_mut(&identity.tab_id) {
@@ -496,19 +536,7 @@ where
                 }
             }
         }
-        if !queued.cancellation.is_cancelled()
-            || matches!(result, Err(RenderFailure::Panicked { .. }))
-        {
-            let mut completed = shared
-                .completed
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let completion_capacity = shared.queue_capacity.saturating_add(MAX_WORKERS);
-            if completed.len() == completion_capacity {
-                completed.pop_front();
-            }
-            completed.push_back(CompletedRender { identity, result });
-            drop(completed);
+        if published {
             wake();
         }
     }
@@ -540,6 +568,7 @@ mod tests {
         RenderIdentity {
             tab_id: tab,
             generation,
+            document_serial: 1,
             dom_revision: 7,
             viewport: RenderViewport { width, height: 600 },
             scroll_offset: RenderOffset {
@@ -657,6 +686,65 @@ mod tests {
         }
         values.sort_unstable();
         assert_eq!(values, [12, 21]);
+    }
+
+    #[test]
+    fn a_completed_frame_is_not_hidden_by_a_newer_submission() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let worker = RenderWorker::start(
+            RenderWorkerOptions {
+                queue_capacity: 2,
+                worker_count: 1,
+            },
+            {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                move |job: RenderJob<usize>, _| {
+                    if job.payload == 2 {
+                        entered.wait();
+                        release.wait();
+                    }
+                    Ok(job.payload)
+                }
+            },
+            {
+                let wakes = Arc::clone(&wakes);
+                move || {
+                    wakes.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+        )
+        .expect("worker starts");
+
+        worker.submit(job(identity(1, 1, 800, 0.0), 1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while wakes.load(Ordering::Relaxed) == 0 {
+            assert!(Instant::now() < deadline, "first frame did not finish");
+            thread::yield_now();
+        }
+        // The frame is complete but not drained. A new schedule arrives before
+        // the event loop can poll it; the completed frame must still be
+        // delivered when the tab is next drained.
+        assert!(worker.is_tab_busy(1));
+        worker.submit(job(identity(1, 2, 800, 0.0), 2)).unwrap();
+        let completed = worker.drain_latest();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].result, Ok(1));
+
+        entered.wait();
+        release.wait();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let completed = worker.drain_latest();
+            if let Some(completed) = completed.first() {
+                assert_eq!(completed.result, Ok(2));
+                break;
+            }
+            assert!(Instant::now() < deadline, "second frame did not finish");
+            thread::yield_now();
+        }
     }
 
     #[test]

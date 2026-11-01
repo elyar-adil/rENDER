@@ -308,6 +308,7 @@ mod tests {
         RenderIdentity {
             tab_id: 1,
             generation,
+            document_serial: 1,
             dom_revision: 1,
             viewport: RenderViewport {
                 width: 80,

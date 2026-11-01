@@ -63,6 +63,16 @@ use winit::dpi::PhysicalSize as WindowSize;
 /// pump instead.
 const SCRIPT_BATCH_TURN_BUDGET: usize = 1_024;
 
+/// Wall-clock slice for one event-loop pass. A single script turn is never
+/// interrupted (that would require resumable interpreter state), but a page
+/// that queues an unbounded chain of independent tasks cannot keep the UI
+/// thread inside one pass.
+const PAGE_TURN_TIME_BUDGET: Duration = Duration::from_millis(24);
+
+/// Wall-clock slice for one prepared classic-script batch. Once it expires the
+/// remaining turns stay queued and drain through the bounded page pump.
+const SCRIPT_BATCH_TIME_BUDGET: Duration = Duration::from_millis(32);
+
 #[allow(
     clippy::struct_excessive_bools,
     reason = "each flag tracks an independent pipeline stage: styles, scripts, images, pending rerender"
@@ -143,7 +153,16 @@ pub(super) struct PageState {
     /// instead of rendering the document the request was made for.
     pub(super) render_dirty_viewport: Option<WindowSize<u32>>,
     pub(super) frame: Vec<u32>,
+    /// The viewport of the currently presented frame.
     pub(super) viewport: WindowSize<u32>,
+    /// The viewport the newest full-render request was made for. A frame for a
+    /// different size must not be installed merely because it finished after a
+    /// resize.
+    pub(super) requested_viewport: WindowSize<u32>,
+    /// The newest frame actually installed into `frame`. A later completion
+    /// may be older than the newest submitted generation, but it must never
+    /// replace a newer presented frame.
+    pub(super) committed_render: Option<RenderIdentity>,
     pub(super) display_list: Option<Arc<DisplayList>>,
     pub(super) paint_scene: Option<Arc<PaintScene>>,
     /// Retained compositor for scroll frames, when the scene is compositable.
@@ -340,6 +359,8 @@ impl PageState {
             render_dirty_viewport: None,
             frame: Vec::new(),
             viewport: WindowSize::new(0, 0),
+            requested_viewport: WindowSize::new(0, 0),
+            committed_render: None,
             display_list: None,
             paint_scene: None,
             compositor: None,
@@ -469,6 +490,8 @@ impl PageState {
         self.render_dirty_viewport = None;
         self.frame.clear();
         self.viewport = WindowSize::new(0, 0);
+        self.requested_viewport = WindowSize::new(0, 0);
+        self.committed_render = None;
         self.display_list = None;
         self.paint_scene = None;
         self.compositor = None;
@@ -720,11 +743,20 @@ impl PageState {
             })
             .collect::<HashMap<_, _>>();
         let mut turns = 0_usize;
+        let started = Instant::now();
         loop {
             if turns >= SCRIPT_BATCH_TURN_BUDGET {
                 eprintln!(
                     "render-browser script batch hit its {SCRIPT_BATCH_TURN_BUDGET}-turn budget; \
                      remaining page work drains through the bounded page pump"
+                );
+                break;
+            }
+            if turns > 0 && started.elapsed() >= SCRIPT_BATCH_TIME_BUDGET {
+                eprintln!(
+                    "render-browser script batch yielded after {turns} turns and \
+                     {SCRIPT_BATCH_TIME_BUDGET:?}; remaining page work drains through the \
+                     bounded page pump"
                 );
                 break;
             }
@@ -931,7 +963,11 @@ impl PageState {
         let now = self.created_at.elapsed();
         let revision_before = self.page.document().dom().revision().as_u64();
         let mut defaults = HashMap::new();
-        match self.page.pump_at_most_without_render(now, turn_budget) {
+        let deadline = Instant::now() + PAGE_TURN_TIME_BUDGET;
+        match self
+            .page
+            .pump_at_most_without_render_until(now, turn_budget, Some(deadline))
+        {
             Ok(outcome) => {
                 for (id, result) in outcome.task_results {
                     let default_allowed = match &result {

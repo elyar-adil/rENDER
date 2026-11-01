@@ -157,6 +157,7 @@ fn identity(generation: u64, scroll_y: f32) -> RenderIdentity {
     RenderIdentity {
         tab_id: 1,
         generation,
+        document_serial: 1,
         dom_revision: 1,
         viewport: RenderViewport {
             width: VIEWPORT.width as u32,
