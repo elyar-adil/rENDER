@@ -1,3 +1,116 @@
+# 交接文档 (2026-11-01, 续六十五) — 独立 compositor worker 与滚动帧脱离 render worker
+
+这一轮把 scroll compositing 从 render worker 的队列里拆出来，放进独立的
+compositor worker 线程。render worker 继续负责 style/layout/display list 和完整
+raster；滚动帧只读取 retained layer tree 与 band cache，提交 presentable surface。
+没有站点特判。
+
+## 架构
+
+- 新增 `crates/render-browser/src/compositor.rs`：
+  - `CompositorScroll { compositor, images, content_height, viewport_height }`；
+    scroll offset 仍放在 `RenderIdentity`，与既有 supersession/coalescing 共用；
+  - `CompositorFrame { surface, render_time, worker_thread, content_height,
+    viewport_height }`；
+  - `start_compositor_worker` 用 `RenderWorker` 启动 1 个线程、queue capacity 8；
+  - worker 内调用 `CompositorCache::render`，返回 CPU `Surface` 和本帧
+    `render_time`；不在 worker 内跑 style、layout 或 display list。
+- app 新增 `compositor_worker: Option<CompositorWorker>`：
+  - `PageState` 新增 `expected_compositor`，与 `expected_render` 分开，所以 full
+    render 在途时滚动帧仍可提交和 commit；
+  - `schedule_page_render` 在能合成时直接向 compositor worker 提交，绕过
+    `render_worker.is_tab_busy`；
+  - `commit_compositor_frame` 只更新 surface、viewport、scroll metrics 和 runtime
+    viewport，然后 damage/compose/redraw；
+  - full render commit 会取消在途的旧 compositor job 并清空
+    `expected_compositor`，防止旧 layer tree 的帧覆盖新内容；
+  - zero viewport、导航、关闭 tab 都同时 cancel 两个 worker；
+  - `UserEvent::CompositorReady` 负责唤醒事件循环，`about_to_wait` 也会 poll 一次
+    compositor worker。
+- 删除了 `PageRenderPayload::CompositedScroll`：scroll 不再经过 render worker。
+  没有 compositor worker 的环境（headless test 或 worker 启动失败）继续走
+  `RetainedRaster` / full render 回退。
+- `main.rs` 启动失败时只打印 `render-browser dedicated compositor disabled` 并继续
+  运行，不让整个浏览器失败。
+
+## 测试
+
+- `render-browser/src/compositor.rs`：
+  - `twenty_scroll_frames_run_on_the_dedicated_thread`：20 个 80x60 滚动帧，
+    每帧断言 `worker_thread != caller`，surface 尺寸和像素正确，记录
+    `render_time`，最慢一帧 < 2s（宽松上界，用于抓布局级回退）。
+- `app_tests.rs`：
+  - `a_scroll_frame_composites_while_the_render_worker_is_blocked`：
+    gated render worker 卡在 full frame，`is_tab_busy == true`；随后 scroll 仍通过
+    compositor worker 提交并在 5s 内 commit，render worker 的 log 没有收到 scroll
+    job；commit 后 `expected_compositor == None`。
+- 既有 8 个 compositor core tests 继续覆盖 fixed/sticky/affine 与完整 raster 的
+  逐像素相等。
+
+## Benchmark
+
+新增 `crates/render-browser/src/bin/render-compositor-bench.rs`：一个模拟 render
+worker 线程阻塞 500ms，主线程顺序提交 120 个滚动 job，等待每个 compositor frame：
+
+```text
+cargo run --release -p render-browser --bin render-compositor-bench
+{"frames":"120","scroll_step_px":"16","viewport":"800x600",
+ "render_worker_block_ms":"500","frames_during_block":"120",
+ "mean_latency_us":"1412.2","median_latency_us":"1300.1",
+ "max_latency_us":"4595.9"}
+```
+
+如果滚动帧和 render worker 共享队列，这个数字会是 0；实际 **120/120** 帧在
+500ms 阻塞期间完成，平均 1.41ms、中位 1.30ms。
+
+原有 `render-scroll-bench` 仍然测量单帧合成成本与完整 raster：
+
+```text
+{"frames":"120","scroll_step_px":"16","viewport":"800x600",
+ "compositor_ms":"272.476","compositor_us_per_frame":"2270.6",
+ "full_raster_ms":"726.360","full_raster_us_per_frame":"6053.0",
+ "initial_bands":"5","final_bands":"9","scroll_bands_rasterized":"4",
+ "scroll_frames_without_new_bands":"116"}
+```
+
+retained **2.27ms/帧** vs full raster **6.05ms/帧**；116/120 帧没有新增 band。
+
+## 验证
+
+```text
+cargo test -p render-browser --lib compositor::tests  1 passed, 0 failed
+cargo test -p render-browser --bin render-browser \
+  a_scroll_frame_composites_while_the_render_worker_is_blocked
+                                                    1 passed, 0 failed
+cargo test --workspace                              all crates passed, 0 failed
+cargo fmt --all --check                             clean
+cargo clippy ... --all-targets -- -D warnings       clean
+python tools/check_site_neutrality.py               0 blocking, 26 advisory
+```
+
+## 已知缺口
+
+- 仍是 CPU dedicated-surface，不是 GPU 合成；没有 GPU texture、swapchain 或
+  平台合成器集成。
+- compositor worker 只有 1 个线程；多 tab 同时滚动时串行，后续可按 tab/图层
+  并行或给活跃 tab 优先队列。
+- 动画采样仍在 event-loop 线程；没有 compositor-driven animation timeline。
+- filter/mask、非 Normal blend、ambient clip 跨 layer、嵌套 sticky、sticky 内
+  transform 仍回退到完整 raster。
+- band cache 无上限/淘汰策略；fixed 内容仍按整个 viewport 建 source。
+- 没有独立的 compositor frame timing 历史导出到 `render-perf`，目前只有单帧
+  `render_time` 和两个 benchmark。
+
+## 下一步
+
+- GPU texture/swapchain 合成，或至少把 `Surface` 上传到平台 surface 后由
+  compositor worker 直接 present。
+- 多 tab compositor 调度与 band residency/eviction。
+- 把 animation 采样移入 compositor timeline。
+- 继续 RTL 块轴镜像、`scroll-state()`、`@starting-style`。
+
+---
+
 # 交接文档 (2026-11-01, 续六十四) — compositor 支持 fixed/sticky 与 scale/rotate/skew
 
 这一轮扩展上一轮的 retained compositor：fixed 内容进入 viewport-space 的
@@ -102,6 +215,8 @@ python tools/check_site_neutrality.py             0 blocking, 26 advisory
 ```
 
 ## 已知缺口
+
+> 续六十五已关闭“没有独立 compositor 线程”这一条；以下保留为当时记录。
 
 - 没有独立 compositor 线程或 GPU 合成；所有工作仍在 render worker。
 - fixed 内容按整个 viewport 建立 source，透明区域虽已跳过，但窗口越大固定层

@@ -556,7 +556,9 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 play/pause/finish/cancel, finish/cancel events and a frame-driven \
                 timeline, but it is not yet unified with the CSS animation timeline and \
                 lacks playbackRate/reverse, effect composition and per-keyframe easing. \
-                There is no compositor thread.",
+                Scroll composition runs on a dedicated compositor worker, but animation \
+                sampling still runs on the event-loop thread and is not driven by a \
+                compositor timeline.",
         dependencies: &[CSS_SYNTAX],
         tests: &[ConformanceTest::new("rust", "css::animation::tests")],
     },
@@ -736,9 +738,11 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 and scale/rotate/skew layers, fixed viewport-space content and \
                 top-level sticky scopes; scrolling composites those bands, resolves \
                 sticky displacement at composite time, and only rasterizes newly \
-                exposed bands. Filters, masks, non-normal blend modes, ambient \
-                clips crossing a layer and nested sticky still take the complete \
-                raster.",
+                exposed bands. A dedicated compositor worker runs scroll jobs off \
+                the render worker, so a scroll frame does not wait behind style, \
+                layout or a complete raster. Filters, masks, non-normal blend modes, \
+                ambient clips crossing a layer and nested sticky still take the \
+                complete raster, and no GPU backend exists yet.",
         dependencies: &[LAYOUT],
         tests: PAINT_TESTS,
     },
