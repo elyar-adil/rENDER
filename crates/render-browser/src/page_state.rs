@@ -71,7 +71,7 @@ const PAGE_TURN_TIME_BUDGET: Duration = Duration::from_millis(24);
 
 /// Wall-clock slice for one prepared classic-script batch. Once it expires the
 /// remaining turns stay queued and drain through the bounded page pump.
-const SCRIPT_BATCH_TIME_BUDGET: Duration = Duration::from_millis(32);
+const SCRIPT_BATCH_TIME_BUDGET: Duration = Duration::from_millis(500);
 
 #[allow(
     clippy::struct_excessive_bools,
