@@ -1,10 +1,12 @@
 //! Conservative, in-memory HTTP response caching for the browser shell.
 //!
 //! The cache intentionally accepts only anonymous, direct HTTP(S) `200`
-//! responses with an explicit `Cache-Control: max-age` lifetime. Expired
-//! entries remain available as validator metadata until they are replaced or
-//! evicted, allowing callers to perform conditional revalidation without
-//! blocking the UI thread.
+//! responses with an explicit `Cache-Control: max-age` lifetime. Responses
+//! selected by a `Vary` header retain the request-header values that selected
+//! them and are only served to requests carrying the same values; `Vary: *`
+//! responses are never stored. Expired entries remain available as validator
+//! metadata until they are replaced or evicted, allowing callers to perform
+//! conditional revalidation without blocking the UI thread.
 
 pub mod disk;
 pub mod payload;
@@ -86,6 +88,9 @@ pub enum CacheSkipReason {
     ResponseStatus(u16),
     Redirected,
     ResponseSetsCookie,
+    /// The response cannot be represented as one or more variants, either
+    /// because it declares `Vary: *` or because its `Vary` field names are
+    /// malformed.
     Vary,
     NoStore,
     Private,
@@ -117,7 +122,9 @@ pub enum CacheStoreOutcome {
 #[derive(Debug)]
 pub struct HttpCache {
     config: HttpCacheConfig,
-    entries: HashMap<CacheKey, CacheEntry>,
+    /// One bucket per primary cache key, holding one entry per selected
+    /// response variant. Most responses have a single, no-`Vary` variant.
+    entries: HashMap<CacheKey, Vec<CacheEntry>>,
     memory_bytes: usize,
     access_clock: u64,
     epoch: CacheEpoch,
@@ -157,7 +164,7 @@ impl HttpCache {
     /// Returns the number of retained in-memory responses.
     #[must_use]
     pub fn entry_count(&self) -> usize {
-        self.entries.len()
+        self.entries.values().map(Vec::len).sum()
     }
 
     /// Returns the number of retained response-body bytes.
@@ -174,16 +181,20 @@ impl HttpCache {
         }
 
         let key = CacheKey::from_request(request);
-        let Some(fresh_until) = self.entries.get(&key).map(|entry| entry.fresh_until) else {
+        let Some(index) = self
+            .entries
+            .get(&key)
+            .and_then(|entries| fresh_entry_index(entries, request, now))
+        else {
             return CacheLookup::Miss;
         };
 
-        if now >= fresh_until {
-            return CacheLookup::Miss;
-        }
-
         let last_used = self.next_access();
-        let Some(entry) = self.entries.get_mut(&key) else {
+        let Some(entry) = self
+            .entries
+            .get_mut(&key)
+            .and_then(|entries| entries.get_mut(index))
+        else {
             return CacheLookup::Miss;
         };
         entry.last_used = last_used;
@@ -203,18 +214,18 @@ impl HttpCache {
             return None;
         }
         let key = CacheKey::from_request(request);
-        let is_stale = self
+        let index = self
             .entries
             .get(&key)
-            .is_some_and(|entry| now >= entry.fresh_until);
-        if !is_stale {
-            return None;
-        }
+            .and_then(|entries| stale_entry_index(entries, request, now))?;
         let last_used = self.next_access();
-        self.entries.get_mut(&key).map(|entry| {
-            entry.last_used = last_used;
-            Box::new(entry.response.clone())
-        })
+        self.entries
+            .get_mut(&key)
+            .and_then(|entries| entries.get_mut(index))
+            .map(|entry| {
+                entry.last_used = last_used;
+                Box::new(entry.response.clone())
+            })
     }
 
     /// Builds a conditional request from an expired cached response.
@@ -262,11 +273,11 @@ impl HttpCache {
             return None;
         }
         let key = CacheKey::from_request(request);
-        let previous_entry = self.entries.get(&key)?;
-        if now < previous_entry.fresh_until {
-            return None;
-        }
-        let previous = previous_entry.response.clone();
+        let index = self
+            .entries
+            .get(&key)
+            .and_then(|entries| stale_entry_index(entries, request, now))?;
+        let previous = self.entries.get(&key)?.get(index)?.response.clone();
         let headers = merge_headers(&previous.headers, &response.headers);
         let merged = FetchResponse {
             requested_url: previous.requested_url,
@@ -278,30 +289,39 @@ impl HttpCache {
             headers,
             body: previous.body,
         };
+        // The 304 either preserved the stored `Vary` field (merge_headers
+        // keeps it when the update omits one) or replaced it. Recompute the
+        // selecting values from this request so a changed field list is
+        // represented accurately. A `Vary: *` update makes this variant
+        // unusable; evict only that variant and still return the merged body.
+        let Some(variant) = VaryVariant::from_request(request, &merged.headers) else {
+            self.remove_bucket_entry(&key, index);
+            return Some(merged);
+        };
         let freshness = match cache_policy(request, &merged) {
-            CachePolicy::Store { freshness } => Some(freshness),
+            CachePolicy::Store { freshness } => freshness,
             // A 304 still supplies a usable representation. If its updated
-            // directives make it uncacheable, evict the old entry but return
+            // directives make it uncacheable, evict that variant but return
             // the merged body to the resource pipeline.
             CachePolicy::Skip(_) => {
-                self.remove_entry(&key);
+                self.remove_bucket_entry(&key, index);
                 return Some(merged);
             }
         };
-        let fresh_until = now.checked_add(freshness?)?;
+        let fresh_until = now.checked_add(freshness)?;
         let response_bytes = merged.body.len();
         let last_used = self.next_access();
         let entry = CacheEntry {
             response: merged.clone(),
+            variant,
             fresh_until,
             response_bytes,
             last_used,
         };
-        if let Some(previous) = self.entries.insert(key, entry) {
-            self.memory_bytes = self.memory_bytes.saturating_sub(previous.response_bytes);
-        }
-        self.memory_bytes = self.memory_bytes.saturating_add(response_bytes);
-        self.evict_to_limits();
+        // Only the selected variant is refreshed. Other variants stored under
+        // the same primary key keep their previous freshness.
+        self.remove_bucket_entry(&key, index);
+        self.insert_entry(key, entry);
         Some(merged)
     }
 
@@ -325,6 +345,9 @@ impl HttpCache {
             CachePolicy::Store { freshness } => freshness,
             CachePolicy::Skip(reason) => return CacheStoreOutcome::Skipped(reason),
         };
+        let Some(variant) = VaryVariant::from_request(request, &response.headers) else {
+            return CacheStoreOutcome::Skipped(CacheSkipReason::Vary);
+        };
 
         if self.config.max_entries == 0 || self.config.max_bytes == 0 {
             return CacheStoreOutcome::Skipped(CacheSkipReason::CapacityDisabled);
@@ -342,16 +365,12 @@ impl HttpCache {
         let key = CacheKey::from_request(request);
         let entry = CacheEntry {
             response: response.clone(),
+            variant,
             fresh_until,
             response_bytes,
             last_used: self.next_access(),
         };
-
-        if let Some(previous) = self.entries.insert(key, entry) {
-            self.memory_bytes = self.memory_bytes.saturating_sub(previous.response_bytes);
-        }
-        self.memory_bytes = self.memory_bytes.saturating_add(response_bytes);
-        self.evict_to_limits();
+        self.insert_entry(key, entry);
 
         CacheStoreOutcome::Stored
     }
@@ -361,7 +380,7 @@ impl HttpCache {
     pub fn clear(&mut self) -> CacheClearResult {
         self.epoch = CacheEpoch(self.epoch.0.saturating_add(1));
         let result = CacheClearResult {
-            memory_entries: self.entries.len(),
+            memory_entries: self.entry_count(),
             memory_bytes: self.memory_bytes,
             epoch: self.epoch,
         };
@@ -375,25 +394,60 @@ impl HttpCache {
         self.access_clock
     }
 
-    fn remove_entry(&mut self, key: &CacheKey) {
-        if let Some(entry) = self.entries.remove(key) {
-            self.memory_bytes = self.memory_bytes.saturating_sub(entry.response_bytes);
+    fn insert_entry(&mut self, key: CacheKey, entry: CacheEntry) {
+        let response_bytes = entry.response_bytes;
+        if let Some(entries) = self.entries.get_mut(&key) {
+            // A newer response for the same variant replaces the old one; a
+            // different variant is retained alongside it.
+            if let Some(index) = entries
+                .iter()
+                .position(|existing| existing.variant == entry.variant)
+            {
+                let previous = entries.remove(index);
+                self.memory_bytes = self.memory_bytes.saturating_sub(previous.response_bytes);
+            }
+            entries.push(entry);
+        } else {
+            self.entries.insert(key, vec![entry]);
         }
+        self.memory_bytes = self.memory_bytes.saturating_add(response_bytes);
+        self.evict_to_limits();
+    }
+
+    fn remove_bucket_entry(&mut self, key: &CacheKey, index: usize) {
+        let Some(entries) = self.entries.get_mut(key) else {
+            return;
+        };
+        if index >= entries.len() {
+            return;
+        }
+        let removed = entries.remove(index);
+        let empty = entries.is_empty();
+        if empty {
+            self.entries.remove(key);
+        }
+        self.memory_bytes = self.memory_bytes.saturating_sub(removed.response_bytes);
     }
 
     fn evict_to_limits(&mut self) {
-        while self.entries.len() > self.config.max_entries
+        while self.entry_count() > self.config.max_entries
             || self.memory_bytes > self.config.max_bytes
         {
-            let Some(key) = self
+            let Some((key, index)) = self
                 .entries
                 .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| key.clone())
+                .flat_map(|(key, entries)| {
+                    entries
+                        .iter()
+                        .enumerate()
+                        .map(move |(index, entry)| (entry.last_used, key, index))
+                })
+                .min_by_key(|(last_used, _, _)| *last_used)
+                .map(|(_, key, index)| (key.clone(), index))
             else {
                 return;
             };
-            self.remove_entry(&key);
+            self.remove_bucket_entry(&key, index);
         }
     }
 }
@@ -417,7 +471,7 @@ pub fn cache_policy(request: &FetchRequest, response: &FetchResponse) -> CachePo
     if has_header(&response.headers, "set-cookie") {
         return CachePolicy::Skip(CacheSkipReason::ResponseSetsCookie);
     }
-    if has_nonempty_header(&response.headers, "vary") {
+    if vary_selectors(&response.headers).is_none() {
         return CachePolicy::Skip(CacheSkipReason::Vary);
     }
 
@@ -442,9 +496,214 @@ impl CacheKey {
 #[derive(Debug)]
 struct CacheEntry {
     response: FetchResponse,
+    /// Request-header values that selected this response, captured when the
+    /// response was stored (or last revalidated).
+    variant: VaryVariant,
     fresh_until: Instant,
     response_bytes: usize,
     last_used: u64,
+}
+
+/// One stored response's `Vary` selecting fields and the request values that
+/// selected it.
+///
+/// Field names are lowercase and sorted so equivalent responses compare
+/// equal regardless of spelling or order. Each value is the normalized
+/// combination of every request field line with that name. `None` means the
+/// request did not carry the field at all, while `Some("")` means it carried
+/// the field with an empty value; they are deliberately distinct because
+/// RFC 9111 §4.1 requires an absent field to match only another absent field.
+/// Being strict here can cause a cache miss, but never a wrong variant hit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VaryVariant {
+    selectors: Vec<(String, Option<String>)>,
+}
+
+impl VaryVariant {
+    /// Captures the selecting values for a response, or returns `None` when
+    /// its `Vary` metadata cannot be represented (`Vary: *` or malformed
+    /// field names).
+    fn from_request(request: &FetchRequest, response_headers: &[Header]) -> Option<Self> {
+        let names = vary_selectors(response_headers)?;
+        Some(Self {
+            selectors: names
+                .into_iter()
+                .map(|name| {
+                    let value = request_header_value(request, &name);
+                    (name, value)
+                })
+                .collect(),
+        })
+    }
+
+    /// Whether this stored variant was selected by the same request field
+    /// values as `request`.
+    fn matches(&self, request: &FetchRequest) -> bool {
+        self.selectors
+            .iter()
+            .all(|(name, stored)| request_header_value(request, name).as_ref() == stored.as_ref())
+    }
+}
+
+/// Returns the index of the freshest entry selected by `request`.
+fn fresh_entry_index(
+    entries: &[CacheEntry],
+    request: &FetchRequest,
+    now: Instant,
+) -> Option<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| now < entry.fresh_until && entry.variant.matches(request))
+        .max_by_key(|(_, entry)| (entry.fresh_until, entry.last_used))
+        .map(|(index, _)| index)
+}
+
+/// Returns the index of the most recently freshened stale entry selected by
+/// `request`.
+fn stale_entry_index(
+    entries: &[CacheEntry],
+    request: &FetchRequest,
+    now: Instant,
+) -> Option<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| now >= entry.fresh_until && entry.variant.matches(request))
+        .max_by_key(|(_, entry)| (entry.fresh_until, entry.last_used))
+        .map(|(index, _)| index)
+}
+
+/// Parses all `Vary` field lines into a sorted, deduplicated list of lowercase
+/// field names. Returns `None` for `Vary: *` or a field name that is not an
+/// HTTP token, both of which make the response unusable by this cache.
+fn vary_selectors(headers: &[Header]) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for header in headers {
+        if !header.name.eq_ignore_ascii_case("vary") {
+            continue;
+        }
+        let value = std::str::from_utf8(&header.value).ok()?;
+        for field in value.split(',') {
+            let field = field.trim_matches([' ', '\t']);
+            if field.is_empty() {
+                continue;
+            }
+            if field == "*" {
+                return None;
+            }
+            if !is_http_token(field) {
+                return None;
+            }
+            let name = field.to_ascii_lowercase();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names.sort_unstable();
+    Some(names)
+}
+
+/// Returns the normalized value(s) of a request field used for `Vary`
+/// selection.
+///
+/// Repeated field lines are combined in order with commas, as required when a
+/// recipient treats repeated fields as a list. `FetchRequest::accept` is a
+/// separate transport field but goes on the wire as `Accept`, so it is used
+/// when no explicit `Accept` field was supplied. Other fields injected by the
+/// transport with one fixed value for every request (`Accept-Language`,
+/// `Accept-Encoding`, client hints) are intentionally not synthesized here:
+/// they cannot select different variants while constant, and an explicitly
+/// supplied value is present in `headers` and compared normally.
+fn request_header_value(request: &FetchRequest, name: &str) -> Option<String> {
+    let mut values: Vec<&str> = request
+        .headers
+        .iter()
+        .filter(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    if values.is_empty()
+        && name.eq_ignore_ascii_case("accept")
+        && let Some(accept) = request.accept.as_deref()
+    {
+        values.push(accept);
+    }
+    if values.is_empty() {
+        return None;
+    }
+    Some(
+        values
+            .into_iter()
+            .map(normalize_field_value)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+/// Trims optional whitespace from a field value and around list commas.
+///
+/// OWS inside quoted strings is preserved, so the normalization only removes
+/// whitespace that HTTP list syntax allows to vary (RFC 9111 §4.1).
+fn normalize_field_value(value: &str) -> String {
+    let value = value.trim_matches([' ', '\t']);
+    let mut normalized = String::with_capacity(value.len());
+    let mut in_quotes = false;
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '"' => {
+                in_quotes = !in_quotes;
+                normalized.push(character);
+            }
+            '\\' if in_quotes => {
+                normalized.push(character);
+                if let Some(escaped) = chars.next() {
+                    normalized.push(escaped);
+                }
+            }
+            ',' if !in_quotes => {
+                while normalized.ends_with(' ') || normalized.ends_with('\t') {
+                    normalized.pop();
+                }
+                normalized.push(',');
+                while chars
+                    .peek()
+                    .is_some_and(|next| *next == ' ' || *next == '\t')
+                {
+                    chars.next();
+                }
+            }
+            _ => normalized.push(character),
+        }
+    }
+    normalized
+}
+
+/// Whether `value` is an RFC 9110 `token`, the only valid shape for a header
+/// field name.
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 fn request_skip_reason(request: &FetchRequest) -> Option<CacheSkipReason> {
@@ -479,16 +738,6 @@ fn has_header(headers: &[Header], name: &str) -> bool {
         .any(|header| header.name.eq_ignore_ascii_case(name))
 }
 
-fn has_nonempty_header(headers: &[Header], name: &str) -> bool {
-    headers.iter().any(|header| {
-        header.name.eq_ignore_ascii_case(name)
-            && match std::str::from_utf8(&header.value) {
-                Ok(value) => !value.trim().is_empty(),
-                Err(_) => true,
-            }
-    })
-}
-
 fn merge_headers(previous: &[Header], update: &[Header]) -> Vec<Header> {
     let mut merged = previous.to_vec();
     for replacement in update {
@@ -502,11 +751,16 @@ fn merge_headers(previous: &[Header], update: &[Header]) -> Vec<Header> {
         ) {
             continue;
         }
-        if let Some(existing) = merged
-            .iter_mut()
-            .find(|header| header.name.eq_ignore_ascii_case(&replacement.name))
-        {
-            *existing = replacement.clone();
+        // A 304 update replaces every stored field line with the same name,
+        // not just the first one (RFC 9111 §3.2). This matters for list-valued
+        // fields such as `Vary`, whose selecting names must not keep stale
+        // duplicates from the previous response.
+        let insert_at = merged
+            .iter()
+            .position(|header| header.name.eq_ignore_ascii_case(&replacement.name));
+        merged.retain(|header| !header.name.eq_ignore_ascii_case(&replacement.name));
+        if let Some(index) = insert_at {
+            merged.insert(index, replacement.clone());
         } else {
             merged.push(replacement.clone());
         }
@@ -639,6 +893,20 @@ mod tests {
         response(url, vec![header("Cache-Control", "max-age=60")], body)
     }
 
+    fn request_with_headers(url: &str, headers: &[(&str, &str)]) -> FetchRequest {
+        headers.iter().fold(request(url), |request, (name, value)| {
+            request.with_header(*name, *value)
+        })
+    }
+
+    fn vary_response(url: &str, vary: &str, body: &[u8]) -> FetchResponse {
+        response(
+            url,
+            vec![header("Cache-Control", "max-age=60"), header("Vary", vary)],
+            body,
+        )
+    }
+
     #[test]
     fn a_post_neither_reads_nor_writes_the_cache() {
         let url = "https://example.test/login";
@@ -733,6 +1001,168 @@ mod tests {
             panic!("fresh response should be cached");
         };
         assert_eq!(cached.body, b"cached body");
+    }
+
+    #[test]
+    fn vary_accept_language_keeps_variants_separate() {
+        let url = "https://example.test/page";
+        let english = request_with_headers(url, &[("Accept-Language", "en-US")]);
+        let french = request_with_headers(url, &[("Accept-Language", "fr-FR")]);
+        let english_response = vary_response(url, "Accept-Language", b"hello");
+        let french_response = vary_response(url, "Accept-Language", b"bonjour");
+        let now = Instant::now();
+        let mut cache = HttpCache::default();
+
+        assert_eq!(
+            cache.store(&english, &english_response, now, cache.epoch()),
+            CacheStoreOutcome::Stored
+        );
+        assert_eq!(cache.lookup(&french, now), CacheLookup::Miss);
+        let CacheLookup::Hit(cached) = cache.lookup(&english, now) else {
+            panic!("the English variant should be cached");
+        };
+        assert_eq!(cached.body, b"hello");
+        assert_eq!(cache.entry_count(), 1);
+
+        // A second variant is retained alongside the first instead of
+        // replacing it.
+        assert_eq!(
+            cache.store(&french, &french_response, now, cache.epoch()),
+            CacheStoreOutcome::Stored
+        );
+        assert_eq!(cache.entry_count(), 2);
+        let CacheLookup::Hit(cached) = cache.lookup(&french, now) else {
+            panic!("the French variant should be cached");
+        };
+        assert_eq!(cached.body, b"bonjour");
+        let CacheLookup::Hit(cached) = cache.lookup(&english, now) else {
+            panic!("the English variant should still be cached");
+        };
+        assert_eq!(cached.body, b"hello");
+    }
+
+    #[test]
+    fn vary_matching_values_share_a_cached_response() {
+        let url = "https://example.test/page";
+        let stored = request_with_headers(url, &[("Accept-Language", " en-US ")]);
+        let matching = request_with_headers(url, &[("accept-language", "en-US")]);
+        let response = vary_response(url, "Accept-Language", b"hello");
+        let now = Instant::now();
+        let mut cache = HttpCache::default();
+
+        assert_eq!(
+            cache.store(&stored, &response, now, cache.epoch()),
+            CacheStoreOutcome::Stored
+        );
+        let CacheLookup::Hit(cached) = cache.lookup(&matching, now) else {
+            panic!("normalized selecting values should match");
+        };
+        assert_eq!(cached.body, b"hello");
+    }
+
+    #[test]
+    fn vary_names_and_values_are_normalized() {
+        let url = "https://example.test/page";
+        let stored = request_with_headers(
+            url,
+            &[
+                ("ACCEPT-LANGUAGE", " en-US "),
+                ("accept-language", "\tfr "),
+                ("Accept-Encoding", " gzip "),
+            ],
+        );
+        let matching = request_with_headers(
+            url,
+            &[
+                ("accept-language", "en-US,\tfr"),
+                ("ACCEPT-ENCODING", "gzip"),
+            ],
+        );
+        let different = request_with_headers(
+            url,
+            &[
+                ("Accept-Language", "en-US, fr;q=0.5"),
+                ("Accept-Encoding", "gzip"),
+            ],
+        );
+        let response = vary_response(url, " accept-language ,  ACCEPT-ENCODING ", b"body");
+        let now = Instant::now();
+        let mut cache = HttpCache::default();
+
+        assert_eq!(
+            cache.store(&stored, &response, now, cache.epoch()),
+            CacheStoreOutcome::Stored
+        );
+        assert!(matches!(cache.lookup(&matching, now), CacheLookup::Hit(_)));
+        assert_eq!(cache.lookup(&different, now), CacheLookup::Miss);
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn vary_treats_absent_and_empty_request_fields_as_distinct() {
+        let url = "https://example.test/page";
+        let absent = request(url);
+        let empty = request_with_headers(url, &[("Accept-Language", "")]);
+        let response = vary_response(url, "Accept-Language", b"body");
+        let now = Instant::now();
+
+        let mut cache = HttpCache::default();
+        assert_eq!(
+            cache.store(&absent, &response, now, cache.epoch()),
+            CacheStoreOutcome::Stored
+        );
+        assert!(matches!(cache.lookup(&absent, now), CacheLookup::Hit(_)));
+        assert_eq!(cache.lookup(&empty, now), CacheLookup::Miss);
+
+        let mut cache = HttpCache::default();
+        assert_eq!(
+            cache.store(&empty, &response, now, cache.epoch()),
+            CacheStoreOutcome::Stored
+        );
+        assert_eq!(cache.lookup(&absent, now), CacheLookup::Miss);
+        assert!(matches!(cache.lookup(&empty, now), CacheLookup::Hit(_)));
+    }
+
+    #[test]
+    fn vary_star_is_never_stored_or_reused() {
+        let url = "https://example.test/page";
+        let request = request(url);
+        let response = vary_response(url, "*", b"body");
+        let now = Instant::now();
+        let mut cache = HttpCache::default();
+
+        assert_eq!(
+            cache_policy(&request, &response),
+            CachePolicy::Skip(CacheSkipReason::Vary)
+        );
+        assert_eq!(
+            cache.store(&request, &response, now, cache.epoch()),
+            CacheStoreOutcome::Skipped(CacheSkipReason::Vary)
+        );
+        assert_eq!(cache.entry_count(), 0);
+        assert_eq!(cache.lookup(&request, now), CacheLookup::Miss);
+    }
+
+    #[test]
+    fn response_without_vary_ignores_unlisted_request_headers() {
+        let url = "https://example.test/page";
+        let stored = request(url);
+        let different = request_with_headers(
+            url,
+            &[("Accept-Language", "fr-FR"), ("Accept-Encoding", "br")],
+        );
+        let response = cacheable_response(url, b"body");
+        let now = Instant::now();
+        let mut cache = HttpCache::default();
+
+        assert_eq!(
+            cache.store(&stored, &response, now, cache.epoch()),
+            CacheStoreOutcome::Stored
+        );
+        let CacheLookup::Hit(cached) = cache.lookup(&different, now) else {
+            panic!("a response without Vary is reusable for any request headers");
+        };
+        assert_eq!(cached.body, b"body");
     }
 
     #[test]
@@ -833,6 +1263,145 @@ mod tests {
             panic!("merged response should be fresh");
         };
         assert_eq!(hit.body, b"cached body");
+    }
+
+    #[test]
+    fn not_modified_preserves_vary_and_refreshes_only_the_selected_variant() {
+        let url = "https://example.test/page";
+        let english = request_with_headers(url, &[("Accept-Language", "en-US")]);
+        let french = request_with_headers(url, &[("Accept-Language", "fr-FR")]);
+        let english_response = response(
+            url,
+            vec![
+                header("Cache-Control", "max-age=1"),
+                header("ETag", "\"en\""),
+                header("Vary", "Accept-Language"),
+            ],
+            b"hello",
+        );
+        let french_response = response(
+            url,
+            vec![
+                header("Cache-Control", "max-age=1"),
+                header("ETag", "\"fr\""),
+                header("Vary", "Accept-Language"),
+            ],
+            b"bonjour",
+        );
+        let not_modified = response(
+            url,
+            vec![
+                header("Cache-Control", "max-age=60"),
+                header("ETag", "\"en\""),
+            ],
+            b"",
+        );
+        let not_modified = FetchResponse {
+            status: HttpStatus::from_u16(304),
+            ..not_modified
+        };
+        let now = Instant::now();
+        let mut cache = HttpCache::default();
+        assert_eq!(
+            cache.store(&english, &english_response, now, cache.epoch()),
+            CacheStoreOutcome::Stored
+        );
+        assert_eq!(
+            cache.store(&french, &french_response, now, cache.epoch()),
+            CacheStoreOutcome::Stored
+        );
+
+        let merged = cache
+            .merge_not_modified(
+                &english,
+                &not_modified,
+                now + Duration::from_secs(1),
+                cache.epoch(),
+            )
+            .expect("304 should merge");
+        assert_eq!(merged.body, b"hello");
+        assert!(
+            merged.headers.iter().any(|header| {
+                header.name.eq_ignore_ascii_case("vary") && header.value == b"Accept-Language"
+            }),
+            "a 304 without Vary preserves the stored selecting fields"
+        );
+
+        // Only the English variant was refreshed. French remains stale and
+        // still matches only French requests.
+        let CacheLookup::Hit(cached) = cache.lookup(&english, now + Duration::from_secs(2)) else {
+            panic!("the refreshed English variant should be fresh");
+        };
+        assert_eq!(cached.body, b"hello");
+        assert_eq!(
+            cache.lookup(&french, now + Duration::from_secs(2)),
+            CacheLookup::Miss
+        );
+        assert!(
+            cache
+                .stale_response(&french, now + Duration::from_secs(2))
+                .is_some()
+        );
+        assert_eq!(cache.entry_count(), 2);
+    }
+
+    #[test]
+    fn not_modified_can_update_vary_selecting_fields() {
+        let url = "https://example.test/page";
+        let request = request_with_headers(
+            url,
+            &[("Accept-Language", "en-US"), ("Accept-Encoding", "gzip")],
+        );
+        let cached = response(
+            url,
+            vec![
+                header("Cache-Control", "max-age=1"),
+                header("ETag", "\"v1\""),
+                header("Vary", "Accept-Language"),
+            ],
+            b"body",
+        );
+        let not_modified = response(
+            url,
+            vec![
+                header("Cache-Control", "max-age=60"),
+                header("ETag", "\"v1\""),
+                header("Vary", "accept-language, ACCEPT-ENCODING"),
+            ],
+            b"",
+        );
+        let not_modified = FetchResponse {
+            status: HttpStatus::from_u16(304),
+            ..not_modified
+        };
+        let now = Instant::now();
+        let mut cache = HttpCache::default();
+        assert_eq!(
+            cache.store(&request, &cached, now, cache.epoch()),
+            CacheStoreOutcome::Stored
+        );
+        cache
+            .merge_not_modified(
+                &request,
+                &not_modified,
+                now + Duration::from_secs(1),
+                cache.epoch(),
+            )
+            .expect("304 should merge");
+
+        // The updated Vary list now also selects on Accept-Encoding.
+        let different_encoding = request_with_headers(
+            url,
+            &[("Accept-Language", "en-US"), ("Accept-Encoding", "br")],
+        );
+        assert_eq!(
+            cache.lookup(&different_encoding, now + Duration::from_secs(2)),
+            CacheLookup::Miss
+        );
+        assert!(matches!(
+            cache.lookup(&request, now + Duration::from_secs(2)),
+            CacheLookup::Hit(_)
+        ));
     }
 
     #[test]
