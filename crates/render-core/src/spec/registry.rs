@@ -732,10 +732,13 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 `clip-path` as a *shape* rather than a rectangle. `z-index` sorts \
                 block siblings only: flex and grid children are not sorted and the \
                 paint layer has no other notion of stacking level. A retained \
-                banded compositor caches root segments and top-level translate/opacity \
-                layers; scrolling composites those bands and only rasterizes newly \
-                exposed bands. Fixed/sticky content, masks, non-normal blend modes and \
-                rotate/scale transforms still take the complete raster.",
+                banded compositor caches root segments, top-level translate/opacity \
+                and scale/rotate/skew layers, fixed viewport-space content and \
+                top-level sticky scopes; scrolling composites those bands, resolves \
+                sticky displacement at composite time, and only rasterizes newly \
+                exposed bands. Filters, masks, non-normal blend modes, ambient \
+                clips crossing a layer and nested sticky still take the complete \
+                raster.",
         dependencies: &[LAYOUT],
         tests: PAINT_TESTS,
     },

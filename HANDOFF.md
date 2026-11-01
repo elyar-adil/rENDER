@@ -1,3 +1,127 @@
+# 交接文档 (2026-11-01, 续六十四) — compositor 支持 fixed/sticky 与 scale/rotate/skew
+
+这一轮扩展上一轮的 retained compositor：fixed 内容进入 viewport-space 的
+retained segment/layer，top-level sticky 作为可位移 layer，scale/rotate/skew
+layer 用逆映射选择 source band 并直接合成。没有站点特判。
+
+## coordinate space 与 fixed
+
+- `CompositedLayer` 新增 `space: PaintCoordinateSpace`；`RootSegment` 同样记录
+  自己的 space。`from_display_list` 在 root 连续 item 的 space 变化处切段，所以
+  document 内容和 fixed 内容不会共享同一个 source。
+- viewport-space 的 source 按整个 viewport 栅格化，合成时 `to_viewport` 是
+  identity，不减去 scroll offset；document-space source 才随 scroll 平移。
+- viewport layer 的 bounds 也取 viewport rect，避免把一个 `top: 10px` 的
+  fixed 元素裁到从 `(0,0)` 开始的小 surface 里。
+
+## sticky
+
+- top-level `PushSticky` 不再回退：它被提取为 `CompositedLayer`，source band
+  保持 document-space 未位移内容，`sticky: Some(constraint)` 保存约束。
+- 每次 `render` 用 `sticky_displacement(constraint, default, viewport_origin)`
+  计算当前位移，再与 layer 的变换、band 原点和 scroll 平移组合成一个 affine
+  matrix。band cache 不因 scroll 失效。
+- 嵌套 sticky、sticky 内的 stacking context/transform 仍回退，因为内层 scope
+  需要外层的位移来重定位变换原点。
+
+## scale / rotate / skew
+
+- `from_display_list` 不再要求 `transform.is_translation()`；filter、mask、
+  非 Normal blend、ambient clip 仍回退。
+- `composite_surface` 改为对每个 layer/segment 计算
+  `base_mapped = to_viewport ∘ transform ∘ band_origin`，求逆后把 viewport 四角
+  映射回 source 坐标，取包围盒与 source 相交的 band；只有这些 band 需要
+  栅格化。
+- 栅格化仍使用未变换的 source band；合成时由 `warp_surface` 应用完整仿射矩阵。
+- 纯整数平移继续走 `blit_translated` 快速路径；透明像素跳过，alpha 255 且
+  opacity 1 时直接写入，避免把 fixed 的大片透明区域和仿射层的覆盖区域逐像素
+  blend。
+
+## 测试
+
+`render-core/src/paint/compositor.rs` 现在 8 个测试：
+
+- translated + 0.5 opacity layer 的位置和混色；
+- 2048px 页面首帧 2 band、16px 滚动 0 新 band、跳转新增 band；
+- 合成结果与完整 `CpuRasterizer::rasterize` 逐像素相等；
+- transformed layer 不被未变换 bounds 裁掉；
+- 连续 20 个 16px 滚动帧每帧最多新增 1 个 band；
+- `fixed_content_is_retained_in_viewport_space`：fixed item 放在 `y=10`
+  （非原点），滚动 50px 后与完整 raster 逐像素相等，并在 `(5,15)` 命中它；
+- `scaled_and_rotated_layers_match_the_full_raster`：`scale(2)` 与 30° 旋转
+  （0.866/0.5 系数）两个仿射 layer 都与完整 raster 逐像素相等；
+- `a_sticky_layer_is_displaced_at_composite_time`：在 scroll 0/10/50/120/300
+  五个位置与完整 raster 逐像素相等，并断言 scroll 50 时 sticky 条位于 viewport
+  顶部。
+
+## Benchmark
+
+`render-scroll-bench` 的场景扩展为：160 个彩色块、translate+opacity layer、
+scale+rotate layer、top-level sticky bar、viewport-space fixed header。120 帧、
+16px/帧、800x600 视口、12,000px 文档：
+
+```text
+cargo run --release -p render-browser --bin render-scroll-bench
+{"frames":"120","scroll_step_px":"16","viewport":"800x600",
+ "compositor_ms":"265.012","compositor_us_per_frame":"2208.4",
+ "full_raster_ms":"700.858","full_raster_us_per_frame":"5840.5",
+ "initial_bands":"5","final_bands":"9","scroll_bands_rasterized":"4",
+ "scroll_frames_without_new_bands":"116"}
+```
+
+retained 路径约 **2.21ms/帧**，完整 raster 约 **5.84ms/帧**；116/120 帧没有
+新的 band 栅格化。新增 fixed/sticky/affine 内容后仍保持在 16ms 预算内。
+
+真实页面验证：release shell 打开一个包含 `position:fixed` header、`position:sticky`
+nav、`transform:rotate(12deg) scale(1.1)` card 和 3000px 文档的本地页面，开启
+`RENDER_DEBUG_FRAME=1` 后日志为：
+
+```text
+render-browser compositor retained layers=5
+render-browser health page=file:///.../compositor-demo.html ready=Complete
+dom_elements=12 boxes=9 scripts_failed=0 scripts_threw=0 css_errors=0 css_warnings=0
+render-browser screenshot written to ...\compositor-demo.png
+```
+
+截图（82,898 字节）中 fixed header 和 sticky nav 固定在顶部，旋转后的 card 正常
+显示。说明真实 display list 的 fixed/sticky/affine 内容确实生成了 retained
+compositor，而不是回退。
+
+## 验证
+
+```text
+cargo test -p render-core --lib paint::compositor  8 passed, 0 failed
+cargo test -p render-browser --bin render-browser a_scroll_with_a_retained_compositor_uses_the_composited_payload
+                                                  1 passed, 0 failed
+cargo run --release -p render-browser --bin render-scroll-bench
+                                                  see benchmark above
+cargo test --workspace                            all crates passed, 0 failed
+cargo fmt --all --check                           clean
+cargo clippy ... --all-targets -- -D warnings     clean
+python tools/check_site_neutrality.py             0 blocking, 26 advisory
+```
+
+## 已知缺口
+
+- 没有独立 compositor 线程或 GPU 合成；所有工作仍在 render worker。
+- fixed 内容按整个 viewport 建立 source，透明区域虽已跳过，但窗口越大固定层
+  的扫描成本越高；后续可按实际 item bounds 建立局部 source。
+- filter/mask、非 Normal blend mode、ambient clip 跨 layer、嵌套 sticky、
+  sticky 内 transform 仍回退到完整 raster。
+- band cache 无上限/淘汰策略；超长页面会持续保留已访问 band。
+- 嵌套 stacking context 仍由单个 band surface 内的 rasterizer 处理，跨 band
+  的裁剪/合成边界没有独立测试。
+- 滚动帧没有独立的 frame timing 历史，只有 `CompositorStats` 和 benchmark。
+
+## 下一步
+
+- band residency/eviction 与 compositor 线程/GPU 合成。
+- sticky 内 transform 与嵌套 sticky 的 retained 表示。
+- 把 compositor frame time 纳入 `render-perf` JSON 和 CI 滚动 benchmark。
+- 继续 RTL 块轴镜像、`scroll-state()`、`@starting-style`。
+
+---
+
 # 交接文档 (2026-11-01, 续六十三) — retained 分层 compositor 与 banded 滚动
 
 这一轮实现浏览器 compositor 的第一条完整路径：从 display list 提取 top-level
@@ -82,6 +206,8 @@ python tools/check_site_neutrality.py             0 blocking, 26 advisory
 ```
 
 ## 已知缺口
+
+> 续六十四已关闭其中 fixed/sticky/scale-rotate 的回退；以下保留为当时记录。
 
 - 没有独立 compositor 线程或 GPU 合成；所有工作仍在 render worker。
 - 只支持 translation transform；rotate/scale/skew 的 top-level layer 仍走完整

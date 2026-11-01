@@ -16,7 +16,7 @@ says so. `docs/visual_fidelity_gaps.md` is the working register; this file is th
 | --- | --- | --- |
 | `render-js` unit tests | 1,210 passed, 0 failed | 2026-11-01 |
 | `render-css` unit tests | 305 passed, 0 failed | 2026-11-01 |
-| `render-core` unit tests | 465 passed, 0 failed | 2026-11-01 |
+| `render-core` unit tests | 467 passed, 0 failed | 2026-11-01 |
 | `render-core` webfont integration tests | 2 passed, 0 failed | 2026-11-01 |
 | `render-layout` unit tests | 352 passed, 1 ignored | 2026-11-01 |
 | `render-browser` unit tests | 210 passed, 0 failed | 2026-11-01 |
@@ -131,16 +131,24 @@ parsed and currently lays its contents out normally; skipping off-screen content
 `solver/content_visibility_tests.rs`.
 
 **Retained compositor.** `CompositorCache` turns a display list into a small top-level layer
-tree: root segments preserve paint order, translate/opacity stacking contexts become layers, and
-each surface is divided into 512px bands. `render` only rasterizes bands that are not cached;
-scrolling changes the composite matrices, not the scene. The browser keeps the cache on the page
-and sends `CompositedScroll` payloads, so scrolling does not re-run style, layout or display-list
-building. Fixed/sticky content, filters, masks, non-normal blending and rotate/scale transforms
-still use the complete raster. Six core tests compare composited pixels with a full raster,
-pin band reuse over twenty 16px scroll frames, and cover the fixed-position fallback;
+tree: root segments preserve paint order and are split by coordinate space, transform/opacity
+stacking contexts become layers, and each surface is divided into 512px bands. `render` only
+rasterizes bands that are not cached; scrolling changes the composite matrices, not the scene.
+Fixed content is rasterized in viewport space and composited without the scroll translation;
+a top-level sticky scope is rasterized untransformed and displaced at composite time; scale,
+rotate and skew layers inverse-map the viewport into source-local coordinates and composite the
+untransformed source through the affine matrix. The browser keeps the cache on the page and
+sends `CompositedScroll` payloads, so scrolling does not re-run style, layout or display-list
+building. Filters, masks, non-normal blending, ambient clips crossing a layer, and nested sticky
+still use the complete raster. Eight core tests compare composited pixels with a full raster,
+pin band reuse over twenty 16px scroll frames, and cover fixed content away from the origin,
+sticky displacement at five scroll offsets, and scale/rotation layers;
 `cargo run --release -p render-browser --bin render-scroll-bench` reports
-**1.29ms/frame retained vs 11.78ms/frame full raster** with **117/120 frames rasterizing no new
-band** (800x600 viewport, 12,000px document, 16px scroll steps).
+**2.21ms/frame retained vs 5.84ms/frame full raster** with **116/120 frames rasterizing no new
+band** (800x600 viewport, 12,000px document, fixed header, sticky bar, translated opacity layer,
+scaled/rotated layer, 16px scroll steps). A real shell page containing a fixed header, a sticky
+nav and a rotated card logs `render-browser compositor retained layers=5`, so the live display
+list takes the retained path rather than the fallback.
 
 **Table layout.** 47 tests. CSS 2.1 §17 including border-collapse conflict resolution, row groups,
 `colspan`/`rowspan`, `caption-side`, fixed layout, intrinsic widths. This is the single most-used
@@ -206,7 +214,7 @@ Verified by grep, not inferred. Full discussion in the register's S30.
 | **Animations and transitions** | *Closed for the CSS surface.* `@keyframes`, `animation-*`, and CSS transitions are sampled by a browser-driven 16 ms timeline clock; keyframes inside `@media` are gated, while keyframes inside `@container` are global per CSS Conditional 5 §5.4. Multi-animation lists, reversing shortening and WAAPI edge cases remain partial. |
 | **Selection / Range** | Range is implemented (DOM §5): `Range`, `StaticRange`, `createRange`, the boundary-point and content algorithms, and live updates on every tree mutation. There is no `getSelection` selection state, so `getSelection()` reports an empty selection, and no caret position APIs |
 | **Shadow-scoped styling** | shadow trees, `attachShadow` and autonomous `customElements` exist; shadow-tree stylesheets are collected and isolated per tree, `:host`/`:host()`/`:host-context()`/`::slotted()` match, and `slotchange` fires. `::part()`, `:has-slotted()`, declarative shadow roots and `::slotted()::before/after` remain |
-| **Compositing** | **Partial.** `CompositorCache` builds a retained top-level layer tree from the display list: contiguous root segments preserve z-order, transform/opacity stacking contexts become layers, and every surface is cut into 512px bands. Scrolling composites cached bands through an integer-translation fast path and rasterizes only newly exposed bands. Fixed/sticky content, filters, masks, non-normal blend modes and non-translation transforms fall back to the complete raster. There is still no compositor thread; all work is on the render worker. Benchmark: 120 sixteen-pixel scroll frames, 800x600 viewport, 12,000px document: 1.29ms/frame retained vs 11.78ms/frame full raster, with 117/120 frames rasterizing no new band. |
+| **Compositing** | **Partial.** `CompositorCache` builds a retained top-level layer tree from the display list: contiguous root segments preserve z-order and coordinate space, transform/opacity stacking contexts and top-level sticky scopes become layers, and every surface is cut into 512px bands. Scrolling composites cached bands through an integer-translation fast path and rasterizes only newly exposed bands. Fixed content lives in viewport space; sticky scopes are displaced at composite time; scale/rotate/skew layers inverse-map the viewport for band selection and composite the untransformed source through their matrix. Filters, masks, non-normal blend modes, ambient clips crossing a layer and nested sticky still fall back to the complete raster. There is still no compositor thread; all work is on the render worker. Benchmark: 120 sixteen-pixel scroll frames, 800x600 viewport, 12,000px document, fixed header, sticky bar and affine layer: 2.21ms/frame retained vs 5.84ms/frame full raster, with 116/120 frames rasterizing no new band. |
 | **Bidi** | UAX #9 has zero occurrences, so right-to-left scripts lay out left-to-right. Correctly lower priority given the corpus, but recorded rather than left to be rediscovered |
 | **HTTP/2** | structurally rejected: a pooled connection leaves the pool while in use and is held for the whole request, so one connection carries one in-flight request. Multiplexing is the inverse |
 | Multi-column layout | `column-count`, `column-width`, `columns`, `column-gap`, `column-fill` and `column-span: all`: the flow is cut at line boundaries, and a block that a break crosses is split with `box-decoration-break: slice` | `column-rule` is not implemented; `column-span` applies to direct block children only |
@@ -342,8 +350,9 @@ them would break more real pages than everything else combined:
 3. **Shadow-scoped styling** - stylesheets, `:host` and `::slotted` now work; `::part()`,
    declarative shadow roots and nested pseudo-elements on `::slotted()` remain
 4. **Selection, bidi, workers and compositing** - the remaining structural absences. The
-   compositor in particular is an architectural fact rather than a gap: it changes what scrolling
-   and fixed positioning can cost
+   retained compositor now handles scrolling, fixed, sticky and affine layers on the render
+   worker, but there is still no compositor thread or GPU backend, and filters, masks and
+   nested sticky scopes still take the complete raster
 
 **Closed from this list:** dynamic interaction state is now wired through
 `InteractionState` and `Document::render_with_interaction`, so `:hover`, `:active`, `:focus`,
