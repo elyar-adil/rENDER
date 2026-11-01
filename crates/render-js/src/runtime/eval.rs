@@ -66,6 +66,7 @@ use crate::runtime::convert::to_int32;
 use crate::runtime::convert::to_number;
 use crate::runtime::convert::unsigned_shift_right;
 use crate::runtime::coroutine_run::Resume;
+use crate::runtime::types::ActivationPlan;
 use crate::runtime::types::ArgumentsMap;
 use crate::runtime::types::Binding;
 use crate::runtime::types::CallFrame;
@@ -382,6 +383,16 @@ fn describe_source(value: &JsValue) -> String {
     }
 }
 
+/// Declarations collected from one statement list before any binding exists.
+struct DeclarationScan {
+    lexical: BTreeMap<String, VariableKind>,
+    vars: BTreeSet<String>,
+    /// Indices into the scanned list of function declarations.
+    functions: Vec<usize>,
+    /// Annex B block-level function names, which become `var` bindings.
+    hoisted: BTreeSet<String>,
+}
+
 impl JsRuntime {
     pub(super) fn evaluate_statements(
         &mut self,
@@ -433,14 +444,14 @@ impl JsRuntime {
         parameters: &Environment,
     ) -> Result<(), JsError> {
         if !function.defaults.iter().any(Option::is_some) {
-            return self.instantiate_statements(&function.body);
+            return self.instantiate_function_plan(function);
         }
         self.environment
             .push(Rc::new(RefCell::new(EnvironmentRecord {
                 function_scope: true,
                 ..EnvironmentRecord::default()
             })));
-        self.instantiate_statements(&function.body)?;
+        self.instantiate_function_plan(function)?;
         let body = self
             .environment
             .last()
@@ -471,14 +482,14 @@ impl JsRuntime {
         Ok(())
     }
 
-    pub(super) fn instantiate_statements(
-        &mut self,
-        statements: &[Statement],
-    ) -> Result<(), JsError> {
-        let mut lexical_declarations = BTreeMap::new();
-        let mut var_names = BTreeSet::new();
+    /// The declarations a statement list hoists, collected without creating
+    /// any bindings. Shared by per-call instantiation and the
+    /// [`ActivationPlan`] cached when a function is created.
+    fn scan_declarations(statements: &[Statement]) -> Result<DeclarationScan, JsError> {
+        let mut lexical = BTreeMap::new();
+        let mut vars = BTreeSet::new();
         let mut functions = Vec::new();
-        for statement in statements {
+        for (index, statement) in statements.iter().enumerate() {
             let statement = labelled_function(statement).unwrap_or(statement);
             match statement {
                 Statement::Variable {
@@ -490,7 +501,7 @@ impl JsRuntime {
                     name,
                     ..
                 } => {
-                    if lexical_declarations.insert(name.clone(), *kind).is_some() {
+                    if lexical.insert(name.clone(), *kind).is_some() {
                         return Err(JsError::syntax(
                             format!("binding {name:?} is declared more than once"),
                             0,
@@ -502,7 +513,7 @@ impl JsRuntime {
                     name,
                     ..
                 } => {
-                    var_names.insert(name.clone());
+                    vars.insert(name.clone());
                 }
                 Statement::VariableList {
                     kind, declarations, ..
@@ -510,8 +521,8 @@ impl JsRuntime {
                     for (target, _) in declarations {
                         for name in target.names() {
                             if *kind == VariableKind::Var {
-                                var_names.insert(name);
-                            } else if lexical_declarations.insert(name.clone(), *kind).is_some() {
+                                vars.insert(name);
+                            } else if lexical.insert(name.clone(), *kind).is_some() {
                                 return Err(JsError::syntax(
                                     format!("binding {name:?} is declared more than once"),
                                     0,
@@ -520,91 +531,166 @@ impl JsRuntime {
                         }
                     }
                 }
-                Statement::Function {
-                    name,
-                    parameters,
-                    body,
-                    kind,
-                    strict,
-                    source,
-                    ..
-                } => {
-                    var_names.insert(name.clone());
-                    functions.push((name, parameters, body, *kind, *strict, source));
+                Statement::Function { name, .. } => {
+                    vars.insert(name.clone());
+                    functions.push(index);
                 }
                 Statement::Class { name, .. } => {
                     // A class declaration is a mutable `let`-style binding; only
                     // the inner name the class body sees is immutable.
-                    if lexical_declarations
-                        .insert(name.clone(), VariableKind::Let)
-                        .is_some()
-                    {
+                    if lexical.insert(name.clone(), VariableKind::Let).is_some() {
                         return Err(JsError::syntax(
                             format!("binding {name:?} is declared more than once"),
                             0,
                         ));
                     }
                 }
-                _ => collect_var_names(statement, &mut var_names),
+                _ => collect_var_names(statement, &mut vars),
             }
         }
-        if let Some(name) = lexical_declarations
-            .keys()
-            .find(|name| var_names.contains(*name))
-        {
+        if let Some(name) = lexical.keys().find(|name| vars.contains(*name)) {
             return Err(JsError::syntax(
                 format!("binding {name:?} conflicts with a var declaration"),
                 0,
             ));
         }
+        // Annex B.3.2.1 and B.3.2.2: a block-level function the parser marked
+        // also gets a var binding. Collected separately because a global script
+        // filters them after the checks above.
+        let mut hoisted = BTreeSet::new();
+        for statement in statements {
+            collect_hoisted_names(statement, &mut hoisted);
+        }
+        Ok(DeclarationScan {
+            lexical,
+            vars,
+            functions,
+            hoisted,
+        })
+    }
+
+    /// Cache the body's hoisting plan when its declarations are valid. A
+    /// declaration error leaves `None`, so the call path re-scans and reports
+    /// it exactly as before.
+    fn activation_plan(statements: &[Statement]) -> Option<ActivationPlan> {
+        let scan = Self::scan_declarations(statements).ok()?;
+        let mut vars = scan.vars;
+        vars.extend(scan.hoisted);
+        Some(ActivationPlan {
+            lexical: scan.lexical.into_iter().collect(),
+            vars: vars.into_iter().collect(),
+            functions: scan.functions,
+        })
+    }
+
+    /// Create the bindings and hoisted function objects of a function body
+    /// from its cached plan. This is the hot path of a call.
+    fn instantiate_function_plan(&mut self, function: &UserFunction) -> Result<(), JsError> {
+        let Some(plan) = &function.activation else {
+            return self.instantiate_statements(&function.body);
+        };
+        for (name, kind) in &plan.lexical {
+            self.create_binding(name, *kind, false, JsValue::Undefined)?;
+        }
+        for name in &plan.vars {
+            self.create_binding(name, VariableKind::Var, true, JsValue::Undefined)?;
+        }
+        for &index in &plan.functions {
+            let Some(statement) = function.body.get(index) else {
+                continue;
+            };
+            let statement = labelled_function(statement).unwrap_or(statement);
+            let Statement::Function {
+                name,
+                parameters,
+                body,
+                kind,
+                strict,
+                source,
+                ..
+            } = statement
+            else {
+                continue;
+            };
+            let value = self.create_function(
+                Some(binding_function_name(name)),
+                parameters,
+                body,
+                *kind,
+                *strict,
+            )?;
+            self.attach_function_source(&value, source);
+            self.initialize_declared_binding(name, value, VariableKind::Var)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn instantiate_statements(
+        &mut self,
+        statements: &[Statement],
+    ) -> Result<(), JsError> {
+        let DeclarationScan {
+            lexical,
+            mut vars,
+            functions,
+            mut hoisted,
+        } = Self::scan_declarations(statements)?;
 
         // GlobalDeclarationInstantiation steps 16 and 17 (ECMA-262 16.1.7): at the
         // top level of a script, a function or var that the global object cannot
         // take throws before any binding is created.
         if self.environment.is_empty() {
-            if let Some((name, ..)) = functions
-                .iter()
-                .find(|(name, ..)| !self.can_declare_global_function(name))
-            {
-                return Err(JsError::type_error(format!(
-                    "cannot declare the global function {name:?}"
-                )));
+            for &index in &functions {
+                let Some(statement) = statements.get(index) else {
+                    continue;
+                };
+                let statement = labelled_function(statement).unwrap_or(statement);
+                let Statement::Function { name, .. } = statement else {
+                    continue;
+                };
+                if !self.can_declare_global_function(name) {
+                    return Err(JsError::type_error(format!(
+                        "cannot declare the global function {name:?}"
+                    )));
+                }
             }
-            if let Some(name) = var_names
-                .iter()
-                .find(|name| !self.can_declare_global_var(name))
-            {
+            if let Some(name) = vars.iter().find(|name| !self.can_declare_global_var(name)) {
                 return Err(JsError::type_error(format!(
                     "cannot declare the global variable {name:?}"
                 )));
             }
-        }
-        // Annex B.3.2.1 and B.3.2.2: a block-level function the parser marked also
-        // gets a var binding. Function code always creates it. Global code creates it
-        // only when the name is not lexically bound and can be declared
-        // (`fnDefinable`), and a name that cannot be declared is skipped rather than
-        // thrown on.
-        let mut hoisted = BTreeSet::new();
-        for statement in statements {
-            collect_hoisted_names(statement, &mut hoisted);
-        }
-        if self.environment.is_empty() {
             hoisted.retain(|name| !self.global_lexical(name) && self.can_declare_global_var(name));
         }
-        var_names.extend(hoisted);
-        for (name, kind) in lexical_declarations {
+        vars.extend(hoisted);
+        for (name, kind) in lexical {
             self.create_binding(&name, kind, false, JsValue::Undefined)?;
         }
-        for name in var_names {
+        for name in vars {
             self.create_binding(&name, VariableKind::Var, true, JsValue::Undefined)?;
         }
-        for (name, parameters, body, kind, strict, source) in functions {
-            let value = self.create_function(
-                Some(binding_function_name(name)),
+        for index in functions {
+            let Some(statement) = statements.get(index) else {
+                continue;
+            };
+            let statement = labelled_function(statement).unwrap_or(statement);
+            let Statement::Function {
+                name,
                 parameters,
                 body,
                 kind,
                 strict,
+                source,
+                ..
+            } = statement
+            else {
+                continue;
+            };
+            let value = self.create_function(
+                Some(binding_function_name(name)),
+                parameters,
+                body,
+                *kind,
+                *strict,
             )?;
             self.attach_function_source(&value, source);
             self.initialize_declared_binding(name, value, VariableKind::Var)?;
@@ -720,7 +806,7 @@ impl JsRuntime {
             self.realm.host(*object)
             && let Some(function) = self.functions.get_mut(index)
         {
-            function.source = Some(source.clone());
+            Rc::make_mut(function).source = Some(source.clone());
         }
     }
 
@@ -829,6 +915,10 @@ impl JsRuntime {
         let function_index = self.functions.len();
         let uses_arguments = !arrow && body_observes_arguments(body);
         let (body, defaults, patterns) = Self::extract_parameter_markers(body);
+        // The body's hoisting data is a pure function of the immutable AST, so
+        // compute it once. Each call then creates the same bindings without
+        // re-scanning the body or rebuilding declaration maps.
+        let activation = Self::activation_plan(&body);
         let (parameters, length, rest) = Self::binding_parameters(parameters);
         let defaults = (0..parameters.len())
             .map(|index| defaults.get(&index).cloned())
@@ -850,13 +940,13 @@ impl JsRuntime {
         } else {
             ThisContext::default()
         };
-        self.functions.push(UserFunction {
+        self.functions.push(Rc::new(UserFunction {
             name: name.map(str::to_owned),
             parameters,
             defaults,
             patterns,
             body,
-            captured_environment: self.environment.clone(),
+            captured_environment: Rc::from(self.environment.clone()),
             arrow,
             strict,
             class,
@@ -867,7 +957,8 @@ impl JsRuntime {
             this_context,
             source: None,
             source_name: self.script_filename.clone(),
-        });
+            activation,
+        }));
         // Spec: the `name` of an anonymous function in progress is the empty
         // string (anonymous arrows included); `length` counts parameters
         // before the first default initializer, excluding the rest parameter.
@@ -3463,7 +3554,7 @@ impl JsRuntime {
         // Adding the call site to the message itself is a debug facility: it
         // changes what script sees in `error.message`, so it stays behind the
         // same flag that labels stack frames.
-        if std::env::var_os("RENDER_JS_FRAME_OFFSETS").is_none() {
+        if !Self::frame_offsets_enabled() {
             return error;
         }
         let detail = match error.thrown_value() {
@@ -4532,7 +4623,7 @@ impl JsRuntime {
                 "[bind create document depth={} scopes={} initialized={initialized} | stack {:?}]",
                 self.calls_active,
                 self.environment.len(),
-                self.call_stack
+                self.debug_call_stack()
             );
         }
         Ok(())
@@ -4790,9 +4881,37 @@ impl JsRuntime {
             .map_or(self.root_strict, |frame| frame.strict)
     }
 
+    /// `GetValue` of an identifier reference: walk the environment chain
+    /// innermost first and read the binding in the same pass. This is the hot
+    /// path for every identifier read, so it does not resolve a depth and then
+    /// look the same name up again.
     pub(super) fn lookup_binding(&mut self, dom: &mut Dom, name: &str) -> Result<JsValue, JsError> {
-        let scope = self.resolve_name(dom, name)?;
-        self.read_resolved_binding(dom, scope, name)
+        let mut depth = self.environment.len();
+        while depth > 0 {
+            depth -= 1;
+            {
+                let scope = self.environment[depth].borrow();
+                if let Some(binding) = scope.bindings.get(name) {
+                    if !binding.initialized {
+                        return Err(JsError::reference(format!(
+                            "cannot access {name} before initialization"
+                        )));
+                    }
+                    return Ok(binding.value.clone());
+                }
+                if let Some(import) = scope.imports.get(name) {
+                    let import = import.clone();
+                    drop(scope);
+                    return self.read_import(&import);
+                }
+            }
+            if let Some(object) = self.with_object_at(depth)
+                && self.with_object_has_binding(dom, object, name)?
+            {
+                return self.read_resolved_binding(dom, Some(depth), name);
+            }
+        }
+        self.read_global_binding(dom, name)
     }
 
     /// `PutValue` of an identifier reference resolved by [`Self::resolve_name`];
@@ -4880,8 +4999,50 @@ impl JsRuntime {
         name: &str,
         value: JsValue,
     ) -> Result<(), JsError> {
-        let scope = self.resolve_name(dom, name)?;
-        self.write_resolved_binding(dom, scope, name, value)
+        // Resolve and write in one pass, like `lookup_binding`: the common
+        // local/`var` assignment must not walk the chain twice.
+        let strict = self.code_is_strict();
+        let mut depth = self.environment.len();
+        while depth > 0 {
+            depth -= 1;
+            {
+                let mut environment = self.environment[depth].borrow_mut();
+                if let Some(binding) = environment.bindings.get_mut(name) {
+                    if !binding.initialized {
+                        return Err(JsError::reference(format!(
+                            "cannot access {name} before initialization"
+                        )));
+                    }
+                    if !binding.mutable {
+                        // An immutable binding made with `strict = false` ignores the write
+                        // in sloppy code (CreateImmutableBinding, ECMA-262 9.1.1.1.2).
+                        if binding.kind == VariableKind::FunctionName && !strict {
+                            return Ok(());
+                        }
+                        return Err(JsError::type_error(format!(
+                            "assignment to constant binding {name:?}"
+                        )));
+                    }
+                    binding.value = value;
+                    return Ok(());
+                }
+                // Only an import binding is left in a record that resolves the
+                // name; imports are immutable.
+                if environment.imports.contains_key(name) {
+                    return Err(JsError::type_error(format!(
+                        "assignment to constant binding {name:?}"
+                    )));
+                }
+                let with_object = environment.with_object;
+                drop(environment);
+                if let Some(object) = with_object
+                    && self.with_object_has_binding(dom, object, name)?
+                {
+                    return self.set_with_binding(dom, object, name, value);
+                }
+            }
+        }
+        self.write_global_binding(dom, name, value)
     }
 
     /// Whether `name` is bound in the global environment (its global
@@ -4928,11 +5089,14 @@ impl JsRuntime {
         property: &str,
     ) -> Result<JsValue, JsError> {
         self.consume_step()?;
-        self.ensure_deferred_namespace(dom, object, Some(property))?;
-        if self.realm.has_deferred_namespace()
-            && self.realm.own_property(object, property).is_none()
-        {
-            self.ensure_deferred_read(dom, self.realm.get_prototype(object), property)?;
+        // Import-defer namespaces are rare; skip the realm and namespace
+        // lookups entirely on pages that have none. This is the common
+        // property-read path for every bundle.
+        if self.realm.has_deferred_namespace() {
+            self.ensure_deferred_namespace(dom, object, Some(property))?;
+            if self.realm.own_property(object, property).is_none() {
+                self.ensure_deferred_read(dom, self.realm.get_prototype(object), property)?;
+            }
         }
         // A namespace export reads its binding, which throws while the binding is uninitialized (ECMA-262 10.4.6.8).
         if let Some(local) = self.realm.uninitialized_namespace_binding(object, property) {
@@ -7205,7 +7369,7 @@ impl JsRuntime {
                     "value is not callable (callee host {:?}, keys [{keys}])",
                     self.realm.host(callee)
                 );
-                if std::env::var_os("RENDER_JS_FRAME_OFFSETS").is_some() {
+                if Self::frame_offsets_enabled() {
                     use std::fmt::Write as _;
                     let _ = write!(message, " stack {:?}", self.debug_call_stack());
                 }
@@ -7396,10 +7560,13 @@ impl JsRuntime {
                 },
             );
         }
-        let suspended = self.suspend_scopes();
-        let previous_environment =
-            std::mem::replace(&mut self.environment, function.captured_environment.clone());
-        self.environment.push(call_environment.clone());
+        let mut call_chain = function.captured_environment.to_vec();
+        call_chain.push(call_environment.clone());
+        let previous_environment = std::mem::replace(&mut self.environment, call_chain);
+        // The caller's chain is still reachable only from this Rust frame, so
+        // park the whole vector in the reported roots instead of cloning each
+        // environment into them.
+        self.suspended_environments.push(previous_environment);
         // `super` and `#name` resolve through the class context the function
         // was created in. An arrow's `class` was captured from the frame around
         // it, so arrows and nested functions see their lexical class, not the
@@ -7430,23 +7597,10 @@ impl JsRuntime {
             strict: function.strict,
         };
         self.class_frames.push(class_context);
-        let label = function
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("<anonymous fn #{index}>"));
-        // Diagnostic: append the body source offset and the defining script to
-        // the frame label so offline stack traces map back to minified bundle
-        // positions (RENDER_JS_FRAME_OFFSETS=1).
-        let label = match function.body.first().and_then(statement_offset) {
-            Some(offset) if std::env::var_os("RENDER_JS_FRAME_OFFSETS").is_some() => {
-                match &function.source_name {
-                    Some(source) => format!("{label}@{offset} [{source}]"),
-                    None => format!("{label}@{offset}"),
-                }
-            }
-            _ => label,
-        };
-        self.call_stack.push(CallFrame { name: label });
+        // The label is symbolic: formatting, the anonymous-name fallback and
+        // the `RENDER_JS_FRAME_OFFSETS` diagnostic suffix are only paid for
+        // when a trace is rendered.
+        self.call_stack.push(CallFrame::Function(index));
         // Parameter expressions may run eval code, which sees this record as its
         // variable environment; see `EnvironmentRecord::parameter_scope`.
         call_environment.borrow_mut().parameter_scope = true;
@@ -7479,39 +7633,30 @@ impl JsRuntime {
         self.class_frames.pop();
         // A constructor's `[[Construct]]` result is its final `this`
         // (a base constructor's pre-created instance, or the object a
-        // derived constructor received from `super()`).
-        let final_this = call_environment
-            .borrow()
-            .bindings
-            .get("this")
-            .map(|binding| binding.value.clone());
-        let this_initialized = call_environment
-            .borrow()
-            .bindings
-            .get("this")
-            .is_some_and(|binding| binding.initialized);
-        self.environment = previous_environment;
-        self.resume_scopes(suspended);
+        // derived constructor received from `super()`). Ordinary calls never
+        // read the binding, so they do not borrow the record or clone `this`.
+        let constructor = function
+            .class
+            .as_ref()
+            .is_some_and(|class| class.constructor);
+        let (final_this, this_initialized) = if constructor {
+            let environment = call_environment.borrow();
+            let binding = environment.bindings.get("this");
+            (
+                binding.map(|binding| binding.value.clone()),
+                binding.is_some_and(|binding| binding.initialized),
+            )
+        } else {
+            (None, false)
+        };
+        self.environment = self.suspended_environments.pop().unwrap_or_default();
         match result? {
-            Completion::Normal(_)
-                if function
-                    .class
-                    .as_ref()
-                    .is_some_and(|class| class.constructor) =>
-            {
-                Ok(final_this.unwrap_or(JsValue::Undefined))
-            }
+            Completion::Normal(_) if constructor => Ok(final_this.unwrap_or(JsValue::Undefined)),
             Completion::Normal(_) => Ok(JsValue::Undefined),
             // `return;` (or `return undefined`) from a constructor yields its `this`
             // once it is set. Before that, the undefined result lets the caller
             // throw the derived constructor's ReferenceError.
-            Completion::Return(JsValue::Undefined)
-                if this_initialized
-                    && function
-                        .class
-                        .as_ref()
-                        .is_some_and(|class| class.constructor) =>
-            {
+            Completion::Return(JsValue::Undefined) if constructor && this_initialized => {
                 Ok(final_this.unwrap_or(JsValue::Undefined))
             }
             Completion::Return(value) => Ok(value),
@@ -7611,6 +7756,28 @@ impl JsRuntime {
         arguments: &[JsValue],
         call_environment: &Environment,
     ) -> Result<(), JsError> {
+        // A simple parameter list binds positional values with no initializer
+        // or pattern to run in between. All ordinary calls take this path, so
+        // it binds the whole list under one record borrow.
+        if !function.rest
+            && function.defaults.iter().all(Option::is_none)
+            && function.patterns.iter().all(Option::is_none)
+        {
+            let mut environment = call_environment.borrow_mut();
+            for (index, parameter) in function.parameters.iter().enumerate() {
+                let value = arguments.get(index).cloned().unwrap_or(JsValue::Undefined);
+                environment.bindings.insert(
+                    parameter.clone(),
+                    Binding {
+                        value,
+                        mutable: true,
+                        initialized: true,
+                        kind: VariableKind::Var,
+                    },
+                );
+            }
+            return Ok(());
+        }
         for (index, parameter) in function.parameters.iter().enumerate() {
             let value = if function.rest && index + 1 == function.parameters.len() {
                 let rest =
@@ -7664,7 +7831,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        if std::env::var_os("RENDER_TRACE_NATIVE").is_some() {
+        if Self::native_trace_enabled() {
             eprintln!(
                 "[native] {function:?} receiver={:?} args={}",
                 self.realm.host(receiver),
@@ -7685,9 +7852,7 @@ impl JsRuntime {
                 JsValue::Object(object) => Some(*object),
                 _ => None,
             }));
-        self.call_stack.push(CallFrame {
-            name: format!("{function:?}"),
-        });
+        self.call_stack.push(CallFrame::Native(function));
         let result = self.call_native_dispatch(dom, function, receiver, arguments);
         self.call_stack.pop();
         self.transient_roots.truncate(pinned);

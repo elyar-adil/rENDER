@@ -375,17 +375,15 @@ impl JsRuntime {
         self.realm.configure_class_prototype(constructor, prototype);
         // The constructor's [[HomeObject]] is the class prototype, so field
         // initializers and constructor bodies resolve `super.x` there.
-        if let Some(ObjectHost::UserFunction(index)) = self.realm.host(constructor)
-            && let Some(class) = self
-                .functions
-                .get_mut(index)
-                .and_then(|function| function.class.take())
-        {
-            let updated = Rc::new(ClassFunction {
-                home_object: Some(prototype),
-                ..(*class).clone()
-            });
-            self.functions[index].class = Some(updated);
+        if let Some(ObjectHost::UserFunction(index)) = self.realm.host(constructor) {
+            let function = Rc::make_mut(&mut self.functions[index]);
+            if let Some(class) = function.class.take() {
+                let updated = Rc::new(ClassFunction {
+                    home_object: Some(prototype),
+                    ..(*class).clone()
+                });
+                function.class = Some(updated);
+            }
         }
         if let Some(super_constructor) = super_constructor {
             self.realm
@@ -708,9 +706,9 @@ impl JsRuntime {
         if class.fields.is_empty() {
             return Ok(());
         }
-        let suspended = self.suspend_scopes();
         let previous_environment =
             std::mem::replace(&mut self.environment, class.environment.clone());
+        self.suspended_environments.push(previous_environment);
         // Field initializers run with `this` bound and the class's own
         // private scope visible to nested classes they may define.
         self.class_frames.push(ClassFrame {
@@ -762,8 +760,7 @@ impl JsRuntime {
         // The frame and environment are restored on failure too, so an
         // initializer that throws leaves the caller's context intact.
         self.class_frames.pop();
-        self.environment = previous_environment;
-        self.resume_scopes(suspended);
+        self.environment = self.suspended_environments.pop().unwrap_or_default();
         result
     }
 
@@ -790,7 +787,7 @@ impl JsRuntime {
             ..ClassFunction::default()
         });
         if let Some(function) = self.functions.get_mut(index) {
-            function.class = Some(metadata);
+            Rc::make_mut(function).class = Some(metadata);
         }
     }
 

@@ -162,7 +162,7 @@ pub(super) struct Coroutine {
     loops: Vec<LoopEntry>,
     /// The promise an async function resolves with its result.
     promise: Option<usize>,
-    label: String,
+    label: Rc<str>,
     /// Set while suspended on an `await` whose settlement needs more than
     /// resuming the body (see [`AfterAwait`]).
     after_await: Option<AfterAwait>,
@@ -291,10 +291,10 @@ impl JsRuntime {
             self.coroutine_code.insert(function_index, code.clone());
             code
         };
-        let label = function
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("<anonymous fn #{function_index}>"));
+        let label: Rc<str> = match &function.name {
+            Some(name) => Rc::from(name.as_str()),
+            None => Rc::from(format!("<anonymous fn #{function_index}>")),
+        };
         let id = self.coroutines.len();
         self.coroutines.push(Some(Coroutine {
             code,
@@ -352,7 +352,7 @@ impl JsRuntime {
             handlers: Vec::new(),
             loops: Vec::new(),
             promise: Some(promise),
-            label: label.to_owned(),
+            label: Rc::from(label),
             after_await: None,
         }));
         self.async_continue(dom, id, Resume::Next(JsValue::Undefined));
@@ -539,9 +539,8 @@ impl JsRuntime {
             std::mem::take(&mut coroutine.environment),
         );
         self.class_frames.push(coroutine.class_frame.clone());
-        self.call_stack.push(CallFrame {
-            name: coroutine.label.clone(),
-        });
+        self.call_stack
+            .push(CallFrame::Label(coroutine.label.clone()));
         let result = self.run(dom, &mut coroutine, resume);
         self.call_stack.pop();
         self.class_frames.pop();

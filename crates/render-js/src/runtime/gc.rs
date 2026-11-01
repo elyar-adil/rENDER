@@ -116,7 +116,7 @@ pub(super) fn mark_function(
     let Some(function) = runtime.functions.get(function_index) else {
         return;
     };
-    for environment in &function.captured_environment {
+    for environment in function.captured_environment.iter() {
         mark_environment(runtime, marked, work, marked_environments, environment);
     }
     // Class metadata keeps the home object and parent constructor alive, and
@@ -780,7 +780,11 @@ impl JsRuntime {
         }
         // Collecting mid-execution must also treat the active scopes as
         // roots; between scripts these are empty.
-        for scope in self.environment.iter().chain(&self.suspended_environments) {
+        for scope in self
+            .environment
+            .iter()
+            .chain(self.suspended_environments.iter().flatten())
+        {
             mark_environment(
                 self,
                 &mut marked,

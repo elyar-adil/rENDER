@@ -275,7 +275,10 @@ pub(super) struct UserFunction {
     /// runs it during the call, before any body statement.
     pub(super) patterns: Vec<Option<Statement>>,
     pub(super) body: Vec<Statement>,
-    pub(super) captured_environment: Vec<Environment>,
+    /// The scope chain the function closed over, captured when it was created.
+    /// Shared between the function's metadata and every call, which only needs
+    /// to prepend its own call environment to it.
+    pub(super) captured_environment: Rc<[Environment]>,
     /// Arrow functions do not bind their own `this`; they resolve the
     /// enclosing function's `this` binding lexically.
     pub(super) arrow: bool,
@@ -305,6 +308,26 @@ pub(super) struct UserFunction {
     pub(super) source: Option<SourceSpan>,
     /// The script URL this function was created by, for stack traces.
     pub(super) source_name: Option<String>,
+    /// `FunctionDeclarationInstantiation` data for the body, computed once
+    /// when the function is created. A call then creates the same bindings
+    /// without re-scanning the body and rebuilding its declaration maps.
+    /// `None` when the body has a declaration error: the call path re-scans it
+    /// so the error is still reported as a `SyntaxError` at call time.
+    pub(super) activation: Option<ActivationPlan>,
+}
+
+/// Precomputed hoisting information for one function body (ECMA-262 10.2.11).
+#[derive(Clone, Debug, Default)]
+pub(super) struct ActivationPlan {
+    /// Lexical declarations in sorted-name order, the order the records are
+    /// created in.
+    pub(super) lexical: Vec<(String, VariableKind)>,
+    /// `var` names plus Annex B block-function names, sorted.
+    pub(super) vars: Vec<String>,
+    /// Indices into `UserFunction::body` of hoisted function declarations, in
+    /// source order. The declarations are instantiated from the body itself,
+    /// so the plan does not copy their parameter lists or nested bodies.
+    pub(super) functions: Vec<usize>,
 }
 
 /// The function context that `this` and the other per-function bindings come
@@ -414,11 +437,18 @@ pub(super) struct ClassFrame {
 }
 
 /// One active JavaScript call frame, retained for stack traces and
-/// depth-limit diagnostics. User functions surface their source name;
-/// native entry points surface the Rust variant name.
+/// depth-limit diagnostics. The label is kept symbolic so an ordinary call
+/// does not format or allocate a string; it is materialized only when a trace
+/// is actually rendered (an error, `Error.stack`, or a diagnostic).
 #[derive(Clone, Debug)]
-pub(super) struct CallFrame {
-    pub(super) name: String,
+pub(super) enum CallFrame {
+    /// A running user function: the index of its code in `JsRuntime::functions`.
+    Function(usize),
+    /// A running generator or async activation, whose name was fixed when it
+    /// was created.
+    Label(Rc<str>),
+    /// A native builtin; its frame name is the variant's `Debug` form.
+    Native(crate::value::NativeFunction),
 }
 
 /// Where the outcome of a promise reaction is delivered (ECMA-262 27.2.1.1).

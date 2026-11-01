@@ -40,6 +40,7 @@ use render_dom::DomError;
 use render_dom::DomRevision;
 use render_dom::NodeId;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 pub(crate) use types::{BindingRead, Environment};
 use url::Url;
 
@@ -49,6 +50,8 @@ mod async_iteration;
 #[cfg(test)]
 mod bigint_tests;
 pub(crate) mod builtins;
+#[cfg(test)]
+mod call_path_tests;
 mod class;
 mod convert;
 mod coroutine;
@@ -142,10 +145,12 @@ pub struct JsRuntime {
     calls_active: usize,
     dom_nodes_created: usize,
     environment: Vec<Environment>,
-    /// Scopes of callers whose frames are suspended while a callee runs. They
-    /// are held here, not only in the caller's Rust locals, so a collection
-    /// during the call still sees them.
-    suspended_environments: Vec<Environment>,
+    /// Scope chains moved aside while another chain runs. Each frame keeps a
+    /// whole chain alive as one root, so suspending a call moves its `Vec`
+    /// instead of cloning every environment handle. They are held here, not
+    /// only in the caller's Rust locals, so a collection during the call still
+    /// sees them.
+    suspended_environments: Vec<Vec<Environment>>,
     /// Declared modules by key (the module's absolute URL), one map per realm,
     /// indexed by [`RealmId`]. A module belongs to the realm that declared it.
     modules: Vec<BTreeMap<String, module::ModuleRecord>>,
@@ -165,7 +170,10 @@ pub struct JsRuntime {
     async_generators: async_iteration::AsyncGenerators,
     /// The error the prelude failed with, if it did; a test pins this to `None`.
     prelude_error: Option<JsError>,
-    functions: Vec<UserFunction>,
+    /// Parsed function code, shared with every call. A call only bumps the
+    /// `Rc`; cloning the body, parameter list and captured chain per call
+    /// dominated the interpreter's cost on large bundles.
+    functions: Vec<Rc<UserFunction>>,
     /// Class context of each active user-function call, for `super`,
     /// `new.target`, and field initialization.
     class_frames: Vec<ClassFrame>,
@@ -636,8 +644,37 @@ impl JsRuntime {
     pub fn debug_call_stack(&self) -> Vec<String> {
         self.call_stack
             .iter()
-            .map(|frame| frame.name.clone())
+            .map(|frame| self.frame_label(frame))
             .collect()
+    }
+
+    /// Render one active frame's label. A user function frame stores only its
+    /// code index during the call, so names, the anonymous fallback and the
+    /// source-offset diagnostic suffix are built here, on the error path.
+    fn frame_label(&self, frame: &CallFrame) -> String {
+        match frame {
+            CallFrame::Function(index) => {
+                let Some(function) = self.functions.get(*index) else {
+                    return format!("<unknown function #{index}>");
+                };
+                let label = function
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("<anonymous fn #{index}>"));
+                // Diagnostic: append the body source offset and the defining
+                // script so offline stack traces map back to minified bundle
+                // positions (RENDER_JS_FRAME_OFFSETS=1).
+                match function.body.first().and_then(eval::statement_offset) {
+                    Some(offset) if Self::frame_offsets_enabled() => match &function.source_name {
+                        Some(source) => format!("{label}@{offset} [{source}]"),
+                        None => format!("{label}@{offset}"),
+                    },
+                    _ => label,
+                }
+            }
+            CallFrame::Label(label) => label.to_string(),
+            CallFrame::Native(function) => format!("{function:?}"),
+        }
     }
 
     /// Innermost-first `    at <frame>` lines for `Error.prototype.stack`.
@@ -645,7 +682,7 @@ impl JsRuntime {
         let mut lines = String::new();
         for frame in self.call_stack.iter().rev() {
             lines.push_str("\n    at ");
-            lines.push_str(&frame.name);
+            lines.push_str(&self.frame_label(frame));
         }
         lines
     }
@@ -657,7 +694,7 @@ impl JsRuntime {
             .iter()
             .rev()
             .take(limit)
-            .map(|frame| frame.name.clone())
+            .map(|frame| self.frame_label(frame))
             .collect::<Vec<_>>();
         names.iter().rev().cloned().collect::<Vec<_>>().join(" <- ")
     }
@@ -1651,6 +1688,21 @@ impl JsRuntime {
         *ENABLED.get_or_init(|| std::env::var("RENDER_JS_STEP_TRACE").is_ok())
     }
 
+    /// `RENDER_JS_FRAME_OFFSETS` diagnostic: frame labels and error messages
+    /// carry the source offset and script name. Checked when a label is
+    /// materialized, never on the ordinary call path.
+    fn frame_offsets_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("RENDER_JS_FRAME_OFFSETS").is_some())
+    }
+
+    /// `RENDER_TRACE_NATIVE` diagnostic: log every native dispatch. Cached so
+    /// the environment is not consulted once per builtin call.
+    fn native_trace_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("RENDER_TRACE_NATIVE").is_some())
+    }
+
     fn consume_step(&mut self) -> Result<(), JsError> {
         if Self::step_trace_enabled() && self.steps_remaining.is_multiple_of(1_000_000) {
             eprintln!(
@@ -1675,8 +1727,7 @@ impl JsRuntime {
     /// `resume_scopes` once the chain is back in place.
     fn suspend_scopes(&mut self) -> usize {
         let depth = self.suspended_environments.len();
-        self.suspended_environments
-            .extend(self.environment.iter().cloned());
+        self.suspended_environments.push(self.environment.clone());
         depth
     }
 
