@@ -23,6 +23,7 @@ use render_css::properties::GridLine;
 use render_css::properties::GridTemplate;
 use render_css::properties::GridTrack;
 use render_css::properties::GridTrackBreadth;
+use render_css::properties::JustifyContent;
 use render_css::properties::LengthPercentage;
 use render_css::properties::Size;
 use render_css::properties::TypedPropertyValue;
@@ -125,6 +126,33 @@ impl Solver<'_> {
         rows.resize(row_count, TrackSizing::Intrinsic { minimum: 0.0 });
 
         let column_axis = size_axis(&columns, Some(containing.size.width), column_gap, &[]);
+        // CSS Grid §12.2: `justify-content` aligns the grid inside the grid
+        // container along the inline axis. `start`/`end` name writing-mode
+        // edges, so the free space moves to the other side under RTL.
+        let justify = match container_style.and_then(|style| style.typed("justify-content")) {
+            Some(TypedPropertyValue::JustifyContent(value)) => *value,
+            _ => JustifyContent::Normal,
+        };
+        let free_inline = (containing.size.width - column_axis.extent()).max(0.0);
+        let (justify_offset, extra_column_gap) =
+            grid_justify_offsets(justify, free_inline, columns.len());
+        let column_width = |column: usize, span: usize| -> f32 {
+            (column..column.saturating_add(span))
+                .map(|column| column_axis.size(column))
+                .sum::<f32>()
+                + (column_gap + extra_column_gap) * count_as_f32(span.saturating_sub(1))
+        };
+        let column_origin = |column: usize, span: usize| -> f32 {
+            let logical = column_axis.offset(column) + extra_column_gap * count_as_f32(column);
+            let width = column_width(column, span);
+            if container_rtl {
+                // Positive grid line numbers count from the inline-start edge
+                // (CSS Grid §8.3), which is the right edge under RTL.
+                containing.origin.x + containing.size.width - justify_offset - logical - width
+            } else {
+                containing.origin.x + justify_offset + logical
+            }
+        };
         let mut row_contributions = vec![0.0_f32; rows.len()];
         let mut items = Vec::with_capacity(children.len());
         let mut occupied = HashSet::new();
@@ -210,11 +238,8 @@ impl Solver<'_> {
                 rows.resize(row_end, TrackSizing::Intrinsic { minimum: 0.0 });
                 row_contributions.resize(rows.len(), 0.0);
             }
-            let track_width = (column..column.saturating_add(column_span))
-                .map(|column| column_axis.size(column))
-                .sum::<f32>()
-                + column_gap * count_as_f32(column_span.saturating_sub(1));
-            let track_x = containing.origin.x + column_axis.offset(column);
+            let track_width = column_width(column, column_span);
+            let track_x = column_origin(column, column_span);
             let item_source = self.formatting.get(node).and_then(|node| node.source);
             let forced_content_width = self.flex_content_width(
                 item_style,
@@ -278,6 +303,7 @@ impl Solver<'_> {
                 row,
                 row_span,
                 column,
+                column_span,
                 natural_outer_height: result.outer_height,
                 stretch_height: self.grid_item_axis_is_auto(node, "height"),
             });
@@ -303,7 +329,7 @@ impl Solver<'_> {
                 ));
             self.translate_fragment_subtree(
                 item.fragment,
-                containing.origin.x + column_axis.offset(item.column) - outer.origin.x,
+                column_origin(item.column, item.column_span) - outer.origin.x,
                 containing.origin.y + row_axis.offset(item.row) - outer.origin.y,
             );
             fragments.push(item.fragment);
@@ -424,6 +450,34 @@ impl Solver<'_> {
             code: LayoutDiagnosticCode::GridTrackLimit,
             message: "grid track limit exceeded".to_owned(),
         });
+    }
+}
+
+/// CSS Grid §12.2 / CSS Box Alignment §5: distribute the inline free space
+/// around the grid tracks. Returns the offset from the inline-start edge and
+/// any extra gap between tracks.
+fn grid_justify_offsets(justify: JustifyContent, free: f32, count: usize) -> (f32, f32) {
+    let slots = count_as_f32(count.saturating_sub(1));
+    match justify {
+        JustifyContent::End | JustifyContent::FlexEnd => (free, 0.0),
+        JustifyContent::Center => (free / 2.0, 0.0),
+        JustifyContent::SpaceBetween if count > 1 && free > 0.0 => (0.0, free / slots),
+        JustifyContent::SpaceAround if count > 0 && free > 0.0 => {
+            let distributed = free / count_as_f32(count);
+            (distributed / 2.0, distributed)
+        }
+        JustifyContent::SpaceEvenly if count > 0 && free > 0.0 => {
+            let distributed = free / count_as_f32(count.saturating_add(1));
+            (distributed, distributed)
+        }
+        // `normal` stretches auto tracks; the track sizer already gives
+        // flexible tracks the remaining space, so it resolves to `start` here.
+        JustifyContent::Normal
+        | JustifyContent::FlexStart
+        | JustifyContent::Start
+        | JustifyContent::SpaceBetween
+        | JustifyContent::SpaceAround
+        | JustifyContent::SpaceEvenly => (0.0, 0.0),
     }
 }
 

@@ -672,6 +672,7 @@ struct GridItem {
     row: usize,
     row_span: usize,
     column: usize,
+    column_span: usize,
     natural_outer_height: f32,
     stretch_height: bool,
 }

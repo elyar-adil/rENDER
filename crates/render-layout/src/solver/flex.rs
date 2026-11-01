@@ -330,11 +330,15 @@ impl Solver<'_> {
         let (extra_per_column, offset, extra_gap) =
             Self::flex_line_distribution(align_content, columns.len(), free_cross);
         let used_width = containing.size.width.max(total_width);
+        let container_rtl = is_rtl(container_style);
+        // A wrapped column's cross axis is the inline axis. Cross-start is the
+        // right edge under RTL, and `wrap-reverse` reverses it again.
+        let cross_reverse = wrap_reverse != container_rtl;
         let mut cursor = offset;
         let mut fragments = Vec::new();
         for (column, natural_width) in columns.into_iter().zip(column_widths) {
             let width = natural_width + extra_per_column;
-            let x = if wrap_reverse {
+            let x = if cross_reverse {
                 containing.origin.x + used_width - cursor - width
             } else {
                 containing.origin.x + cursor
@@ -393,10 +397,19 @@ impl Solver<'_> {
         };
         let container_rtl = is_rtl(container_style);
         let horizontal = matches!(direction, FlexDirection::Row | FlexDirection::RowReverse);
-        let reverse = matches!(
+        // Flexbox §5.4: `row` runs along the inline axis, so its main-start is
+        // the inline-start edge and reverses with `direction`; `row-reverse`
+        // reverses again. The block axis is unaffected by `direction`, so a
+        // column only reverses for `column-reverse`.
+        let main_reverse = matches!(
             direction,
             FlexDirection::RowReverse | FlexDirection::ColumnReverse
         );
+        let line_reverse = if horizontal {
+            main_reverse != container_rtl
+        } else {
+            main_reverse
+        };
         let main_size = if horizontal {
             containing.size.width
         } else {
@@ -444,14 +457,26 @@ impl Solver<'_> {
                 let extras =
                     self.flex_outer_extras(style, horizontal, containing.size.width, source);
                 let base_outer = (basis + extras).max(0.0);
-                let (before_property, after_property) = match direction {
-                    FlexDirection::Row => ("margin-left", "margin-right"),
-                    FlexDirection::RowReverse => ("margin-right", "margin-left"),
-                    FlexDirection::Column => ("margin-top", "margin-bottom"),
-                    FlexDirection::ColumnReverse => ("margin-bottom", "margin-top"),
+                // A main-axis auto margin absorbs free space on the side it is
+                // declared on. `row` starts at the inline-start edge, so under
+                // RTL that is the right margin; `row-reverse` starts at the
+                // inline-end edge and swaps again.
+                let (before_property, after_property) = match (direction, container_rtl) {
+                    (FlexDirection::Row, true) | (FlexDirection::RowReverse, false) => {
+                        ("margin-right", "margin-left")
+                    }
+                    (FlexDirection::Row, false) | (FlexDirection::RowReverse, true) => {
+                        ("margin-left", "margin-right")
+                    }
+                    (FlexDirection::Column, _) => ("margin-top", "margin-bottom"),
+                    (FlexDirection::ColumnReverse, _) => ("margin-bottom", "margin-top"),
                 };
                 let (cross_before_property, cross_after_property) = if horizontal {
                     ("margin-top", "margin-bottom")
+                } else if container_rtl {
+                    // A column's cross axis is the inline axis, whose start is
+                    // the right edge under RTL.
+                    ("margin-right", "margin-left")
                 } else {
                     ("margin-left", "margin-right")
                 };
@@ -657,6 +682,15 @@ impl Solver<'_> {
             Some(TypedPropertyValue::JustifyContent(value)) => *value,
             _ => JustifyContent::Normal,
         };
+        // CSS Box Alignment §5.1: `start` and `end` name the container's
+        // writing-mode edges, not the flex main-start/main-end sides, so they
+        // swap when `flex-direction` reverses. `flex-start`/`flex-end` keep
+        // their main-axis meaning and are handled by the physical cursor.
+        let justify = match justify {
+            JustifyContent::Start if main_reverse => JustifyContent::FlexEnd,
+            JustifyContent::End if main_reverse => JustifyContent::FlexStart,
+            other => other,
+        };
         let (main_offset, distributed_gap) = if auto_main_margin_count > 0 {
             (0.0, gap)
         } else {
@@ -692,7 +726,7 @@ impl Solver<'_> {
                     item.auto_cross_before,
                     item.auto_cross_after,
                 );
-                let target_x = if reverse {
+                let target_x = if line_reverse {
                     containing.origin.x + available_main - cursor - item.target_outer
                 } else {
                     containing.origin.x + cursor
@@ -719,7 +753,12 @@ impl Solver<'_> {
                     item.auto_cross_before,
                     item.auto_cross_after,
                 );
-                let target_y = if reverse {
+                let cross_offset = if container_rtl {
+                    (line_cross - outer.size.width) - cross_offset
+                } else {
+                    cross_offset
+                };
+                let target_y = if main_reverse {
                     containing.origin.y + available_main - cursor - item.target_outer
                 } else {
                     containing.origin.y + cursor

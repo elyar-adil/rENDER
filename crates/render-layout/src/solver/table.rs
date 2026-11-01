@@ -227,12 +227,25 @@ fn border_style_of(style: Option<&ComputedStyle>, side: Side) -> BorderStyle {
 
 /// CSS 2.1 §17.6.1: in the separated table model every column, and the table
 /// itself, is preceded by one `border-spacing` amount.
-fn column_offsets(origin_x: f32, widths: &[f32], spacing: f32) -> Vec<f32> {
+///
+/// CSS 2.1 §17.1: the table's own `direction` sets the column axis. An RTL
+/// table numbers its first column at the right edge, so column 0 is mirrored
+/// to the inline-start (right) side while row order stays block-axis order.
+fn column_offsets(origin_x: f32, width: f32, widths: &[f32], spacing: f32, rtl: bool) -> Vec<f32> {
     let mut offsets = Vec::with_capacity(widths.len());
-    let mut x = origin_x + spacing;
-    for width in widths {
-        offsets.push(x);
-        x += width + spacing;
+    if rtl {
+        let mut x = origin_x + width - spacing;
+        for column_width in widths {
+            x -= column_width;
+            offsets.push(x);
+            x -= spacing;
+        }
+    } else {
+        let mut x = origin_x + spacing;
+        for column_width in widths {
+            offsets.push(x);
+            x += column_width + spacing;
+        }
     }
     offsets
 }
@@ -341,9 +354,9 @@ impl Solver<'_> {
         depth: usize,
     ) -> (Vec<FragmentId>, f32) {
         // CSS Writing Modes 3 §2.1: the table's own `direction` is the
-        // containing-block direction of its cells and captions. Column
-        // placement itself still follows physical order in this solver; that
-        // is a table-axis RTL gap recorded separately from cell content.
+        // containing-block direction of its cells and captions. CSS 2.1
+        // §17.1 also makes it the direction of the column axis: an RTL table
+        // places column 0 at the right edge.
         let table_rtl = crate::solver::resolve::is_rtl(style);
         // §17.2.1: the table structure.
         let structure = self.table_structure(children);
@@ -362,7 +375,13 @@ impl Solver<'_> {
         self.apply_table_edge_rules(node, style, containing.size.width, &structure);
         let spacing = Self::table_border_spacing(style, containing.size.width);
         let (_, widths) = self.table_column_layout(node, style, containing.size.width);
-        let offsets = column_offsets(containing.origin.x, &widths, spacing);
+        let offsets = column_offsets(
+            containing.origin.x,
+            containing.size.width,
+            &widths,
+            spacing,
+            table_rtl,
+        );
 
         // Allocate the row and row-group boxes in document order, then fill
         // them with the cells they position.
@@ -398,6 +417,14 @@ impl Solver<'_> {
                     .iter()
                     .sum::<f32>()
                     + spacing * count_as_f32(placement.column_span.saturating_sub(1));
+                // `offsets` is indexed by logical column. In an RTL table the
+                // first column is the rightmost, so the physical left edge of a
+                // spanning cell is the left edge of its last column.
+                let cell_x = if table_rtl {
+                    offsets[placement.column + placement.column_span - 1]
+                } else {
+                    offsets[placement.column]
+                };
                 let cell_style = self
                     .formatting
                     .get(placement.node)
@@ -417,7 +444,7 @@ impl Solver<'_> {
                     (width - self.cell_horizontal_extras(cell_style, width, cell_source)).max(0.0);
                 let Some(result) = self.layout_block_with_containing_height(
                     placement.node,
-                    PhysicalRect::new(offsets[placement.column], 0.0, content_width, 0.0),
+                    PhysicalRect::new(cell_x, 0.0, content_width, 0.0),
                     table_rtl,
                     positioning_containing,
                     positioning_containing_rtl,
