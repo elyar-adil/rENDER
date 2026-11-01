@@ -450,6 +450,9 @@ impl JsRuntime {
         let current = buffer
             .view_length(1, start, length)
             .ok_or_else(|| JsError::type_error("encodeInto destination is out of bounds"))?;
+        // The destination is written in place, so an immutable backing buffer is
+        // refused rather than silently left unchanged.
+        buffer.ensure_mutable()?;
         let mut written = 0usize;
         let mut read = 0usize;
         {

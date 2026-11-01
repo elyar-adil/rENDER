@@ -76,16 +76,26 @@ impl JsRuntime {
         }
     }
 
-    /// `ValidateIntegerTypedArray(typedArray, waitable)` (ECMA-262 25.4.3.1): the
-    /// argument must be a typed array in bounds of a live buffer, of an integer
-    /// element type, or of `Int32` or `BigInt64` when `waitable`.
-    fn atomics_target(&self, value: Option<&JsValue>, waitable: bool) -> Result<Target, JsError> {
+    /// `ValidateIntegerTypedArray(typedArray, waitable, accessMode)` (ECMA-262
+    /// 25.4.3.1): the argument must be a typed array in bounds of a live buffer,
+    /// of an integer element type, or of `Int32` or `BigInt64` when `waitable`.
+    /// `write` adds the immutable-arraybuffer proposal's access-mode check before
+    /// any argument coercion.
+    fn atomics_target(
+        &self,
+        value: Option<&JsValue>,
+        waitable: bool,
+        write: bool,
+    ) -> Result<Target, JsError> {
         let Some(JsValue::Object(receiver)) = value else {
             return Err(JsError::type_error(
                 "Atomics requires an integer typed array",
             ));
         };
         let (kind, buffer, start, length) = self.typed_array_host(*receiver)?;
+        if write {
+            buffer.ensure_mutable()?;
+        }
         let accepted = if waitable {
             matches!(kind, TypedArrayKind::Int32 | TypedArrayKind::BigInt64)
         } else {
@@ -169,7 +179,7 @@ impl JsRuntime {
         op: RmwOp,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let target = self.atomics_target(arguments.first(), false)?;
+        let target = self.atomics_target(arguments.first(), false, true)?;
         let index = self.atomics_index(dom, &target, arguments.get(1))?;
         let operand = self.atomics_operand(dom, target.kind, arguments.get(2))?;
         self.atomics_revalidate(&target, index)?;
@@ -189,7 +199,7 @@ impl JsRuntime {
         dom: &mut Dom,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let target = self.atomics_target(arguments.first(), false)?;
+        let target = self.atomics_target(arguments.first(), false, true)?;
         let index = self.atomics_index(dom, &target, arguments.get(1))?;
         let expected = self.atomics_operand(dom, target.kind, arguments.get(2))?;
         let replacement = self.atomics_operand(dom, target.kind, arguments.get(3))?;
@@ -220,7 +230,7 @@ impl JsRuntime {
 
     /// `Atomics.load(typedArray, index)` (ECMA-262 25.4.6).
     fn atomics_load(&mut self, dom: &mut Dom, arguments: &[JsValue]) -> Result<JsValue, JsError> {
-        let target = self.atomics_target(arguments.first(), false)?;
+        let target = self.atomics_target(arguments.first(), false, false)?;
         let index = self.atomics_index(dom, &target, arguments.get(1))?;
         self.atomics_revalidate(&target, index)?;
         let size = target.kind.element_size();
@@ -231,7 +241,7 @@ impl JsRuntime {
     /// `Atomics.store(typedArray, index, value)` (ECMA-262 25.4.12). The result is
     /// the converted operand, not the wrapped element value.
     fn atomics_store(&mut self, dom: &mut Dom, arguments: &[JsValue]) -> Result<JsValue, JsError> {
-        let target = self.atomics_target(arguments.first(), false)?;
+        let target = self.atomics_target(arguments.first(), false, true)?;
         let index = self.atomics_index(dom, &target, arguments.get(1))?;
         let operand = self.atomics_operand(dom, target.kind, arguments.get(2))?;
         self.atomics_revalidate(&target, index)?;
@@ -258,7 +268,7 @@ impl JsRuntime {
         reason = "waiter counts stay far below 2^53"
     )]
     fn atomics_notify(&mut self, dom: &mut Dom, arguments: &[JsValue]) -> Result<JsValue, JsError> {
-        let target = self.atomics_target(arguments.first(), true)?;
+        let target = self.atomics_target(arguments.first(), true, false)?;
         let index = self.atomics_index(dom, &target, arguments.get(1))?;
         // The count is coerced before the buffer is checked (25.4.15 steps 3 to 6).
         let count = match arguments.get(2) {
@@ -286,7 +296,7 @@ impl JsRuntime {
         arguments: &[JsValue],
         asynchronous: bool,
     ) -> Result<JsValue, JsError> {
-        let target = self.atomics_target(arguments.first(), true)?;
+        let target = self.atomics_target(arguments.first(), true, false)?;
         if !target.buffer.is_shared() {
             return Err(JsError::type_error(
                 "Atomics.wait and Atomics.waitAsync require a SharedArrayBuffer",

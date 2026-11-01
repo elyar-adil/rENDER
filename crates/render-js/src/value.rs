@@ -1525,14 +1525,17 @@ pub(crate) enum NativeFunction {
     ArrayBufferSpecies,
     TypedArraySpecies,
     /// The resizable-buffer surface of `ArrayBuffer.prototype` (ECMA-262 25.1.6):
-    /// the `resizable`, `maxByteLength` and `detached` accessors, `resize`, and
-    /// the two transfer methods.
+    /// the `resizable`, `maxByteLength`, `detached` and `immutable` accessors,
+    /// `resize`, the two transfer methods, and the two immutable-copy methods.
     ArrayBufferResizableGetter,
     ArrayBufferMaxByteLengthGetter,
     ArrayBufferDetachedGetter,
+    ArrayBufferImmutableGetter,
     ArrayBufferResize,
     ArrayBufferTransfer,
     ArrayBufferTransferToFixedLength,
+    ArrayBufferTransferToImmutable,
+    ArrayBufferSliceToImmutable,
     /// The `SharedArrayBuffer.prototype` members (ECMA-262 25.2.5): the
     /// `byteLength`, `growable` and `maxByteLength` accessors, `grow` and `slice`.
     SharedArrayBufferByteLengthGetter,
@@ -1791,6 +1794,10 @@ pub(crate) struct BufferStore {
     /// `[[ArrayBufferMaxByteLength]]` (ECMA-262 25.1.3.1). `Some` makes the
     /// buffer resizable (or, shared, growable); `None` is a fixed-length buffer.
     max_byte_length: Option<usize>,
+    /// `[[ArrayBufferIsImmutable]]` (immutable-arraybuffer proposal). An
+    /// immutable buffer is always fixed-length: it cannot be resized, detached,
+    /// transferred, or written through any view.
+    immutable: bool,
     /// Whether this is a `SharedArrayBuffer` (ECMA-262 25.2). It never detaches,
     /// and its `ArrayBuffer` and `SharedArrayBuffer` brands are kept apart.
     shared: bool,
@@ -1838,8 +1845,34 @@ impl TypedBuffer {
         })))
     }
 
+    /// A fixed-length, immutable `ArrayBuffer` of `bytes` (immutable-arraybuffer
+    /// proposal). Its `[[ArrayBufferIsImmutable]]` slot makes every write,
+    /// detach, transfer and resize a `TypeError`.
+    pub(crate) fn new_immutable(bytes: Vec<u8>) -> Self {
+        Self(std::rc::Rc::new(std::cell::RefCell::new(BufferStore {
+            bytes,
+            immutable: true,
+            ..BufferStore::default()
+        })))
+    }
+
     pub(crate) fn is_shared(&self) -> bool {
         self.0.borrow().shared
+    }
+
+    /// Whether this store carries `[[ArrayBufferIsImmutable]]`.
+    pub(crate) fn is_immutable(&self) -> bool {
+        self.0.borrow().immutable
+    }
+
+    /// `TypeError` unless the store can be written. Every write path calls this
+    /// before converting its arguments, as the immutable-arraybuffer proposal
+    /// orders the check.
+    pub(crate) fn ensure_mutable(&self) -> Result<(), JsError> {
+        if self.is_immutable() {
+            return Err(JsError::type_error("operation on an immutable ArrayBuffer"));
+        }
+        Ok(())
     }
 
     pub(crate) fn byte_length(&self) -> usize {
@@ -6255,6 +6288,7 @@ impl Realm {
                 ),
                 ("resizable", NativeFunction::ArrayBufferResizableGetter),
                 ("detached", NativeFunction::ArrayBufferDetachedGetter),
+                ("immutable", NativeFunction::ArrayBufferImmutableGetter),
             ],
         );
         for (name, function, arity) in [
@@ -6264,6 +6298,16 @@ impl Realm {
                 "transferToFixedLength",
                 NativeFunction::ArrayBufferTransferToFixedLength,
                 0.0,
+            ),
+            (
+                "transferToImmutable",
+                NativeFunction::ArrayBufferTransferToImmutable,
+                0.0,
+            ),
+            (
+                "sliceToImmutable",
+                NativeFunction::ArrayBufferSliceToImmutable,
+                2.0,
             ),
         ] {
             let method = Self::install_native_method(objects, function_prototype, function, arity);

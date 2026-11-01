@@ -111,9 +111,14 @@ impl JsRuntime {
             }
             Some(ObjectHost::ArrayBufferHost(buffer)) => {
                 let bytes = buffer.bytes();
-                Ok(JsValue::Object(
-                    self.array_buffer_object(&TypedBuffer::new(bytes))?,
-                ))
+                // The immutable-arraybuffer proposal serializes the immutability
+                // slot, so a cloned immutable buffer is still immutable.
+                let copy = if buffer.is_immutable() {
+                    TypedBuffer::new_immutable(bytes)
+                } else {
+                    TypedBuffer::new(bytes)
+                };
+                Ok(JsValue::Object(self.array_buffer_object(&copy)?))
             }
             // A callable, a promise, a weak collection, a proxy, and every
             // other host the algorithm lists as non-cloneable.

@@ -241,9 +241,12 @@ impl JsRuntime {
             | NativeFunction::ArrayBufferResizableGetter
             | NativeFunction::ArrayBufferMaxByteLengthGetter
             | NativeFunction::ArrayBufferDetachedGetter
+            | NativeFunction::ArrayBufferImmutableGetter
             | NativeFunction::ArrayBufferResize
             | NativeFunction::ArrayBufferTransfer
             | NativeFunction::ArrayBufferTransferToFixedLength
+            | NativeFunction::ArrayBufferTransferToImmutable
+            | NativeFunction::ArrayBufferSliceToImmutable
             | NativeFunction::SharedArrayBufferByteLengthGetter
             | NativeFunction::SharedArrayBufferGrowableGetter
             | NativeFunction::SharedArrayBufferMaxByteLengthGetter

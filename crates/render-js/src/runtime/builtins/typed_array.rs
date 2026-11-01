@@ -388,6 +388,9 @@ impl JsRuntime {
         let target =
             self.typed_array_create_from_constructor(dom, constructor, &[JsValue::Number(length)])?;
         self.transient_roots.push(target);
+        // `TypedArrayCreateFromConstructor(..., ~write~)`: a species constructor
+        // may return a view over an immutable buffer, which cannot be filled.
+        self.typed_array_write_host(target)?;
         for index in 0..length as usize {
             let value = match &iterated {
                 Some(values) => values[index].clone(),
@@ -427,6 +430,8 @@ impl JsRuntime {
             &[JsValue::Number(arguments.len() as f64)],
         )?;
         self.transient_roots.push(target);
+        // `TypedArrayCreateFromConstructor(..., ~write~)`.
+        self.typed_array_write_host(target)?;
         for (index, value) in arguments.iter().enumerate() {
             self.typed_array_set_element_or_throw(dom, target, index, value.clone())?;
         }
@@ -597,6 +602,19 @@ impl JsRuntime {
         Ok((kind, buffer, start, length))
     }
 
+    /// `ValidateTypedArray(receiver, ~write~)`: the attached, in-bounds view and
+    /// a mutable backing buffer. The immutable-arraybuffer proposal makes every
+    /// in-place mutator start here, so its `TypeError` precedes argument
+    /// conversion.
+    fn typed_array_write_host(
+        &self,
+        receiver: ObjectId,
+    ) -> Result<(TypedArrayKind, TypedBuffer, usize, usize), JsError> {
+        let parts = self.typed_array_host(receiver)?;
+        parts.1.ensure_mutable()?;
+        Ok(parts)
+    }
+
     /// [[Get]] of element `index` (ECMA-262 10.4.5.15): `undefined` unless the
     /// index is valid for the view's current length. Callbacks read through this,
     /// so a buffer resized mid-iteration is seen at each visit.
@@ -630,9 +648,9 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        // ECMA-262 23.2.3.27 steps 2-5: the receiver must be a typed array, and the
-        // offset converts before the source or the view's state is examined.
-        self.typed_array_parts(receiver)?;
+        // ECMA-262 23.2.3.27 steps 2-5: the receiver must be a writable typed
+        // array, and the offset converts before the source is examined.
+        self.typed_array_write_host(receiver)?;
         let source = arguments.first().cloned().unwrap_or(JsValue::Undefined);
         let offset = self.optional_integer_value(dom, arguments.get(1))?;
         if offset < 0.0 {
@@ -708,6 +726,7 @@ impl JsRuntime {
         exemplar: ObjectId,
         kind: TypedArrayKind,
         arguments: &[JsValue],
+        writable: bool,
     ) -> Result<ObjectId, JsError> {
         // SpeciesConstructor over the kind's intrinsic constructor (ECMA-262 7.3.22).
         let Some(JsValue::Object(default)) = self.realm.global(kind.name()) else {
@@ -715,11 +734,16 @@ impl JsRuntime {
         };
         let species = self.species_constructor(dom, exemplar, default)?;
         let result = self.typed_array_create_from_constructor(dom, species, arguments)?;
-        let (result_kind, _, _, _) = self.typed_array_host(result)?;
+        let (result_kind, result_buffer, _, _) = self.typed_array_host(result)?;
         if result_kind.is_bigint() != kind.is_bigint() {
             return Err(JsError::type_error(
                 "cannot mix BigInt and other types in typed array copies",
             ));
+        }
+        // `TypedArraySpeciesCreate(..., ~write~)` validates the destination
+        // before any element is visited.
+        if writable {
+            result_buffer.ensure_mutable()?;
         }
         Ok(result)
     }
@@ -740,6 +764,7 @@ impl JsRuntime {
         let converted = self.typed_element_value(dom, kind, value)?;
         let (_, buffer, start, length) = self.typed_array_parts(target)?;
         if length.is_some_and(|length| index < length) {
+            buffer.ensure_mutable()?;
             buffer.set_converted_element(kind, start + index, &converted);
         }
         Ok(())
@@ -770,9 +795,9 @@ impl JsRuntime {
         if !(tracking && end_is_absent) {
             args.push(JsValue::Number((end - begin) as f64));
         }
-        Ok(JsValue::Object(
-            self.typed_array_species_create(dom, receiver, kind, &args)?,
-        ))
+        Ok(JsValue::Object(self.typed_array_species_create(
+            dom, receiver, kind, &args, false,
+        )?))
     }
 
     /// `%TypedArray%.prototype.slice(start, end)` (ECMA-262 23.2.3.27): the copy
@@ -791,6 +816,7 @@ impl JsRuntime {
             receiver,
             kind,
             &[JsValue::Number((end - begin) as f64)],
+            true,
         )?;
         if end <= begin {
             return Ok(JsValue::Object(result));
@@ -879,7 +905,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
+        let (kind, buffer, start, length) = self.typed_array_write_host(receiver)?;
         let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
         let fill_value = self.typed_element_value(dom, kind, &value)?;
         let rest = arguments.get(1..).unwrap_or(&[]);
@@ -1057,6 +1083,7 @@ impl JsRuntime {
                 receiver,
                 kind,
                 &[JsValue::Number(length as f64)],
+                true,
             )?)
         } else {
             None
@@ -1088,6 +1115,7 @@ impl JsRuntime {
             receiver,
             kind,
             &[JsValue::Number(kept.len() as f64)],
+            true,
         )?;
         for (index, value) in kept.iter().enumerate() {
             self.typed_array_set_index(dom, result, index, value)?;
@@ -1166,7 +1194,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
+        let (kind, buffer, start, length) = self.typed_array_write_host(receiver)?;
         let len = length as f64;
         let to = self.relative_position(dom, arguments.first(), len, 0.0)?;
         let from = self.relative_position(dom, arguments.get(1), len, 0.0)?;
@@ -1290,7 +1318,7 @@ impl JsRuntime {
 
     /// `%TypedArray%.prototype.reverse()`: in place, and returns the receiver.
     fn typed_array_reverse(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
-        let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
+        let (kind, buffer, start, length) = self.typed_array_write_host(receiver)?;
         let mut elements = buffer.elements_value(kind, start, length)?;
         elements.reverse();
         store_typed_elements(&buffer, kind, start, &elements);
@@ -1371,7 +1399,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let (kind, buffer, start, _) = self.typed_array_host(receiver)?;
+        let (kind, buffer, start, _) = self.typed_array_write_host(receiver)?;
         let comparator = self.typed_array_comparator(arguments.first())?;
         let mut elements = self.typed_array_elements(receiver)?;
         self.typed_array_sort_values(dom, comparator, &mut elements)?;
@@ -1551,12 +1579,13 @@ impl JsRuntime {
         key: &str,
         value: &JsValue,
     ) -> Result<(), JsError> {
-        let kind = match self.realm.host(object) {
-            Some(ObjectHost::TypedArray { kind, .. }) => kind,
+        let (kind, buffer) = match self.realm.host(object) {
+            Some(ObjectHost::TypedArray { kind, buffer, .. }) => (kind, buffer),
             _ => return Ok(()),
         };
         let converted = self.typed_element_value(dom, kind, value)?;
         if let TypedKey::Element(index) = self.realm.typed_key(object, key) {
+            buffer.ensure_mutable()?;
             self.realm.typed_element_store(object, index, &converted);
         }
         Ok(())
@@ -1687,6 +1716,15 @@ impl JsRuntime {
         Ok(())
     }
 
+    /// The receiver check of the two `setFrom*` methods: a `Uint8Array` whose
+    /// backing buffer is mutable. The immutable check lives here, before either
+    /// argument is read, because those methods write in place.
+    fn validate_writable_uint8_array_receiver(&self, receiver: ObjectId) -> Result<(), JsError> {
+        self.validate_uint8_array_receiver(receiver)?;
+        let (_, buffer, _, _) = self.typed_array_parts(receiver)?;
+        buffer.ensure_mutable()
+    }
+
     fn create_uint8_array_from_bytes(&mut self, bytes: Vec<u8>) -> Result<JsValue, JsError> {
         let length = bytes.len();
         if length > Self::MAX_TYPED_ARRAY_ELEMENTS {
@@ -1753,7 +1791,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        self.validate_uint8_array_receiver(receiver)?;
+        self.validate_writable_uint8_array_receiver(receiver)?;
         let Some(JsValue::String(text)) = arguments.first() else {
             return Err(JsError::type_error(
                 "Uint8Array.prototype.setFromBase64 requires a string",
@@ -1778,7 +1816,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        self.validate_uint8_array_receiver(receiver)?;
+        self.validate_writable_uint8_array_receiver(receiver)?;
         let Some(JsValue::String(text)) = arguments.first() else {
             return Err(JsError::type_error(
                 "Uint8Array.prototype.setFromHex requires a string",

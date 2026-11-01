@@ -377,12 +377,22 @@ impl JsRuntime {
                 let buffer = self.array_buffer_host(receiver, "detached")?;
                 Ok(JsValue::Boolean(buffer.is_detached()))
             }
+            NativeFunction::ArrayBufferImmutableGetter => {
+                let buffer = self.array_buffer_host(receiver, "immutable")?;
+                Ok(JsValue::Boolean(buffer.is_immutable()))
+            }
             NativeFunction::ArrayBufferResize => self.array_buffer_resize(dom, receiver, arguments),
             NativeFunction::ArrayBufferTransfer => {
                 self.array_buffer_transfer(dom, receiver, arguments, true)
             }
             NativeFunction::ArrayBufferTransferToFixedLength => {
                 self.array_buffer_transfer(dom, receiver, arguments, false)
+            }
+            NativeFunction::ArrayBufferTransferToImmutable => {
+                self.array_buffer_transfer_to_immutable(dom, receiver, arguments)
+            }
+            NativeFunction::ArrayBufferSliceToImmutable => {
+                self.array_buffer_slice_to_immutable(dom, receiver, arguments)
             }
             NativeFunction::DataViewBufferGetter => self.data_view_buffer(receiver),
             NativeFunction::DataViewByteLengthGetter => {
@@ -517,6 +527,7 @@ impl JsRuntime {
             Some(value) => usize_from(self.to_index_value(dom, Some(value))?),
         };
         buffer.ensure_attached()?;
+        buffer.ensure_mutable()?;
         let max = if preserve_resizability {
             buffer.max_byte_length()
         } else {
@@ -537,6 +548,100 @@ impl JsRuntime {
         };
         buffer.detach();
         let object = self.new_array_buffer(prototype, &transferred)?;
+        Ok(JsValue::Object(object))
+    }
+
+    /// `ArrayBuffer.prototype.transferToImmutable(newLength)` (immutable-arraybuffer
+    /// proposal, `ArrayBufferCopyAndDetach` with `~immutable~`): the receiver's
+    /// bytes, resized to `newLength`, move into an immutable fixed-length buffer,
+    /// and the receiver is detached. An already detached or immutable receiver is
+    /// a `TypeError`, after `newLength` has been converted.
+    fn array_buffer_transfer_to_immutable(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let buffer = self.array_buffer_host(receiver, "transferToImmutable")?;
+        let new_length = match arguments.first() {
+            None | Some(JsValue::Undefined) => buffer.byte_length(),
+            Some(value) => usize_from(self.to_index_value(dom, Some(value))?),
+        };
+        buffer.ensure_attached()?;
+        buffer.ensure_mutable()?;
+        if new_length > Self::MAX_TYPED_ARRAY_ELEMENTS {
+            return Err(self.range_error("new length exceeds the engine bound"));
+        }
+        // `AllocateImmutableArrayBuffer` reads the prefix and zero-fills any
+        // growth; the source is detached only after the copy exists.
+        let prototype = self.array_buffer_prototype(false);
+        self.ensure_heap_capacity(1)?;
+        let mut bytes = buffer.bytes();
+        bytes.resize(new_length, 0);
+        let transferred = TypedBuffer::new_immutable(bytes);
+        buffer.detach();
+        let object = self.new_array_buffer(prototype, &transferred)?;
+        Ok(JsValue::Object(object))
+    }
+
+    /// `ArrayBuffer.prototype.sliceToImmutable(start, end)` (immutable-arraybuffer
+    /// proposal): a copy of the selected range as an immutable fixed-length
+    /// buffer. Unlike `slice`, no species constructor is consulted, and the
+    /// source is left attached. Bounds resolve against the length the receiver
+    /// had when the call started, while the final range check uses its current
+    /// length.
+    fn array_buffer_slice_to_immutable(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let buffer = self.array_buffer_host(receiver, "sliceToImmutable")?;
+        // The spec checks detachment before either bound is converted, so a
+        // detached receiver throws without running user coercion code.
+        buffer.ensure_attached()?;
+        let total = buffer.byte_length();
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "buffer lengths stay far below any precision boundary"
+        )]
+        let total_value = total as f64;
+        let relative = |integer: f64| -> f64 {
+            if integer < 0.0 {
+                (total_value + integer).max(0.0)
+            } else {
+                integer.min(total_value)
+            }
+        };
+        let start_value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let start = relative(self.to_integer_value(dom, &start_value)?);
+        let end = match arguments.get(1) {
+            None | Some(JsValue::Undefined) => total_value,
+            Some(value) => relative(self.to_integer_value(dom, value)?),
+        };
+        // The conversions above can run user code that detaches, resizes or
+        // grows the receiver.
+        buffer.ensure_attached()?;
+        let current = buffer.byte_length();
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "buffer lengths stay far below any precision boundary"
+        )]
+        let current_value = current as f64;
+        if current_value < end {
+            return Err(self.range_error("resolved end is past the buffer's current length"));
+        }
+        let new_length = (end - start).max(0.0);
+        let new_length = usize_from(new_length);
+        let bytes = if new_length == 0 {
+            Vec::new()
+        } else {
+            buffer.read_bytes(usize_from(start), new_length)?
+        };
+        let prototype = self.array_buffer_prototype(false);
+        self.ensure_heap_capacity(1)?;
+        let copied = TypedBuffer::new_immutable(bytes);
+        let object = self.new_array_buffer(prototype, &copied)?;
         Ok(JsValue::Object(object))
     }
 
@@ -601,6 +706,8 @@ impl JsRuntime {
         match value {
             JsValue::Object(object) => match self.realm.host(*object) {
                 Some(ObjectHost::ArrayBufferHost(buffer)) => {
+                    // `DetachArrayBuffer` refuses an immutable buffer.
+                    buffer.ensure_mutable()?;
                     buffer.detach();
                     Ok(())
                 }
@@ -686,6 +793,9 @@ impl JsRuntime {
         // from the receiver, and at least `newLen` bytes long.
         let created_buffer = self.buffer_host(created, shared, "slice")?;
         created_buffer.ensure_attached()?;
+        // The immutable-buffer proposal adds step 23: a species constructor may
+        // not return an immutable buffer for a slice that is about to be written.
+        created_buffer.ensure_mutable()?;
         if created == receiver {
             return Err(JsError::type_error(
                 "slice species constructor returned the receiver",
@@ -725,6 +835,11 @@ impl JsRuntime {
             )));
         };
         let (buffer, byte_offset, byte_length) = self.data_view_host(receiver)?;
+        // `SetViewValue` step 3: an immutable backing buffer is a `TypeError`
+        // before the request index or the value is converted.
+        if is_write(function) {
+            buffer.ensure_mutable()?;
+        }
         let index = self.to_index_value(dom, arguments.first())?;
         if is_write(function) {
             let value = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
@@ -1196,6 +1311,29 @@ mod tests {
         assert!(runtime.detach_array_buffer(&plain).is_err());
     }
 
+    /// `DetachArrayBuffer` (which `$262.detachArrayBuffer` calls) refuses an
+    /// immutable buffer, and the failed attempt leaves it attached and readable.
+    #[test]
+    fn an_immutable_buffer_cannot_be_detached_by_the_host() {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        runtime
+            .execute(
+                &mut parsed.dom,
+                r"var iab = new ArrayBuffer(4).transferToImmutable();",
+            )
+            .expect("an immutable buffer is built");
+        let buffer = runtime.realm().global("iab").expect("iab is defined");
+        assert!(runtime.detach_array_buffer(&buffer).is_err());
+        let outcome = runtime
+            .execute(
+                &mut parsed.dom,
+                "[iab.detached, iab.byteLength, iab.immutable].join(',')",
+            )
+            .expect("the immutable buffer still answers");
+        assert_eq!(outcome.value.to_js_string().to_lossy(), "false,4,true");
+    }
+
     #[test]
     fn a_buffer_slice_copies_and_clamps() {
         assert_eq!(
@@ -1657,6 +1795,158 @@ return out.join(' | ');
 })()
             "),
             "TypeError | none | 0,3 | none | 9"
+        );
+    }
+
+    /// `transferToImmutable` copies the requested prefix, zero-fills growth,
+    /// returns a fixed-length buffer whose `[[ArrayBufferIsImmutable]]` slot is
+    /// set, and detaches the receiver (immutable-arraybuffer proposal).
+    #[test]
+    fn transfer_to_immutable_detaches_the_source_and_returns_an_immutable_buffer() {
+        assert_eq!(
+            run(r"
+(function () {
+function thrown(fn) { try { fn(); return 'none'; } catch (e) { return e.constructor.name; } }
+var out = [];
+var ab = new ArrayBuffer(4);
+new Uint8Array(ab).set([1, 2, 3, 4]);
+var iab = ab.transferToImmutable();
+out.push(ab.detached, ab.byteLength, ab.maxByteLength);
+out.push(iab.immutable, iab.resizable, iab.detached, iab.byteLength, iab.maxByteLength);
+out.push(Array.from(new Uint8Array(iab)).join(','));
+out.push(thrown(function () { iab.transfer(); }));
+out.push(thrown(function () { iab.transferToFixedLength(); }));
+out.push(thrown(function () { iab.transferToImmutable(); }));
+out.push(thrown(function () { iab.resize(1); }));
+var grown = new ArrayBuffer(2);
+new Uint8Array(grown).set([7, 8]);
+var big = grown.transferToImmutable(4);
+out.push(grown.detached, big.byteLength, big.maxByteLength, big.immutable, Array.from(new Uint8Array(big)).join(','));
+var shrunk = new ArrayBuffer(4);
+new Uint8Array(shrunk).set([9, 10, 11, 12]);
+var small = shrunk.transferToImmutable(2);
+out.push(shrunk.detached, small.byteLength, Array.from(new Uint8Array(small)).join(','));
+return out.join(' | ');
+})()
+            "),
+            "true | 0 | 0 | true | false | false | 4 | 4 | 1,2,3,4 | TypeError | TypeError | TypeError | TypeError | true | 4 | 4 | true | 7,8,0,0 | true | 2 | 9,10"
+        );
+    }
+
+    /// `sliceToImmutable` copies a range without detaching the source, never
+    /// consults a species constructor, and its result survives later source
+    /// writes, resizes and detach (immutable-arraybuffer proposal).
+    #[test]
+    fn slice_to_immutable_copies_a_range_and_is_unaffected_by_the_source() {
+        assert_eq!(
+            run(r"
+(function () {
+var out = [];
+var source = new ArrayBuffer(8, { maxByteLength: 8 });
+var view = new Uint8Array(source);
+for (var i = 0; i < 8; i++) view[i] = i + 1;
+var dest = source.sliceToImmutable(2, 6);
+out.push(source.detached, source.byteLength);
+out.push(dest.immutable, dest.resizable, dest.detached, dest.byteLength, dest.maxByteLength);
+out.push(Array.from(new Uint8Array(dest)).join(','));
+view[2] = 99;
+out.push(Array.from(new Uint8Array(dest)).join(','));
+source.resize(4);
+out.push(Array.from(new Uint8Array(dest)).join(','), source.byteLength);
+out.push(Array.from(new Uint8Array(source.sliceToImmutable())).join(','));
+var nested = dest.sliceToImmutable(1, 3);
+out.push(nested.immutable, Array.from(new Uint8Array(nested)).join(','));
+out.push(source.sliceToImmutable(-2).byteLength);
+return out.join(' | ');
+})()
+            "),
+            "false | 8 | true | false | false | 4 | 4 | 3,4,5,6 | 3,4,5,6 | 3,4,5,6 | 4 | 1,2,99,4 | true | 4,5 | 2"
+        );
+    }
+
+    /// Every in-place typed-array and `DataView` write path refuses an immutable
+    /// backing buffer with a `TypeError`, while reads and read-only views keep
+    /// working. `setFromBase64`/`setFromHex` reject before reading their
+    /// arguments, and the bytes stay unchanged.
+    #[test]
+    fn an_immutable_backing_buffer_rejects_typed_array_and_dataview_writes() {
+        assert_eq!(
+            run(r"
+(function () {
+function thrown(fn) { try { fn(); return 'none'; } catch (e) { return e.constructor.name; } }
+var out = [];
+var iab = new ArrayBuffer(4).transferToImmutable();
+var ta = new Uint8Array(iab);
+var dv = new DataView(iab);
+var calls = [];
+out.push(ta.length, ta.byteLength, ta[0]);
+out.push(thrown(function () { ta[0] = 1; }));
+out.push(thrown(function () { ta.set([1]); }));
+out.push(thrown(function () { ta.fill(1); }));
+out.push(thrown(function () { ta.reverse(); }));
+out.push(thrown(function () { ta.sort(); }));
+out.push(thrown(function () { ta.copyWithin(0, 1); }));
+out.push(thrown(function () { dv.setUint8(0, 1); }));
+out.push(thrown(function () {
+  ta.setFromBase64('Zm9v', {
+    get alphabet() { calls.push('alphabet'); return undefined; }
+  });
+}));
+out.push(thrown(function () { ta.setFromHex('666f6f'); }));
+out.push(calls.length, Array.from(ta).join(','), ta.toHex());
+out.push(ta.subarray(1).length, new Uint8Array(iab, 2).length);
+return out.join(' | ');
+})()
+            "),
+            "4 | 4 | 0 | TypeError | TypeError | TypeError | TypeError | TypeError | TypeError | TypeError | TypeError | TypeError | 0 | 0,0,0,0 | 00000000 | 3 | 2"
+        );
+    }
+
+    /// Species-created writable results are validated before any element is
+    /// visited; a read-only `subarray` over the same immutable buffer stays
+    /// legal (immutable-arraybuffer proposal).
+    #[test]
+    fn immutable_species_destinations_are_refused_for_write_operations() {
+        assert_eq!(
+            run(r"
+(function () {
+function thrown(fn) { try { fn(); return 'none'; } catch (e) { return e.constructor.name; } }
+var out = [];
+var iab = new Uint8Array([3, 4]).buffer.transferToImmutable();
+var source = new Uint8Array([1, 2]);
+var species = {};
+species[Symbol.species] = function () { return new Uint8Array(iab); };
+source.constructor = species;
+out.push(thrown(function () { return source.map(function (value) { return value; }); }));
+out.push(thrown(function () { return source.slice(0); }));
+out.push(thrown(function () { return source.filter(function () { return true; }); }));
+function ImmutableCtor() { return new Uint8Array(iab); }
+out.push(thrown(function () { return Uint8Array.from.call(ImmutableCtor, [1, 2]); }));
+out.push(thrown(function () { return Uint8Array.of.call(ImmutableCtor, 1, 2); }));
+out.push(source.subarray(0).length);
+return out.join(' | ');
+})()
+            "),
+            "TypeError | TypeError | TypeError | TypeError | TypeError | 2"
+        );
+    }
+
+    /// Structured cloning keeps the immutable slot, so the clone is not a
+    /// mutable buffer that happens to share bytes.
+    #[test]
+    fn structured_clone_of_an_immutable_buffer_stays_immutable() {
+        assert_eq!(
+            run(r"
+(function () {
+var source = new ArrayBuffer(3);
+new Uint8Array(source).set([5, 6, 7]);
+var iab = source.transferToImmutable();
+var copy = structuredClone(iab);
+return [copy.immutable, copy.resizable, copy.byteLength,
+        Array.from(new Uint8Array(copy)).join(',')].join(' | ');
+})()
+            "),
+            "true | false | 3 | 5,6,7"
         );
     }
 }
