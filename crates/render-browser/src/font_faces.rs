@@ -40,7 +40,7 @@
 //! own eviction policy, and a bounded cache is a policy someone has to get
 //! right. Document scope has no policy to get wrong.
 //!
-//! # What a face looks like before it has arrived
+//! # What a face looks like before it has arrived, and for how long
 //!
 //! Nothing. §5.2: "If the font resources defined for a given face in an
 //! `@font-face` rule are either not available or contain invalid font data, then
@@ -50,18 +50,43 @@
 //! state the rule carries. That is the whole of the "not yet arrived" answer, and
 //! it is consistent between measurement and painting because there is nothing
 //! per-face for the two to disagree about: both read the one table.
+//!
+//! How long "not yet" can last is §3.2's font download timeline, and this module
+//! is its clock. [`DocumentFontLoader::begin_document`] starts a monotonic
+//! timeline for each navigation; each URL records when its stylesheet first
+//! entered this document's render (the first full render that installs it); and
+//! `DocumentFonts::apply_display_policy` compares the arrival time recorded by
+//! [`DocumentFontLoader::install_fetched`] against the block+swap boundary
+//! [`render_core::font_face::FontDisplay::timing`] gives. A `block` or `swap`
+//! face (and `auto`, which this engine maps to `block`) has an infinite swap
+//! period and may swap in whenever it arrives. A `fallback` face may swap for
+//! the first 3.1s after it is needed; an `optional` face only for the first
+//! 100ms. After the failure period starts the URL is marked expired on the rule:
+//! the bytes stay cached for another rule that can still use them, but this rule
+//! is permanently on §5.2's fallback path. Nothing sleeps - a render asks the
+//! clock where it is, and an arriving body is what schedules the next render
+//! (the browser already re-renders when `finish_font_fetches` installs bytes).
+//!
+//! During the block period the engine paints the fallback visibly and measures
+//! it, rather than §3.2's invisible fallback. That is the UA policy documented on
+//! `render_core::font_face`: a single measure/paint pass cannot hide ink without
+//! a second face table, and §4.8.1 requires unavailable fonts to leave text
+//! visible. The periods still do their real work, which is deciding how long a
+//! late face may still replace that fallback.
 
 use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use fontdue::{Font, FontSettings};
 use render_core::document::FontFaceInstaller;
 use render_core::dom::{Dom, NodeKind};
 use render_core::font_face::{
-    FontFaceRule, FontFaceSheet, FontFaceSource, FontSource, UnicodeRangeSet,
+    FontDisplay, FontFaceRule, FontFaceSheet, FontFaceSource, FontSource, UnicodeRangeSet,
 };
 use render_core::layout::FontStyle;
 use render_net::{FetchRequest, FetchResult, Url};
@@ -77,6 +102,8 @@ pub struct DocumentRule {
     pub style: FontStyle,
     /// §4.5's `unicode-range` descriptor.
     pub range: UnicodeRangeSet,
+    /// §4.9's `font-display`, so the loader can apply §3.2's periods.
+    pub display: FontDisplay,
     /// §4.3.1's items, in author order, with §4.3.2's URL resolution done.
     pub sources: Vec<ResolvedSource>,
 }
@@ -88,7 +115,36 @@ pub enum ResolvedSource {
     /// any URL is fetched.
     Local(String),
     /// A URL, already absolute.
-    Url(Url),
+    Url {
+        url: Url,
+        /// §3.2's failure period has started and this face was not loaded, so
+        /// the URL may never supply this rule again. The bytes stay cached (a
+        /// second rule with `swap` may still use them), but this rule's table
+        /// entry is permanently absent and §5.2 falls through to its family
+        /// fallback.
+        expired: bool,
+    },
+}
+
+impl ResolvedSource {
+    /// The absolute URL this item names, when it is a URL item.
+    #[must_use]
+    pub fn url(&self) -> Option<&Url> {
+        match self {
+            Self::Local(_) => None,
+            Self::Url { url, .. } => Some(url),
+        }
+    }
+
+    /// Whether the failure period has made this URL permanently unusable for
+    /// its rule.
+    #[must_use]
+    pub const fn is_expired(&self) -> bool {
+        match self {
+            Self::Local(_) => false,
+            Self::Url { expired, .. } => *expired,
+        }
+    }
 }
 
 /// One family a document declares, with its rules in §4.5.1's check order.
@@ -277,6 +333,7 @@ impl DocumentFonts {
                         weight: rule.weight,
                         style: rule.style,
                         range: rule.unicode_range.clone(),
+                        display: rule.display,
                         sources: resolve_sources(&rule.sources, base),
                     },
                 )
@@ -356,7 +413,8 @@ impl DocumentFonts {
         let mut urls = Vec::new();
         for rule in self.rules() {
             for source in &rule.sources {
-                if let ResolvedSource::Url(url) = source
+                if let Some(url) = source.url()
+                    && !source.is_expired()
                     && !self.resources.contains_key(url)
                     && seen.insert(url.clone())
                 {
@@ -394,6 +452,57 @@ impl DocumentFonts {
     /// `Arc<Font>` across that rebuild.
     pub fn insert_resource(&mut self, url: Url, font: Arc<Font>) {
         self.resources.insert(url, font);
+    }
+
+    /// Applies §3.2's font download timeline to every URL source.
+    ///
+    /// `started_at` is the document's timeline origin, `url_started` the first
+    /// instant each URL was needed, and `arrivals` the instant each resource was
+    /// decoded. A rule with a finite swap period is permanently expired when
+    /// its failure period begins without the resource having arrived; an
+    /// infinite swap period (`block`, `swap`, `auto`) never expires. A resource
+    /// decoded before the document started counts as available immediately,
+    /// which is what makes the cross-document decoded-resource cache safe.
+    ///
+    /// Returns the earliest future failure-period boundary among rules that are
+    /// still waiting, so the loader can tell whether a rebuild is necessary
+    /// without rebuilding the table on every scroll frame.
+    fn apply_display_policy(
+        &mut self,
+        now: Duration,
+        started_at: Duration,
+        url_started: &HashMap<Url, Duration>,
+        arrivals: &HashMap<Url, Duration>,
+    ) -> Option<Duration> {
+        let mut next_expiry: Option<Duration> = None;
+        for family in &mut self.families {
+            for rule in &mut family.rules {
+                for source in &mut rule.sources {
+                    let ResolvedSource::Url { url, expired } = source else {
+                        continue;
+                    };
+                    let Some(failure) = rule.display.timing().failure_period_start() else {
+                        // An infinite swap period: a late arrival is always
+                        // allowed, so there is no boundary to schedule.
+                        continue;
+                    };
+                    let start = url_started.get(url).copied().unwrap_or(started_at);
+                    let deadline = start + failure;
+                    let arrived_in_time =
+                        arrivals.get(url).is_some_and(|arrival| *arrival < deadline)
+                            || (self.resources.contains_key(url) && !arrivals.contains_key(url));
+                    if arrived_in_time {
+                        continue;
+                    }
+                    if now >= deadline {
+                        *expired = true;
+                    } else {
+                        next_expiry = Some(next_expiry.map_or(deadline, |next| next.min(deadline)));
+                    }
+                }
+            }
+        }
+        next_expiry
     }
 
     /// The URLs to fetch for a page that names `used_families` and contains
@@ -459,7 +568,8 @@ impl DocumentFonts {
                 // That ordering is what stops a network request for a font
                 // already on the machine.
                 for source in &rule.sources {
-                    if let ResolvedSource::Url(url) = source
+                    if let Some(url) = source.url()
+                        && !source.is_expired()
                         && !self.resources.contains_key(url)
                         && seen.insert(url.clone())
                     {
@@ -486,7 +596,10 @@ fn resolve_sources(sources: &[FontSource], base: Option<&Url>) -> Vec<ResolvedSo
         .iter()
         .filter_map(|source| match source {
             FontSource::Local { name } => Some(ResolvedSource::Local(name.clone())),
-            FontSource::Url { url, .. } => Some(ResolvedSource::Url(resolve_url(url, base)?)),
+            FontSource::Url { url, .. } => Some(ResolvedSource::Url {
+                url: resolve_url(url, base)?,
+                expired: false,
+            }),
         })
         .collect()
 }
@@ -524,6 +637,24 @@ struct DocumentFontState {
     /// arrive before the stylesheet that names it is re-rendered, and a rule
     /// rebuild must not decode a 10 MB face twice.
     resources: HashMap<Url, Arc<Font>>,
+    /// When each decoded resource arrived on the loader's clock. Absolute rather
+    /// than document-relative because the resource cache outlives a document:
+    /// an arrival before the current document's origin is "available
+    /// immediately".
+    resource_arrivals: HashMap<Url, Duration>,
+    /// The navigation this timeline belongs to. `None` starts the timeline at
+    /// the first install, which is the useful fallback for a direct caller.
+    document_key: Option<(u64, u64)>,
+    /// The document timeline's zero, on the loader's clock.
+    started_at: Duration,
+    /// When each URL first entered the current document's face set, which is
+    /// the first full render that installs its stylesheet. A stylesheet added
+    /// later starts its faces' timers then, not at document load.
+    url_started: HashMap<Url, Duration>,
+    /// The earliest failure-period boundary still pending, so an unchanged rule
+    /// set does not rebuild the backend table until a `fallback`/`optional`
+    /// face actually expires.
+    next_expiry: Option<Duration>,
     /// Set when `install_fetched` added a resource, so the next `install`
     /// rebuilds the backend table even though the rule set itself did not
     /// change.
@@ -532,6 +663,44 @@ struct DocumentFontState {
     /// `unicode-range` hint does not walk the DOM on every frame.
     character_revision: Option<(u64, u64, u64)>,
     characters: Arc<BTreeSet<char>>,
+}
+
+/// A monotonic clock for §3.2's font download timer.
+///
+/// The loader never sleeps and never blocks a render thread waiting for a
+/// period to pass: fonts arrive when they arrive, and a render asks the clock
+/// where on the timeline it is. Tests substitute a manual clock to pin the
+/// block/swap/failure boundaries exactly.
+pub trait FontClock: Send + Sync + fmt::Debug {
+    /// Time elapsed since an arbitrary fixed origin. Only differences are used.
+    fn now(&self) -> Duration;
+}
+
+/// The production clock: a process-lifetime monotonic instant.
+#[derive(Debug)]
+pub struct MonotonicFontClock {
+    start: Instant,
+}
+
+impl MonotonicFontClock {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Default for MonotonicFontClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FontClock for MonotonicFontClock {
+    fn now(&self) -> Duration {
+        self.start.elapsed()
+    }
 }
 
 /// Loads each document's `@font-face` resources and publishes the resulting
@@ -544,9 +713,19 @@ struct DocumentFontState {
 /// still named is not decoded twice. An unchanged rule set does not rebuild the
 /// backend table at all, which keeps the font-instance generation stable across
 /// scroll and animation frames.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DocumentFontLoader {
     state: Mutex<DocumentFontState>,
+    clock: Arc<dyn FontClock>,
+}
+
+impl Default for DocumentFontLoader {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(DocumentFontState::default()),
+            clock: Arc::new(MonotonicFontClock::new()),
+        }
+    }
 }
 
 impl DocumentFontLoader {
@@ -555,22 +734,81 @@ impl DocumentFontLoader {
         Self::default()
     }
 
+    /// A loader whose timeline is read from `clock`.
+    ///
+    /// The clock is the document's font download timer. Production passes
+    /// [`MonotonicFontClock`]; tests pass a manual clock and call
+    /// [`Self::install`] at chosen instants, which is how the §3.2 boundaries are
+    /// pinned without sleeping.
+    #[must_use]
+    pub fn with_clock(clock: Arc<dyn FontClock>) -> Self {
+        Self {
+            state: Mutex::new(DocumentFontState::default()),
+            clock,
+        }
+    }
+
+    /// Starts a new document timeline at the current clock reading.
+    ///
+    /// The browser calls this for every full render with `(tab_id,
+    /// document_serial)`, so a navigation starts its webfont timers at zero
+    /// rather than inheriting the previous document's elapsed time. Repeating
+    /// the same key is a no-op, which keeps a re-render inside one document on
+    /// one timeline. The decoded-resource cache is deliberately not cleared:
+    /// §4.1 says font caching behaves as for any other web resource, and a
+    /// resource that predates the document counts as available immediately.
+    pub fn begin_document(&self, key: (u64, u64)) {
+        let now = self.clock.now();
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.document_key == Some(key) {
+            return;
+        }
+        state.document_key = Some(key);
+        state.started_at = now;
+        state.url_started.clear();
+        state.next_expiry = None;
+        // Force the next `install` to rebuild even when the two documents name
+        // exactly the same sources: their timelines differ by construction.
+        state.sources.clear();
+        state.document = DocumentFonts::new();
+        state.character_revision = None;
+    }
+
     /// Installs `sources` into `backend`, loading `file:` and base64 `data:`
     /// resources synchronously. Network resources are left outstanding: the
     /// browser fetches them and calls [`Self::install_fetched`] before the next
-    /// render, so §5.2's "not present" rule applies only until the bytes arrive.
+    /// render, so §5.2's "not present" rule applies only until the bytes arrive,
+    /// and §3.2's periods decide whether there is still time to swap.
     pub fn install(&self, backend: &SystemFontBackend, sources: &[FontFaceSource]) {
+        let now = self.clock.now();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.document_key.is_none() {
+            // A direct caller that never called `begin_document`: the first
+            // install is the moment the document first attempts to use a face,
+            // which is exactly where §3.2 starts the timer.
+            state.started_at = now;
+            state.document_key = Some((0, 0));
+        }
         let local_resource_pending = state
             .document
             .outstanding_urls()
             .iter()
             .any(|url| matches!(url.scheme(), "file" | "data"));
-        if state.sources == sources && !local_resource_pending && !state.dirty {
+        let before_expiry = state.next_expiry.is_some_and(|boundary| now >= boundary);
+        if state.sources == sources && !local_resource_pending && !state.dirty && !before_expiry {
             return;
         }
         let mut next = DocumentFonts::new();
         for source in sources {
+            for rule in &source.rules {
+                for item in &rule.sources {
+                    if let FontSource::Url { url, .. } = item
+                        && let Some(resolved) = resolve_url(url, source.base_url.as_ref())
+                    {
+                        state.url_started.entry(resolved).or_insert(now);
+                    }
+                }
+            }
             next.add_rules_at(&source.rules, source.base_url.as_ref());
         }
         let mut decoded = Vec::new();
@@ -585,12 +823,19 @@ impl DocumentFontLoader {
                 });
             if let Some(font) = font {
                 next.insert_resource(url.clone(), Arc::clone(&font));
+                state.resource_arrivals.entry(url.clone()).or_insert(now);
                 decoded.push((url, font));
             }
         }
         for (url, font) in decoded {
             state.resources.insert(url, font);
         }
+        state.next_expiry = next.apply_display_policy(
+            now,
+            state.started_at,
+            &state.url_started,
+            &state.resource_arrivals,
+        );
         backend.set_document_faces(&next);
         state.sources = sources.to_vec();
         state.document = next;
@@ -607,6 +852,7 @@ impl DocumentFontLoader {
         if resources.is_empty() {
             return;
         }
+        let now = self.clock.now();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         for (url, bytes) in resources {
             if state.resources.contains_key(url) {
@@ -614,6 +860,7 @@ impl DocumentFontLoader {
             }
             if let Ok(font) = load_font_bytes(bytes) {
                 state.resources.insert(url.clone(), font);
+                state.resource_arrivals.entry(url.clone()).or_insert(now);
                 state.dirty = true;
             }
         }
@@ -627,6 +874,7 @@ impl DocumentFontLoader {
         if resources.is_empty() {
             return installed;
         }
+        let now = self.clock.now();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         for (url, bytes) in resources {
             if state.resources.contains_key(url) {
@@ -634,6 +882,7 @@ impl DocumentFontLoader {
             }
             if let Ok(font) = load_font_bytes(bytes) {
                 state.resources.insert(url.clone(), font);
+                state.resource_arrivals.entry(url.clone()).or_insert(now);
                 state.dirty = true;
                 installed.push(url.clone());
             }
@@ -933,15 +1182,17 @@ mod tests {
     use std::collections::BTreeSet;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::time::Duration;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
-    use render_core::font_face::{FontFaceSource, parse_font_faces};
+    use render_core::font_face::{FontDisplay, FontFaceSource, parse_font_faces};
     use render_core::layout::{FontRequest, FontStyle, TextMeasurer, TextStyle};
     use render_net::{BatchOptions, CancelToken, FetchConfig, HttpTransport};
 
     use super::{
-        DocumentFontLoader, DocumentFonts, FontFetchPlan, FontLoadFailure, ResolvedSource, Url,
-        apply_font_batch, decode_font_container,
+        DocumentFontLoader, DocumentFonts, FontClock, FontFetchPlan, FontLoadFailure,
+        ResolvedSource, Url, apply_font_batch, decode_font_container,
     };
     use crate::font_backend::SystemFontBackend;
 
@@ -956,6 +1207,84 @@ mod tests {
         document
     }
 
+    /// A [`FontClock`] whose reading a test sets directly, so §3.2's period
+    /// boundaries can be pinned without sleeping on the render thread.
+    #[derive(Debug, Default)]
+    struct ManualClock {
+        millis: AtomicU64,
+    }
+
+    impl ManualClock {
+        fn set(&self, millis: u64) {
+            self.millis.store(millis, Ordering::SeqCst);
+        }
+    }
+
+    impl FontClock for ManualClock {
+        fn now(&self) -> Duration {
+            Duration::from_millis(self.millis.load(Ordering::SeqCst))
+        }
+    }
+
+    const TIMED_FAMILY: &str = "Render Test Webfont";
+
+    /// One document face on a loopback URL, with `font-display` chosen by the
+    /// test. The fixture's `H` is one em, so `HHH` is 48px at 16px when the face
+    /// is in the table and the platform fallback's own advance otherwise.
+    fn timed_sources(display: FontDisplay, url: &Url) -> Vec<FontFaceSource> {
+        let source = format!(
+            "@font-face {{ font-family: '{TIMED_FAMILY}'; src: url({url}) format(woff2); \
+             font-display: {} }}",
+            display.keyword()
+        );
+        let (sheet, problems) = parse_font_faces(&source);
+        assert!(problems.is_empty(), "{problems:?}");
+        vec![FontFaceSource::new(Some(base()), sheet.rules().to_vec())]
+    }
+
+    fn timed_advance(backend: &SystemFontBackend) -> f32 {
+        backend
+            .measure(
+                "HHH",
+                TextStyle {
+                    font_size: 16.0,
+                    line_height: 19.2,
+                    font: FontRequest::of_family(TIMED_FAMILY),
+                },
+            )
+            .advance
+    }
+
+    fn timed_url() -> Url {
+        Url::parse("https://cdn.test/assets/timed.woff2").expect("a parseable font URL")
+    }
+
+    /// Runs one face through a loader with a manual clock and returns
+    /// `(fallback_advance, advance after the bytes arrive at
+    /// arrival_millis)`. The fixture's face is one em, so an accepted arrival
+    /// measures 48px; a rejected one keeps the platform fallback's advance.
+    fn measure_at_arrival(display: FontDisplay, arrival_millis: u64) -> (f32, f32) {
+        let backend = SystemFontBackend::load().expect("the platform table loads");
+        // Before the document face exists the request falls through to the
+        // platform fallback, which is the advance a missing family keeps.
+        let fallback = timed_advance(&backend);
+        let clock = Arc::new(ManualClock::default());
+        let loader = DocumentFontLoader::with_clock(clock.clone());
+        loader.begin_document((7, 1));
+        let url = timed_url();
+        let sources = timed_sources(display, &url);
+        loader.install(&backend, &sources);
+        assert_eq!(
+            timed_advance(&backend),
+            fallback,
+            "before the bytes arrive the fallback face is measured"
+        );
+        clock.set(arrival_millis);
+        loader.install_fetched(&[(url, fixture_bytes("woff2"))]);
+        loader.install(&backend, &sources);
+        (fallback, timed_advance(&backend))
+    }
+
     /// Every URL a family holds, in family order.
     fn urls_of(document: &DocumentFonts, family: &str) -> Vec<String> {
         document
@@ -967,10 +1296,7 @@ mod tests {
                     .rules
                     .iter()
                     .flat_map(|rule| rule.sources.iter())
-                    .filter_map(|source| match source {
-                        ResolvedSource::Url(url) => Some(url.to_string()),
-                        ResolvedSource::Local(_) => None,
-                    })
+                    .filter_map(|source| source.url().map(Url::to_string))
                     .collect()
             })
             .unwrap_or_default()
@@ -1091,7 +1417,10 @@ mod tests {
             document.families()[0].rules[0].sources,
             vec![
                 ResolvedSource::Local("Gentium".to_owned()),
-                ResolvedSource::Url("https://cdn.test/assets/g.ttf".parse().expect("a URL")),
+                ResolvedSource::Url {
+                    url: "https://cdn.test/assets/g.ttf".parse().expect("a URL"),
+                    expired: false,
+                },
             ],
             "§4.3.3.1: local() is tried first, so a font already on the machine \
              costs no request"
@@ -1277,9 +1606,15 @@ mod tests {
     fn a_stored_rule_carries_the_descriptors_the_matcher_selects_on() {
         let document = store_of(
             "@font-face { font-family: Sel; font-weight: 700; font-style: oblique 20deg; \
-             src: url(s.ttf) format(truetype); unicode-range: U+4E00-9FFF }",
+             src: url(s.ttf) format(truetype); unicode-range: U+4E00-9FFF; \
+             font-display: fallback }",
         );
         let rule = &document.families()[0].rules[0];
+        assert_eq!(
+            rule.display,
+            FontDisplay::Fallback,
+            "§4.9's value reaches the loader that runs its §3.2 periods"
+        );
         assert_eq!(
             rule.weight, 700,
             "§5.2's weight search needs the descriptor"
@@ -1477,6 +1812,235 @@ mod tests {
             48.0,
             "the HTTP-fetched WOFF2 is the face layout measures"
         );
+        server.join().expect("the test server finishes");
+    }
+
+    // ---- §3.2 / §4.9: the font display timeline ---------------------------
+
+    /// `block`: the face gets a 3s block period and then an infinite swap
+    /// period. This engine paints fallback metrics during the block period, so
+    /// the measurement before the bytes arrive is the reference fallback, and
+    /// an arrival after the block period still swaps in because the swap period
+    /// never ends.
+    #[test]
+    fn font_display_block_shows_fallback_then_swaps_even_after_the_block_period() {
+        assert_eq!(
+            measure_at_arrival(FontDisplay::Block, 1_000).1,
+            48.0,
+            "an arrival during the block period swaps in"
+        );
+        assert_eq!(
+            measure_at_arrival(FontDisplay::Block, 60_000).1,
+            48.0,
+            "an infinite swap period means even a very late face still swaps"
+        );
+    }
+
+    /// `swap`: no block period worth measuring and an infinite swap period, so
+    /// the existing "fallback immediately, swap when it arrives" behaviour is
+    /// preserved - including for the corpus's dominant value.
+    #[test]
+    fn font_display_swap_accepts_a_late_face() {
+        assert_eq!(measure_at_arrival(FontDisplay::Swap, 4_000).1, 48.0);
+    }
+
+    /// `auto` is user-agent-defined; this engine chooses the `block` policy, so
+    /// a late face still swaps.
+    #[test]
+    fn font_display_auto_uses_the_block_policy() {
+        assert_eq!(measure_at_arrival(FontDisplay::Auto, 4_000).1, 48.0);
+    }
+
+    /// `fallback`: a 100ms block period plus a 3s swap period. An arrival one
+    /// millisecond before the failure period swaps; an arrival exactly at the
+    /// boundary does not, because §3.2 starts the failure period at that
+    /// instant.
+    #[test]
+    fn font_display_fallback_swaps_inside_the_swap_period_and_not_at_its_end() {
+        assert_eq!(
+            measure_at_arrival(FontDisplay::Fallback, 3_099).1,
+            48.0,
+            "inside the swap period the face replaces the fallback"
+        );
+        let (fallback, at_boundary) = measure_at_arrival(FontDisplay::Fallback, 3_100);
+        assert_eq!(
+            at_boundary, fallback,
+            "at the start of the failure period the fallback is permanent"
+        );
+        let (fallback, later) = measure_at_arrival(FontDisplay::Fallback, 10_000);
+        assert_eq!(
+            later, fallback,
+            "and it stays permanent for the rest of the document"
+        );
+    }
+
+    /// `optional`: a zero-length swap period. The face must be available by the
+    /// end of the 100ms block period or it is never used, so it can never cause
+    /// a late layout jump.
+    #[test]
+    fn font_display_optional_only_uses_a_face_from_its_initial_period() {
+        assert_eq!(
+            measure_at_arrival(FontDisplay::Optional, 99).1,
+            48.0,
+            "available within the initial 100ms period"
+        );
+        let (fallback, at_boundary) = measure_at_arrival(FontDisplay::Optional, 100);
+        assert_eq!(
+            at_boundary, fallback,
+            "the zero swap period ends at the block-period boundary"
+        );
+        let (fallback, later) = measure_at_arrival(FontDisplay::Optional, 5_000);
+        assert_eq!(later, fallback, "and an optional face never swaps in later");
+    }
+
+    /// Once a finite swap period has elapsed, the loader stops planning the
+    /// fetch: the bytes are no longer useful for this rule, so §3.2's failure
+    /// state is also a scheduling fact and not only a rendering one.
+    #[test]
+    fn an_expired_pending_face_is_no_longer_planned_for_a_fetch() {
+        let backend = SystemFontBackend::load().expect("the platform table loads");
+        let fallback = timed_advance(&backend);
+        let clock = Arc::new(ManualClock::default());
+        let loader = DocumentFontLoader::with_clock(clock.clone());
+        loader.begin_document((7, 2));
+        let url = timed_url();
+        let sources = timed_sources(FontDisplay::Fallback, &url);
+        loader.install(&backend, &sources);
+        assert_eq!(
+            loader.plan_fetches([TIMED_FAMILY], &BTreeSet::from(['H'])),
+            vec![url.clone()],
+            "before the failure period the face is worth fetching"
+        );
+
+        clock.set(3_100);
+        loader.install(&backend, &sources);
+        assert!(
+            loader
+                .plan_fetches([TIMED_FAMILY], &BTreeSet::from(['H']))
+                .is_empty(),
+            "the failure period has started, so the URL is no longer planned"
+        );
+        assert!(!loader.has_pending_network());
+        assert_eq!(
+            timed_advance(&backend),
+            fallback,
+            "the family is still present as a missing family, so §5.2 does not \
+             borrow an installed family of the same name"
+        );
+    }
+
+    /// The HTTP path proves the same timeline end to end: the same late body
+    /// swaps under `swap` and is refused under `fallback` once its swap period
+    /// has expired. The clock is manual, so this is not a sleep.
+    #[test]
+    fn a_late_http_face_swaps_under_swap_but_not_after_the_fallback_period() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let address = listener.local_addr().expect("a bound address");
+        let body = fixture_bytes("woff2");
+        let url = Url::parse(&format!("http://{address}/font.woff2")).expect("a font URL");
+        let swap_sources = timed_sources(FontDisplay::Swap, &url);
+        let fallback_sources = timed_sources(FontDisplay::Fallback, &url);
+        let backend = SystemFontBackend::load().expect("the platform table loads");
+        let fallback = timed_advance(&backend);
+        let swap_clock = Arc::new(ManualClock::default());
+        let fallback_clock = Arc::new(ManualClock::default());
+        let swap_loader = DocumentFontLoader::with_clock(swap_clock.clone());
+        let fallback_loader = DocumentFontLoader::with_clock(fallback_clock.clone());
+        swap_loader.begin_document((8, 1));
+        fallback_loader.begin_document((8, 2));
+        swap_loader.install(&backend, &swap_sources);
+        fallback_loader.install(&backend, &fallback_sources);
+
+        // Start serving only after the (slow) platform table load, so the
+        // bounded lifetime below covers the transfers and not the setup.
+        let server = std::thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("a non-blocking listener");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut served = 0;
+            while served < 2 && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("a blocking client stream");
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .expect("a read timeout");
+                        let mut request = [0_u8; 1024];
+                        let _ = stream.read(&mut request);
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: font/woff2\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .expect("response headers");
+                        stream.write_all(&body).expect("response body");
+                        served += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("the test server stopped: {error}"),
+                }
+            }
+        });
+
+        let transport = HttpTransport::new(FetchConfig::default());
+        let swap_plan =
+            FontFetchPlan::new(swap_loader.plan_fetches([TIMED_FAMILY], &BTreeSet::from(['H'])));
+        let fallback_plan = FontFetchPlan::new(
+            fallback_loader.plan_fetches([TIMED_FAMILY], &BTreeSet::from(['H'])),
+        );
+        assert_eq!(swap_plan.urls, vec![url.clone()]);
+        assert_eq!(fallback_plan.urls, vec![url.clone()]);
+
+        let swap_batch = apply_font_batch(
+            &swap_plan,
+            transport.fetch_batch(
+                swap_plan.requests(),
+                &BatchOptions::default(),
+                &CancelToken::default(),
+            ),
+        );
+        let fallback_batch = apply_font_batch(
+            &fallback_plan,
+            transport.fetch_batch(
+                fallback_plan.requests(),
+                &BatchOptions::default(),
+                &CancelToken::default(),
+            ),
+        );
+        assert!(swap_batch.failures.is_empty(), "{:?}", swap_batch.failures);
+        assert!(
+            fallback_batch.failures.is_empty(),
+            "{:?}",
+            fallback_batch.failures
+        );
+
+        // Both bodies really arrived over TCP; only the timeline sees them at
+        // 4s, which is two seconds past `fallback`'s swap period.
+        swap_clock.set(4_000);
+        swap_loader.install_fetched(&swap_batch.resources);
+        swap_loader.install(&backend, &swap_sources);
+        assert_eq!(
+            timed_advance(&backend),
+            48.0,
+            "§4.9 `swap` has an infinite swap period, so the late face is used"
+        );
+
+        fallback_clock.set(4_000);
+        fallback_loader.install_fetched(&fallback_batch.resources);
+        fallback_loader.install(&backend, &fallback_sources);
+        assert_eq!(
+            timed_advance(&backend),
+            fallback,
+            "§4.9 `fallback` expired at 3.1s, so the body that arrived at 4s is \
+             not used and the fallback is permanent"
+        );
+
         server.join().expect("the test server finishes");
     }
 }

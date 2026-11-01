@@ -21,7 +21,10 @@ use render_core::document::{
     Document, DocumentBackends, DocumentRenderOptions, ExternalStyleSheets, FontFaceInstaller,
 };
 use render_core::font_face::{FontFaceSource, FontSource};
-use render_core::layout::{FragmentKind, SimpleTextMeasurer, TextMeasure, TextMeasurer, TextStyle};
+use render_core::layout::{
+    FragmentKind, LayoutOptions, PhysicalSize, SimpleTextMeasurer, TextMeasure, TextMeasurer,
+    TextStyle,
+};
 use render_core::paint::{NoGlyphMasks, ReferenceTextShaper};
 use url::Url;
 
@@ -113,6 +116,51 @@ impl FontFaceInstaller for LocalInstaller {
     }
 }
 
+/// Captures the sources the document hands to the install hook, so a test can
+/// assert what the fetch planner would have been offered.
+struct RecordingInstaller {
+    sources: Mutex<Vec<FontFaceSource>>,
+}
+
+impl FontFaceInstaller for RecordingInstaller {
+    fn install_font_faces(&self, sources: &[FontFaceSource]) {
+        self.sources
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(sources);
+    }
+}
+
+fn installed_sources(html: &str, base: &Url, viewport: PhysicalSize) -> Vec<FontFaceSource> {
+    let installer = RecordingInstaller {
+        sources: Mutex::new(Vec::new()),
+    };
+    let faces = Arc::new(Mutex::new(HashMap::new()));
+    let fonts = FixtureFonts { faces };
+    let document = Document::parse(html);
+    let _ = document.render_with_external_style_sheets(
+        DocumentRenderOptions {
+            layout: LayoutOptions {
+                viewport,
+                ..LayoutOptions::default()
+            },
+            ..DocumentRenderOptions::default()
+        },
+        DocumentBackends {
+            text_measurer: &fonts,
+            text_shaper: &ReferenceTextShaper,
+            glyph_masks: &NoGlyphMasks,
+            font_face_installer: Some(&installer),
+        },
+        base,
+        &ExternalStyleSheets::default(),
+    );
+    installer
+        .sources
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
 fn base_url() -> Url {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -150,19 +198,6 @@ fn an_external_stylesheet_keeps_its_font_faces_and_base_url() {
     use render_core::document::{DocumentLimits, ExternalStyleSheetKey};
     use render_core::font_face::FontSource;
 
-    struct RecordingInstaller {
-        sources: Mutex<Vec<FontFaceSource>>,
-    }
-
-    impl FontFaceInstaller for RecordingInstaller {
-        fn install_font_faces(&self, sources: &[FontFaceSource]) {
-            self.sources
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .extend_from_slice(sources);
-        }
-    }
-
     let document = Document::parse(
         "<!doctype html><link rel='stylesheet' href='/assets/main.css'><p>text</p>",
     );
@@ -190,6 +225,12 @@ fn an_external_stylesheet_keeps_its_font_faces_and_base_url() {
     external.insert_css(
         key,
         "@font-face { font-family: Ext; src: url(../fonts/ext.ttf) format(truetype) } \
+         @media screen { \
+           @font-face { font-family: ScreenExt; src: url(../fonts/screen.ttf) format(truetype) } \
+         } \
+         @media print { \
+           @font-face { font-family: PrintExt; src: url(../fonts/print.ttf) format(truetype) } \
+         } \
          p { color: red }",
     );
 
@@ -216,11 +257,24 @@ fn an_external_stylesheet_keeps_its_font_faces_and_base_url() {
         .sources
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    assert_eq!(sources.len(), 1, "one sheet declares one face");
+    assert_eq!(
+        sources.len(),
+        1,
+        "one external sheet supplies its matching faces"
+    );
     assert_eq!(
         sources[0].base_url.as_ref().map(Url::as_str),
         Some("https://example.test/assets/main.css"),
         "a relative src resolves against the stylesheet, not the document"
+    );
+    assert_eq!(
+        sources[0]
+            .rules
+            .iter()
+            .map(|rule| rule.family.as_str())
+            .collect::<Vec<_>>(),
+        ["ext", "screenext"],
+        "the screen condition holds; the print-only face is not installed"
     );
     assert_eq!(sources[0].rules[0].family, "ext");
     assert!(
@@ -229,6 +283,105 @@ fn an_external_stylesheet_keeps_its_font_faces_and_base_url() {
             FontSource::Url { url, .. } if url == "../fonts/ext.ttf"
         ),
         "the descriptor keeps the author's URL for §4.3.2 resolution"
+    );
+}
+
+#[test]
+fn conditional_font_faces_are_installed_only_when_their_conditions_match() {
+    const CONDITIONAL: &str = r"<!doctype html><style>
+@media screen { @font-face { font-family: Screen; src: url(screen.ttf) format(truetype) } }
+@media print { @font-face { font-family: Print; src: url(print.ttf) format(truetype) } }
+@media (min-width: 700px) {
+  @font-face { font-family: Wide; src: url(wide.ttf) format(truetype) }
+}
+@media (max-width: 699px) {
+  @font-face { font-family: Narrow; src: url(narrow.ttf) format(truetype) }
+}
+@supports (display: grid) {
+  @font-face { font-family: Grid; src: url(grid.ttf) format(truetype) }
+}
+@supports (display: definitely-not-a-display) {
+  @font-face { font-family: NoGrid; src: url(no-grid.ttf) format(truetype) }
+}
+@media screen { @supports (display: grid) {
+  @font-face { font-family: Nested; src: url(nested.ttf) format(truetype) }
+} }
+@media print { @supports (display: grid) {
+  @font-face { font-family: PrintNested; src: url(print-nested.ttf) format(truetype) }
+} }
+</style><p>x</p>";
+    let base = Url::parse("https://example.test/page.html").expect("a base URL");
+
+    let wide = installed_sources(
+        CONDITIONAL,
+        &base,
+        PhysicalSize {
+            width: 800.0,
+            height: 600.0,
+        },
+    );
+    let families: Vec<_> = wide
+        .iter()
+        .flat_map(|source| source.rules.iter())
+        .map(|rule| rule.family.as_str())
+        .collect();
+    assert_eq!(
+        families,
+        ["screen", "wide", "grid", "nested"],
+        "the matching media/supports faces are installed; `print`, the false \
+         width query and the unsupported declaration are not"
+    );
+
+    let narrow = installed_sources(
+        CONDITIONAL,
+        &base,
+        PhysicalSize {
+            width: 500.0,
+            height: 600.0,
+        },
+    );
+    let families: Vec<_> = narrow
+        .iter()
+        .flat_map(|source| source.rules.iter())
+        .map(|rule| rule.family.as_str())
+        .collect();
+    assert_eq!(
+        families,
+        ["screen", "narrow", "grid", "nested"],
+        "the width query follows the render viewport"
+    );
+}
+
+#[test]
+fn a_print_or_undecidable_font_face_is_never_offered_to_the_installer() {
+    const HTML: &str = r"<!doctype html><style>
+@media print { @font-face { font-family: Print; src: url(print.ttf) format(truetype) } }
+@supports at-rule(@page) {
+  @font-face { font-family: Undecidable; src: url(undecidable.ttf) format(truetype) }
+}
+@supports (display: grid) {
+  @font-face { font-family: Grid; src: url(grid.ttf) format(truetype) }
+}
+</style><p>x</p>";
+    let base = Url::parse("https://example.test/page.html").expect("a base URL");
+    let sources = installed_sources(
+        HTML,
+        &base,
+        PhysicalSize {
+            width: 800.0,
+            height: 600.0,
+        },
+    );
+    let families: Vec<_> = sources
+        .iter()
+        .flat_map(|source| source.rules.iter())
+        .map(|rule| rule.family.as_str())
+        .collect();
+    assert_eq!(
+        families,
+        ["grid"],
+        "a print-only face and an undecidable @supports face are not planned or \
+         installed; the answered true condition is"
     );
 }
 

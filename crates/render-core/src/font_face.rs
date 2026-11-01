@@ -19,8 +19,16 @@
 //!   `@font-face` rule must not be considered when performing the font
 //!   matching algorithm." There is no half-registered face, and
 //!   [`FontFaceSheet::rules`] holds only rules that can be considered.
-//! - **`font-display` has no timeline to act on, so it has no effect.** See
-//!   [`FontDisplay`].
+//! - **A conditional face is still a face, and its condition travels with it.**
+//!   CSS Cascade 5 §6 puts `@font-face` inside `@media` and §7 inside
+//!   `@supports`, so the rule list retains the enclosing conditions. Applying
+//!   them is [`FontFaceRule::applies_under`]'s job, using the same media and
+//!   `@supports` evaluators the cascade uses, so a face cannot apply where the
+//!   stylesheet around it does not.
+//! - **`font-display` has a timeline now.** [`FontDisplay::timing`] carries the
+//!   block, swap and failure periods CSS Fonts 4 §3.2/§4.9 defines; the browser
+//!   loader is the clock. See the note on rendering during the block period
+//!   below.
 //!
 //! # Why the block walk is here and not in `render-css`
 //!
@@ -42,14 +50,24 @@
 //!
 //! §3.2 defines a font face's life as three periods driven by a font download
 //! timer: a block period, a swap period, and a failure period. `font-display`
-//! chooses the *lengths* of the first two. This engine has no font download
-//! timer, so it has no block period, no swap period, and no clock to start one:
-//! there is exactly one point on §3.2's timeline it can ever be at, and that is
-//! the failure period, whose defined outcome is "causing normal font fallback".
-//! Every one of the five `font-display` values reaches that same outcome here,
-//! which is why this module validates the descriptor, reports an invalid one,
-//! and then lets the *absence* of a face decide rendering rather than the
-//! descriptor.
+//! chooses the *lengths* of the first two, and [`FontDisplay::timing`] is the
+//! one table of those lengths. A value with an infinite swap period (`block`,
+//! `swap`, and this engine's choice for `auto`) may be replaced by its webfont
+//! whenever the bytes finally arrive; `fallback` and `optional` stop accepting
+//! a late arrival when their failure period starts.
+//!
+//! §3.2 says the block period renders "with an invisible fallback font face".
+//! This engine measures and paints in one pass, so an invisible fallback would
+//! mean either a second paint-only face table or text that is absent from the
+//! display list while present in layout. Neither is available, and §4.8.1
+//! requires an unavailable font to leave the text visible ("user agents must
+//! display the text visibly"). The user-agent policy here is therefore: **the
+//! block period uses fallback metrics and paints the fallback visibly**. It
+//! keeps block, swap, fallback and optional distinguishable where §3.2 makes
+//! them matter - the duration after which a late face can no longer swap in -
+//! without inventing a second measure/paint state. The browser loader applies
+//! the periods against the document's monotonic clock; see
+//! `render-browser::font_faces`.
 //!
 //! What the absence means is settled by §5.2 and not by this module: "If the
 //! font resources defined for a given face in an `@font-face` rule are either
@@ -65,13 +83,17 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::time::Duration;
 
 use cssparser::{
     AtRuleParser, CowRcStr, ParseError, Parser, ParserInput, ParserState, QualifiedRuleParser,
     SourceLocation, StyleSheetParser, Token,
 };
 use render_css::at_rules::at_rule_block_is_declaration_list;
+use render_css::cascade::media_query_list_matches;
+use render_css::selector::MatchContext;
 use render_css::stylesheet::{Declaration, StyleSheetDiagnostic, parse_declaration_list};
+use render_css::supports::{SupportsCondition, evaluate_supports_condition};
 use render_layout::{FontStyle, computed_font_style, computed_font_weight};
 use url::Url;
 
@@ -120,6 +142,23 @@ impl FontFaceSheet {
         self.rules.iter().rev()
     }
 
+    /// The rules whose enclosing `@media`/`@supports` conditions hold in
+    /// `context`, in document order.
+    ///
+    /// This is the collection step a font installer must use: a face under a
+    /// non-matching condition is not a face for this rendering, so it must not
+    /// be planned for a fetch or installed into the backend table. Cloning is
+    /// deliberate - the returned rules cross into a document-scoped source and
+    /// the sheet itself is not kept alive by the font backend.
+    #[must_use]
+    pub fn rules_matching(&self, context: &MatchContext) -> Vec<FontFaceRule> {
+        self.rules
+            .iter()
+            .filter(|rule| rule.applies_under(context))
+            .cloned()
+            .collect()
+    }
+
     /// Whether the stylesheet declared no `@font-face` at all, which is the
     /// common case and the reason the fetch planner has nothing to do.
     #[must_use]
@@ -154,6 +193,65 @@ impl FontFaceSource {
     }
 }
 
+/// One enclosing conditional group rule around an `@font-face`.
+///
+/// CSS Cascade 5 §6 and §7 make a face inside `@media`/`@supports` apply only
+/// when the group's condition holds. The text is kept exactly as the prelude
+/// was written so evaluation is the same call the cascade makes, not a second
+/// parser with its own rules.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FontFaceCondition {
+    /// A `<media-query-list>` from `@media`.
+    Media(String),
+    /// A `<supports-condition>` from `@supports`, with its outer parentheses
+    /// intact because that is what `evaluate_supports_condition` reads.
+    Supports(String),
+}
+
+impl FontFaceCondition {
+    /// Whether this condition holds in `context`.
+    ///
+    /// `@media` uses the cascade's evaluator, so an unsupported feature is
+    /// false (Media Queries 4 §2.1.1) exactly as it is for a style rule.
+    /// `@supports` returns true only for a fully answered true condition:
+    /// [`SupportsCondition::Undecidable`] is not a maybe that can be guessed
+    /// into either branch.
+    #[must_use]
+    pub fn matches(&self, context: &MatchContext) -> bool {
+        match self {
+            Self::Media(query) => media_query_list_matches(query, context),
+            Self::Supports(condition) => evaluate_supports_condition(condition).applies(),
+        }
+    }
+
+    /// Whether `@supports` named a feature this crate cannot answer.
+    ///
+    /// Such a condition is treated as not matching - applying it would claim a
+    /// capability the engine cannot see - and this method exists so a caller can
+    /// report the gap rather than silently dropping the face.
+    #[must_use]
+    pub fn is_undecidable(&self) -> bool {
+        match self {
+            Self::Media(_) => false,
+            Self::Supports(condition) => {
+                matches!(
+                    evaluate_supports_condition(condition),
+                    SupportsCondition::Undecidable(_)
+                )
+            }
+        }
+    }
+
+    /// A one-line description for a diagnostic.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Media(query) => format!("@media {query}"),
+            Self::Supports(condition) => format!("@supports {condition}"),
+        }
+    }
+}
+
 /// One `@font-face` rule, as §4.1 defines it.
 ///
 /// Every field is a descriptor's *computed* value, so a rule that omits a
@@ -176,9 +274,12 @@ pub struct FontFaceRule {
     /// §4.3.1's `<font-src-list>`, in author order. Empty when every item was
     /// rejected, which §4.3.1 makes a parse error for the descriptor.
     pub sources: Vec<FontSource>,
-    /// §4.9's `font-display`, validated and recorded. It does not change
-    /// rendering; see the module documentation and [`FontDisplay`].
+    /// §4.9's `font-display`, whose timing the browser loader applies. See
+    /// [`FontDisplay::timing`].
     pub display: FontDisplay,
+    /// The `@media`/`@supports` conditions enclosing this rule, outermost first.
+    /// Empty for a face declared at the stylesheet's top level.
+    pub conditions: Vec<FontFaceCondition>,
     /// This rule's position in its stylesheet, ascending from zero.
     pub order: usize,
 }
@@ -206,15 +307,34 @@ impl FontFaceRule {
     pub fn admits(&self, character: char) -> bool {
         self.unicode_range.contains(character)
     }
+
+    /// Whether every enclosing condition holds in `context`.
+    ///
+    /// A face with no conditions is unconditional. A condition this engine
+    /// cannot answer (`@supports at-rule(...)`) counts as not matching, which is
+    /// the same honest outcome the cascade gives the block around it: applying
+    /// it would claim support that does not exist.
+    #[must_use]
+    pub fn applies_under(&self, context: &MatchContext) -> bool {
+        self.conditions
+            .iter()
+            .all(|condition| condition.matches(context))
+    }
+
+    /// The first enclosing condition this engine cannot answer, if any.
+    #[must_use]
+    pub fn undecidable_condition(&self) -> Option<&FontFaceCondition> {
+        self.conditions
+            .iter()
+            .find(|condition| condition.is_undecidable())
+    }
 }
 
 /// §4.9's `font-display` values.
 ///
-/// The enum exists so that an *invalid* value is a reported parse error rather
-/// than a silently ignored declaration, and so the value is available to a
-/// diagnostic. It deliberately does not reach rendering: this engine has no font
-/// download timer, so every value resolves to §3.2's failure period, which is
-/// "normal font fallback". See the module documentation.
+/// The enum validates the descriptor and gives the browser loader the periods
+/// §3.2 defines. `auto` is user-agent-defined; this engine chooses the `block`
+/// timing (the behaviour the specification's note says many browsers use).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FontDisplay {
     #[default]
@@ -224,6 +344,57 @@ pub enum FontDisplay {
     Fallback,
     Optional,
 }
+
+/// §3.2's block and swap periods for one `font-display` value.
+///
+/// `swap: None` is an infinite swap period, so the failure period never starts
+/// and a late face may always be used. `Some(Duration::ZERO)` is `optional`'s
+/// zero-length swap period: only a face available by the end of the block
+/// period is used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FontDisplayTiming {
+    /// How long an unavailable face is given before fallback is shown. This
+    /// engine paints fallback metrics throughout the block period; see the
+    /// module documentation.
+    pub block: Duration,
+    /// How long after the block period a late arrival may still replace the
+    /// fallback. `None` means forever.
+    pub swap: Option<Duration>,
+}
+
+impl FontDisplayTiming {
+    /// The moment the failure period starts, relative to the face's timer
+    /// start, or `None` for an infinite swap period.
+    #[must_use]
+    pub fn failure_period_start(self) -> Option<Duration> {
+        self.swap.map(|swap| self.block + swap)
+    }
+
+    /// Whether a face that arrives `elapsed` after its timer started may still
+    /// be used.
+    ///
+    /// The failure period starts *at* the end of the swap period, so an arrival
+    /// exactly at that instant is late. Pinning the boundary this way is what
+    /// lets the loader apply one rule and a test assert it.
+    #[must_use]
+    pub fn allows_arrival(self, elapsed: Duration) -> bool {
+        self.failure_period_start()
+            .is_none_or(|failure| elapsed < failure)
+    }
+}
+
+/// §4.9's recommended `block` block period.
+pub const BLOCK_PERIOD: Duration = Duration::from_secs(3);
+
+/// §4.9's "100ms or less" block period for `swap`. The engine uses zero, which
+/// is what browsers do for the value whose point is to paint a fallback at once.
+pub const SWAP_BLOCK_PERIOD: Duration = Duration::ZERO;
+
+/// §4.9's recommended short block period for `fallback` and `optional`.
+pub const SHORT_BLOCK_PERIOD: Duration = Duration::from_millis(100);
+
+/// §4.9's recommended swap period for `fallback`.
+pub const FALLBACK_SWAP_PERIOD: Duration = Duration::from_secs(3);
 
 impl FontDisplay {
     /// §4.9's `<font-display>` keyword, or `None` for a value the descriptor's
@@ -250,6 +421,44 @@ impl FontDisplay {
             Self::Fallback => "fallback",
             Self::Optional => "optional",
         }
+    }
+
+    /// §3.2's periods for this value, with §4.9's recommended durations.
+    ///
+    /// | value | block | swap |
+    /// | --- | --- | --- |
+    /// | `auto` | 3s (UA choice) | infinite |
+    /// | `block` | 3s | infinite |
+    /// | `swap` | 0s | infinite |
+    /// | `fallback` | 100ms | 3s |
+    /// | `optional` | 100ms | 0s |
+    #[must_use]
+    pub const fn timing(self) -> FontDisplayTiming {
+        match self {
+            Self::Auto | Self::Block => FontDisplayTiming {
+                block: BLOCK_PERIOD,
+                swap: None,
+            },
+            Self::Swap => FontDisplayTiming {
+                block: SWAP_BLOCK_PERIOD,
+                swap: None,
+            },
+            Self::Fallback => FontDisplayTiming {
+                block: SHORT_BLOCK_PERIOD,
+                swap: Some(FALLBACK_SWAP_PERIOD),
+            },
+            Self::Optional => FontDisplayTiming {
+                block: SHORT_BLOCK_PERIOD,
+                swap: Some(Duration::ZERO),
+            },
+        }
+    }
+
+    /// Whether a face whose bytes arrive `elapsed` after its timer started may
+    /// still be used, per [`FontDisplayTiming::allows_arrival`].
+    #[must_use]
+    pub fn allows_arrival(self, elapsed: Duration) -> bool {
+        self.timing().allows_arrival(elapsed)
     }
 }
 
@@ -1127,6 +1336,7 @@ fn collect_rules(
         order,
         sheet,
         problems,
+        conditions: Vec::new(),
     };
     for item in StyleSheetParser::new(&mut parser, &mut walker) {
         let _ = item;
@@ -1176,6 +1386,8 @@ struct FontFaceWalker<'a> {
     order: &'a mut usize,
     sheet: &'a mut FontFaceSheet,
     problems: &'a mut Vec<FontFaceProblem>,
+    /// The conditions of the group rules this walk is inside, outermost first.
+    conditions: Vec<FontFaceCondition>,
 }
 
 impl FontFaceWalker<'_> {
@@ -1281,6 +1493,7 @@ impl FontFaceWalker<'_> {
             unicode_range: descriptors.unicode_range.unwrap_or_default(),
             sources: src.sources,
             display: descriptors.display.unwrap_or_default(),
+            conditions: self.conditions.clone(),
             order: *self.order,
         });
         *self.order += 1;
@@ -1311,7 +1524,10 @@ impl<'i> QualifiedRuleParser<'i> for FontFaceWalker<'_> {
 }
 
 impl<'i> AtRuleParser<'i> for FontFaceWalker<'_> {
-    type Prelude = CowRcStr<'i>;
+    /// The at-rule name plus the prelude's source text. The text is what makes
+    /// `@media` and `@supports` conditions evaluable later by the cascade's own
+    /// parsers; the name is still canonicalised exactly as before.
+    type Prelude = (CowRcStr<'i>, String);
     type AtRule = ();
     type Error = ();
 
@@ -1319,14 +1535,17 @@ impl<'i> AtRuleParser<'i> for FontFaceWalker<'_> {
         &mut self,
         name: CowRcStr<'i>,
         input: &mut Parser<'i, 't>,
-    ) -> Result<CowRcStr<'i>, ParseError<'i, ()>> {
+    ) -> Result<Self::Prelude, ParseError<'i, ()>> {
+        let start = input.position();
         while input.next_including_whitespace_and_comments().is_ok() {}
-        Ok(name)
+        let end = input.position();
+        let prelude = input.slice(start..end).trim().to_owned();
+        Ok((name, prelude))
     }
 
     fn rule_without_block(
         &mut self,
-        _prelude: CowRcStr<'i>,
+        _prelude: Self::Prelude,
         _start: &ParserState,
     ) -> Result<(), ()> {
         Ok(())
@@ -1334,11 +1553,12 @@ impl<'i> AtRuleParser<'i> for FontFaceWalker<'_> {
 
     fn parse_block<'t>(
         &mut self,
-        prelude: CowRcStr<'i>,
+        prelude: Self::Prelude,
         start: &ParserState,
         input: &mut Parser<'i, 't>,
     ) -> Result<(), ParseError<'i, ()>> {
-        let name = canonical_at_keyword(prelude.as_ref());
+        let (written_name, prelude) = prelude;
+        let name = canonical_at_keyword(written_name.as_ref());
         if name == "font-face" {
             self.read_block(input, start.source_location());
             return Ok(());
@@ -1353,10 +1573,23 @@ impl<'i> AtRuleParser<'i> for FontFaceWalker<'_> {
         }
         // A `@media`, `@supports` or `@layer` block may hold a `@font-face`, so
         // the walk continues inside it, which is what CSS Cascade 5 §6 and §7
-        // require. `parse_block` is handed a parser already scoped to the
-        // block's contents, so the same parser walks the nested rule list.
+        // require. A condition is pushed for the duration of the nested walk so
+        // the face retains the whole outer-to-inner chain; `@layer` contributes
+        // no condition because it does not gate whether its contents apply.
+        let condition = match name.as_str() {
+            "media" => Some(FontFaceCondition::Media(prelude)),
+            "supports" => Some(FontFaceCondition::Supports(prelude)),
+            _ => None,
+        };
+        let pushed = condition.is_some();
+        if let Some(condition) = condition {
+            self.conditions.push(condition);
+        }
         for item in StyleSheetParser::new(input, self) {
             let _ = item;
+        }
+        if pushed {
+            self.conditions.pop();
         }
         Ok(())
     }
@@ -1403,10 +1636,14 @@ mod tests {
         reason = "descriptor grammars are compared at the values the specification names"
     )]
 
+    use std::time::Duration;
+
+    use render_css::selector::MatchContext;
     use render_layout::FontStyle;
 
     use super::{
-        Component, FontDisplay, FontFaceRule, FontFormat, FontSource, SrcProblem, UnicodeRangeSet,
+        Component, FALLBACK_SWAP_PERIOD, FontDisplay, FontDisplayTiming, FontFaceCondition,
+        FontFaceRule, FontFormat, FontSource, SHORT_BLOCK_PERIOD, SrcProblem, UnicodeRangeSet,
         components_of, declared_families, implied_format, parse_font_faces, parse_range_token,
         parse_src,
     };
@@ -1511,6 +1748,112 @@ mod tests {
         assert_eq!(
             declared_families(&sheet).into_iter().collect::<Vec<_>>(),
             ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn a_conditional_face_retains_every_enclosing_condition_in_order() {
+        // CSS Cascade 5 §6/§7: the condition travels with the rule, and nesting
+        // composes. Keeping the prelude text rather than a parsed copy means the
+        // media/supports evaluators are the cascade's, not a second opinion.
+        let (sheet, _problems) = parse_font_faces(
+            "@media screen { @supports (display: grid) { \
+             @font-face { font-family: Nested; src: url(n.woff2) } } }",
+        );
+        assert_eq!(
+            sheet.rules()[0].conditions,
+            [
+                FontFaceCondition::Media("screen".to_owned()),
+                FontFaceCondition::Supports("(display: grid)".to_owned()),
+            ]
+        );
+        assert!(
+            sheet.rules()[0].conditions[0].matches(&MatchContext {
+                viewport_width: Some(800.0),
+                viewport_height: Some(600.0),
+                ..MatchContext::default()
+            }),
+            "`screen` is a media type this engine produces"
+        );
+    }
+
+    #[test]
+    fn only_faces_whose_media_and_supports_conditions_hold_are_collected() {
+        let (sheet, _problems) = parse_font_faces(
+            "@media screen { @font-face { font-family: Screen; src: url(s.woff2) } } \
+             @media print { @font-face { font-family: Print; src: url(p.woff2) } } \
+             @media (min-width: 700px) { \
+                 @font-face { font-family: Wide; src: url(w.woff2) } } \
+             @supports (display: grid) { \
+                 @font-face { font-family: Grid; src: url(g.woff2) } } \
+             @supports (display: definitely-not-a-display) { \
+                 @font-face { font-family: NoGrid; src: url(n.woff2) } } \
+             @media screen { @supports (display: grid) { \
+                 @font-face { font-family: Nested; src: url(n2.woff2) } } } \
+             @media print { @supports (display: grid) { \
+                 @font-face { font-family: PrintNested; src: url(pn.woff2) } } }",
+        );
+        let context = MatchContext {
+            viewport_width: Some(800.0),
+            viewport_height: Some(600.0),
+            ..MatchContext::default()
+        };
+        let families: Vec<_> = sheet
+            .rules_matching(&context)
+            .into_iter()
+            .map(|rule| rule.family)
+            .collect();
+        assert_eq!(
+            families,
+            ["screen", "wide", "grid", "nested"],
+            "a face under a false `print`, a false width query or an unsupported \
+             declaration must not be planned or installed; the nested screen+grid \
+             face must be"
+        );
+
+        let narrow = MatchContext {
+            viewport_width: Some(500.0),
+            viewport_height: Some(600.0),
+            ..MatchContext::default()
+        };
+        let families: Vec<_> = sheet
+            .rules_matching(&narrow)
+            .into_iter()
+            .map(|rule| rule.family)
+            .collect();
+        assert_eq!(
+            families,
+            ["screen", "grid", "nested"],
+            "the width query follows the same viewport the cascade uses"
+        );
+    }
+
+    #[test]
+    fn an_undecidable_supports_condition_is_not_guessed_into_either_branch() {
+        // CSS Conditional Rules 5 `at-rule()` needs a consumer this crate does
+        // not have. The cascade treats Undecidable as "do not apply"; the face
+        // must do the same rather than claim support.
+        let (sheet, _problems) = parse_font_faces(
+            "@supports at-rule(@page) { \
+             @font-face { font-family: Unknown; src: url(u.woff2) } } \
+             @supports (display: grid) { \
+             @font-face { font-family: Known; src: url(k.woff2) } }",
+        );
+        let rule = &sheet.rules()[0];
+        assert_eq!(rule.family, "unknown");
+        assert!(!rule.applies_under(&MatchContext::default()));
+        assert!(
+            rule.undecidable_condition().is_some(),
+            "the caller can report the gap rather than silently dropping it"
+        );
+        assert_eq!(
+            sheet
+                .rules_matching(&MatchContext::default())
+                .into_iter()
+                .map(|rule| rule.family)
+                .collect::<Vec<_>>(),
+            ["known"],
+            "only the answered true condition applies"
         );
     }
 
@@ -2016,6 +2359,75 @@ mod tests {
         let parsed =
             rules("@font-face { font-family: A; src: url(a.ttf); font-display: eventually }");
         assert_eq!(parsed[0].display, FontDisplay::Auto);
+    }
+
+    #[test]
+    fn every_display_value_has_the_periods_fonts_four_prescribes() {
+        // §4.9: block is 3s + infinite swap; swap is a very small block +
+        // infinite swap; fallback is a very small block + 3s swap; optional is
+        // a very small block + zero swap. `auto` is UA-defined and this engine
+        // chooses the block policy.
+        assert_eq!(
+            FontDisplay::Auto.timing(),
+            FontDisplayTiming {
+                block: Duration::from_secs(3),
+                swap: None,
+            }
+        );
+        assert_eq!(
+            FontDisplay::Block.timing(),
+            FontDisplayTiming {
+                block: Duration::from_secs(3),
+                swap: None,
+            }
+        );
+        assert_eq!(
+            FontDisplay::Swap.timing(),
+            FontDisplayTiming {
+                block: Duration::ZERO,
+                swap: None,
+            }
+        );
+        assert_eq!(
+            FontDisplay::Fallback.timing(),
+            FontDisplayTiming {
+                block: SHORT_BLOCK_PERIOD,
+                swap: Some(FALLBACK_SWAP_PERIOD),
+            }
+        );
+        assert_eq!(
+            FontDisplay::Optional.timing(),
+            FontDisplayTiming {
+                block: SHORT_BLOCK_PERIOD,
+                swap: Some(Duration::ZERO),
+            }
+        );
+    }
+
+    #[test]
+    fn the_failure_period_starts_exactly_when_the_swap_period_ends() {
+        // §3.2: the failure period occurs "immediately after the swap period",
+        // so the boundary instant belongs to the failure period. A face that
+        // arrives at 3099ms under `fallback` may swap; one at 3100ms may not.
+        let fallback = FontDisplay::Fallback.timing();
+        assert_eq!(
+            fallback.failure_period_start(),
+            Some(Duration::from_millis(3_100))
+        );
+        assert!(fallback.allows_arrival(Duration::from_millis(3_099)));
+        assert!(!fallback.allows_arrival(Duration::from_millis(3_100)));
+
+        let optional = FontDisplay::Optional.timing();
+        assert_eq!(optional.failure_period_start(), Some(SHORT_BLOCK_PERIOD));
+        assert!(optional.allows_arrival(Duration::from_millis(99)));
+        assert!(!optional.allows_arrival(SHORT_BLOCK_PERIOD));
+
+        assert_eq!(FontDisplay::Block.timing().failure_period_start(), None);
+        assert!(
+            FontDisplay::Block.allows_arrival(Duration::from_secs(60)),
+            "an infinite swap period never starts the failure period"
+        );
+        assert_eq!(FontDisplay::Swap.timing().failure_period_start(), None);
     }
 
     // ---- S26: a malformed descriptor costs the block nothing else ----------

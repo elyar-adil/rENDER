@@ -50,25 +50,29 @@
 //!
 //! # The face that has not arrived
 //!
-//! There is no font download timer, so there is no block period, no swap period
-//! and no failure period to honour, and `font-display` has nothing to act on - see
-//! [`render_core::font_face`] for why that is the specification's own outcome at
-//! the only point on the timeline this engine can occupy. What §5.2 settles is
-//! what a face that has not arrived *is*: "If the font resources defined for a
-//! given face in an `@font-face` rule are either not available or contain invalid
-//! font data, then the face should be treated as not present in the family."
+//! What §5.2 settles is what a face that has not arrived *is*: "If the font
+//! resources defined for a given face in an `@font-face` rule are either not
+//! available or contain invalid font data, then the face should be treated as not
+//! present in the family." So the engine's answer is: **the face is not in the
+//! table.** Not present with an empty character map, and not present with a
+//! "loading" flag. §5.2 then walks on to the next name in `font-family` and,
+//! after that, to installed font fallback - which is what §4.8.1 requires when a
+//! font is unavailable ("user agents must display the text visibly"), and which
+//! paints text rather than hiding it.
 //!
-//! So the engine's answer is: **the face is not in the table.** Not present with
-//! an empty character map, and not present with a "loading" flag. §5.2 then walks
-//! on to the next name in `font-family` and, after that, to installed font
-//! fallback - which is what §4.8.1 requires when a font is unavailable ("user
-//! agents must display the text visibly"), and which paints text rather than
-//! hiding it.
+//! How long a face may still arrive and replace that fallback is §3.2's timeline,
+//! implemented in [`crate::font_faces`]. A `fallback` or `optional` face whose
+//! swap period elapsed is marked expired on its rule by the loader, so
+//! [`SystemFontBackend`] never resolves it even though the decoded bytes may stay
+//! cached for a sibling rule. `block`, `swap` and `auto` have an infinite swap
+//! period and remain eligible.
 //!
 //! The measure/draw consistency is structural rather than argued: there is no
 //! per-face rendering state, so there is nothing for measurement and painting to
 //! disagree about. Both read the one table, at one generation, and the generation
-//! is inside the instance id both are given.
+//! is inside the instance id both are given. A face that swaps in produces a new
+//! table generation, so a memo or mask from the fallback table cannot be reused
+//! under the webfont table.
 //!
 //! # Private Use Area characters, and the per-site table that is gone
 //!
@@ -966,7 +970,13 @@ impl SystemFontBackend {
                         return Some(Arc::clone(font));
                     }
                 }
-                ResolvedSource::Url(url) => {
+                ResolvedSource::Url { url, expired } => {
+                    // §3.2's failure period: a face that missed its swap period
+                    // is marked failed and normal fallback is permanent for this
+                    // rule, even though another rule may share the bytes.
+                    if *expired {
+                        continue;
+                    }
                     if let Some(font) = document.resource(url) {
                         return Some(font);
                     }
@@ -2331,8 +2341,9 @@ mod tests {
             .expect("a parseable font URL");
         let webfont = "Late Webfont";
         // `font-display: swap` is here on purpose: 259 of the corpus's 287 rules
-        // ask for it, and it must not change the outcome, because there is no
-        // timeline to run a swap period on.
+        // ask for it. This test exercises the not-yet-arrived state directly on
+        // the store (without the loader's timeline), so the descriptor is
+        // deliberately not the thing deciding the outcome.
         let source = format!(
             "@font-face {{ font-family: '{webfont}'; src: url({url}) format(truetype);              font-display: swap; }}"
         );
@@ -2347,11 +2358,11 @@ mod tests {
     /// measurement and painting agree about it.
     ///
     /// The choice is stated in this file's documentation: a face that has not
-    /// arrived is **not in the family**, so §5.2 walks on to the next name. There
-    /// is no swap period to honour because there is no font download timer, so
-    /// every `font-display` value - including the 216 corpus blocks that ask for
-    /// `swap` - reaches the same place, which is §3.2's failure period and §4.8.1's
-    /// "user agents must display the text visibly".
+    /// arrived is **not in the family**, so §5.2 walks on to the next name. This
+    /// test drives the store directly, without the loader's §3.2 timeline, so
+    /// even a `font-display: swap` face (the corpus's dominant value) has no
+    /// bytes to put in the table and the fallback is what §4.8.1 requires to be
+    /// visible.
     ///
     /// What the test pins is that the answer is *one* answer. A face that is
     /// declared but not fetched, and the same face fetched, must differ - or the
@@ -2384,9 +2395,9 @@ mod tests {
         let text = "Handgloves 019";
         let origin = PhysicalPoint { x: 0.0, y: 0.0 };
 
-        // Not in the family: the walk falls through to the next name, and
-        // `font-display: swap` cannot change that, because there is no timeline
-        // to run a swap period on.
+        // Not in the family: the walk falls through to the next name. The
+        // loader's §3.2 timeline can later decide a late `swap` face is still
+        // eligible, but without the bytes there is no face to put in the table.
         let pending_measured = backend.measure(
             text,
             TextStyle {

@@ -167,6 +167,11 @@ pub(super) fn process_page_render(
                 transition_state,
             } = *full;
             cancellation.check()?;
+            // §3.2's font download timer belongs to the document, not the
+            // process. Starting it at zero for a new navigation is what keeps a
+            // `fallback`/`optional` face from inheriting the previous page's
+            // elapsed time. Repeating the key within one document is a no-op.
+            font_loader.begin_document((job.identity.tab_id, document_serial));
             let installed_fonts = font_loader.install_fetched_map(&font_resources);
             let (style_sheets, applied_style_sheets, style_diagnostics) =
                 if let Some((plan, results)) = style_batch {

@@ -2149,6 +2149,7 @@ fn collect_author_style_sheets(
                 slot.owner,
                 base_url,
                 limits,
+                context,
                 &mut embedded_sheet_count,
                 &mut style_bytes,
                 &mut collected,
@@ -2180,13 +2181,18 @@ fn collect_author_style_sheets(
                 // Font faces are collected even when the sheet's style rules
                 // were empty, because a sheet may legitimately consist only of
                 // `@font-face` rules.
-                if let Some((faces, base)) = external.font_faces(&key)
-                    && !faces.is_empty()
-                {
-                    collected.font_faces.push(FontFaceSource::new(
-                        Some(base.clone()),
-                        faces.rules().to_vec(),
-                    ));
+                if let Some((faces, base)) = external.font_faces(&key) {
+                    // CSS Cascade 5 §6/§7: a `@font-face` inside `@media` or
+                    // `@supports` applies only when that condition holds. The
+                    // same `MatchContext` that gates the sheet's style rules
+                    // gates its faces, so a non-matching face is never planned
+                    // for a fetch or installed.
+                    let rules = faces.rules_matching(context);
+                    if !rules.is_empty() {
+                        collected
+                            .font_faces
+                            .push(FontFaceSource::new(Some(base.clone()), rules));
+                    }
                 }
             }
             AuthorStyleSource::External {
@@ -2446,11 +2452,16 @@ fn resolve_style_url(base_url: Option<&Url>, href: &str) -> Option<Url> {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the arguments are the collection pass's existing state plus the match context the face conditions need"
+)]
 fn collect_style_element(
     dom: &Dom,
     node_id: NodeId,
     base_url: Option<&Url>,
     limits: DocumentLimits,
+    context: &MatchContext,
     embedded_sheet_count: &mut usize,
     style_bytes: &mut usize,
     collected: &mut CollectedStyleSheets,
@@ -2498,11 +2509,15 @@ fn collect_style_element(
             message: problem.to_string(),
         });
     }
-    if !faces.is_empty() {
-        collected.font_faces.push(FontFaceSource::new(
-            base_url.cloned(),
-            faces.rules().to_vec(),
-        ));
+    // CSS Cascade 5 §6/§7: the face's conditions are evaluated in the same
+    // environment as the sheet's style rules. A face under a false `@media`,
+    // `@supports` or `print` query is not a face for this render, so its URL is
+    // never offered to the fetch planner.
+    let rules = faces.rules_matching(context);
+    if !rules.is_empty() {
+        collected
+            .font_faces
+            .push(FontFaceSource::new(base_url.cloned(), rules));
     }
 }
 
