@@ -15,8 +15,8 @@ says so. `docs/visual_fidelity_gaps.md` is the working register; this file is th
 | what | number | when |
 | --- | --- | --- |
 | `render-js` unit tests | 1,116 passed, 0 failed | 2026-10-22 |
-| `render-css` unit tests | 304 passed, 0 failed | 2026-11-01 |
-| `render-core` unit tests | 456 passed, 0 failed | 2026-11-01 |
+| `render-css` unit tests | 305 passed, 0 failed | 2026-11-01 |
+| `render-core` unit tests | 458 passed, 0 failed | 2026-11-01 |
 | `render-layout` unit tests | 352 passed, 1 ignored | 2026-11-01 |
 | `render-browser` unit tests | 206 passed, 0 failed | 2026-11-01 |
 | `render-browser` app tests (binary) | 114 passed, 0 failed | 2026-11-01 |
@@ -71,9 +71,12 @@ components carry forward to analogous components during `color-mix()` and serial
 outside interpolation they behave as zero, including canvas paint and transitions. Relative color
 syntax works in `rgb()`/`hsl()`/`hwb()`/`lab()`/`lch()`/`oklab()`/`oklch()`/`color()` with
 channel keywords, `none`, inherited alpha and basic `calc()` arithmetic; `alpha()` changes
-only the origin's alpha, and `light-dark()` selects its arm from
-`DocumentRenderOptions.color_scheme`, which also drives `prefers-color-scheme`. There is no
-`color-scheme` property yet. Shorthand
+only the origin's alpha, and `light-dark()` selects its arm from the element's used
+color scheme. `color-scheme` is a typed inherited property; `normal` follows the page
+scheme from `DocumentRenderOptions.color_scheme`, while an explicit `light`/`dark`/list
+resolves per element and feeds both `light-dark()` and `Canvas`/`CanvasText`. The same
+property currently does not change `prefers-color-scheme`, because the page scheme is still
+the render input. Shorthand
 expansion is now
 spec-correct for `text-decoration`, which is what fixed the most-reported visual symptom in the
 project's history. `@property` registrations validate their syntax and initial value, stop

@@ -453,11 +453,13 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 and color(), including channel keywords, `none`, alpha inheritance \
                 and basic `calc()` arithmetic. `alpha()` changes only the origin's \
                 alpha while retaining its components. `light-dark()` selects its \
-                arm from the used paint color scheme; `DocumentRenderOptions` now \
-                carries that scheme and feeds both `prefers-color-scheme` and \
-                `SystemPalette.dark`. A `color-scheme` property is still absent, \
-                so the scheme is a render input rather than an element property. \
-                `device-cmyk()` and `contrast-color()` remain absent.",
+                arm from the element's used color scheme. `color-scheme` is a typed \
+                inherited property: `normal` follows the page scheme, an explicit \
+                `light`/`dark`/list resolves per element, and the used scheme drives \
+                `light-dark()` and the `Canvas`/`CanvasText` system colors through \
+                `SystemPalette::for_scheme`. It does not yet change the page-level \
+                `prefers-color-scheme` media query, and `device-cmyk()` and \
+                `contrast-color()` remain absent.",
         dependencies: &[CSS_TYPED_VALUES],
         tests: TYPED_VALUE_TESTS,
     },

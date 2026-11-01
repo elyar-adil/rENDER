@@ -1,3 +1,94 @@
+# 交接文档 (2026-11-01, 续六十) — per-element `color-scheme` 与 used scheme 绘制
+
+这一轮把上一轮的文档级 used color scheme 推进为 CSS Color Adjustment 1 的
+`color-scheme` 属性：typed、inherited、按元素解析 used scheme，并让
+`light-dark()` 与 `Canvas`/`CanvasText` 系统色在绘制期使用元素自己的 scheme。
+没有站点特判。
+
+## 属性
+
+- `render-css/src/properties.rs` 新增：
+  - `ColorSchemeName::{Light, Dark, Custom(String)}`；
+  - `ColorSchemeValue::{Normal, Supported { schemes, only }}`；
+  - grammar `normal | [light | dark | <custom-ident>]+ && only?`，
+    保留顺序、custom-ident 与 `only`；`normal` 不能与其他值组合，
+    `only` 只能出现一次，CSS-wide/reserved keyword 被拒绝。
+  - 序列化 canonical 顺序为 `only light dark` / `light dark`。
+- `ColorSchemeValue::used_dark(preferred_dark)` 实现 CSS Color Adjustment 1
+  §2.3 的本引擎子集：
+  - `normal` 使用 page scheme（`DocumentRenderOptions.color_scheme`）；
+  - 显式 support list 若包含当前偏好则用偏好；
+  - 否则（包括 `only`）取列表中第一个 UA 支持的 `light`/`dark`；
+  - 只有未知 custom ident 时回退到 light。
+- `render-css/src/computed.rs` 将 `color-scheme` 注册为 inherited、initial
+  `normal`，所以它进入 typed computed map 并自动继承给后代。
+
+## 绘制
+
+- `SystemPalette` 新增 `dark_canvas`/`dark_canvas_text` 与
+  `for_scheme(dark)`；`resolve` 先按 `dark` 选择 palette，再解析
+  `light-dark()`、`Canvas`、`CanvasText`、相对色和 `alpha()`。
+- `display_list.rs` 新增 `palette_for(style)`：读取元素的 typed `color-scheme`，
+  以 `options.palette.dark` 作为 page preference，得到该元素的
+  `SystemPalette`。
+- 绘制链路全部改为按元素取 palette：
+  - `current_color` 的 fallback 与 `color` 解析；
+  - 背景色、边框、box-shadow、text-shadow；
+  - 文本装饰色、列表 marker；
+  - 线性/径向/锥形渐变、mask 颜色。
+- `light-dark()` 不再只看文档级 `options.palette.dark`；元素重写 scheme 后立即
+  影响其整棵子树。
+
+## 测试
+
+- `render-css` 的 `parses_color_scheme_supports_and_resolves_used_scheme`：
+  `normal`、`light dark`、`only light/dark`、custom-ident 的
+  used-scheme 结果，以及非法组合。
+- `render-core/src/paint/color.rs` 的
+  `for_scheme_selects_system_colors_and_the_light_dark_arm`：
+  light palette `canvas=white`/`canvastext=black`，dark 反过来，
+  `light-dark()` 分别取两支。
+- `document.rs` 的
+  `per_element_color_scheme_selects_light_dark_and_system_colors`：
+  page scheme 为 Dark 时，`#light { color-scheme:light }` 背景取 light arm，
+  `#dark` 的继承子元素取 dark arm；边框的 `canvas` 分别为 white/black。
+
+## 验证
+
+```
+cargo test -p render-layout --lib                 352 passed, 1 ignored
+cargo test -p render-css --lib                    305 passed, 0 failed
+cargo test -p render-core --lib                   458 passed, 0 failed
+cargo test --workspace                            all crates passed, 0 failed
+cargo fmt --all --check                           clean
+cargo clippy -p render-css -p render-core -p render-browser \
+  -p render-dom -p render-layout --all-targets -- -D warnings
+                                                    clean
+python tools/check_site_neutrality.py             0 blocking, 26 advisory
+```
+
+## 已知缺口
+
+- `prefers-color-scheme` 仍只读 `DocumentRenderOptions.color_scheme`；
+  root `color-scheme` 的页面级协商尚未回写媒体查询，因此可能出现媒体查询为
+  dark 而 root 元素 actual used scheme 为 light 的不一致。
+- 文档 canvas 背景（`raster_background`）仍是 render option，不随 root
+  `color-scheme` 自动切换。
+- `<meta name="color-scheme">` 尚未映射。
+- `only` 的 overriding preference 语义没有实现，因为引擎没有 UA override
+  preference / forced colors。
+- 未知 custom scheme 不参与解析；forced-colors、`forced-color-adjust` 未实现。
+- 绘制仍落在 8-bit sRGB；没有宽色域合成。
+
+## 下一步
+
+- root `color-scheme` 与 page scheme / `prefers-color-scheme` / canvas 背景联动。
+- `<meta name=color-scheme>`。
+- forced-colors 与 forced-color-adjust。
+- 继续 `@font-face` 描述符、RTL 块轴镜像、`scroll-state()`。
+
+---
+
 # 交接文档 (2026-11-01, 续五十九) — `content-visibility: hidden`
 
 这一轮补齐 CSS Containment 2 §4 的 `content-visibility: hidden`：元素保留自己的

@@ -16,6 +16,7 @@ Kept so the work is not repeated, and so the cost of the fix stays visible.
 | Gap | Closed by | Evidence |
 | --- | --- | --- |
 | **CSS 2.1 §8.3 vertical margin collapsing was absent.** Block layout resolved every box's `margin-top`/`margin-bottom` and added both, so adjacent siblings doubled their gap, a first/last child's margin never escaped its parent, and an empty block occupied its own margins instead of collapsing through. | `crates/render-layout/src/solver/{block,mod,resolve}.rs`, `crates/render-layout/src/solver/collapse_tests.rs` | A `MarginStrut` represents `max(positive) + min(negative)`; adjacent siblings, parent-first, parent-last and empty-block collapse-through are implemented, with floats, absolute boxes, flex/grid items, table cells, BFC roots and clearance kept out. 13 exact-geometry tests pin positive, negative, mixed, through, nested-through, border/padding-blocked, BFC and positioned-descendant cases. `render-layout`: **352 passed, 1 ignored**. |
+| **`color-scheme` was absent; `light-dark()` and system colors were document-wide only.** An element could not opt its subtree into light or dark, and `Canvas`/`CanvasText` stayed the same everywhere. | `crates/render-css/src/{properties,computed}.rs`, `crates/render-core/src/paint/{color,display_list}.rs`, `crates/render-core/src/document.rs` | `color-scheme` is a typed inherited property (`normal`, `light`, `dark`, custom idents, `only`); normal follows the page scheme, explicit support resolves per element. Paint selects `SystemPalette::for_scheme`, so `light-dark()`, gradients, shadows, borders, markers and `Canvas`/`CanvasText` all use the element's used scheme. Numeric tests pin light/dark arms and white/black system colors; a document test covers an inherited dark subtree. |
 | **`content-visibility` was unparsed and absent.** Hidden subtrees were laid out and painted like any other content, and the property could not even reach the cascade. | `crates/render-css/src/{properties,computed}.rs`, `crates/render-layout/src/solver/{block,inline}.rs`, `crates/render-layout/src/solver/content_visibility_tests.rs` | `content-visibility: hidden` now keeps the element's own box, applies size/layout/paint containment, skips all in-flow and positioned descendants, and produces no child fragments. `auto` is parsed and currently renders its contents (off-screen skipping is the remaining optimization). 5 exact-geometry tests cover border/padding-only height, specified height, inline text removal, positioned descendants, and `auto` preserving content. |
 | **`direction: rtl` and bidi reordering were absent.** `direction` only had an initial value and no consumer, so right-to-left text was painted in logical left-to-right order and `text-align: start` always meant the left edge. | `crates/render-layout/src/solver/{inline,mod}.rs`, `crates/render-css/src/properties.rs`, `crates/render-core/src/document.rs` | `direction` is a typed inherited property; the UA sheet maps `dir=ltr/rtl`; UAX #9 levels are resolved with `unicode-bidi` and level runs are placed in visual order per line, with odd runs reversed for the painter. `text-align:start/end`, RTL `text-indent`, mixed LTR/RTL runs, European numbers, wrapping and atomic inlines are covered by 12 exact-geometry tests in `bidi_tests.rs`. |
 | **Shadow-tree styling was unreachable and `slotchange` never fired.** A `<style>` inside a shadow root applied nowhere, `:host`/`::slotted` matched nothing, and a script waiting for `slotchange` hung forever. | `crates/render-core/src/{document,page}.rs`, `crates/render-css/src/{cascade,selector,stylesheet}.rs`, `crates/render-dom/src/{lib,shadow}.rs` | Shadow-including style discovery with per-sheet `tree_root`, tree-isolated author sheets, Cascade Context ordering, `:host`/`:host()`/`:host-context()`/`::slotted()`, and a bounded `slotchange` dispatch after each microtask checkpoint. `render-core` **453 passed**, `render-css` **295 passed**, `render-dom` **78 passed**. |
@@ -1471,12 +1472,13 @@ Verified against known values: `color-mix(in oklab, red, blue)` = `rgb(140, 83, 
 `oklch(0.7 0.1 120)` = `rgb(150, 168, 94)`, `color-mix(in srgb-linear, red, blue)` =
 `rgb(188, 0, 188)`, and `color-mix(in srgb, red, transparent)` = `rgba(255, 0, 0, 0.5)`.
 
-**Remaining colour gaps:** relative color syntax, `light-dark()` and `alpha()` are
-implemented, including channel keywords, missing components, alpha inheritance and
-basic `calc()` arithmetic; `device-cmyk()` and `contrast-color()` are not.
-`DocumentRenderOptions.color_scheme` supplies the used scheme to both
-`prefers-color-scheme` and `light-dark()`; there is no `color-scheme` property yet, so
-an element cannot select its own scheme. Colour animations still interpolate sRGB
+**Remaining colour gaps:** relative color syntax, `light-dark()`, `alpha()` and the
+`color-scheme` property are implemented, including channel keywords, missing components,
+alpha inheritance and basic `calc()` arithmetic; `device-cmyk()` and `contrast-color()`
+are not. `DocumentRenderOptions.color_scheme` is the page scheme and feeds
+`prefers-color-scheme`; each element's inherited `color-scheme` picks a used scheme for
+`light-dark()` and `Canvas`/`CanvasText`, but it does not yet change the page-level media
+query. Colour animations still interpolate sRGB
 channels rather than using the specified interpolation space and premultiplication; and
 the engine flattens every computed colour to its 8-bit sRGB paint contract, so the
 §14.2.2 gamut mapping happens at the sRGB boundary rather than in a wide-gamut
