@@ -43,5 +43,5 @@ pub use sticky::{StickyConstraint, StickyInsets, sticky_offset, sticky_view_rect
 pub use tree::{
     FormattingContextKind, FormattingDiagnostic, FormattingDiagnosticCode, FormattingLimits,
     FormattingNode, FormattingNodeId, FormattingNodeKind, FormattingTree, FormattingWorkUnit,
-    build_formatting_tree,
+    build_formatting_tree, build_formatting_tree_from_root,
 };

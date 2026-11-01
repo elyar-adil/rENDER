@@ -362,6 +362,27 @@ const INTRINSICS_PRELUDE_SOURCE: &str = include_str!("../prelude_intrinsics.js")
 pub type HostFunction = fn(&mut JsRuntime, &mut Dom, &[JsValue]) -> Result<JsValue, JsError>;
 
 impl JsRuntime {
+    /// The iframe elements that currently display a loaded nested document,
+    /// each mapped to that document's root node and base URL.
+    ///
+    /// The embedding renderer uses this to lay out and paint a frame's own
+    /// document without cloning the DOM: both roots live in the same arena and
+    /// node ids stay stable. A frame that has not loaded yet (or was refused a
+    /// realm) is absent, so it paints only its own box.
+    #[must_use]
+    pub fn frame_documents(&self) -> BTreeMap<NodeId, (NodeId, Url)> {
+        self.frames
+            .iter()
+            .filter_map(|(frame, state)| {
+                let FrameState::Realm(realm) = state else {
+                    return None;
+                };
+                let context = &self.contexts[realm.0];
+                Some((*frame, (context.document?, context.base.clone())))
+            })
+            .collect()
+    }
+
     #[must_use]
     ///
     /// # Panics

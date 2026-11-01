@@ -16,7 +16,7 @@ use crate::css::cascade::{
 };
 use crate::css::computed::{
     ComputationDiagnostic, ComputationLimits, ComputedStyle, PropertyRegistry,
-    compute_document_styles_with_hints, compute_starting_styles,
+    compute_document_styles_with_hints_from_root, compute_starting_styles,
 };
 use crate::css::container::{ContainerContext, container_geometry_for_style};
 use crate::css::length::{LengthContext, resolve_length_expr};
@@ -35,8 +35,8 @@ use crate::image::inline_svg::{
 use crate::image::{ImageLimits, ImageResources};
 use crate::layout::{
     FormattingDiagnostic, FormattingLimits, FormattingTree, FragmentKind, LayoutDiagnostic,
-    LayoutOptions, LayoutOutput, PhysicalPoint, PhysicalRect, TextMeasurer, build_formatting_tree,
-    layout_formatting_tree_with_images_and_containers,
+    LayoutOptions, LayoutOutput, PhysicalPoint, PhysicalRect, TextMeasurer,
+    build_formatting_tree_from_root, layout_formatting_tree_with_images_and_containers,
 };
 use crate::paint::{
     ClipFillRule, ClipPathResolver, ClipShape, Color, CpuRasterOutput, CpuRasterizer,
@@ -236,6 +236,12 @@ input:not([type="hidden" i]) {
   padding-left: 4px; padding-right: 4px;
   border: 1px solid #888;
 }
+
+/* A frame's viewport clips its document: the nested document paints into the
+   frame's content box, and content beyond it must not escape into the
+   embedding page. The box itself is sized as a replaced element by the
+   layout solver (HTML dimension attributes, or 300x150 by default). */
+iframe { overflow: hidden; }
 
 /* §15.3.11 The hr element. */
 hr {
@@ -1202,6 +1208,7 @@ impl Document {
         let mut transitions = TransitionState::default();
         render_dom(
             &self.dom,
+            self.dom.document(),
             self.quirks_mode,
             options,
             backends,
@@ -1210,6 +1217,8 @@ impl Document {
                 external: &ExternalStyleSheets::default(),
                 images: None,
                 interaction: &InteractionState::default(),
+                frames: &FrameDocuments::new(),
+                frame_depth: 0,
             },
             &mut transitions,
         )
@@ -1225,6 +1234,7 @@ impl Document {
         let mut transitions = TransitionState::default();
         render_dom(
             &self.dom,
+            self.dom.document(),
             self.quirks_mode,
             options,
             backends,
@@ -1233,6 +1243,42 @@ impl Document {
                 external: &ExternalStyleSheets::default(),
                 images: Some(images),
                 interaction: &InteractionState::default(),
+                frames: &FrameDocuments::new(),
+                frame_depth: 0,
+            },
+            &mut transitions,
+        )
+    }
+
+    /// Render the page and every loaded nested browsing context it displays.
+    ///
+    /// This is the [`Page`](crate::page::Page) path: `frames` maps each iframe
+    /// element to its child document root and base URL. The public
+    /// [`Self::render`] keeps its old behaviour and paints no nested document,
+    /// because a [`Document`] does not own the runtime state that records which
+    /// child document a frame displays.
+    #[must_use]
+    pub(crate) fn render_with_images_and_frames(
+        &self,
+        options: DocumentRenderOptions,
+        backends: DocumentBackends<'_>,
+        images: &ImageResources,
+        frames: &FrameDocuments,
+    ) -> DocumentRenderOutput {
+        let mut transitions = TransitionState::default();
+        render_dom(
+            &self.dom,
+            self.dom.document(),
+            self.quirks_mode,
+            options,
+            backends,
+            RenderEnvironment {
+                base_url: None,
+                external: &ExternalStyleSheets::default(),
+                images: Some(images),
+                interaction: &InteractionState::default(),
+                frames,
+                frame_depth: 0,
             },
             &mut transitions,
         )
@@ -1269,7 +1315,13 @@ impl Document {
         limits: DocumentLimits,
         context: &MatchContext,
     ) -> AuthorStyleDiscovery {
-        discover_author_style_slots(&self.dom, Some(base_url), limits, context)
+        discover_author_style_slots(
+            &self.dom,
+            self.dom.document(),
+            Some(base_url),
+            limits,
+            context,
+        )
     }
 
     /// Renders with parsed external stylesheets supplied by the caller. Slots
@@ -1285,6 +1337,7 @@ impl Document {
         let mut transitions = TransitionState::default();
         render_dom(
             &self.dom,
+            self.dom.document(),
             self.quirks_mode,
             options,
             backends,
@@ -1293,6 +1346,8 @@ impl Document {
                 external,
                 images: None,
                 interaction: &InteractionState::default(),
+                frames: &FrameDocuments::new(),
+                frame_depth: 0,
             },
             &mut transitions,
         )
@@ -1336,6 +1391,7 @@ impl Document {
         let mut transitions = TransitionState::default();
         render_dom(
             &self.dom,
+            self.dom.document(),
             self.quirks_mode,
             options,
             backends,
@@ -1344,6 +1400,8 @@ impl Document {
                 external,
                 images: Some(images),
                 interaction,
+                frames: &FrameDocuments::new(),
+                frame_depth: 0,
             },
             &mut transitions,
         )
@@ -1369,8 +1427,46 @@ impl Document {
         interaction: &InteractionState,
         transitions: &mut TransitionState,
     ) -> DocumentRenderOutput {
+        self.render_with_interaction_and_transitions_and_frames(
+            options,
+            backends,
+            base_url,
+            external,
+            images,
+            interaction,
+            transitions,
+            &FrameDocuments::new(),
+        )
+    }
+
+    /// The full render environment with the loaded nested browsing contexts
+    /// this document displays.
+    ///
+    /// `frames` is normally `JsRuntime::frame_documents()`. Each child root is
+    /// laid out at its iframe's content-box size and rasterised into a separate
+    /// surface; the parent list gains one image command per frame and no child
+    /// nodes. Pass an empty map for a document that has no frames, which is
+    /// exactly what [`Self::render_with_interaction_and_transitions`] does.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the frame-aware render needs the same environment as \
+                  render_with_interaction_and_transitions plus the frame map"
+    )]
+    pub fn render_with_interaction_and_transitions_and_frames(
+        &self,
+        options: DocumentRenderOptions,
+        backends: DocumentBackends<'_>,
+        base_url: &Url,
+        external: &ExternalStyleSheets,
+        images: &ImageResources,
+        interaction: &InteractionState,
+        transitions: &mut TransitionState,
+        frames: &FrameDocuments,
+    ) -> DocumentRenderOutput {
         render_dom(
             &self.dom,
+            self.dom.document(),
             self.quirks_mode,
             options,
             backends,
@@ -1379,6 +1475,8 @@ impl Document {
                 external,
                 images: Some(images),
                 interaction,
+                frames,
+                frame_depth: 0,
             },
             transitions,
         )
@@ -1433,7 +1531,36 @@ pub struct DocumentRenderOutput {
     pub diagnostics: DocumentRenderDiagnostics,
     /// `transitionend` events observed while this frame sampled the timeline.
     pub transition_events: Vec<TransitionEvent>,
+    /// The nested documents displayed by direct-child `<iframe>` elements of
+    /// this document, in frame tree order. Each child has its own styles,
+    /// formatting tree, layout, display list and raster; the parent list paints
+    /// its viewport as one surface image in the iframe's content box.
+    pub frames: Vec<NestedFrameRender>,
 }
+
+/// One nested browsing context's rendered viewport inside an iframe box.
+#[derive(Clone, Debug)]
+pub struct NestedFrameRender {
+    /// The `<iframe>` element in the embedding document that displays this
+    /// document.
+    pub frame: NodeId,
+    /// The child document root. It lives in the same DOM arena as the
+    /// embedding document; node ids are never copied.
+    pub document: NodeId,
+    /// The iframe's content box in the embedding document's coordinate space.
+    pub content_rect: PhysicalRect,
+    /// The child document's complete render output. Its layout viewport is the
+    /// content box size, so child coordinates begin at the content box origin.
+    pub output: Box<DocumentRenderOutput>,
+}
+
+/// The loaded nested contexts a render should paint: iframe element ->
+/// (child document root, the child document's base URL).
+///
+/// Both roots live in the same [`Dom`] arena. An embedding that renders a
+/// clone of the document must copy this map into the worker alongside it; node
+/// ids stay valid because [`Dom::clone`] preserves the arena layout.
+pub type FrameDocuments = BTreeMap<NodeId, (NodeId, Url)>;
 
 #[derive(Clone, Copy)]
 struct RenderEnvironment<'a> {
@@ -1441,7 +1568,18 @@ struct RenderEnvironment<'a> {
     external: &'a ExternalStyleSheets,
     images: Option<&'a ImageResources>,
     interaction: &'a InteractionState,
+    /// Loaded iframe documents, keyed by the embedding iframe element.
+    frames: &'a FrameDocuments,
+    /// How many nested browsing contexts enclose the document being rendered.
+    /// Bounded so a pathological frame tree cannot exhaust the Rust stack.
+    frame_depth: usize,
 }
+
+/// The deepest iframe nesting this renderer paints. A frame at the limit still
+/// paints its box and background, but its nested document is not rendered; the
+/// frame is explicit in [`NestedFrameRender`] only while it is within the
+/// limit.
+const MAX_FRAME_DEPTH: usize = 8;
 
 /// Prints the fragment tree with each box's source element, rect and the
 /// computed `position`/`z-index` that decide its paint layer
@@ -1589,6 +1727,7 @@ fn text_mentions_container_unit(text: &str) -> bool {
 /// yet, and choosing one fragment is at least deterministic.
 fn build_container_context(
     dom: &Dom,
+    root: NodeId,
     styles: &BTreeMap<NodeId, ComputedStyle>,
     layout: &LayoutOutput,
 ) -> ContainerContext {
@@ -1619,7 +1758,7 @@ fn build_container_context(
         containers,
         viewport_width: layout.fragments.viewport.width,
         viewport_height: layout.fragments.viewport.height,
-        root_font_size: root_font_size(dom, styles),
+        root_font_size: root_font_size(dom, root, styles),
     }
 }
 
@@ -1628,8 +1767,8 @@ fn build_container_context(
 // A computed font size is a small finite length; the f32 style pipeline stores
 // it in f32 deliberately, so the narrow cast is the representation boundary.
 #[allow(clippy::cast_possible_truncation)]
-fn root_font_size(dom: &Dom, styles: &BTreeMap<NodeId, ComputedStyle>) -> f32 {
-    let root = dom.children(dom.document()).and_then(|children| {
+fn root_font_size(dom: &Dom, root: NodeId, styles: &BTreeMap<NodeId, ComputedStyle>) -> f32 {
+    let root = dom.children(root).and_then(|children| {
         children
             .iter()
             .copied()
@@ -1653,9 +1792,13 @@ fn root_font_size(dom: &Dom, styles: &BTreeMap<NodeId, ComputedStyle>) -> f32 {
 /// change event" as the condition without a before-change style; keeping the
 /// set explicit is what makes the difference between a first render, a DOM
 /// insertion and `display: none` to rendered observable to the sampler.
-fn rendered_elements(dom: &Dom, styles: &BTreeMap<NodeId, ComputedStyle>) -> BTreeSet<NodeId> {
+fn rendered_elements(
+    dom: &Dom,
+    root: NodeId,
+    styles: &BTreeMap<NodeId, ComputedStyle>,
+) -> BTreeSet<NodeId> {
     let mut rendered = BTreeSet::new();
-    let mut stack = vec![(dom.document(), true)];
+    let mut stack = vec![(root, true)];
     while let Some((node, parent_rendered)) = stack.pop() {
         let is_element = matches!(dom.node(node).map(Node::kind), Some(NodeKind::Element(_)));
         let display_none = styles.get(&node).is_some_and(|style| {
@@ -1676,6 +1819,7 @@ fn rendered_elements(dom: &Dom, styles: &BTreeMap<NodeId, ComputedStyle>) -> BTr
 
 fn render_dom(
     dom: &Dom,
+    root: NodeId,
     quirks_mode: QuirksMode,
     options: DocumentRenderOptions,
     backends: DocumentBackends<'_>,
@@ -1721,6 +1865,7 @@ fn render_dom(
     };
     let collected = collect_author_style_sheets(
         dom,
+        root,
         environment.base_url,
         environment.external,
         options.document_limits,
@@ -1767,8 +1912,9 @@ fn render_dom(
     };
 
     let cascade_match_started = std::time::Instant::now();
-    let mut styles = compute_document_styles_with_hints(
+    let mut styles = compute_document_styles_with_hints_from_root(
         dom,
+        root,
         &cascade_inputs,
         &PropertyRegistry::standard_baseline(),
         &options.computation_limits,
@@ -1786,24 +1932,26 @@ fn render_dom(
     if sheets_use_container_features(&cascade_inputs, dom) {
         let container_started = std::time::Instant::now();
         for _ in 0..3 {
-            let formatting = build_formatting_tree(dom, &styles, &options.formatting_limits);
+            let formatting =
+                build_formatting_tree_from_root(dom, root, &styles, &options.formatting_limits);
             let layout = layout_formatting_tree_with_images_and_containers(
                 dom,
                 &formatting,
                 &styles,
-                options.layout,
+                root_layout_options(root, dom, &styles, options.layout),
                 backends.text_measurer,
                 environment.images,
                 Some(match_context.containers.as_ref()),
             );
-            let measured = build_container_context(dom, &styles, &layout);
+            let measured = build_container_context(dom, root, &styles, &layout);
             let measured = std::sync::Arc::new(measured);
             if measured == match_context.containers {
                 break;
             }
             match_context.containers = measured;
-            styles = compute_document_styles_with_hints(
+            styles = compute_document_styles_with_hints_from_root(
                 dom,
+                root,
                 &cascade_inputs,
                 &PropertyRegistry::standard_baseline(),
                 &options.computation_limits,
@@ -1823,7 +1971,7 @@ fn render_dom(
     // style change event have no before-change style. Their starting style —
     // the after-change style with `@starting-style` rules applied in addition —
     // supplies the values their entry transitions start from.
-    let rendered = rendered_elements(dom, &styles);
+    let rendered = rendered_elements(dom, root, &styles);
     let starting_styles = if starting_candidates.is_empty() {
         BTreeMap::new()
     } else {
@@ -1875,13 +2023,15 @@ fn render_dom(
     let (inline_images, inline_svg_diagnostics) = with_inline_svgs(environment.images, &inline_svg);
     let images = inline_images.as_ref().or(environment.images);
     stage_elapsed("inline-svg", &mut stage_mark);
-    let formatting = build_formatting_tree(dom, &styles, &options.formatting_limits);
+    let formatting =
+        build_formatting_tree_from_root(dom, root, &styles, &options.formatting_limits);
     stage_elapsed("formatting", &mut stage_mark);
+    let layout_options = root_layout_options(root, dom, &styles, options.layout);
     let layout = layout_formatting_tree_with_images_and_containers(
         dom,
         &formatting,
         &styles,
-        options.layout,
+        layout_options,
         backends.text_measurer,
         images,
         Some(match_context.containers.as_ref()),
@@ -1894,6 +2044,21 @@ fn render_dom(
         );
         dump_fragment_tree(dom, &styles, &layout.fragments);
     }
+    // A frame's content box is known only after the embedding layout has run,
+    // so nested documents are rendered here, between the two parent stages.
+    // Their viewports become surface images in `image_resources`, and the
+    // parent display list then paints each one through its ordinary image
+    // command. Node ids stay shared, but no child item joins the parent list.
+    let (frame_images, frames) = render_nested_frames(
+        dom,
+        quirks_mode,
+        options,
+        backends,
+        &layout,
+        images,
+        &environment,
+    );
+    let images = frame_images.as_ref().or(images);
     let clip_path_resolver = DomClipPathResolver::new(dom);
     let display = build_display_list_with_images_clip_paths_and_containers(
         Some(dom),
@@ -1976,7 +2141,137 @@ fn render_dom(
         raster,
         diagnostics,
         transition_events,
+        frames,
     }
+}
+
+/// Render every direct-child iframe of the document whose layout is `layout`.
+///
+/// The returned image store is a layer over `images` with each child viewport
+/// installed under its iframe node. The parent display list then paints the
+/// child as one surface image in the iframe's content box. `None` means no
+/// frame produced a surface, so the caller keeps the unmodified image store.
+fn render_nested_frames(
+    dom: &Dom,
+    quirks_mode: QuirksMode,
+    options: DocumentRenderOptions,
+    backends: DocumentBackends<'_>,
+    layout: &LayoutOutput,
+    images: Option<&ImageResources>,
+    environment: &RenderEnvironment<'_>,
+) -> (Option<ImageResources>, Vec<NestedFrameRender>) {
+    let mut rendered = Vec::new();
+    if environment.frame_depth >= MAX_FRAME_DEPTH {
+        return (None, rendered);
+    }
+    // Only boxes the embedding layout actually produced can display a frame:
+    // a `display: none` iframe has no fragment and its document is not
+    // painted. The map may also name frames of other documents in the arena,
+    // but those never appear in this layout.
+    let mut boxes: BTreeMap<NodeId, PhysicalRect> = BTreeMap::new();
+    for fragment in layout.fragments.iter() {
+        let Some(source) = fragment.source else {
+            continue;
+        };
+        if !environment.frames.contains_key(&source) {
+            continue;
+        }
+        let FragmentKind::Box(geometry) = &fragment.kind else {
+            continue;
+        };
+        boxes.entry(source).or_insert(geometry.content_rect);
+    }
+    if boxes.is_empty() {
+        return (None, rendered);
+    }
+    let mut layered = images.cloned().unwrap_or_default();
+    for (frame, content_rect) in boxes {
+        let (document, base) = &environment.frames[&frame];
+        if !content_rect.size.width.is_finite()
+            || !content_rect.size.height.is_finite()
+            || content_rect.size.width <= 0.0
+            || content_rect.size.height <= 0.0
+        {
+            continue;
+        }
+        let mut child_options = options;
+        child_options.layout.viewport = crate::layout::PhysicalSize {
+            width: content_rect.size.width,
+            height: content_rect.size.height,
+        };
+        child_options.scroll_offset = PhysicalPoint::default();
+        // The frame's viewport is transparent; the iframe element's own
+        // background paints beneath it and the child document paints only what
+        // its own boxes cover. A child `body` background is a normal box and
+        // still hides the embedding background, as browsers do.
+        child_options.raster_background = Color::TRANSPARENT;
+        // A child @font-face must not replace the embedding document's face
+        // table mid-frame; webfonts inside frames remain unsupported. The
+        // measurer and shaper still use whatever faces the embedding installed.
+        let child_backends = DocumentBackends {
+            font_face_installer: None,
+            ..backends
+        };
+        let child_interaction = InteractionState::default();
+        let mut child_transitions = TransitionState::default();
+        let child = render_dom(
+            dom,
+            *document,
+            quirks_mode,
+            child_options,
+            child_backends,
+            RenderEnvironment {
+                base_url: Some(base),
+                external: environment.external,
+                images: Some(&layered),
+                interaction: &child_interaction,
+                frames: environment.frames,
+                frame_depth: environment.frame_depth + 1,
+            },
+            &mut child_transitions,
+        );
+        let (width, height) = (child.raster.surface.width(), child.raster.surface.height());
+        if width == 0 || height == 0 {
+            continue;
+        }
+        let Ok(bitmap) = crate::image::DecodedImage::from_pixels(
+            width,
+            height,
+            child.raster.surface.pixels().to_vec(),
+        ) else {
+            continue;
+        };
+        if layered
+            .set_frame_bitmap(frame, child.revision, bitmap, ImageLimits::default())
+            .is_err()
+        {
+            continue;
+        }
+        rendered.push(NestedFrameRender {
+            frame,
+            document: *document,
+            content_rect,
+            output: Box::new(child),
+        });
+    }
+    if rendered.is_empty() {
+        return (None, rendered);
+    }
+    (Some(layered), rendered)
+}
+
+/// Layout options for one document tree. A nested document's `rem` base is its
+/// own root element's computed `font-size`, not the embedding document's.
+fn root_layout_options(
+    root: NodeId,
+    dom: &Dom,
+    styles: &BTreeMap<NodeId, ComputedStyle>,
+    mut options: LayoutOptions,
+) -> LayoutOptions {
+    if root != dom.document() {
+        options.root_font_size = root_font_size(dom, root, styles);
+    }
+    options
 }
 
 /// The colour `currentColor` resolves to on an `svg` element: its computed
@@ -2125,12 +2420,13 @@ struct CollectedStyleSheets {
 
 fn collect_author_style_sheets(
     dom: &Dom,
+    root: NodeId,
     base_url: Option<&Url>,
     external: &ExternalStyleSheets,
     limits: DocumentLimits,
     context: &MatchContext,
 ) -> CollectedStyleSheets {
-    let discovery = discover_author_style_slots(dom, base_url, limits, context);
+    let discovery = discover_author_style_slots(dom, root, base_url, limits, context);
     let mut collected = CollectedStyleSheets {
         sheets: Vec::new(),
         font_faces: Vec::new(),
@@ -2211,12 +2507,13 @@ fn collect_author_style_sheets(
 
 fn discover_author_style_slots(
     dom: &Dom,
+    root: NodeId,
     base_url: Option<&Url>,
     limits: DocumentLimits,
     context: &MatchContext,
 ) -> AuthorStyleDiscovery {
     let mut discovery = StyleDiscoveryState::new(context);
-    let mut stack = vec![dom.document()];
+    let mut stack = vec![root];
     let mut visited_nodes = 0_usize;
 
     while let Some(node_id) = stack.pop() {

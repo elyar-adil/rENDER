@@ -2113,6 +2113,34 @@ pub fn compute_document_styles_with_hints(
     context: &MatchContext,
     hints: &dyn Fn(NodeId) -> Vec<Declaration>,
 ) -> BTreeMap<NodeId, ComputedStyle> {
+    compute_document_styles_with_hints_from_root(
+        dom,
+        dom.document(),
+        sources,
+        registry,
+        limits,
+        context,
+        hints,
+    )
+}
+
+/// [`compute_document_styles_with_hints`] for one document tree in an arena
+/// that holds several documents.
+///
+/// A nested browsing context's document is grafted into the same [`Dom`] as
+/// its embedder, so style computation must start at the nested document's root
+/// instead of the arena's primary document. `root` may be any document node;
+/// the walk covers only that tree (through the flat tree), and inheritance
+/// begins from the root rather than from the embedder's document element.
+pub fn compute_document_styles_with_hints_from_root(
+    dom: &Dom,
+    root: NodeId,
+    sources: &[CascadeInput<'_>],
+    registry: &PropertyRegistry,
+    limits: &ComputationLimits,
+    context: &MatchContext,
+    hints: &dyn Fn(NodeId) -> Vec<Declaration>,
+) -> BTreeMap<NodeId, ComputedStyle> {
     let mut styles = BTreeMap::new();
     let initials = Arc::new(InitialValues::new(registry, limits));
     let registered =
@@ -2143,7 +2171,7 @@ pub fn compute_document_styles_with_hints(
                 .any(|selector| selector.has_pseudo_element("after"))
         })
     });
-    let mut stack = vec![(dom.document(), None)];
+    let mut stack = vec![(root, None)];
     let mut cascade_time = std::time::Duration::ZERO;
     let mut compute_time = std::time::Duration::ZERO;
     let mut pseudo_cascade_time = std::time::Duration::ZERO;

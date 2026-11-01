@@ -30,6 +30,7 @@ use render_core::document::DocumentBackends;
 use render_core::document::DocumentRenderOptions;
 use render_core::document::DocumentRenderOutput;
 use render_core::document::ExternalStyleSheets;
+use render_core::document::FrameDocuments;
 use render_core::dom::Dom;
 use render_core::dom::NodeId;
 use render_core::image::ImageResources;
@@ -83,6 +84,10 @@ pub(super) struct FullPageRenderPayload {
     pub(super) interaction: InteractionState,
     /// CSS transition targets and active transitions for this document.
     pub(super) transition_state: TransitionState,
+    /// The iframe documents the page's runtime currently displays. The
+    /// document clone above contains their roots in the same arena; this map
+    /// is what tells the renderer which root belongs to which frame.
+    pub(super) frame_documents: FrameDocuments,
 }
 
 #[derive(Debug)]
@@ -165,6 +170,7 @@ pub(super) fn process_page_render(
                 images,
                 interaction,
                 transition_state,
+                frame_documents,
             } = *full;
             cancellation.check()?;
             // §3.2's font download timer belongs to the document, not the
@@ -247,7 +253,7 @@ pub(super) fn process_page_render(
                 backend: fonts,
                 loader: font_loader,
             };
-            let output = document.render_with_interaction_and_transitions(
+            let output = document.render_with_interaction_and_transitions_and_frames(
                 options,
                 DocumentBackends {
                     text_measurer: fonts,
@@ -260,6 +266,7 @@ pub(super) fn process_page_render(
                 &images,
                 &interaction,
                 &mut transition_state,
+                &frame_documents,
             );
             cancellation.check()?;
             // §4.8.1: only families the computed styles name and characters the

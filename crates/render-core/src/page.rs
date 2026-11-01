@@ -405,6 +405,10 @@ pub struct Page {
     js_timers: BTreeMap<u64, TimerId>,
     /// Latest border-box geometry per DOM node, refreshed after each render.
     geometry_index: BTreeMap<u64, ElementRect>,
+    /// The iframe documents the latest snapshot painted. Loading or replacing
+    /// a frame changes this map without mutating the DOM, so a turn compares
+    /// it with the runtime's current map to request a render.
+    rendered_frame_documents: BTreeMap<NodeId, (NodeId, Url)>,
     /// Decoded video frames currently presented by `<video>` elements, keyed
     /// by element node. Advanced every pump/turn from the script runtime's
     /// presentation clocks; layout and paint consume them through the
@@ -517,6 +521,7 @@ impl Page {
             microtask_source_bytes: BTreeMap::new(),
             js_timers: BTreeMap::new(),
             geometry_index: BTreeMap::new(),
+            rendered_frame_documents: BTreeMap::new(),
             video_frames: ImageResources::default(),
             video_frames_dirty: false,
             script_title_override: None,
@@ -572,6 +577,7 @@ impl Page {
             microtask_source_bytes: BTreeMap::new(),
             js_timers: BTreeMap::new(),
             geometry_index: BTreeMap::new(),
+            rendered_frame_documents: BTreeMap::new(),
             video_frames: ImageResources::default(),
             video_frames_dirty: false,
             script_title_override: None,
@@ -1667,7 +1673,15 @@ impl Page {
         self.sync_script_title();
         let invalidation = self.invalidation.take(self.document.dom())?;
         let canvas_changed = self.canvas.engine().borrow().has_changes();
-        let render = (!invalidation.is_empty() || self.video_frames_dirty || canvas_changed)
+        // Grafting a frame's document does not record a DOM mutation in the
+        // embedding tree, and replacing a frame can change the child root
+        // without changing the iframe element, so frame membership is its own
+        // rendering invalidation.
+        let frames_changed = self.runtime.frame_documents() != self.rendered_frame_documents;
+        let render = (!invalidation.is_empty()
+            || self.video_frames_dirty
+            || canvas_changed
+            || frames_changed)
             .then(|| backends.map(|backends| self.render_update(backends)))
             .flatten();
         Ok(Some(PageTurnOutcome {
@@ -1768,11 +1782,16 @@ impl Page {
 
     fn render_update(&mut self, backends: DocumentBackends<'_>) -> PageRenderUpdate {
         self.publish_canvas_bitmaps();
+        let frame_documents = self.runtime.frame_documents();
         let previous = self.snapshot.as_ref();
         let previous_revision = previous.map(|snapshot| snapshot.revision);
-        let next =
-            self.document
-                .render_with_images(self.render_options, backends, &self.video_frames);
+        let next = self.document.render_with_images_and_frames(
+            self.render_options,
+            backends,
+            &self.video_frames,
+            &frame_documents,
+        );
+        self.rendered_frame_documents = frame_documents;
         self.video_frames_dirty = false;
         let display_list_diff =
             previous.map(|snapshot| next.display.list.diff(&snapshot.display.list));

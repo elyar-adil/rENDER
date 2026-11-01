@@ -632,6 +632,7 @@ impl BrowserApp {
                 images: page.images.clone(),
                 interaction: page.interaction.clone(),
                 transition_state: page.transition_state.clone(),
+                frame_documents: page.page.runtime().frame_documents(),
             }))
         };
         let source_snapshot = Arc::from(page.navigation.committed().html.as_str());

@@ -12,10 +12,13 @@
 //! `contentWindow` is usable straight after insertion. Its document is loaded
 //! in a later task, and its `load` event is a task after that.
 //!
-//! Not implemented: painting a nested document (an iframe still renders as
-//! nothing), `window.open`, the cross-origin restrictions on frames (every
-//! frame may script every other frame), navigating an existing frame to a new
-//! URL, and the `onmessage` attribute handler.
+//! Painting is separate from this module: the embedding renderer asks for the
+//! document each frame displays (see `JsRuntime::frame_documents`) and renders
+//! that root into the iframe's content box.
+//!
+//! Not implemented: `window.open`, the cross-origin restrictions on frames
+//! (every frame may script every other frame), navigating an existing frame to
+//! a new URL, and the `onmessage` attribute handler.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;

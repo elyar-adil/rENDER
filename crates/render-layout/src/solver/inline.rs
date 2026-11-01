@@ -1722,7 +1722,13 @@ impl<'a> Solver<'a> {
         // attributes. Without a raster it is not replaced, so its size stays the
         // presentation-hint size it had before.
         let is_svg = element.namespace == Namespace::Svg && element.local_name == "svg";
-        if !is_svg && !matches!(element.local_name.as_str(), "img" | "video" | "canvas") {
+        let is_frame = element.namespace == Namespace::Html && element.local_name == "iframe";
+        if !is_svg
+            && !matches!(
+                element.local_name.as_str(),
+                "img" | "video" | "canvas" | "iframe"
+            )
+        {
             return None;
         }
         let html_width = if is_svg {
@@ -1735,15 +1741,21 @@ impl<'a> Solver<'a> {
         } else {
             self.html_image_dimension(source, "height")
         };
-        let intrinsic = self
-            .images
-            .and_then(|images| images.intrinsic_size_for_node(source))
-            .map(|(width, height)| {
-                (
-                    image_dimension_to_f32(width),
-                    image_dimension_to_f32(height),
-                )
-            });
+        // An iframe's size is its HTML dimension attributes or the 300x150
+        // default; the nested document's pixels must not make layout depend on
+        // the previous frame's raster surface.
+        let intrinsic = if is_frame {
+            None
+        } else {
+            self.images
+                .and_then(|images| images.intrinsic_size_for_node(source))
+                .map(|(width, height)| {
+                    (
+                        image_dimension_to_f32(width),
+                        image_dimension_to_f32(height),
+                    )
+                })
+        };
         if is_svg && intrinsic.is_none() {
             return None;
         }

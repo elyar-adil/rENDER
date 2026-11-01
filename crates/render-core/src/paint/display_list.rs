@@ -432,6 +432,11 @@ pub struct ImagePaint {
     pub destination: PhysicalRect,
     pub source: PhysicalRect,
     pub interpolate: bool,
+    /// The DOM revision whose pixels `resource` presents for a live surface
+    /// (a nested document viewport), or `None` for an immutable decoded image.
+    /// A child-only mutation does not change the parent DOM revision, so the
+    /// display-list diff needs this to mark the iframe's dirty rectangle.
+    pub content_revision: Option<DomRevision>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1596,6 +1601,7 @@ impl<'a> Builder<'a> {
                         destination,
                         source,
                         interpolate: true,
+                        content_revision: None,
                     }),
                 );
                 tiles += 1;
@@ -2062,6 +2068,7 @@ impl<'a> Builder<'a> {
                     image_dimension_to_f32(height),
                 ),
                 interpolate: true,
+                content_revision: loaded.content_revision,
             }),
         );
         if clips {

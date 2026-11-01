@@ -224,6 +224,22 @@ pub fn build_formatting_tree(
     styles: &BTreeMap<NodeId, ComputedStyle>,
     limits: &FormattingLimits,
 ) -> FormattingTree {
+    build_formatting_tree_from_root(dom, dom.document(), styles, limits)
+}
+
+/// Build the formatting structure of one document tree in an arena that holds
+/// several documents.
+///
+/// A nested browsing context's document lives beside its embedder in the same
+/// [`Dom`]. Its formatting tree must start at that document's root so that the
+/// embedder's boxes are not laid out twice, while node identities stay shared.
+#[must_use]
+pub fn build_formatting_tree_from_root(
+    dom: &Dom,
+    document_root: NodeId,
+    styles: &BTreeMap<NodeId, ComputedStyle>,
+    limits: &FormattingLimits,
+) -> FormattingTree {
     let mut builder = Builder {
         dom,
         styles,
@@ -249,7 +265,7 @@ pub fn build_formatting_tree(
             });
             FormattingNodeId(0)
         });
-    builder.append_dom_children(dom.document(), root, None, 0);
+    builder.append_dom_children(document_root, root, None, 0);
     // §9.2.1.1 can only be applied once an inline box's whole child list is
     // known, because the split has to know what is left on each side of the
     // block-level box that caused it.
@@ -656,6 +672,14 @@ impl Builder<'_> {
                                 | "object" | "embed"
                         )
                 );
+                // An iframe's children are its fallback content, which is never
+                // rendered while the frame itself is (HTML §4.8.5). The frame's
+                // content box belongs to the nested document, not to its DOM
+                // children, so they must not contribute boxes to this tree.
+                let is_frame = matches!(
+                    node.kind(),
+                    NodeKind::Element(element) if element.local_name == "iframe"
+                );
                 let generated_allowed = host_is_html_element
                     && !host_is_replaced
                     && !matches!(
@@ -674,13 +698,15 @@ impl Builder<'_> {
                         depth,
                     );
                 }
-                self.append_dom_children_seeded(
-                    dom_node,
-                    id,
-                    Some(dom_node),
-                    depth.saturating_add(1),
-                    &mut anonymous,
-                );
+                if !is_frame {
+                    self.append_dom_children_seeded(
+                        dom_node,
+                        id,
+                        Some(dom_node),
+                        depth.saturating_add(1),
+                        &mut anonymous,
+                    );
+                }
                 if generated_allowed {
                     self.append_generated_content(
                         dom_node,
@@ -834,7 +860,10 @@ impl Builder<'_> {
         if matches!(
             self.dom.node(node).map(render_dom::Node::kind),
             Some(NodeKind::Element(element))
-                if matches!(element.local_name.as_str(), "img" | "video" | "canvas")
+                if matches!(
+                    element.local_name.as_str(),
+                    "img" | "video" | "canvas" | "iframe"
+                )
         ) {
             let inline = matches!(
                 display,
