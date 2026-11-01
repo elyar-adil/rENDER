@@ -740,9 +740,12 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 sticky displacement at composite time, and only rasterizes newly \
                 exposed bands. A dedicated compositor worker runs scroll jobs off \
                 the render worker, so a scroll frame does not wait behind style, \
-                layout or a complete raster. Filters, masks, non-normal blend modes, \
-                ambient clips crossing a layer and nested sticky still take the \
-                complete raster, and no GPU backend exists yet.",
+                layout or a complete raster, and it presents through a platform \
+                sink directly; the softbuffer sink writes the page into its last \
+                full window frame from the worker thread. Filters, masks, \
+                non-normal blend modes, ambient clips crossing a layer and nested \
+                sticky still take the complete raster, and no GPU swapchain exists \
+                yet.",
         dependencies: &[LAYOUT],
         tests: PAINT_TESTS,
     },

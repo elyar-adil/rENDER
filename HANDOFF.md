@@ -1,3 +1,134 @@
+# 交接文档 (2026-11-01, 续六十六) — compositor worker 直接呈现平台 surface
+
+这一轮把上一轮的 compositor worker 从“返回 surface 给主线程”推进到“worker 直接
+present 平台窗口”。实现的是 **platform-surface 路径**（softbuffer），不是 GPU
+swapchain；这样滚动帧的呈现不再经过事件循环线程。没有站点特判。
+
+## 接口
+
+- 新增 `render_browser::compositor::PlatformPresenter`：
+  - `present_full(frame, width, height)`：完整窗口帧（含 chrome）；
+  - `present_page(page, origin_x, origin_y)`：把 page surface 合成到上一张完整帧的
+    page 区域并 present，返回 platform present 耗时。
+- `SharedPresenter = Arc<Mutex<Option<Box<dyn PlatformPresenter>>>>`：
+  - compositor worker 在启动时拿到这个 slot，窗口创建后由 shell 安装
+    `SoftbufferPresenter`；
+  - 窗口销毁/失败时 slot 为空，worker 仍返回 surface，shell 走原有 redraw 回退。
+- `CompositorScroll` 新增 `page_origin`；worker 用 layout 的 chrome height
+  把 page 放在 chrome 下方。
+- `CompositorFrame` 新增 `present_time: Option<Duration>`；只有平台 present
+  真正成功时才为 `Some`。
+
+## SoftbufferPresenter
+
+- `crates/render-browser/src/platform_presenter.rs` 实现：
+  - 持有 `softbuffer::Surface<Arc<Window>, Arc<Window>>`；
+  - `base: Vec<u32>` 保存最近一次完整窗口帧；
+  - `present_full` resize、复制完整帧、present；
+  - `present_page` 用 `surface_to_softbuffer` 把 page 转成窗口像素，按
+    `page_origin` 覆盖 base 的 page 矩形，再复制整个 base 到 softbuffer
+    buffer 并 present；
+  - 返回这次 copy+present 的耗时。
+- app 删除 `surface: Option<NativeSurface>`，改为共享 `presenter` slot；
+  `present()` 通过 sink 执行完整帧 present。
+- compositor commit 后：
+  - 若 `present_time.is_some()`，worker 已经把新页面呈现到窗口；主线程仍
+    `mark_page_damage` + `compose_frame` 更新 CPU 帧，但不 `request_redraw`；
+  - 若平台 present 失败（`None`），按旧路径 damage/redraw，主线程补一次完整帧。
+
+## 测试
+
+- `render-browser/src/compositor.rs` 的
+  `twenty_scroll_frames_run_on_the_dedicated_thread`：
+  - 安装记录型 presenter，先 present 一张 80x70 完整帧；
+  - 20 个 80x60 滚动帧，page_origin `(0,10)`；
+  - 每帧断言 `worker_thread != caller`、`present_time.is_some()`；
+  - 断言 presenter 收到 20 次 page present，第一次 origin 是 `(0,10)`。
+- `app_tests::a_scroll_frame_composites_while_the_render_worker_is_blocked`：
+  - 真实 render worker 卡在 full frame；
+  - 安装记录型 presenter 和真实 compositor worker；
+  - scroll commit 后断言 presenter 收到一次 page present，origin 等于
+    `layout.chrome_height`；
+  - render worker 的 log 没有 scroll job。
+
+## Benchmark
+
+`render-compositor-bench` 现在安装内存 presenter（执行同样的 page blit + 全窗口
+复制）并统计 present 时间：
+
+```text
+cargo run --release -p render-browser --bin render-compositor-bench
+{"frames":"120","scroll_step_px":"16","viewport":"800x600",
+ "render_worker_block_ms":"500","frames_during_block":"120",
+ "presented_frames":"120","mean_latency_us":"1655.4",
+ "median_latency_us":"1586.5","max_latency_us":"4176.1",
+ "mean_present_us":"249.8","max_present_us":"269.9"}
+```
+
+模拟 render worker 阻塞 500ms 期间，**120/120** 帧完成并经过 platform present；
+平均端到端 1.66ms，platform present 平均 250us。
+
+原有 `render-scroll-bench` 仍是：
+
+```text
+{"frames":"120","scroll_step_px":"16","viewport":"800x600",
+ "compositor_ms":"271.149","compositor_us_per_frame":"2259.6",
+ "full_raster_ms":"716.267","full_raster_us_per_frame":"5968.9",
+ "initial_bands":"5","final_bands":"9","scroll_bands_rasterized":"4",
+ "scroll_frames_without_new_bands":"116"}
+```
+
+## 验证
+
+```text
+cargo test -p render-browser --lib compositor::tests  1 passed, 0 failed
+cargo test -p render-browser --bin render-browser \
+  a_scroll_frame_composites_while_the_render_worker_is_blocked
+                                                    1 passed, 0 failed
+cargo run --release -p render-browser --bin render-compositor-bench
+                                                    see benchmark above
+cargo run --release -p render-browser --bin render-scroll-bench
+                                                    see benchmark above
+cargo test --workspace                              all crates passed, 0 failed
+cargo fmt --all --check                             clean
+cargo clippy ... --all-targets -- -D warnings       clean
+python tools/check_site_neutrality.py               0 blocking, 26 advisory
+```
+
+真实 release shell 加载 fixed/sticky/rotate 演示页仍输出：
+
+```text
+render-browser compositor retained layers=5
+render-browser health page=file:///.../compositor-demo.html ready=Complete
+dom_elements=12 boxes=9 css_errors=0 css_warnings=0
+render-browser screenshot written to ...\compositor-present-demo.png
+```
+
+截图 82,898 字节，窗口 chrome 与页面内容正常。
+
+## 已知缺口
+
+- **不是 GPU swapchain。** 当前是 softbuffer 平台 surface；`PlatformPresenter`
+  已经是 GPU 实现可以复用的边界，但还没有 wgpu/D3D 纹理与交换链。
+- softbuffer present 从 worker 线程调用；平台若要求主线程 present，会返回
+  error 并回退到主线程 redraw。Windows 已验证可用，其他平台需逐平台验证。
+- `present_page` 复制完整窗口 base，而不是只 present 受损矩形；可优化为
+  damage-only present。
+- compositor worker 只有 1 个线程；多 tab 同时滚动串行。
+- 动画采样仍在 event-loop 线程。
+- filter/mask、非 Normal blend、ambient clip 跨 layer、嵌套 sticky 仍回退。
+- band cache 无上限/淘汰策略。
+
+## 下一步
+
+- 用 wgpu 实现同一个 `PlatformPresenter`：GPU texture + swapchain，present
+  直接从 compositor worker。
+- damage-only platform present 与 band residency/eviction。
+- 多 tab compositor 调度。
+- 继续 RTL 块轴镜像、`scroll-state()`、`@starting-style`。
+
+---
+
 # 交接文档 (2026-11-01, 续六十五) — 独立 compositor worker 与滚动帧脱离 render worker
 
 这一轮把 scroll compositing 从 render worker 的队列里拆出来，放进独立的
@@ -67,8 +198,8 @@ cargo run --release -p render-browser --bin render-compositor-bench
 
 ```text
 {"frames":"120","scroll_step_px":"16","viewport":"800x600",
- "compositor_ms":"272.476","compositor_us_per_frame":"2270.6",
- "full_raster_ms":"726.360","full_raster_us_per_frame":"6053.0",
+ "compositor_ms":"271.149","compositor_us_per_frame":"2259.6",
+ "full_raster_ms":"716.267","full_raster_us_per_frame":"5968.9",
  "initial_bands":"5","final_bands":"9","scroll_bands_rasterized":"4",
  "scroll_frames_without_new_bands":"116"}
 ```
