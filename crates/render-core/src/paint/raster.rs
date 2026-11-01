@@ -1937,6 +1937,125 @@ struct RoundedShape {
     radii: CornerRadii,
 }
 
+/// A rounded rectangle with its radii already normalized against its own
+/// bounds.
+///
+/// Box shadows evaluate a signed distance for every mask pixel. Hoisting the
+/// radius normalization out of that loop keeps interior pixels to one distance
+/// evaluation instead of one point-in-shape plus two distance evaluations.
+#[derive(Clone, Copy)]
+struct PreparedRoundedShape {
+    rect: PhysicalRect,
+    radii: CornerRadii,
+    rounded: bool,
+}
+
+impl PreparedRoundedShape {
+    fn new(rect: PhysicalRect, radii: CornerRadii) -> Self {
+        let radii = normalize_radii(radii, rect);
+        Self {
+            rect,
+            radii,
+            rounded: radii.top_left > 0.0
+                || radii.top_right > 0.0
+                || radii.bottom_right > 0.0
+                || radii.bottom_left > 0.0,
+        }
+    }
+
+    /// Signed Euclidean distance from `point` to the rounded boundary:
+    /// positive inside the shape and negative outside it.
+    fn signed_distance(&self, point: PhysicalPoint) -> f32 {
+        let rect = self.rect;
+        let radii = self.radii;
+        let corner = if !self.rounded {
+            None
+        } else if point.x < rect.origin.x + radii.top_left
+            && point.y < rect.origin.y + radii.top_left
+        {
+            Some((
+                rect.origin.x + radii.top_left,
+                rect.origin.y + radii.top_left,
+                radii.top_left,
+            ))
+        } else if point.x >= rect.right() - radii.top_right
+            && point.y < rect.origin.y + radii.top_right
+        {
+            Some((
+                rect.right() - radii.top_right,
+                rect.origin.y + radii.top_right,
+                radii.top_right,
+            ))
+        } else if point.x >= rect.right() - radii.bottom_right
+            && point.y >= rect.bottom() - radii.bottom_right
+        {
+            Some((
+                rect.right() - radii.bottom_right,
+                rect.bottom() - radii.bottom_right,
+                radii.bottom_right,
+            ))
+        } else if point.x < rect.origin.x + radii.bottom_left
+            && point.y >= rect.bottom() - radii.bottom_left
+        {
+            Some((
+                rect.origin.x + radii.bottom_left,
+                rect.bottom() - radii.bottom_left,
+                radii.bottom_left,
+            ))
+        } else {
+            None
+        };
+        if let Some((center_x, center_y, radius)) = corner
+            && radius > 0.0
+        {
+            return radius - (point.x - center_x).hypot(point.y - center_y);
+        }
+        let left = point.x - rect.origin.x;
+        let top = point.y - rect.origin.y;
+        let right = rect.right() - point.x;
+        let bottom = rect.bottom() - point.y;
+        if left >= 0.0 && top >= 0.0 && right >= 0.0 && bottom >= 0.0 {
+            left.min(top).min(right).min(bottom)
+        } else {
+            -distance_to_rect(rect, point)
+        }
+    }
+
+    /// Coverage of one pixel square.
+    ///
+    /// Interior and exterior pixels use the signed distance at the pixel
+    /// center. Only pixels within a pixel of the boundary pay for the 4x4
+    /// sample grid that matches the rest of the rasterizer's antialiasing.
+    fn coverage(&self, x: i64, y: i64) -> f32 {
+        let x = i64_to_f32(x);
+        let y = i64_to_f32(y);
+        let distance = self.signed_distance(PhysicalPoint {
+            x: x + 0.5,
+            y: y + 0.5,
+        });
+        if distance >= 0.75 {
+            return 1.0;
+        }
+        if distance <= -0.75 {
+            return 0.0;
+        }
+        let samples = [0.125_f32, 0.375, 0.625, 0.875];
+        let mut covered = 0_u32;
+        for sample_y in samples {
+            for sample_x in samples {
+                if self.signed_distance(PhysicalPoint {
+                    x: x + sample_x,
+                    y: y + sample_y,
+                }) >= 0.0
+                {
+                    covered += 1;
+                }
+            }
+        }
+        u32_to_f32(covered) / 16.0
+    }
+}
+
 fn box_shadow_alpha(
     shape: &RoundedShape,
     shadow: &RoundedShape,
@@ -1990,7 +2109,229 @@ fn box_shadow_coverage(
     alpha / 16.0
 }
 
+/// Number of pixels in one box-shadow coverage mask, capped so a pathological
+/// shadow cannot allocate without bound. Masks larger than this fall back to
+/// the bounded analytic path.
+const MAX_BOX_SHADOW_MASK_PIXELS: usize = 16 * 1024 * 1024;
+
+/// Radius of each of the three box-blur passes used to approximate the
+/// `box-shadow` Gaussian.
+///
+/// Three box filters of width `w` have variance `(w² − 1) / 4`. Matching the
+/// CSS `sigma = blur / 2` therefore needs `w = sqrt(blur² + 1)`, or a radius
+/// of `(w − 1) / 2`.
+fn box_shadow_blur_radius(blur_radius: f32) -> usize {
+    if !blur_radius.is_finite() || blur_radius <= 0.0 {
+        return 0;
+    }
+    let box_width = blur_radius.mul_add(blur_radius, 1.0).sqrt();
+    let radius = ((box_width - 1.0) / 2.0).round();
+    usize::try_from(blur_radius_in_pixels(radius).max(0)).unwrap_or(0)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the mask build, blur, and composite steps share one bounds computation"
+)]
 fn paint_box_shadow(
+    surface: &mut Surface,
+    shadow: &BoxShadowPaint,
+    offset: PhysicalPoint,
+    clip: Option<&ClipRegion>,
+    control: Option<&dyn RasterControl>,
+) -> bool {
+    let shape_rect = translate_rect(shadow.rect, offset);
+    let shadow_rect = shifted_rect(shape_rect, shadow.offset, shadow.spread_radius);
+    let shadow_radii = shifted_radii(shadow.radii, shadow.spread_radius);
+    let blur = shadow.blur_radius.max(0.0);
+    let bounds = if shadow.inset {
+        shape_rect
+    } else {
+        expanded_rect(shadow_rect, blur)
+    };
+    let Some(visible) = intersection(Some(bounds), clip.map_or(bounds, |c| c.rect)) else {
+        return true;
+    };
+    let left = floor_to_u32(visible.origin.x);
+    let top = floor_to_u32(visible.origin.y);
+    let right = ceil_to_u32(visible.right().min(u32_to_f32(surface.width)));
+    let bottom = ceil_to_u32(visible.bottom().min(u32_to_f32(surface.height)));
+    if left >= right || top >= bottom {
+        return true;
+    }
+    let box_shape = PreparedRoundedShape::new(shape_rect, shadow.radii);
+    let shadow_shape = PreparedRoundedShape::new(shadow_rect, shadow_radii);
+    let radius = box_shadow_blur_radius(blur);
+    if radius == 0 {
+        return paint_box_shadow_exact(
+            surface,
+            shadow,
+            &box_shape,
+            &shadow_shape,
+            (left, top, right, bottom),
+            clip,
+            control,
+        );
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the box-blur radius is clamped to MAX_BLUR_RADIUS before this conversion"
+    )]
+    let support = 3.0 * radius as f32;
+    let surface_rect = PhysicalRect::new(
+        0.0,
+        0.0,
+        u32_to_f32(surface.width),
+        u32_to_f32(surface.height),
+    );
+    let Some(mask_region) = intersection(
+        Some(expanded_rect(visible, support)),
+        expanded_rect(surface_rect, support),
+    ) else {
+        return true;
+    };
+    // An outer shadow is only nonzero over its own damage bounds, so cropping
+    // the mask there merely replaces the zero padding the blur would use. An
+    // inset shadow needs the inverse mask outside the border box before it is
+    // clipped to the border box during compositing.
+    let mask_region = if shadow.inset {
+        mask_region
+    } else {
+        let Some(mask_region) = intersection(Some(mask_region), bounds) else {
+            return true;
+        };
+        mask_region
+    };
+    let mask_left = floor_to_i64(mask_region.origin.x);
+    let mask_top = floor_to_i64(mask_region.origin.y);
+    let mask_right = ceil_to_i64(mask_region.right());
+    let mask_bottom = ceil_to_i64(mask_region.bottom());
+    let Ok(mask_width) = usize::try_from(mask_right.saturating_sub(mask_left)) else {
+        return true;
+    };
+    let Ok(mask_height) = usize::try_from(mask_bottom.saturating_sub(mask_top)) else {
+        return true;
+    };
+    if mask_width == 0 || mask_height == 0 {
+        return true;
+    }
+    let Some(area) = mask_width.checked_mul(mask_height) else {
+        return paint_box_shadow_analytic(surface, shadow, offset, clip, control);
+    };
+    if area > MAX_BOX_SHADOW_MASK_PIXELS {
+        return paint_box_shadow_analytic(surface, shadow, offset, clip, control);
+    }
+
+    let mut mask = vec![0_u8; area];
+    for y in 0..mask_height {
+        if control.is_some_and(RasterControl::is_cancelled) {
+            return false;
+        }
+        let world_y = mask_top + i64::try_from(y).unwrap_or(i64::MAX);
+        let row = y * mask_width;
+        for x in 0..mask_width {
+            let world_x = mask_left + i64::try_from(x).unwrap_or(i64::MAX);
+            let coverage = shadow_shape.coverage(world_x, world_y);
+            let coverage = if shadow.inset {
+                1.0 - coverage
+            } else {
+                coverage
+            };
+            mask[row + x] = clamped_rounded_u8(coverage * 255.0);
+        }
+    }
+    blur_alpha_channel(&mut mask, mask_width, mask_height, radius, true);
+
+    let mask_height_i64 = i64::try_from(mask_height).unwrap_or(i64::MAX);
+    let mask_width_i64 = i64::try_from(mask_width).unwrap_or(i64::MAX);
+    for y in top..bottom {
+        if control.is_some_and(RasterControl::is_cancelled) {
+            return false;
+        }
+        let mask_y = i64::from(y) - mask_top;
+        if mask_y < 0 || mask_y >= mask_height_i64 {
+            continue;
+        }
+        let row = usize::try_from(mask_y).unwrap_or(0) * mask_width;
+        for x in left..right {
+            let mask_x = i64::from(x) - mask_left;
+            if mask_x < 0 || mask_x >= mask_width_i64 {
+                continue;
+            }
+            let Some(mask_alpha) = usize::try_from(mask_x)
+                .ok()
+                .and_then(|mask_x| mask.get(row + mask_x))
+                .copied()
+            else {
+                continue;
+            };
+            let mut alpha = f32::from(mask_alpha) / 255.0;
+            if shadow.inset {
+                alpha *= box_shape.coverage(i64::from(x), i64::from(y));
+            }
+            if alpha <= 0.0 {
+                continue;
+            }
+            let clip_alpha = clip_coverage(clip, u32_to_f32(x) + 0.5, u32_to_f32(y) + 0.5);
+            if clip_alpha <= 0.0 {
+                continue;
+            }
+            if let Some(index) = surface.index(x, y) {
+                surface.pixels[index] = blend(
+                    surface.pixels[index],
+                    shadow.color.with_opacity(alpha * clip_alpha),
+                    1.0,
+                );
+            }
+        }
+    }
+    true
+}
+
+/// Paints the exact rounded-shape coverage with no convolution. This is the
+/// `blur-radius: 0` fast path, and it also covers radii too small for the
+/// three-pass box approximation.
+fn paint_box_shadow_exact(
+    surface: &mut Surface,
+    shadow: &BoxShadowPaint,
+    box_shape: &PreparedRoundedShape,
+    shadow_shape: &PreparedRoundedShape,
+    (left, top, right, bottom): (u32, u32, u32, u32),
+    clip: Option<&ClipRegion>,
+    control: Option<&dyn RasterControl>,
+) -> bool {
+    for y in top..bottom {
+        if control.is_some_and(RasterControl::is_cancelled) {
+            return false;
+        }
+        for x in left..right {
+            let mut alpha = shadow_shape.coverage(i64::from(x), i64::from(y));
+            if shadow.inset {
+                alpha = (1.0 - alpha) * box_shape.coverage(i64::from(x), i64::from(y));
+            }
+            if alpha <= 0.0 {
+                continue;
+            }
+            let clip_alpha = clip_coverage(clip, u32_to_f32(x) + 0.5, u32_to_f32(y) + 0.5);
+            if clip_alpha <= 0.0 {
+                continue;
+            }
+            if let Some(index) = surface.index(x, y) {
+                surface.pixels[index] = blend(
+                    surface.pixels[index],
+                    shadow.color.with_opacity(alpha * clip_alpha),
+                    1.0,
+                );
+            }
+        }
+    }
+    true
+}
+
+/// Bounded analytic fallback used only when a coverage mask would exceed
+/// [`MAX_BOX_SHADOW_MASK_PIXELS`]. The normal path above is the CSS blur model;
+/// this path keeps pathological shadows from allocating without bound.
+fn paint_box_shadow_analytic(
     surface: &mut Surface,
     shadow: &BoxShadowPaint,
     offset: PhysicalPoint,
@@ -2337,75 +2678,114 @@ fn blur_alpha(surface: &mut Surface, blur_radius: f32) {
         return;
     }
     let radius = blur_radius_in_pixels(box_width / 2.0);
+    let Ok(radius) = usize::try_from(radius) else {
+        return;
+    };
     if radius < 1 {
         return;
     }
-    let width = i32::try_from(surface.width()).unwrap_or(i32::MAX);
-    let height = i32::try_from(surface.height()).unwrap_or(i32::MAX);
-    let mut alpha = vec![0_u8; surface.pixels.len()];
-    for (index, pixel) in surface.pixels.iter().enumerate() {
-        alpha[index] = pixel.alpha;
+    let width = usize::try_from(surface.width()).unwrap_or(0);
+    let height = usize::try_from(surface.height()).unwrap_or(0);
+    let mut alpha: Vec<u8> = surface.pixels.iter().map(|pixel| pixel.alpha).collect();
+    blur_alpha_channel(&mut alpha, width, height, radius, false);
+    for (pixel, value) in surface.pixels.iter_mut().zip(alpha) {
+        pixel.alpha = value;
     }
+}
+
+/// Three separable box-blur passes over a single-channel coverage buffer.
+///
+/// Each pass uses a prefix sum, so its cost is linear in the number of pixels
+/// instead of proportional to the radius. `zero_padding` treats samples beyond
+/// the buffer as transparent; otherwise the window average uses only the
+/// samples that exist, preserving the legacy text-shadow edge behavior.
+fn blur_alpha_channel(
+    alpha: &mut [u8],
+    width: usize,
+    height: usize,
+    radius: usize,
+    zero_padding: bool,
+) {
+    if radius == 0 || width == 0 || height == 0 || alpha.len() < width.saturating_mul(height) {
+        return;
+    }
+    let window = radius.saturating_mul(2).saturating_add(1);
+    // A fixed full-window denominator can be applied with a reciprocal, which
+    // keeps the box-shadow hot path off the integer divider. The approximate
+    // quotient can differ from exact division by one alpha step, well below
+    // the resolution of the final 8-bit composite.
+    let reciprocal = zero_padding.then(|| {
+        let window = u64::try_from(window).unwrap_or(u64::MAX).max(1);
+        ((1_u64 << 32) / window).saturating_add(1)
+    });
     let mut line = vec![0_u8; alpha.len()];
     for _ in 0..3 {
         for y in 0..height {
-            box_blur_line(&alpha, &mut line, width, height, y, radius, true);
+            let base = y * width;
+            blur_alpha_row(
+                &alpha[base..base + width],
+                &mut line[base..base + width],
+                radius,
+                reciprocal,
+            );
         }
         for x in 0..width {
-            box_blur_line(&line, &mut alpha, width, height, x, radius, false);
-        }
-    }
-    for (index, value) in alpha.iter().enumerate() {
-        if let Some(pixel) = surface.pixels.get_mut(index) {
-            pixel.alpha = *value;
+            let first_high = radius.min(height - 1);
+            let mut sum = 0_u64;
+            for y in 0..=first_high {
+                sum += u64::from(line[y * width + x]);
+            }
+            for y in 0..height {
+                let low = y.saturating_sub(radius);
+                let high = y.saturating_add(radius).min(height - 1);
+                alpha[y * width + x] = average_channel(sum, high - low + 1, reciprocal);
+                let next_y = y + 1;
+                if next_y < height {
+                    let next_high = next_y.saturating_add(radius).min(height - 1);
+                    if next_high > high {
+                        sum += u64::from(line[next_high * width + x]);
+                    }
+                    if low < next_y.saturating_sub(radius) {
+                        sum -= u64::from(line[low * width + x]);
+                    }
+                }
+            }
         }
     }
 }
 
-/// One separable box-blur pass over a single row or column, with the edges
-/// clamped as a fully transparent surface would behave.
-fn box_blur_line(
-    source: &[u8],
-    target: &mut [u8],
-    width: i32,
-    height: i32,
-    index: i32,
-    radius: i32,
-    horizontal: bool,
-) {
-    let length = if horizontal { width } else { height };
-    let stride = if horizontal { 1 } else { width.max(1) };
-    let base = if horizontal { index * stride } else { index };
-    for position in 0..length {
-        let mut sum = 0_usize;
-        let mut count = 0_usize;
-        for delta in -radius..=radius {
-            let sample = position + delta;
-            if sample < 0 || sample >= length {
-                continue;
+/// One horizontally separable box-blur pass over one row.
+fn blur_alpha_row(source: &[u8], target: &mut [u8], radius: usize, reciprocal: Option<u64>) {
+    let width = source.len();
+    let first_high = radius.min(width.saturating_sub(1));
+    let mut sum = 0_u64;
+    for value in &source[..=first_high] {
+        sum += u64::from(*value);
+    }
+    for (x, slot) in target.iter_mut().enumerate() {
+        let low = x.saturating_sub(radius);
+        let high = x.saturating_add(radius).min(width - 1);
+        *slot = average_channel(sum, high - low + 1, reciprocal);
+        let next_x = x + 1;
+        if next_x < width {
+            let next_high = next_x.saturating_add(radius).min(width - 1);
+            if next_high > high {
+                sum += u64::from(source[next_high]);
             }
-            let offset = base + position * stride + delta * stride;
-            let Some(value) = usize::try_from(offset)
-                .ok()
-                .and_then(|index| source.get(index))
-                .copied()
-            else {
-                continue;
-            };
-            sum += usize::from(value);
-            count += 1;
-        }
-        let destination = base + position * stride;
-        if let Some(slot) = usize::try_from(destination)
-            .ok()
-            .and_then(|index| target.get_mut(index))
-        {
-            *slot = sum
-                .checked_div(count)
-                .and_then(|average| u8::try_from(average).ok())
-                .unwrap_or(0);
+            if low < next_x.saturating_sub(radius) {
+                sum -= u64::from(source[low]);
+            }
         }
     }
+}
+
+fn average_channel(sum: u64, count: usize, reciprocal: Option<u64>) -> u8 {
+    let average = if let Some(reciprocal) = reciprocal {
+        (sum.saturating_mul(reciprocal) >> 32).min(255)
+    } else {
+        sum / u64::try_from(count).unwrap_or(1)
+    };
+    u8::try_from(average).unwrap_or(0)
 }
 
 fn paint_glyph(
@@ -3334,10 +3714,34 @@ fn rounded_i32(value: f32) -> i32 {
 }
 
 #[allow(
+    clippy::cast_possible_truncation,
+    reason = "mask bounds intentionally use saturating float-to-i64 conversion"
+)]
+fn floor_to_i64(value: f32) -> i64 {
+    value.floor() as i64
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "mask bounds intentionally use saturating float-to-i64 conversion"
+)]
+fn ceil_to_i64(value: f32) -> i64 {
+    value.ceil() as i64
+}
+
+#[allow(
     clippy::cast_precision_loss,
     reason = "raster geometry uses f32 and surfaces cannot exceed u32 dimensions"
 )]
 fn u32_to_f32(value: u32) -> f32 {
+    value as f32
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "mask pixel indexes derive from surface-sized geometry"
+)]
+fn i64_to_f32(value: i64) -> f32 {
     value as f32
 }
 
@@ -3370,7 +3774,8 @@ mod tests {
     };
 
     use super::{
-        Color, CpuRasterizer, NoGlyphMasks, NoRasterCancellation, RasterCancelled, Surface,
+        Color, CpuRasterizer, NoGlyphMasks, NoRasterCancellation, PreparedRoundedShape,
+        RasterCancelled, Surface, paint_box_shadow, paint_box_shadow_analytic,
     };
 
     #[derive(Clone, Copy, Debug)]
@@ -4115,6 +4520,238 @@ mod tests {
         assert_ne!(output.surface.pixel(2, 2), Some(Color::rgb(30, 120, 220)));
         assert_ne!(output.surface.pixel(4, 7), Some(Color::WHITE));
         assert!(output.diagnostics.is_empty());
+    }
+
+    fn black_box_shadow(
+        rect: PhysicalRect,
+        offset: PhysicalPoint,
+        blur_radius: f32,
+        spread_radius: f32,
+        inset: bool,
+        radii: CornerRadii,
+    ) -> BoxShadowPaint {
+        BoxShadowPaint {
+            rect,
+            offset,
+            blur_radius,
+            spread_radius,
+            color: Color::rgb(0, 0, 0),
+            inset,
+            radii,
+        }
+    }
+
+    #[test]
+    fn box_shadow_offset_moves_the_painted_shape_behind_the_element() {
+        let rect = PhysicalRect::new(10.0, 10.0, 20.0, 20.0);
+        let shadow = black_box_shadow(
+            rect,
+            PhysicalPoint { x: 30.0, y: 0.0 },
+            0.0,
+            0.0,
+            false,
+            CornerRadii::default(),
+        );
+        let list = command_items(
+            PhysicalSize {
+                width: 70.0,
+                height: 40.0,
+            },
+            PhysicalRect::new(0.0, 0.0, 70.0, 40.0),
+            vec![
+                (0, DisplayCommand::BoxShadow(shadow)),
+                (
+                    1,
+                    DisplayCommand::SolidRect {
+                        rect,
+                        color: Color::rgb(30, 120, 220),
+                    },
+                ),
+            ],
+        );
+        let output = CpuRasterizer.rasterize(&list, Color::WHITE, &NoGlyphMasks);
+        // The element covers its own box; the shadow is displaced far enough
+        // that it paints a separate shape over the background.
+        assert_eq!(output.surface.pixel(15, 15), Some(Color::rgb(30, 120, 220)));
+        assert_eq!(output.surface.pixel(45, 15), Some(Color::BLACK));
+        assert_eq!(output.surface.pixel(35, 15), Some(Color::WHITE));
+        assert!(output.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn box_shadow_spread_expands_the_painted_shape() {
+        let rect = PhysicalRect::new(20.0, 20.0, 20.0, 20.0);
+        let shadow = black_box_shadow(
+            rect,
+            PhysicalPoint::default(),
+            0.0,
+            5.0,
+            false,
+            CornerRadii::default(),
+        );
+        let list = command_items(
+            PhysicalSize {
+                width: 50.0,
+                height: 50.0,
+            },
+            rect,
+            vec![(0, DisplayCommand::BoxShadow(shadow))],
+        );
+        let output = CpuRasterizer.rasterize(&list, Color::WHITE, &NoGlyphMasks);
+        assert_eq!(output.surface.pixel(17, 30), Some(Color::BLACK));
+        assert_eq!(output.surface.pixel(30, 17), Some(Color::BLACK));
+        assert_eq!(output.surface.pixel(13, 30), Some(Color::WHITE));
+        assert_eq!(output.surface.pixel(25, 25), Some(Color::BLACK));
+    }
+
+    #[test]
+    fn box_shadow_rounded_corners_clip_the_shape() {
+        let rect = PhysicalRect::new(10.0, 10.0, 40.0, 40.0);
+        let radii = CornerRadii {
+            top_left: 20.0,
+            top_right: 20.0,
+            bottom_right: 20.0,
+            bottom_left: 20.0,
+        };
+        let shadow = black_box_shadow(rect, PhysicalPoint::default(), 0.0, 0.0, false, radii);
+        let list = command_items(
+            PhysicalSize {
+                width: 60.0,
+                height: 60.0,
+            },
+            rect,
+            vec![(0, DisplayCommand::BoxShadow(shadow))],
+        );
+        let output = CpuRasterizer.rasterize(&list, Color::WHITE, &NoGlyphMasks);
+        assert_eq!(output.surface.pixel(30, 30), Some(Color::BLACK));
+        assert_eq!(output.surface.pixel(30, 12), Some(Color::BLACK));
+        assert_eq!(output.surface.pixel(11, 11), Some(Color::WHITE));
+        assert_eq!(output.surface.pixel(12, 12), Some(Color::WHITE));
+        assert_eq!(output.surface.pixel(17, 17), Some(Color::BLACK));
+
+        let shape = PreparedRoundedShape::new(rect, radii);
+        for x in 5..55 {
+            for y in 5..55 {
+                let coverage = shape.coverage(i64::from(x), i64::from(y));
+                assert!(
+                    (0.0..=1.0).contains(&coverage),
+                    "coverage {coverage} at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inset_box_shadow_paints_only_inside_the_border_box() {
+        let rect = PhysicalRect::new(10.0, 10.0, 30.0, 30.0);
+        let shadow = black_box_shadow(
+            rect,
+            PhysicalPoint::default(),
+            6.0,
+            0.0,
+            true,
+            CornerRadii::default(),
+        );
+        let list = command_items(
+            PhysicalSize {
+                width: 60.0,
+                height: 60.0,
+            },
+            rect,
+            vec![(0, DisplayCommand::BoxShadow(shadow))],
+        );
+        let output = CpuRasterizer.rasterize(&list, Color::WHITE, &NoGlyphMasks);
+        // Outside the border box stays untouched.
+        assert_eq!(output.surface.pixel(5, 25), Some(Color::WHITE));
+        assert_eq!(output.surface.pixel(9, 25), Some(Color::WHITE));
+        assert_eq!(output.surface.pixel(25, 5), Some(Color::WHITE));
+        // The inner edge is shadowed, the blurred band reaches a few pixels
+        // inward, and the middle of the box stays clear.
+        assert_ne!(output.surface.pixel(10, 25), Some(Color::WHITE));
+        assert_ne!(output.surface.pixel(35, 35), Some(Color::WHITE));
+        assert_eq!(output.surface.pixel(25, 25), Some(Color::WHITE));
+    }
+
+    #[test]
+    fn box_shadow_blur_fades_monotonically_and_stays_inside_damage_bounds() {
+        let rect = PhysicalRect::new(10.0, 10.0, 20.0, 20.0);
+        let shadow = black_box_shadow(
+            rect,
+            PhysicalPoint::default(),
+            12.0,
+            0.0,
+            false,
+            CornerRadii::default(),
+        );
+        let list = command_items(
+            PhysicalSize {
+                width: 64.0,
+                height: 64.0,
+            },
+            rect,
+            vec![(0, DisplayCommand::BoxShadow(shadow))],
+        );
+        let output = CpuRasterizer.rasterize(&list, Color::WHITE, &NoGlyphMasks);
+        let mut previous_red = 0_u8;
+        for x in 30..42 {
+            let pixel = output.surface.pixel(x, 20).expect("shadow falloff pixel");
+            assert!(
+                pixel.red >= previous_red,
+                "falloff increased red at x={x}: {pixel:?}"
+            );
+            previous_red = pixel.red;
+        }
+        // The damage bounds end exactly 12px beyond the shadow shape.
+        assert_eq!(output.surface.pixel(42, 20), Some(Color::WHITE));
+        assert_eq!(output.surface.pixel(43, 20), Some(Color::WHITE));
+        assert_eq!(output.surface.pixel(20, 42), Some(Color::WHITE));
+    }
+
+    #[test]
+    #[ignore = "manual performance check: rasterizes a large blurred box shadow"]
+    fn box_shadow_raster_benchmark() {
+        use std::time::Instant;
+
+        let rect = PhysicalRect::new(100.0, 100.0, 1000.0, 100.0);
+        let shadow = black_box_shadow(
+            rect,
+            PhysicalPoint::default(),
+            40.0,
+            0.0,
+            false,
+            CornerRadii::default(),
+        );
+        let runs = 3;
+
+        let mut new_surface = Surface::new(1200, 800, Color::WHITE);
+        let start = Instant::now();
+        for _ in 0..runs {
+            assert!(paint_box_shadow(
+                &mut new_surface,
+                &shadow,
+                PhysicalPoint::default(),
+                None,
+                None
+            ));
+        }
+        let new_elapsed = start.elapsed() / runs;
+
+        let mut old_surface = Surface::new(1200, 800, Color::WHITE);
+        let start = Instant::now();
+        for _ in 0..runs {
+            assert!(paint_box_shadow_analytic(
+                &mut old_surface,
+                &shadow,
+                PhysicalPoint::default(),
+                None,
+                None
+            ));
+        }
+        let old_elapsed = start.elapsed() / runs;
+
+        println!(
+            "box-shadow 1000x100 blur 40 on 1200x800: old analytic={old_elapsed:?}, new mask={new_elapsed:?}"
+        );
     }
 
     #[test]
