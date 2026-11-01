@@ -2014,6 +2014,7 @@ dependencies = [
  "encoding_rs",
  "entities",
  "fontdue",
+ "gif",
  "image",
  "render-css",
  "render-dom",

@@ -25,6 +25,7 @@ url = "2.5.4"
 
 [dev-dependencies]
 fontdue = "0.9.3"
+gif = "0.14.2"
 url = "2.5.4"
 
 [lints]

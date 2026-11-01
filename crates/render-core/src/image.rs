@@ -7,6 +7,7 @@
 
 #![allow(clippy::cast_precision_loss)]
 
+pub mod animation;
 pub mod inline_svg;
 pub mod svg;
 
@@ -19,6 +20,7 @@ use std::sync::Arc;
 use image_codec::{ImageFormat as CodecImageFormat, ImageReader};
 use url::Url;
 
+use self::animation::AnimatedImage;
 use crate::css::cascade::media_query_list_matches;
 use crate::css::computed::ComputedStyle;
 use crate::css::selector::MatchContext;
@@ -98,6 +100,11 @@ pub enum ImageSource {
     /// (installed through [`ImageResources::set_canvas_bitmap`]), not by a
     /// URL-keyed load.
     Canvas,
+    /// The rasterised viewport of the nested document an `<iframe>` displays,
+    /// installed through [`ImageResources::set_frame_bitmap`]. It is an image
+    /// resource like a canvas bitmap, so the same display command paints it,
+    /// but it belongs to the frame's own painting pipeline.
+    FrameDocument,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -383,7 +390,10 @@ pub fn image_key_is_current(dom: &Dom, document_url: &Url, key: &ImageResourceKe
     }
     // Presented video frames are owned by the video pipeline's lifecycle,
     // not by URL revalidation.
-    if matches!(key.source, ImageSource::VideoFrame | ImageSource::Canvas) {
+    if matches!(
+        key.source,
+        ImageSource::VideoFrame | ImageSource::Canvas | ImageSource::FrameDocument
+    ) {
         return false;
     }
     let Some(element) = html_element(dom, key.owner) else {
@@ -586,6 +596,9 @@ pub enum ImageDecodeError {
     DecodedBytesLimit { actual: usize, limit: usize },
     DimensionOverflow,
     PixelBufferLength { actual: usize, expected: usize },
+    FrameLimit { actual: usize, limit: usize },
+    EmptyAnimation,
+    UnsupportedAnimation(String),
     Codec(String),
 }
 
@@ -618,6 +631,16 @@ impl fmt::Display for ImageDecodeError {
                 formatter,
                 "decoded pixel buffer has {actual} pixels; expected {expected}"
             ),
+            Self::FrameLimit { actual, limit } => {
+                write!(
+                    formatter,
+                    "animation has at least {actual} frames; limit is {limit}"
+                )
+            }
+            Self::EmptyAnimation => formatter.write_str("animation contains no frames"),
+            Self::UnsupportedAnimation(format) => {
+                write!(formatter, "animation decoding is unsupported for {format}")
+            }
             Self::Codec(message) => write!(formatter, "image decode failed: {message}"),
         }
     }
@@ -626,7 +649,8 @@ impl fmt::Display for ImageDecodeError {
 impl Error for ImageDecodeError {}
 
 /// Decode one still image. Animated GIF/WebP inputs deliberately expose only
-/// the codec's first composited frame through this still-image API.
+/// the codec's first composited frame through this still-image API; use
+/// [`animation::decode_animation`] when the frame sequence is needed.
 ///
 /// # Errors
 ///
@@ -716,12 +740,39 @@ pub struct LoadedImage {
     pub id: ImageResourceId,
     pub key: ImageResourceKey,
     pub image: Arc<DecodedImage>,
+    /// The revision whose pixels a live surface presents. Decoded images are
+    /// immutable and leave this `None`; a nested document's rendered viewport
+    /// carries the child DOM revision so a display-list diff sees child-only
+    /// content changes.
+    pub content_revision: Option<DomRevision>,
+    /// The decoded frame sequence when the source is animated. `None` for
+    /// still resources. The first frame shares its pixel buffer with `image`.
+    pub animation: Option<Arc<AnimatedImage>>,
+}
+
+impl LoadedImage {
+    /// Bytes retained by this resource. An animation already includes its
+    /// first frame, which shares `image`'s allocation.
+    #[must_use]
+    pub fn decoded_bytes(&self) -> usize {
+        self.animation.as_ref().map_or_else(
+            || self.image.decoded_bytes(),
+            |animation| animation.decoded_bytes(),
+        )
+    }
 }
 
 /// The requested-URL component of a canvas bitmap's key. A canvas has no URL,
 /// so every bitmap carries this fixed one; the owner node tells them apart.
 fn canvas_bitmap_url() -> Url {
     Url::parse("about:canvas").expect("about:canvas is a valid URL")
+}
+
+/// The requested-URL component of a frame bitmap's key. A nested document's
+/// rendered viewport has no URL of its own here, so the iframe node tells the
+/// entries apart.
+fn frame_document_url() -> Url {
+    Url::parse("about:iframe").expect("about:iframe is a valid URL")
 }
 
 #[derive(Clone, Debug, Default)]
@@ -755,7 +806,12 @@ impl ImageResources {
         self.by_node_url
             .values()
             .find(|loaded| {
-                loaded.key.owner == node && matches!(loaded.key.source, ImageSource::VideoFrame)
+                loaded.key.owner == node && matches!(loaded.key.source, ImageSource::FrameDocument)
+            })
+            .or_else(|| {
+                self.by_node_url.values().find(|loaded| {
+                    loaded.key.owner == node && matches!(loaded.key.source, ImageSource::VideoFrame)
+                })
             })
             .or_else(|| {
                 self.by_node_url.values().find(|loaded| {
@@ -802,6 +858,15 @@ impl ImageResources {
         self.by_id.get(&id).map(Arc::as_ref)
     }
 
+    /// The decoded frame sequence attached to a resource, when it is animated.
+    #[must_use]
+    pub fn get_animation(&self, id: ImageResourceId) -> Option<&AnimatedImage> {
+        self.by_node_url
+            .values()
+            .find(|loaded| loaded.id == id)
+            .and_then(|loaded| loaded.animation.as_deref())
+    }
+
     /// Replace the image for one DOM node with a newly allocated resource ID.
     /// New IDs ensure display-list diffs observe same-node content changes.
     ///
@@ -814,15 +879,51 @@ impl ImageResources {
         image: DecodedImage,
         limits: ImageLimits,
     ) -> Result<ImageResourceId, ImageStoreError> {
+        self.insert_entry(key, Arc::new(image), None, limits)
+    }
+
+    /// Store a decoded animation while keeping its first frame as the ordinary
+    /// still bitmap in [`LoadedImage::image`].
+    ///
+    /// The document clock is deliberately not wired in this layer. Before each
+    /// paint, the coordinator should choose
+    /// [`AnimatedImage::frame_at`](animation::AnimatedImage::frame_at) at the
+    /// page's monotonic/document time and publish that frame through the
+    /// ordinary image-resource seam so display-list diffs and paint observe it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store-limit error without changing the existing resource.
+    pub fn insert_animated(
+        &mut self,
+        key: ImageResourceKey,
+        animation: AnimatedImage,
+        limits: ImageLimits,
+    ) -> Result<ImageResourceId, ImageStoreError> {
+        let image = animation.first_frame_image_arc();
+        self.insert_entry(key, image, Some(Arc::new(animation)), limits)
+    }
+
+    fn insert_entry(
+        &mut self,
+        key: ImageResourceKey,
+        image: Arc<DecodedImage>,
+        animation: Option<Arc<AnimatedImage>>,
+        limits: ImageLimits,
+    ) -> Result<ImageResourceId, ImageStoreError> {
         let map_key = (key.owner, key.requested_url.to_string());
+        let retained_bytes = animation.as_ref().map_or_else(
+            || image.decoded_bytes(),
+            |animation| animation.decoded_bytes(),
+        );
         let replaced_bytes = self
             .by_node_url
             .get(&map_key)
-            .map_or(0, |loaded| loaded.image.decoded_bytes());
+            .map_or(0, LoadedImage::decoded_bytes);
         let new_total = self
             .decoded_bytes
             .saturating_sub(replaced_bytes)
-            .checked_add(image.decoded_bytes())
+            .checked_add(retained_bytes)
             .ok_or(ImageStoreError::TotalDecodedBytesLimit {
                 actual: usize::MAX,
                 limit: limits.max_total_decoded_bytes,
@@ -845,13 +946,20 @@ impl ImageResources {
             .checked_add(1)
             .ok_or(ImageStoreError::IdentifierExhausted)?;
         let id = ImageResourceId(next);
-        let image = Arc::new(image);
         if let Some(previous) = self.by_node_url.remove(&map_key) {
             self.by_id.remove(&previous.id);
         }
         self.by_id.insert(id, Arc::clone(&image));
-        self.by_node_url
-            .insert(map_key, LoadedImage { id, key, image });
+        self.by_node_url.insert(
+            map_key,
+            LoadedImage {
+                id,
+                key,
+                image,
+                content_revision: None,
+                animation,
+            },
+        );
         self.next_id = next;
         self.decoded_bytes = new_total;
         Ok(id)
@@ -865,9 +973,7 @@ impl ImageResources {
             .cloned()?;
         let loaded = self.by_node_url.remove(&key)?;
         self.by_id.remove(&loaded.id);
-        self.decoded_bytes = self
-            .decoded_bytes
-            .saturating_sub(loaded.image.decoded_bytes());
+        self.decoded_bytes = self.decoded_bytes.saturating_sub(loaded.decoded_bytes());
         Some(loaded)
     }
 
@@ -924,6 +1030,57 @@ impl ImageResources {
         self.insert(key, bitmap, limits)
     }
 
+    /// Publish the rendered viewport of the nested document displayed by the
+    /// `<iframe>` element at `node`.
+    ///
+    /// The bitmap is composited into the iframe's content box by the ordinary
+    /// image display command, so the child document stays a separate surface:
+    /// its nodes never join the parent display list. Replacing the bitmap
+    /// allocates a new resource id, exactly as a canvas or video frame does, so
+    /// display-list diffs observe child-only content changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store-limit error without changing the existing bitmap.
+    pub fn set_frame_bitmap(
+        &mut self,
+        node: NodeId,
+        content_revision: DomRevision,
+        bitmap: DecodedImage,
+        limits: ImageLimits,
+    ) -> Result<ImageResourceId, ImageStoreError> {
+        self.remove_frame_bitmap(node);
+        let key = ImageResourceKey {
+            owner: node,
+            requested_url: frame_document_url(),
+            source_snapshot: String::new(),
+            source: ImageSource::FrameDocument,
+            selection_context: ImageSelectionContext::default(),
+        };
+        let map_key = (node, key.requested_url.to_string());
+        let id = self.insert(key, bitmap, limits)?;
+        if let Some(loaded) = self.by_node_url.get_mut(&map_key) {
+            loaded.content_revision = Some(content_revision);
+        }
+        Ok(id)
+    }
+
+    /// Drop the rendered viewport of the nested document displayed by the
+    /// `<iframe>` element at `node`.
+    pub fn remove_frame_bitmap(&mut self, node: NodeId) -> Option<LoadedImage> {
+        let map_key = self
+            .by_node_url
+            .iter()
+            .find(|((owner, _), loaded)| {
+                *owner == node && loaded.key.source == ImageSource::FrameDocument
+            })
+            .map(|((owner, url), _)| (*owner, url.clone()))?;
+        let loaded = self.by_node_url.remove(&map_key)?;
+        self.by_id.remove(&loaded.id);
+        self.decoded_bytes = self.decoded_bytes.saturating_sub(loaded.decoded_bytes());
+        Some(loaded)
+    }
+
     /// Drop the bitmap of the `<canvas>` element at `node`.
     pub fn remove_canvas_bitmap(&mut self, node: NodeId) -> Option<LoadedImage> {
         let map_key = self
@@ -933,9 +1090,7 @@ impl ImageResources {
             .map(|((owner, url), _)| (*owner, url.clone()))?;
         let loaded = self.by_node_url.remove(&map_key)?;
         self.by_id.remove(&loaded.id);
-        self.decoded_bytes = self
-            .decoded_bytes
-            .saturating_sub(loaded.image.decoded_bytes());
+        self.decoded_bytes = self.decoded_bytes.saturating_sub(loaded.decoded_bytes());
         Some(loaded)
     }
 
@@ -951,9 +1106,7 @@ impl ImageResources {
             .map(|((owner, url), _)| (*owner, url.clone()))?;
         let loaded = self.by_node_url.remove(&map_key)?;
         self.by_id.remove(&loaded.id);
-        self.decoded_bytes = self
-            .decoded_bytes
-            .saturating_sub(loaded.image.decoded_bytes());
+        self.decoded_bytes = self.decoded_bytes.saturating_sub(loaded.decoded_bytes());
         Some(loaded)
     }
 
