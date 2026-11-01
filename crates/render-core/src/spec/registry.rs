@@ -731,7 +731,11 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 `filter`, `backdrop-filter`, `mask-image`, `mix-blend-mode` and \
                 `clip-path` as a *shape* rather than a rectangle. `z-index` sorts \
                 block siblings only: flex and grid children are not sorted and the \
-                paint layer has no other notion of stacking level.",
+                paint layer has no other notion of stacking level. A retained \
+                banded compositor caches root segments and top-level translate/opacity \
+                layers; scrolling composites those bands and only rasterizes newly \
+                exposed bands. Fixed/sticky content, masks, non-normal blend modes and \
+                rotate/scale transforms still take the complete raster.",
         dependencies: &[LAYOUT],
         tests: PAINT_TESTS,
     },

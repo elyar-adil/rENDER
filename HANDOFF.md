@@ -1,3 +1,107 @@
+# 交接文档 (2026-11-01, 续六十三) — retained 分层 compositor 与 banded 滚动
+
+这一轮实现浏览器 compositor 的第一条完整路径：从 display list 提取 top-level
+layer tree、缓存 512px band、滚动时只合成已有 band，并新增 frame/raster 计数测试
+与 release 滚动 benchmark。没有站点特判。
+
+## 核心模型
+
+- 新增 `render-core/src/paint/compositor.rs`：
+  - `CompositorCache::from_display_list` 扫描 display list，提取 top-level
+    `PushStackingContext` 为 `CompositedLayer`；
+  - root 的普通 item 按 layer 边界切成 `RootSegment`，`LayerOp` 保持原绘制顺序，
+    所以 layer 后面的 root 内容不会错误地画到 layer 下面；
+  - 每个 segment/layer 的 surface 按 `DEFAULT_COMPOSITOR_BAND_HEIGHT = 512`
+    分带缓存；
+  - `render(viewport_origin)` 只栅格化与视口相交且未缓存的 band，其余 band 直接
+    合成；`viewport_origin` 只改变合成矩阵，不使 cache 失效；
+  - `CompositorStats { frames, bands_rasterized, last_frame_bands, cached_bands }`
+    供 frame 计数和测试。
+- 保守回退：sticky、viewport-space（fixed）item、`filter`/`mask`、非 `Normal`
+  blend mode、非 translation transform、top-level context 外有 open clip、或
+  band 宽度超过 8192px 时返回 `None`，浏览器继续走旧的完整 raster。
+- `raster.rs` 新增：
+  - `CpuRasterizer::rasterize_item_slice`：按 band viewport 和 item slice 栅格化；
+  - `composite_surface`：公开的 layer 合成入口；
+  - 整数 translation 的快速 blit（scroll 的常见情况），避免每像素双线性采样。
+
+## 浏览器接线
+
+- `PageRenderFrame` 新增 `compositor: Option<Arc<CompositorCache>>`；full render
+  构建 cache。
+- `PageState` 保存 `compositor`，导航/重置时清空。
+- `PageRenderPayload::CompositedScroll` 携带 `Arc<CompositorCache>`；
+  `schedule_page_render` 在 `prefer_retained_raster` 且 cache 存在时优先发送它，
+  否则退回 `RetainedRaster` 或完整 render。
+- `process_page_render` 的 composited 分支只调用 `compositor.render`，不跑
+  style/layout/display list。
+- 整帧仍写回 softbuffer；`display_list`/`paint_scene` 保持上一篇帧的值。
+
+## 测试
+
+`render-core/src/paint/compositor.rs` 5 个测试：
+
+- translated + 0.5 opacity layer 出现在正确位置并正确混色；
+- 2048px 页面首帧栅格化 2 个 band，16px 滚动新增 0 band，跳到 1400px 才新增
+  band；band 总数不超过 4；
+- 合成结果与完整 `CpuRasterizer::rasterize` 逐像素相等（含 root segment、
+  translated/opacity layer 和 layer 后内容）；
+- translated layer 不被未变换 bounds 裁掉；
+- viewport-space item（fixed）回退为 `None`。
+
+## Benchmark
+
+新增 `crates/render-browser/src/bin/render-scroll-bench.rs`，120 帧、16px/帧、
+800x600 视口、12,000px 文档、160 个彩色块和一个 translate+opacity layer：
+
+```
+cargo run --release -p render-browser --bin render-scroll-bench
+{"frames":"120","scroll_step_px":"16","viewport":"800x600",
+ "compositor_ms":"154.702","compositor_us_per_frame":"1289.2",
+ "full_raster_ms":"1414.183","full_raster_us_per_frame":"11784.9",
+ "initial_bands":"3","final_bands":"6","scroll_bands_rasterized":"3",
+ "scroll_frames_without_new_bands":"117"}
+```
+
+即 retained 路径约 **1.29ms/帧**，完整 raster 约 **11.78ms/帧**；117/120 帧
+没有新的 band 栅格化。
+
+## 验证
+
+```
+cargo test -p render-core --lib paint::compositor  5 passed, 0 failed
+cargo test -p render-browser --bin render-browser a_scroll_with_a_retained_compositor_uses_the_composited_payload
+                                                  1 passed, 0 failed
+cargo run --release -p render-browser --bin render-scroll-bench
+                                                  see benchmark above
+cargo test --workspace                            all crates passed, 0 failed
+cargo fmt --all --check                           clean
+cargo clippy ... --all-targets -- -D warnings     clean
+python tools/check_site_neutrality.py             0 blocking, 26 advisory
+```
+
+## 已知缺口
+
+- 没有独立 compositor 线程或 GPU 合成；所有工作仍在 render worker。
+- 只支持 translation transform；rotate/scale/skew 的 top-level layer 仍走完整
+  raster。
+- fixed/sticky 内容、filter/mask、非 Normal blend mode、ambient clip 都回退，
+  因此真实复杂页面可能仍使用完整 raster。
+- band cache 无上限/淘汰策略；超长页面会持续保留已访问 band，后续需要 residency
+  策略或视口外释放。
+- 合成器只处理 top-level stacking context；嵌套 context 由 band rasterizer 在
+  单个 band surface 内处理，可能有跨 band 的裁剪/合成边界问题。
+- 滚动帧没有独立的 frame timing 历史，只有 `CompositorStats` 计数和 benchmark。
+
+## 下一步
+
+- 支持 scale/rotate layer 与 fixed/sticky 的 retained 表示。
+- band residency/eviction 与多线程/GPU 合成。
+- 把 compositor 的 frame time 纳入 `render-perf` JSON 和 CI 滚动 benchmark。
+- 继续 RTL 块轴镜像、`scroll-state()`、`@starting-style`。
+
+---
+
 # 交接文档 (2026-11-01, 续六十二) — HTTP(S) webfont 取回、WOFF/WOFF2 解码与加载循环
 
 这一轮把上一轮的本地 webfont 路径推进到真正的网络循环：render worker 规划

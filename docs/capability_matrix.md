@@ -16,11 +16,11 @@ says so. `docs/visual_fidelity_gaps.md` is the working register; this file is th
 | --- | --- | --- |
 | `render-js` unit tests | 1,210 passed, 0 failed | 2026-11-01 |
 | `render-css` unit tests | 305 passed, 0 failed | 2026-11-01 |
-| `render-core` unit tests | 459 passed, 0 failed | 2026-11-01 |
+| `render-core` unit tests | 464 passed, 0 failed | 2026-11-01 |
 | `render-core` webfont integration tests | 2 passed, 0 failed | 2026-11-01 |
 | `render-layout` unit tests | 352 passed, 1 ignored | 2026-11-01 |
 | `render-browser` unit tests | 210 passed, 0 failed | 2026-11-01 |
-| `render-browser` app tests (binary) | 114 passed, 0 failed | 2026-11-01 |
+| `render-browser` app tests (binary) | 115 passed, 0 failed | 2026-11-01 |
 | `render-html` unit tests | 149 passed, 0 failed | 2026-10-22 |
 | `render-net` unit tests | 32 passed, 0 failed | 2026-10-22 |
 | `render-dom` unit tests | 78 passed, 0 failed | 2026-11-01 |
@@ -130,6 +130,17 @@ parsed and currently lays its contents out normally; skipping off-screen content
 `contain-intrinsic-size` are not implemented. Evidence: 5 exact-geometry tests in
 `solver/content_visibility_tests.rs`.
 
+**Retained compositor.** `CompositorCache` turns a display list into a small top-level layer
+tree: root segments preserve paint order, translate/opacity stacking contexts become layers, and
+each surface is divided into 512px bands. `render` only rasterizes bands that are not cached;
+scrolling changes the composite matrices, not the scene. The browser keeps the cache on the page
+and sends `CompositedScroll` payloads, so scrolling does not re-run style, layout or display-list
+building. Fixed/sticky content, filters, masks, non-normal blending and rotate/scale transforms
+still use the complete raster. Five core tests compare composited pixels with a full raster and
+pin band reuse; `cargo run --release -p render-browser --bin render-scroll-bench` reports
+**1.29ms/frame retained vs 11.78ms/frame full raster** with **117/120 frames rasterizing no new
+band** (800x600 viewport, 12,000px document, 16px scroll steps).
+
 **Table layout.** 47 tests. CSS 2.1 §17 including border-collapse conflict resolution, row groups,
 `colspan`/`rowspan`, `caption-side`, fixed layout, intrinsic widths. This is the single most-used
 feature in the corpus and it is the deepest suite in the tree.
@@ -194,7 +205,7 @@ Verified by grep, not inferred. Full discussion in the register's S30.
 | **Animations and transitions** | *Closed for the CSS surface.* `@keyframes`, `animation-*`, and CSS transitions are sampled by a browser-driven 16 ms timeline clock; keyframes inside `@media` are gated, while keyframes inside `@container` are global per CSS Conditional 5 §5.4. Multi-animation lists, reversing shortening and WAAPI edge cases remain partial. |
 | **Selection / Range** | Range is implemented (DOM §5): `Range`, `StaticRange`, `createRange`, the boundary-point and content algorithms, and live updates on every tree mutation. There is no `getSelection` selection state, so `getSelection()` reports an empty selection, and no caret position APIs |
 | **Shadow-scoped styling** | shadow trees, `attachShadow` and autonomous `customElements` exist; shadow-tree stylesheets are collected and isolated per tree, `:host`/`:host()`/`:host-context()`/`::slotted()` match, and `slotchange` fires. `::part()`, `:has-slotted()`, declarative shadow roots and `::slotted()::before/after` remain |
-| **Compositing** | there is no compositor. Every frame is one raster of the whole document, which is why scrolling cannot be cheap and why `position: fixed` cannot be a layer |
+| **Compositing** | **Partial.** `CompositorCache` builds a retained top-level layer tree from the display list: contiguous root segments preserve z-order, transform/opacity stacking contexts become layers, and every surface is cut into 512px bands. Scrolling composites cached bands through an integer-translation fast path and rasterizes only newly exposed bands. Fixed/sticky content, filters, masks, non-normal blend modes and non-translation transforms fall back to the complete raster. There is still no compositor thread; all work is on the render worker. Benchmark: 120 sixteen-pixel scroll frames, 800x600 viewport, 12,000px document: 1.29ms/frame retained vs 11.78ms/frame full raster, with 117/120 frames rasterizing no new band. |
 | **Bidi** | UAX #9 has zero occurrences, so right-to-left scripts lay out left-to-right. Correctly lower priority given the corpus, but recorded rather than left to be rediscovered |
 | **HTTP/2** | structurally rejected: a pooled connection leaves the pool while in use and is held for the whole request, so one connection carries one in-flight request. Multiplexing is the inverse |
 | Multi-column layout | `column-count`, `column-width`, `columns`, `column-gap`, `column-fill` and `column-span: all`: the flow is cut at line boundaries, and a block that a break crosses is split with `box-decoration-break: slice` | `column-rule` is not implemented; `column-span` applies to direct block children only |
