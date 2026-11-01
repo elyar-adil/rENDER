@@ -23,6 +23,7 @@ use render_css::properties::AspectRatio;
 use render_css::properties::BoxSizing;
 use render_css::properties::Clear;
 use render_css::properties::Containment;
+use render_css::properties::ContentVisibility;
 use render_css::properties::Display;
 use render_css::properties::DisplayInside;
 use render_css::properties::Float;
@@ -49,6 +50,7 @@ pub(super) fn establishes_block_formatting_context(style: Option<&ComputedStyle>
     // containment. Like `overflow: hidden`, that keeps an in-flow float's
     // height inside the box instead of letting it escape into the parent flow.
     declared_containment(style).establishes_independent_formatting_context()
+        || content_visibility_hidden(style)
         || style.is_some_and(|style| ContainerType::from_style(style) != ContainerType::Normal)
         || ["overflow-x", "overflow-y"].into_iter().any(|property| {
             matches!(
@@ -56,6 +58,15 @@ pub(super) fn establishes_block_formatting_context(style: Option<&ComputedStyle>
                 Some(TypedPropertyValue::Overflow(value)) if !matches!(value, Overflow::Visible)
             )
         })
+}
+
+pub(super) fn content_visibility_hidden(style: Option<&ComputedStyle>) -> bool {
+    matches!(
+        style.and_then(|style| style.typed("content-visibility")),
+        Some(TypedPropertyValue::ContentVisibility(
+            ContentVisibility::Hidden
+        ))
+    )
 }
 
 /// Whether a box applies block-axis size containment.
@@ -66,6 +77,7 @@ pub(super) fn establishes_block_formatting_context(style: Option<&ComputedStyle>
 pub(super) fn has_size_containment(style: Option<&ComputedStyle>) -> bool {
     declared_containment(style).contains_size()
         || style.is_some_and(|style| ContainerType::from_style(style) == ContainerType::Size)
+        || content_visibility_hidden(style)
 }
 
 /// Whether a box applies inline-axis size containment.
@@ -75,6 +87,7 @@ pub(super) fn has_size_containment(style: Option<&ComputedStyle>) -> bool {
 pub(super) fn has_inline_size_containment(style: Option<&ComputedStyle>) -> bool {
     declared_containment(style).contains_inline_size()
         || style.is_some_and(|style| ContainerType::from_style(style).supports_inline_axis())
+        || content_visibility_hidden(style)
 }
 
 /// Whether the principal box is a containing block for absolutely and fixed
@@ -83,7 +96,9 @@ pub(super) fn has_inline_size_containment(style: Option<&ComputedStyle>) -> bool
 /// positioned descendants (CSS Position 3 §2.1).
 pub(super) fn establishes_positioning_containing_block(style: Option<&ComputedStyle>) -> bool {
     let containment = declared_containment(style);
-    containment.has_layout_containment() || containment.has_paint_containment()
+    containment.has_layout_containment()
+        || containment.has_paint_containment()
+        || content_visibility_hidden(style)
 }
 
 /// Whether the box establishes a fixed positioning containing block.
@@ -96,7 +111,10 @@ pub(super) fn establishes_fixed_positioning_containing_block(
     style: Option<&ComputedStyle>,
 ) -> bool {
     let containment = declared_containment(style);
-    if containment.has_layout_containment() || containment.has_paint_containment() {
+    if containment.has_layout_containment()
+        || containment.has_paint_containment()
+        || content_visibility_hidden(style)
+    {
         return true;
     }
     let transform = matches!(
@@ -686,10 +704,18 @@ impl Solver<'_> {
                 specified_content_height.unwrap_or(0.0) + padding.vertical(),
             )
         };
-        let (flow_children, positioned_children): (Vec<_>, Vec<_>) = node
-            .children
-            .into_iter()
-            .partition(|child| !self.is_out_of_flow(*child));
+        let content_hidden = content_visibility_hidden(style);
+        let (flow_children, positioned_children): (Vec<_>, Vec<_>) = if content_hidden {
+            // CSS Containment 2 §4.1: `content-visibility: hidden` skips the
+            // element's contents entirely while keeping its own box. Size
+            // containment makes an `auto` content height zero, and no child
+            // fragments are produced, so nothing inside can paint.
+            (Vec::new(), Vec::new())
+        } else {
+            node.children
+                .into_iter()
+                .partition(|child| !self.is_out_of_flow(*child))
+        };
         // Vertical margin collapsing state shared by the block-flow branch.
         // A box's own top and bottom margins are replaced by the collapsed
         // groups they form with their first/last in-flow children, and an

@@ -251,6 +251,7 @@ impl PropertyRegistry {
             // starts with `none` so the containment helpers can read one
             // typed value without special-casing absence.
             ("contain", "none"),
+            ("content-visibility", "visible"),
         ] {
             registry.define(name, false, initial);
         }

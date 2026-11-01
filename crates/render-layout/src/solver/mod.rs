@@ -42,6 +42,8 @@ mod collapse_tests;
 #[cfg(test)]
 mod columns_tests;
 #[cfg(test)]
+mod content_visibility_tests;
+#[cfg(test)]
 mod linebreak_tests;
 #[cfg(test)]
 mod scrollport_tests;

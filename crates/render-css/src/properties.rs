@@ -975,6 +975,12 @@ keyword_enum!(TextAlign {
     Center => "center",
     Justify => "justify",
 });
+// CSS Containment 2 §4: `content-visibility`.
+keyword_enum!(ContentVisibility {
+    Visible => "visible",
+    Auto => "auto",
+    Hidden => "hidden",
+});
 // CSS Writing Modes 3 §2.1: the two-value grammar, `Inherited: yes`.
 keyword_enum!(Direction {
     Ltr => "ltr",
@@ -1435,6 +1441,7 @@ pub enum TypedPropertyValue {
     AlignContent(AlignContent),
     TextAlign(TextAlign),
     Direction(Direction),
+    ContentVisibility(ContentVisibility),
     WordBreak(WordBreak),
     LineBreak(LineBreak),
     Order(i32),
@@ -1496,6 +1503,7 @@ impl TypedPropertyValue {
             Self::AlignContent(_) => "align-content",
             Self::TextAlign(_) => "text-align",
             Self::Direction(_) => "direction",
+            Self::ContentVisibility(_) => "content-visibility",
             Self::WordBreak(_) => "word-break",
             Self::LineBreak(_) => "line-break",
             Self::Order(_) => "order",
@@ -1556,6 +1564,7 @@ impl TypedPropertyValue {
             Self::AlignContent(value) => value.as_str().to_owned(),
             Self::TextAlign(value) => value.as_str().to_owned(),
             Self::Direction(value) => value.as_str().to_owned(),
+            Self::ContentVisibility(value) => value.as_str().to_owned(),
             Self::WordBreak(value) => value.as_str().to_owned(),
             Self::LineBreak(value) => value.as_str().to_owned(),
             Self::Order(value) => value.to_string(),
@@ -1885,6 +1894,7 @@ pub const DECLARED_GRAMMARS: &[&str] = &[
     "align-content",
     "text-align",
     "direction",
+    "content-visibility",
     "word-break",
     "line-break",
     "order",
@@ -1985,6 +1995,8 @@ fn parse_property<'i>(
         }
         "text-align" => parse_keyword(input, TextAlign::parse).map(TypedPropertyValue::TextAlign),
         "direction" => parse_keyword(input, Direction::parse).map(TypedPropertyValue::Direction),
+        "content-visibility" => parse_keyword(input, ContentVisibility::parse)
+            .map(TypedPropertyValue::ContentVisibility),
         "word-break" => parse_keyword(input, WordBreak::parse).map(TypedPropertyValue::WordBreak),
         "line-break" => parse_keyword(input, LineBreak::parse).map(TypedPropertyValue::LineBreak),
         "order" => parse_integer(input).map(TypedPropertyValue::Order),
@@ -5051,6 +5063,20 @@ mod tests {
         assert_eq!(
             parse("color", "rgb(10 20 30 / 25%)").to_css(),
             "rgba(10, 20, 30, 0.25)"
+        );
+    }
+
+    #[test]
+    fn parses_content_visibility_keywords() {
+        assert_eq!(
+            parse("content-visibility", "hidden"),
+            TypedPropertyValue::ContentVisibility(super::ContentVisibility::Hidden)
+        );
+        assert_eq!(parse("content-visibility", "auto").to_css(), "auto");
+        assert!(
+            parse_typed_property("content-visibility", "collapse")
+                .expect("content-visibility is supported")
+                .is_err()
         );
     }
 

@@ -23,6 +23,7 @@ use crate::solver::Solver;
 use crate::solver::TextRun;
 use crate::solver::TextSpacing;
 use crate::solver::TextStyle;
+use crate::solver::block::content_visibility_hidden;
 use crate::solver::block::has_inline_size_containment;
 use crate::solver::block::inline_float_band;
 use crate::solver::is_word_separator;
@@ -1411,6 +1412,15 @@ impl<'a> Solver<'a> {
             });
             return;
         };
+        if content_visibility_hidden(
+            node.style_source
+                .and_then(|source| self.styles.get(&source)),
+        ) {
+            // `content-visibility: hidden` skips the element's contents
+            // (CSS Containment 2 §4.1); its own inline box has nothing to
+            // contribute to this inline formatting context.
+            return;
+        }
         if let FormattingNodeKind::Text(text) = node.kind {
             let typography = self.inline_text_style(node.style_source);
             let line_breaking = self.line_break_options(node.style_source);
@@ -1922,6 +1932,12 @@ impl<'a> Solver<'a> {
         let Some(node) = self.formatting.get(node_id).cloned() else {
             return;
         };
+        if content_visibility_hidden(
+            node.style_source
+                .and_then(|source| self.styles.get(&source)),
+        ) {
+            return;
+        }
         let typography = self.inline_text_style(node.style_source);
         let line_breaking = self.line_break_options(node.style_source);
         if let FormattingNodeKind::Text(text) = node.kind {
