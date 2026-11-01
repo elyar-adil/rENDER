@@ -1,3 +1,106 @@
+# 交接文档 (2026-11-02, 续六十八) — iframe/Selection、HTTP/2、提交饥饿修复、解释器与 raster 性能、HTML5 解析
+
+本轮针对“几乎所有网站慢/卡死”的实测诊断收口，全部无站点特判。主要提交：
+
+```text
+66f95b6 render-core: paint nested browsing contexts inside iframe boxes
+b55c3c1 render-core: render SVG use and symbol references
+d00d350 render-core: decode animated GIF and WebP sequences
+34aabf1 render-dom: implement live Selection APIs
+fa59543 render-html: close HTML tree construction defects
+b4ffb92 render-net: pool TLS HTTP/2 connections and multiplex fetches
+d12cf65 render-browser: commit completed frames without starvation
+e358cc4 render-browser: bound script batches by wall clock
+8451e60 render-js: share function code and cut call-path overhead
+0c0f7d0 render-core: rasterize box shadows through a separable blur mask
+d6c09a7 render-js: add immutable ArrayBuffer and transfer APIs
+```
+
+## 性能诊断结论
+
+对 Bilibili/Baidu/GitHub/Sina/Wikipedia/HN 的只读实测（`RENDER_DEBUG_FRAME=1 RENDER_STAGE_TIMING=1`）：
+
+- **提交饥饿是首要可见故障**：Bilibili 60s 内完成 15 次 full render，只提交 4 帧，屏幕长期停在 0.4–2.2s 的 pre-hydration 帧；13 张图片已解码但未上屏。GitHub/Sina 因此在 10–30s 仍显示裸 HTML。
+- **主线程 JS 无时间片**：Bilibili 三个批次约 19M 解释步 / 8s（约 2.3M steps/s）；Baidu 在一次 45s 运行中 5.1s 后静默 40s。单脚本上限 50M 步，在旧速度下可阻塞约 22s。
+- **资源整批屏障**：Bilibili 13 张图等 4.26s；Sina 119 张图等 5.14s，随后一次应用 488 张；所有 CSS/字体/脚本/图片都等整批。
+- **CPU stage**：Bilibili cascade 0.3–0.5s、raster 0.2–1.6s；Baidu raster 0.1–1.4s；GitHub/HN 证明轻页面 stage 不是问题。
+- 完整报告：`C:\Users\Elyar\AppData\Local\Temp\opencode\bilibili-diagnosis.md`。
+
+## 提交修复（P0）
+
+- `RenderIdentity` 增加 `document_serial`，导航前的帧不能装进新文档。
+- `RenderWorker::drain_latest` 每个 tab 返回**最新完成帧**，不再因有更新的 submitted generation 就丢弃。
+- `is_tab_busy` 覆盖 active、queued 和 completed-but-undrained；`worker_loop` 先发布完成帧、再清 active。
+- `about_to_wait` 先 `poll_render_worker`，再 recovery；避免 recovery 抢先提交新 job。
+- commit gate 接受中间完成帧，但要求 document serial、requested viewport、scroll position 一致，且 generation 不回退。`committed_render` 防止旧帧覆盖新帧。
+- 两个 wall-clock 预算：page pump 24ms/次、classic script batch 500ms 或 1024 turns 后把剩余工作交回 bounded pump。单脚本 turn 仍不可抢占。
+- 测试：worker 6/6；render-browser lib 231/231；app binary 117/117；新增 `a_completed_frame_is_not_hidden_by_a_newer_submission`、`completed_frames_commit_progressively_but_never_go_backwards`、`a_frame_from_a_replaced_document_never_commits`。
+
+## iframe painting
+
+- root-aware style/layout/display pipeline：`compute_document_styles_with_hints_from_root`、`build_formatting_tree_from_root`、root font size、presentational hints。
+- iframe 是 replaced element：默认 300×150、HTML width/height、CSS sizing、atomic inline、fallback children 不参与 formatting；UA `iframe { overflow:hidden }`。
+- 子文档按 content box 尺寸独立 style/layout/display/raster 到透明 surface，以 `ImageSource::FrameDocument` 安装；父 display list 只增加一条 sourced-from-iframe 的 image command。
+- 子文档脚本/realm/load 事件保持独立；子 DOM mutation 通过 `content_revision` 触发父帧重绘；嵌套 iframe 深度 8。
+- 测试 8/8：文本/像素只在 content box 内、默认与 HTML 尺寸、红块/绿背景/蓝边框/父黄底精确坐标、子脚本 mutation、递归 iframe、iframe hit test。
+- 截图：`.artifacts/iframe-srcdoc.png`，1770×1170，82,224 bytes；content box 与红块坐标见 `nested_browsing_contexts.rs`。
+
+## Selection / Range
+
+- `window.getSelection()` / `document.getSelection()` 每文档单例，复用 live `Range` 表；anchor/focus/offset/direction/type、`getRangeAt`、`addRange`、`removeAllRanges`、`collapse*`、`extend`、`setBaseAndExtent`、`selectAllChildren`、`deleteFromDocument`、`containsNode`、`toString`。
+- DOM mutation/remove/split 会 clamp；跨 realm/iframe 独立。测试 render-dom 90、render-js 1234。
+- 仍未接 selection highlight/caret 绘制、`selectionchange`/`selectstart`、`Selection.modify()`。
+
+## HTTP/2
+
+- 完整 RFC 9113 帧层 + RFC 7541 HPACK/Huffman + stream/flow-control + GOAWAY/RST + multiplexed dispatch。
+- transport：direct HTTPS 用 rustls ALPN `h2`；每 origin 一个 `Mutex<H2Connection>` 池；20ms 读锁切片；GOAWAY/EOF 驱逐并重连；HTTP/1.1 fallback；代理请求继续走 ureq CONNECT，绝不绕过代理。
+- 120KB response 跨 initial window；两路并发/out-of-order；TLS no-ALPN fallback；h2 32 测试、render-net 66。
+- 限制：h2 不经过代理、不处理 gzip/brotli（请求 identity）、请求 body >60KB 回退 HTTP/1.1、socket 字节级仍串行、无 server push/priority scheduler。
+
+## 解释器与 raster
+
+- `functions: Vec<Rc<UserFunction>>`、共享 `captured_environment: Rc<[Environment]>`；`call_user` 不再深拷贝函数体/AST/捕获环境。
+- `CallFrame` lazy label（只在 Error.stack/debug stack 时格式化）；缓存 `ActivationPlan`；`lookup_binding`/`assign_binding` 融合为一次作用域链扫描；suspended scope chain move 而非 clone。
+- release synthetic：small_calls 6.86M→13.39M steps/s（1.95×）、closure 3.65M→5.06M（1.39×）、large_body 8.41M→19.07M（2.27×）、object_churn 7.50M→10.08M（1.34×）；真实 109KB legacy polyfill bundle 约 13.6M steps/s。
+- box-shadow：per-pixel 16 sample → prepared rounded shape signed distance + cover mask + 3-pass separable box blur；1000×100 blur40 在 1200×800 上 release 12.93ms→8.89ms；debug 362ms→65ms。大 mask 16M 像素以上回退旧 analytic 路径。
+- SVG `<use>/<symbol>`：local fragment clone、symbol viewBox/preserveAspectRatio、继承、嵌套/环检测、诊断；74 svg + 16 inline svg 测试。
+- 动图：GIF/WebP 帧序列、disposal/blend、loop、frame_at；render-core 527/532 测试（动画自身 13 个）。尚未接 document clock 到 raster。
+
+## HTML5 解析
+
+- html5lib-only：3,247/3,549 (91.49%) → **3,541/3,549 (99.77%)**；全语料：6,602/7,377 (89.49%) → **7,196/7,377 (97.55%)**；engine defect 581 → 41，且无新增非通过。
+- 修复 button scope/paragraph closing、adoption agency、generic end tags、table insertion modes、tokenizer comment/EOF、NUL/CR、foreign content end tags、customizable select selectedcontent、quirks doctypes；`.dat` harness 修正。
+- 剩 41 engine defects：37 个是 pinned PI 期望与现行标准差异，4 个 scripted fixture。`render-html` 176 tests。
+
+## ArrayBuffer immutable/transfer
+
+- `BufferStore.immutable` + `TypedBuffer::new_immutable`；`immutable` getter、`transferToImmutable`、`sliceToImmutable`、`transfer`/`transferToFixedLength`/`resize`/`$262.detachArrayBuffer` 的 immutable 拒绝。
+- TypedArray 写入/set/fill/sort/copyWithin/reverse/map/filter/slice/from/of、DataView setter、Atomics 写、TextEncoder.encodeInto 都拒绝 immutable；structuredClone 保留 immutable。
+- Uint8Array scoped test262 **140/140**；render-js 1234/1234；clippy clean。全量 test262 未重跑，baseline 仍 90,965。
+
+## 验证
+
+```text
+cargo test -p render-browser --lib                         231 passed
+cargo test -p render-browser --bin render-browser           117 passed
+cargo test -p render-core --lib                             532 passed, 1 ignored
+cargo test -p render-core --lib paint::raster               31 passed, 1 ignored
+cargo clippy (8 crates) --all-targets -- -D warnings        clean
+cargo fmt --all --check                                     clean
+python tools/check_site_neutrality.py                       0 blocking, 26 advisory (312 files)
+render-html lib                                             176 passed
+render-net lib                                              66 passed
+render-js lib                                               1234 passed
+render-dom lib                                              90 passed
+html5lib-only                                               3541/3549 = 99.77%
+html5lib all                                                7196/7377 = 97.55%
+```
+
+已知未完成：提交饥饿修复后的真实站点复测（Bilibili/Baidu 截图与 wall time）尚未在最终 release binary 上重跑；资源整批屏障仍未改为逐项应用；动画仍可能触发 full render；selection 绘制、iframe 子节点坐标 hit test、HTTP/2 over proxy、JS 单脚本抢占仍是后续工作。
+
+---
+
 # 交接文档 (2026-11-01, 续六十七) — GPU 呈现、合成器扩展、RTL/逻辑属性、文本间距、SVG/字体/缓存/test262
 
 这一轮并行推进了十条战线，全部无站点特判：

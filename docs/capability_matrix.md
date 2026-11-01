@@ -14,23 +14,23 @@ says so. `docs/visual_fidelity_gaps.md` is the working register; this file is th
 
 | what | number | when |
 | --- | --- | --- |
-| `render-js` unit tests | 1,214 passed, 0 failed | 2026-11-01 |
+| `render-js` unit tests | 1,234 passed, 0 failed | 2026-11-02 |
 | `render-css` unit tests | 319 passed, 0 failed | 2026-11-01 |
-| `render-core` unit tests | 502 passed, 0 failed | 2026-11-01 |
+| `render-core` unit tests | 532 passed, 0 failed, 1 ignored | 2026-11-02 |
 | `render-core` webfont integration tests | 4 passed, 0 failed | 2026-11-01 |
 | `render-core` RTL layout integration tests | 2 passed, 0 failed | 2026-11-01 |
 | `render-layout` unit tests | 389 passed, 1 ignored | 2026-11-01 |
-| `render-browser` unit tests | 230 passed, 0 failed | 2026-11-01 |
-| `render-browser` app tests (binary) | 115 passed, 0 failed | 2026-11-01 |
-| `render-html` unit tests | 149 passed, 0 failed | 2026-10-22 |
-| `render-net` unit tests | 34 passed, 0 failed | 2026-11-01 |
-| `render-dom` unit tests | 78 passed, 0 failed | 2026-11-01 |
+| `render-browser` unit tests | 231 passed, 0 failed | 2026-11-02 |
+| `render-browser` app tests (binary) | 117 passed, 0 failed | 2026-11-02 |
+| `render-html` unit tests | 176 passed, 0 failed | 2026-11-02 |
+| `render-net` unit tests | 66 passed, 0 failed | 2026-11-02 |
+| `render-dom` unit tests | 90 passed, 0 failed | 2026-11-02 |
 | real-site acceptance harness | 25 passed, 5 `#[ignore]`s each mapped to a named gap | last recorded |
 | Python static gate | 15 passed, 55 subtests | last recorded |
-| site-neutrality gate | **9 rules, 297 Rust source files, exit 0** with 26 advisory findings | 2026-11-01 |
+| site-neutrality gate | **9 rules, 312 Rust source files, exit 0** with 26 advisory findings | 2026-11-02 |
 | **test262** | **90,965 / 103,199 = 88.15%**; 264 buckets, 8 timeout, 0 crash; checked-in baseline floor = 90,765 | **2026-11-01, release profile, pinned revision** |
-| **html5lib tree construction** | **5,810 / 7,377 pairs = 78.75%**; 190 acceptable difference, 776 unimplemented, **601 engine defect (8.15%)** | last recorded, pinned |
-| html5lib parse-error count agreement | **4,784 / 6,601 = 72.47%** under `max`, **60.60%** under `sum` - the gap between those two is the choice of reading, not the parser | last recorded |
+| **html5lib tree construction** | **7,196 / 7,377 pairs = 97.55%**; 140 acceptable difference, 0 unimplemented, **41 engine defect (0.56%)**; html5lib-only is **3,541 / 3,549 = 99.77%** with 8 defects | **2026-11-02, pinned revision** |
+| html5lib parse-error count agreement | **5,098 / 6,601 = 77.23%** under `max`, **63.93%** under `sum` - the gap between those two is the choice of reading, not the parser | **2026-11-02** |
 | **WPT `dom/`** | **32 / 297 executable = 10.8%**, 0 vacuous passes | last recorded, pinned `c7fdee80f3f1` |
 | **WPT `html/`** | **165 / 2,520 executable = 6.5%**, 31 errored, 0 vacuous passes | last recorded, pinned |
 | **WPT combined** | **197 / 2,817 = 7.0%** - 5,962 scored, 8,060 skipped, 1,684 with no assertion site at all | last recorded, pinned |
@@ -130,6 +130,56 @@ containment make the box independent, and no descendant fragments are produced. 
 parsed and currently lays its contents out normally; skipping off-screen content and
 `contain-intrinsic-size` are not implemented. Evidence: 5 exact-geometry tests in
 `solver/content_visibility_tests.rs`.
+
+**Nested browsing contexts.** A loaded iframe now has a real replaced box (300x150 default,
+HTML width/height, CSS sizing) and is painted as a clipped child document. The render
+pipeline is root-aware: style computation, presentational hints, the formatting tree, root
+font size, layout and the display list can start at a nested document root in the shared DOM
+arena. Each child renders at its iframe content-box size into a separate transparent surface,
+installed as an `ImageSource::FrameDocument`; the parent list gains one ordinary image command
+sourced from the iframe element, so child nodes never join the parent list. Child scripts and
+load events keep their own realm; a child-only DOM change carries its revision into the parent
+image command and repaints. Nested frames recurse to depth 8. The iframe box hit-tests as the
+iframe element (child coordinate mapping remains open), and a release-shell screenshot shows
+the child block/text at the exact parent coordinates.
+
+**Selection and Range.** `window.getSelection()` and `document.getSelection()` return one live
+`Selection` per document. `anchorNode`/`focusNode`/offsets, direction/type, `getRangeAt`,
+`addRange`, `removeAllRanges`, `collapse`, `collapseToStart/End`, `extend`,
+`setBaseAndExtent`, `selectAllChildren`, `deleteFromDocument`, `containsNode` and `toString`
+operate on the existing live `Range` table, so mutations clamp removed boundaries and text
+splits stay valid. Iframe realms have independent selections. Selection-highlight and caret
+painting plus `selectionchange`/`selectstart` and `Selection.modify()` remain open.
+
+**HTTP/2.** `render-net` now has a real HTTP/2 stack: RFC 9113 frame codec (DATA, HEADERS,
+CONTINUATION, PRIORITY, RST_STREAM, SETTINGS, PUSH_PROMISE, PING, GOAWAY, WINDOW_UPDATE),
+RFC 7541 HPACK plus the full Huffman table, stream lifecycle, flow-control accounting,
+multiplexed response dispatch and GOAWAY/RST handling. The transport connects direct HTTPS
+origins with rustls, requests ALPN `h2`, and pools one multiplexed connection per origin; a
+server that selects HTTP/1.1 is cached as HTTP/1.1-only and falls back to ureq. Proxied
+origins stay on the HTTP/1.1 CONNECT path so no request bypasses a proxy. Loopback TLS tests
+prove ALPN h2, two concurrent streams on one connection, out-of-order responses, a 120KB body
+beyond the initial window, GOAWAY eviction/reconnect, and HTTP/1.1 fallback. h2 bodies are
+assembled in memory and request bodies above 60KB use HTTP/1.1; h2 over proxies, server push
+and priority scheduling remain open.
+
+**Commit starvation and main-thread scheduling.** The render worker now drains the newest
+completed frame per tab even when a newer job is already queued. `is_tab_busy` includes queued
+and completed-but-undrained work; the event loop polls completed frames before recovery
+resubmits; and the commit gate accepts a frame only when its document serial, requested
+viewport and scroll position still apply and its generation is newer than the presented frame.
+This lets the first post-image/post-CSS frame reach the screen instead of being silently
+dropped behind a newer submission. Page pumping also has a 24ms wall-clock slice between
+turns, and the classic-script batch yields after 32ms/1024 turns so remaining work drains
+through the bounded pump. A single script turn is still not preemptible.
+
+**HTML tree construction.** The html5lib/WPT corpus is now **7,196/7,377 = 97.55%**
+(html5lib-only **3,541/3,549 = 99.77%**). Button scope and paragraph closing, adoption agency,
+generic end tags, table insertion modes, tokenizer comment/EOF states, NUL/CR handling,
+foreign-content end tags, customizable select `selectedcontent` and quirks doctypes were
+fixed, and the `.dat` harness no longer swallows attribute names beginning with `<`. The
+remaining 41 engine defects are 37 old processing-instruction expectations (the current
+standard emits PI nodes where the pinned suites expect comments) and 4 scripted fixtures.
 
 **Retained compositor.** `CompositorCache` turns a display list into a small top-level layer
 tree: root segments preserve paint order and are split by coordinate space, transform/opacity
@@ -333,7 +383,7 @@ session.
 **The first external numbers of any kind for CSS, HTML or DOM now exist**, from two pinned
 suites.
 
-- **Tree construction: 78.75%** of 7,377 (test, scripting-mode) pairs pass.
+- **Tree construction: 97.55%** of 7,377 (test, scripting-mode) pairs pass; 140 acceptable differences and 41 engine defects remain, and the html5lib-only corpus is **99.77%**.
 - **DOM and HTML: 7.0%** - 197 of 2,817 executable tests, with 5,962 scored and 8,060 skipped.
   Per area, `dom/` is **10.8%** and `html/` is **6.5%**.
 - **CSS still cannot be run at all**, and the reason is structural rather than a gap in the runner:
@@ -449,7 +499,7 @@ input. Tab/Shift-Tab walk the sequential focus order and every focus path fires
 history is exposed.
 
 **One measurement is deliberately not a claim.** The site-neutrality gate now has 9 rules, scans
-297 Rust source files, and **exits 0 with 26 advisory findings**. The blocking violations this
+312 Rust source files, and **exits 0 with 26 advisory findings**. The blocking violations this
 section used to record are gone; the advisories are site names in comments and diagnostic file
 names, and they are still reported so the vocabulary does not become invisible. A gate that reads
 as enforcement but has stopped detecting is worse than no gate, which is why the self-test runs
