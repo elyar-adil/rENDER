@@ -18,7 +18,9 @@ use super::cascade::{
     cascade_element_with_origins_indexed, media_query_list_matches,
 };
 use super::container::{StyleFeature, StyleQueryEnvironment, parse_container_names};
-use super::properties::{TypedPropertyValue, parse_typed_property};
+use super::properties::{
+    Direction, TypedPropertyValue, parse_typed_property, physical_longhand_for_logical,
+};
 use super::pseudo::{self, PseudoElement};
 use super::registered::{PropertyRegistration, RegisteredSyntax, SyntaxKind, SyntaxMultiplier};
 use super::selector::MatchContext;
@@ -159,26 +161,50 @@ impl PropertyRegistry {
             ("margin-right", "0px"),
             ("margin-bottom", "0px"),
             ("margin-left", "0px"),
+            ("margin-inline-start", "0px"),
+            ("margin-inline-end", "0px"),
+            ("margin-block-start", "0px"),
+            ("margin-block-end", "0px"),
             ("padding-top", "0px"),
             ("padding-right", "0px"),
             ("padding-bottom", "0px"),
             ("padding-left", "0px"),
+            ("padding-inline-start", "0px"),
+            ("padding-inline-end", "0px"),
+            ("padding-block-start", "0px"),
+            ("padding-block-end", "0px"),
             ("border-top-width", "medium"),
             ("border-right-width", "medium"),
             ("border-bottom-width", "medium"),
             ("border-left-width", "medium"),
+            ("border-inline-start-width", "medium"),
+            ("border-inline-end-width", "medium"),
+            ("border-block-start-width", "medium"),
+            ("border-block-end-width", "medium"),
             ("border-top-style", "none"),
             ("border-right-style", "none"),
             ("border-bottom-style", "none"),
             ("border-left-style", "none"),
+            ("border-inline-start-style", "none"),
+            ("border-inline-end-style", "none"),
+            ("border-block-start-style", "none"),
+            ("border-block-end-style", "none"),
             ("border-top-color", "currentcolor"),
             ("border-right-color", "currentcolor"),
             ("border-bottom-color", "currentcolor"),
             ("border-left-color", "currentcolor"),
+            ("border-inline-start-color", "currentcolor"),
+            ("border-inline-end-color", "currentcolor"),
+            ("border-block-start-color", "currentcolor"),
+            ("border-block-end-color", "currentcolor"),
             ("top", "auto"),
             ("right", "auto"),
             ("bottom", "auto"),
             ("left", "auto"),
+            ("inset-inline-start", "auto"),
+            ("inset-inline-end", "auto"),
+            ("inset-block-start", "auto"),
+            ("inset-block-end", "auto"),
             ("opacity", "1"),
             ("overflow-x", "visible"),
             ("overflow-y", "visible"),
@@ -445,14 +471,41 @@ impl ComputedStyle {
         let Ok(tokens) = tokenize(css, &ComputationLimits::default()) else {
             return;
         };
-        Arc::make_mut(&mut self.properties).insert(property.to_owned(), ComputedValue::new(tokens));
-        match parse_typed_property(property, css) {
-            Some(Ok(value)) => {
-                Arc::make_mut(&mut self.typed_properties).insert(property.to_owned(), value);
+        let value = ComputedValue::new(tokens);
+        let parsed = parse_typed_property(property, css);
+        // An animated logical longhand has to reach the physical slot layout
+        // reads, exactly as a cascaded one does. `direction` itself is never
+        // logical, so reading it before the mutation is safe even when the
+        // property being animated is `direction`.
+        let direction =
+            self.get("direction")
+                .map(ComputedValue::css_text)
+                .map_or(Direction::Ltr, |value| {
+                    if value.trim().eq_ignore_ascii_case("rtl") {
+                        Direction::Rtl
+                    } else {
+                        Direction::Ltr
+                    }
+                });
+        let physical = physical_longhand_for_logical(property, direction);
+        Arc::make_mut(&mut self.properties).insert(property.to_owned(), value.clone());
+        match parsed {
+            Some(Ok(typed)) => {
+                Arc::make_mut(&mut self.typed_properties)
+                    .insert(property.to_owned(), typed.clone());
+                if let Some(physical) = physical {
+                    Arc::make_mut(&mut self.typed_properties).insert(physical.to_owned(), typed);
+                }
             }
             _ => {
                 Arc::make_mut(&mut self.typed_properties).remove(property);
+                if let Some(physical) = physical {
+                    Arc::make_mut(&mut self.typed_properties).remove(physical);
+                }
             }
+        }
+        if let Some(physical) = physical {
+            Arc::make_mut(&mut self.properties).insert(physical.to_owned(), value);
         }
     }
 
@@ -1858,6 +1911,13 @@ fn compute_style_with_initials(
         }
     }
     drop(resolver);
+    resolve_logical_box_properties(
+        &mut properties,
+        &mut typed_properties,
+        &mut specified,
+        cascaded,
+        parent,
+    );
     invalid.extend(resolution_invalid);
 
     ComputedStyle {
@@ -1882,6 +1942,66 @@ fn compute_style_with_initials(
         specified: Arc::new(specified),
         initial: Some(Arc::clone(initials)),
         diagnostics: Arc::new(diagnostics),
+    }
+}
+
+/// Resolve logical box longhands onto the physical longhands layout reads.
+///
+/// CSS Logical Properties 1 makes a logical and a physical declaration name the
+/// same side of the box, so they are not independent properties that can each
+/// win their own mini-cascade. The cascade has already selected one winner per
+/// *name*; this pass compares the two winners' full cascade ranks and lets the
+/// higher-ranked declaration write the physical slot. That preserves source
+/// order and specificity in both directions:
+///
+/// ```text
+/// margin-left: 5px; margin-inline-start: 9px   -> 9px
+/// margin-inline-start: 9px; margin-left: 5px   -> 5px
+/// ```
+///
+/// `direction` is read after the property loop because it is inherited and may
+/// itself have been declared on this element. Only `horizontal-tb` is
+/// supported: the block axis is always top/bottom and `writing-mode` is not
+/// parsed, so no vertical mapping is attempted.
+fn resolve_logical_box_properties(
+    properties: &mut BTreeMap<String, ComputedValue>,
+    typed_properties: &mut BTreeMap<String, TypedPropertyValue>,
+    specified: &mut BTreeSet<String>,
+    cascaded: &CascadedStyle,
+    parent: Option<&ComputedStyle>,
+) {
+    let direction = properties
+        .get("direction")
+        .or_else(|| parent.and_then(|style| style.get("direction")))
+        .map(ComputedValue::css_text)
+        .map_or(Direction::Ltr, |value| {
+            if value.trim().eq_ignore_ascii_case("rtl") {
+                Direction::Rtl
+            } else {
+                Direction::Ltr
+            }
+        });
+    for (logical_name, logical_value) in cascaded.properties() {
+        let Some(physical_name) = physical_longhand_for_logical(logical_name, direction) else {
+            continue;
+        };
+        if let Some(physical_value) = cascaded.get(physical_name)
+            && !logical_value.outranks(physical_value)
+        {
+            continue;
+        }
+        let Some(computed) = properties.get(logical_name).cloned() else {
+            continue;
+        };
+        properties.insert(physical_name.to_owned(), computed);
+        if let Some(typed) = typed_properties.get(logical_name).cloned() {
+            typed_properties.insert(physical_name.to_owned(), typed);
+        } else {
+            typed_properties.remove(physical_name);
+        }
+        if specified.contains(logical_name) {
+            specified.insert(physical_name.to_owned());
+        }
     }
 }
 
@@ -3943,6 +4063,205 @@ mod tests {
                 .map(super::ComputedValue::css_text),
             Some("1"),
             "a higher-specificity normal declaration still beats the starting one"
+        );
+    }
+
+    /// Logical and physical declarations name the same side, so both the
+    /// inline start/end swap under RTL and the chosen value must be visible
+    /// through the physical longhand layout reads.
+    #[test]
+    fn logical_margins_resolve_to_the_direction_selected_physical_side() {
+        let output = parse_document("<!doctype html><div id='ltr'></div><div id='rtl'></div>");
+        let sheet = parse_stylesheet(
+            "#ltr, #rtl { margin-inline-start: 12px; margin-inline-end: 7px } \
+             #rtl { direction: rtl }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let text = |selector: &str, property: &str| {
+            styles[&target_id(&output.dom, selector)]
+                .get(property)
+                .map(super::ComputedValue::css_text)
+        };
+
+        assert_eq!(text("#ltr", "margin-left"), Some("12px"));
+        assert_eq!(text("#ltr", "margin-right"), Some("7px"));
+        assert_eq!(text("#rtl", "margin-right"), Some("12px"));
+        assert_eq!(text("#rtl", "margin-left"), Some("7px"));
+        // The logical longhands remain readable too, and the physical side
+        // they won is recorded as specified author intent.
+        assert_eq!(text("#rtl", "margin-inline-start"), Some("12px"));
+        assert!(
+            styles[&target_id(&output.dom, "#rtl")].specified("margin-right"),
+            "the winning logical declaration makes the physical side specified"
+        );
+    }
+
+    /// Physical and logical declarations compete as one property: the later
+    /// declaration wins whichever spelling it used, and specificity beats
+    /// source order as usual.
+    #[test]
+    fn physical_and_logical_box_declarations_compete_by_cascade_rank() {
+        let output = parse_document(
+            "<!doctype html>\
+             <div id='logical-last'></div>\
+             <div id='physical-last'></div>\
+             <div id='specific' class='side'></div>",
+        );
+        let sheet = parse_stylesheet(
+            "#logical-last { margin-left: 5px; margin-inline-start: 9px } \
+             #physical-last { margin-inline-start: 9px; margin-left: 5px } \
+             .side { padding-inline-start: 10px } \
+             #specific { padding-left: 4px }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let text = |selector: &str, property: &str| {
+            styles[&target_id(&output.dom, selector)]
+                .get(property)
+                .map(super::ComputedValue::css_text)
+        };
+
+        assert_eq!(
+            text("#logical-last", "margin-left"),
+            Some("9px"),
+            "a later logical declaration beats an earlier physical one"
+        );
+        assert_eq!(
+            text("#physical-last", "margin-left"),
+            Some("5px"),
+            "a later physical declaration beats an earlier logical one"
+        );
+        assert_eq!(
+            text("#specific", "padding-left"),
+            Some("4px"),
+            "the id selector's physical rule outranks the later class rule"
+        );
+    }
+
+    /// The logical shorthand families and border longhands feed the same
+    /// physical typed slots, preserving calc/percentage/em forms for the
+    /// length engine to resolve at layout time.
+    #[test]
+    fn logical_padding_inset_and_border_values_reach_physical_typed_properties() {
+        let output = parse_document("<!doctype html><div id='box'></div>");
+        let sheet = parse_stylesheet(
+            "#box { direction: rtl; \
+                    padding-inline: 1em 2%; \
+                    inset-block-start: calc(10% + 3px); \
+                    border-inline: 0.25rem solid blue; \
+                    margin-block: 1.5em auto }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let style = &styles[&target_id(&output.dom, "#box")];
+        let text = |property: &str| style.get(property).map(super::ComputedValue::css_text);
+
+        assert_eq!(text("padding-right"), Some("1em"));
+        assert_eq!(text("padding-left"), Some("2%"));
+        assert_eq!(text("top"), Some("calc(10% + 3px)"));
+        assert_eq!(text("border-right-width"), Some("0.25rem"));
+        assert_eq!(text("border-right-style"), Some("solid"));
+        assert_eq!(text("border-right-color"), Some("blue"));
+        assert_eq!(text("border-left-width"), Some("0.25rem"));
+        assert_eq!(text("margin-top"), Some("1.5em"));
+        assert_eq!(text("margin-bottom"), Some("auto"));
+        assert_eq!(
+            style.typed("padding-right"),
+            style.typed("padding-inline-start"),
+            "the physical slot carries the logical typed value"
+        );
+    }
+
+    /// Transition and animation sampling writes computed properties by name;
+    /// a logical name has to keep the physical slot in step too.
+    #[test]
+    fn an_animated_logical_property_updates_the_physical_slot() {
+        let output = parse_document("<!doctype html><div id='rtl'></div>");
+        let sheet = parse_stylesheet("#rtl { direction: rtl }");
+        let mut styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let style = styles
+            .get_mut(&target_id(&output.dom, "#rtl"))
+            .expect("the element has a computed style");
+        style.set_animated_property("margin-inline-start", "25px");
+
+        assert_eq!(
+            style
+                .get("margin-right")
+                .map(super::ComputedValue::css_text),
+            Some("25px")
+        );
+        assert_eq!(
+            style.typed("margin-right"),
+            style.typed("margin-inline-start")
+        );
+    }
+
+    /// A logical declaration that loses to a physical one must not leave its
+    /// value in the physical slot, and CSS-wide keywords resolve through the
+    /// logical longhand's own inheritance metadata.
+    #[test]
+    fn losing_logical_declarations_leave_the_physical_value_untouched() {
+        let output = parse_document("<!doctype html><div id='parent'><div id='child'></div></div>");
+        let sheet = parse_stylesheet(
+            "#parent { margin-left: 4px; margin-inline-start: 20px } \
+             #child { margin-inline-start: inherit; margin-left: 6px }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let text = |selector: &str, property: &str| {
+            styles[&target_id(&output.dom, selector)]
+                .get(property)
+                .map(super::ComputedValue::css_text)
+        };
+
+        assert_eq!(text("#parent", "margin-left"), Some("20px"));
+        assert_eq!(text("#child", "margin-left"), Some("6px"));
+        assert_eq!(
+            text("#child", "margin-inline-start"),
+            Some("20px"),
+            "inherit takes the parent's computed logical value"
         );
     }
 }

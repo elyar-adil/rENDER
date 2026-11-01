@@ -217,3 +217,240 @@ fn rtl_line_alignment_uses_the_band_left_by_a_right_float() {
     // right edge: 150 - 24 (three 8px Hebrew letters) = 126.
     assert_eq!(text.rect, PhysicalRect::new(126.0, 0.0, 24.0, 19.2));
 }
+
+/// `margin-inline-start` is `margin-left` under LTR and `margin-right` under
+/// RTL; the two spellings produce identical geometry on the same side.
+#[test]
+fn logical_and_physical_margins_produce_identical_ltr_and_rtl_geometry() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body>\
+           <div id='ltr'><div id='ltr-logical'></div><div id='ltr-physical'></div></div>\
+           <div id='rtl'><div id='rtl-logical'></div><div id='rtl-physical'></div></div>\
+         </body>",
+        &format!(
+            "{RESET} #ltr, #rtl {{ width:200px; height:40px }} \
+             #ltr-logical, #rtl-logical {{ width:50px; height:10px; margin-inline-start:12px }} \
+             #ltr-physical {{ width:50px; height:10px; margin-left:12px }} \
+             #rtl-physical {{ width:50px; height:10px; margin-right:12px }} \
+             #rtl {{ direction:rtl }}"
+        ),
+        400.0,
+    );
+    let dom = &output.dom;
+
+    assert_eq!(
+        rect(&layout, find(dom, "#ltr-logical")),
+        PhysicalRect::new(12.0, 0.0, 50.0, 10.0)
+    );
+    assert_eq!(
+        rect(&layout, find(dom, "#ltr-physical")),
+        PhysicalRect::new(12.0, 10.0, 50.0, 10.0)
+    );
+    // RTL inline-start is the right edge: 200 - 12 - 50.
+    assert_eq!(
+        rect(&layout, find(dom, "#rtl-logical")),
+        PhysicalRect::new(138.0, 40.0, 50.0, 10.0)
+    );
+    assert_eq!(
+        rect(&layout, find(dom, "#rtl-physical")),
+        PhysicalRect::new(138.0, 50.0, 50.0, 10.0)
+    );
+}
+
+/// The logical padding shorthand feeds the physical padding edges layout uses,
+/// and the content box shrinks by exactly those used values.
+#[test]
+fn logical_padding_shorthand_maps_to_the_physical_edges() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body>\
+           <div id='ltr'><div id='ltr-inner'></div></div>\
+           <div id='rtl'><div id='rtl-inner'></div></div>\
+         </body>",
+        &format!(
+            "{RESET} #ltr, #rtl {{ box-sizing:border-box; width:100px; height:30px; \
+                 padding-inline-start:10px; padding-inline-end:20px }} \
+             #ltr-inner, #rtl-inner {{ height:10px }} \
+             #rtl {{ direction:rtl }}"
+        ),
+        400.0,
+    );
+    let dom = &output.dom;
+    for (parent, selector, left_padding) in
+        [("#ltr", "#ltr-inner", 10.0), ("#rtl", "#rtl-inner", 20.0)]
+    {
+        let parent_geometry = match &fragment(&layout, find(dom, parent)).kind {
+            FragmentKind::Box(geometry) => geometry,
+            FragmentKind::Text(_) => panic!("expected a box fragment"),
+        };
+        assert_eq!(parent_geometry.padding.left, left_padding, "{parent}");
+        assert_eq!(
+            parent_geometry.padding.right,
+            30.0 - left_padding,
+            "{parent}"
+        );
+        assert_eq!(
+            parent_geometry.content_rect.size.width, 70.0,
+            "{parent} content box excludes both paddings"
+        );
+        let geometry = match &fragment(&layout, find(dom, selector)).kind {
+            FragmentKind::Box(geometry) => geometry,
+            FragmentKind::Text(_) => panic!("expected a box fragment"),
+        };
+        assert_eq!(
+            geometry.content_rect.size.width, 70.0,
+            "{selector} fills the content box"
+        );
+        assert_eq!(
+            rect(&layout, find(dom, selector)).origin.x,
+            left_padding,
+            "{selector} starts after the used left padding"
+        );
+    }
+}
+
+/// `inset-inline-*` and `inset-block-*` are the same used insets as
+/// `left`/`right` and `top`/`bottom` for positioned layout.
+#[test]
+fn logical_insets_feed_positioned_layout_in_both_directions() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body>\
+           <div id='ltr-cb'><div id='ltr-box'></div><div id='ltr-end'></div></div>\
+           <div id='rtl-cb'><div id='rtl-box'></div><div id='rtl-end'></div></div>\
+         </body>",
+        &format!(
+            "{RESET} #ltr-cb, #rtl-cb {{ position:relative; width:200px; height:100px }} \
+             #ltr-cb, #ltr-box, #ltr-end {{ direction:ltr }} \
+             #rtl-cb {{ direction:rtl }} \
+             #ltr-box, #rtl-box {{ position:absolute; width:40px; height:10px; \
+                 inset-inline-start:10px; inset-block-start:20px }} \
+             #ltr-end {{ position:absolute; width:20px; height:10px; \
+                 inset-inline-end:15px; inset-block-end:5px }} \
+             #rtl-end {{ position:absolute; width:20px; height:10px; \
+                 inset-inline-end:15px; inset-block-end:5px }}"
+        ),
+        400.0,
+    );
+    let dom = &output.dom;
+
+    assert_eq!(
+        rect(&layout, find(dom, "#ltr-box")),
+        PhysicalRect::new(10.0, 20.0, 40.0, 10.0)
+    );
+    // RTL inline-start is the right inset: 200 - 10 - 40. The second
+    // containing block starts 100px down the page.
+    assert_eq!(
+        rect(&layout, find(dom, "#rtl-box")),
+        PhysicalRect::new(150.0, 120.0, 40.0, 10.0)
+    );
+    // LTR inline-end is right: 200 - 15 - 20; block-end is bottom: 100 - 5 - 10.
+    assert_eq!(
+        rect(&layout, find(dom, "#ltr-end")),
+        PhysicalRect::new(165.0, 85.0, 20.0, 10.0)
+    );
+    // RTL inline-end is left: 15 from the left edge, in the second containing
+    // block.
+    assert_eq!(
+        rect(&layout, find(dom, "#rtl-end")),
+        PhysicalRect::new(15.0, 185.0, 20.0, 10.0)
+    );
+}
+
+/// Logical border longhands set the physical border edges, including the
+/// direction-selected start/end swap, without changing the content width.
+#[test]
+fn logical_borders_affect_physical_geometry_and_follow_direction() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body>\
+           <div id='ltr'></div><div id='rtl'></div>\
+         </body>",
+        &format!(
+            "{RESET} #ltr, #rtl {{ width:100px; height:10px; \
+                 border-inline-start:3px solid; border-inline-end:7px solid; \
+                 border-block-start:4px solid; border-block-end:2px solid }} \
+             #rtl {{ direction:rtl }}"
+        ),
+        400.0,
+    );
+    let dom = &output.dom;
+    for (selector, left, right) in [("#ltr", 3.0, 7.0), ("#rtl", 7.0, 3.0)] {
+        let geometry = match &fragment(&layout, find(dom, selector)).kind {
+            FragmentKind::Box(geometry) => geometry,
+            FragmentKind::Text(_) => panic!("expected a box fragment"),
+        };
+        assert_eq!(geometry.border.left, left, "{selector}");
+        assert_eq!(geometry.border.right, right, "{selector}");
+        // The block axis is top/bottom in horizontal-tb and does not swap for
+        // RTL.
+        assert_eq!(geometry.border.top, 4.0, "{selector}");
+        assert_eq!(geometry.border.bottom, 2.0, "{selector}");
+        assert_eq!(geometry.content_rect.size.width, 100.0, "{selector}");
+        assert_eq!(
+            geometry.border_rect().size.width,
+            110.0,
+            "{selector} outer width includes both borders"
+        );
+        assert_eq!(
+            geometry.border_rect().size.height,
+            16.0,
+            "{selector} outer height includes both block borders"
+        );
+    }
+}
+
+/// Logical values go through the same length engine as physical ones:
+/// percentages against the containing block, calc/em against font size, rem
+/// against the root font size, and viewport units against the viewport.
+#[test]
+fn logical_values_resolve_percentages_calc_em_rem_and_viewport_units() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body>\
+           <div id='pct-ltr'><div id='pct-box'></div></div>\
+           <div id='pct-rtl'><div id='pct-rtl-box'></div></div>\
+           <div id='units'></div>\
+           <div id='cb'><div id='inset'></div></div>\
+         </body>",
+        &format!(
+            "{RESET} #pct-ltr, #pct-rtl {{ width:200px; height:10px }} \
+             #pct-box, #pct-rtl-box {{ width:50px; height:10px; margin-inline-start:10% }} \
+             #pct-rtl {{ direction:rtl }} \
+             #units {{ width:100px; height:10px; font-size:10px; \
+                 margin-inline-start:5vw; \
+                 border-inline-start:0.5rem solid; \
+                 padding-inline-start:calc(1em + 2px) }} \
+             #cb {{ position:relative; width:200px; height:100px; direction:rtl }} \
+             #inset {{ position:absolute; inset-inline-start:calc(25% + 2px); \
+                 width:40px; height:10px }}"
+        ),
+        400.0,
+    );
+    let dom = &output.dom;
+
+    assert_eq!(
+        rect(&layout, find(dom, "#pct-box")),
+        PhysicalRect::new(20.0, 0.0, 50.0, 10.0),
+        "10% of a 200px containing block"
+    );
+    assert_eq!(
+        rect(&layout, find(dom, "#pct-rtl-box")),
+        PhysicalRect::new(130.0, 10.0, 50.0, 10.0),
+        "RTL maps inline-start to the right: 200 - 20 - 50"
+    );
+    // 5vw of 400 = 20; rem borders are 8px (16px root); calc(1em + 2px)
+    // is 12px (10px font). The content box stays 100px wide, so the border
+    // rect is 100 + 12 padding + 8 border = 120px.
+    let units = match &fragment(&layout, find(dom, "#units")).kind {
+        FragmentKind::Box(geometry) => geometry,
+        FragmentKind::Text(_) => panic!("expected a box fragment"),
+    };
+    assert_eq!(rect(&layout, find(dom, "#units")).origin.x, 20.0);
+    assert_eq!(units.border.left, 8.0);
+    assert_eq!(units.padding.left, 12.0);
+    assert_eq!(units.content_rect.size.width, 100.0);
+    assert_eq!(units.border_rect().size.width, 120.0);
+    // 25% of 200 + 2 = 52 from the RTL start (right) edge. The containing
+    // block starts 30px down after the three preceding 10px boxes.
+    assert_eq!(
+        rect(&layout, find(dom, "#inset")),
+        PhysicalRect::new(108.0, 30.0, 40.0, 10.0)
+    );
+}

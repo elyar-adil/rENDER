@@ -192,9 +192,28 @@ pub struct CascadedValue {
     pub layer: Option<LayerName>,
     pub specificity: Specificity,
     pub source_order: u64,
+    /// The complete cascade rank of the declaration that produced this value.
+    ///
+    /// Logical and physical box properties name the same side of a box, so
+    /// resolving one onto the other after the per-property cascade is only
+    /// correct if the two winners can still be compared as if they had been
+    /// candidates for the same property. Keeping the rank here is what lets
+    /// computed-value resolution do that without a second cascade pass.
+    priority: Priority,
 }
 
 impl CascadedValue {
+    /// Whether this declaration outranks `other` in the cascade.
+    ///
+    /// The comparison is the full CSS Cascade rank the candidate selection
+    /// itself used, including layer order, specificity and source order, so
+    /// a logical declaration written later beats an earlier physical one and
+    /// the reverse holds too.
+    #[must_use]
+    pub(crate) fn outranks(&self, other: &Self) -> bool {
+        self.priority > other.priority
+    }
+
     /// Whether a declaration from the document produced this value, rather
     /// than the user agent's own styling.
     ///
@@ -860,6 +879,7 @@ fn cascade_element_with_origins_impl(
                         layer: rule.layer.clone(),
                         specificity,
                         source_order,
+                        priority,
                     };
                     candidates.entry(name).or_default().push(Candidate {
                         priority,
@@ -918,6 +938,7 @@ fn cascade_element_with_origins_impl(
                     layer: None,
                     specificity: ua_specificity,
                     source_order,
+                    priority,
                 },
                 layer_key: None,
             });
@@ -959,6 +980,7 @@ fn cascade_element_with_origins_impl(
                     layer: None,
                     specificity: inline_specificity,
                     source_order,
+                    priority,
                 },
                 layer_key: None,
             });
@@ -1809,14 +1831,39 @@ fn expanded_declaration(name: &str, value: &str) -> Vec<(String, String)> {
     if matches!(name, "margin" | "padding") {
         return expand_box_shorthand(name, value);
     }
+    if matches!(
+        name,
+        "margin-inline"
+            | "margin-block"
+            | "padding-inline"
+            | "padding-block"
+            | "inset-inline"
+            | "inset-block"
+    ) {
+        return expand_logical_pair_shorthand(name, value);
+    }
+    if matches!(name, "border-inline" | "border-block") {
+        return expand_border_axis_shorthand(name, value);
+    }
     match name {
         "border" => expand_border_shorthand(value),
-        "border-top" | "border-right" | "border-bottom" | "border-left" => {
-            expand_border_side_shorthand(name, value)
-        }
-        "border-width" | "border-style" | "border-color" => {
-            expand_border_part_shorthand(name, value)
-        }
+        "border-top"
+        | "border-right"
+        | "border-bottom"
+        | "border-left"
+        | "border-inline-start"
+        | "border-inline-end"
+        | "border-block-start"
+        | "border-block-end" => expand_border_side_shorthand(name, value),
+        "border-width"
+        | "border-style"
+        | "border-color"
+        | "border-inline-width"
+        | "border-inline-style"
+        | "border-inline-color"
+        | "border-block-width"
+        | "border-block-style"
+        | "border-block-color" => expand_border_part_shorthand(name, value),
         "font" => expand_font_shorthand(value)
             .unwrap_or_else(|| vec![(name.to_owned(), value.to_owned())]),
         "text-decoration" => expand_text_decoration_shorthand(value),
@@ -2399,6 +2446,73 @@ fn expand_box_shorthand(name: &str, value: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Expand the two-value logical shorthands `margin-inline`, `margin-block`,
+/// `padding-inline`, `padding-block`, `inset-inline` and `inset-block`.
+///
+/// The grammar is `<value>{1,2}`: one value sets both sides, two set start and
+/// end. The physical side is deliberately *not* chosen here; equality with a
+/// physical declaration later in the sheet is decided after `direction` is
+/// known, by comparing the cascade ranks of the two longhand winners.
+fn expand_logical_pair_shorthand(name: &str, value: &str) -> Vec<(String, String)> {
+    let (start, end) = match name {
+        "margin-inline" => ("margin-inline-start", "margin-inline-end"),
+        "margin-block" => ("margin-block-start", "margin-block-end"),
+        "padding-inline" => ("padding-inline-start", "padding-inline-end"),
+        "padding-block" => ("padding-block-start", "padding-block-end"),
+        "inset-inline" => ("inset-inline-start", "inset-inline-end"),
+        "inset-block" => ("inset-block-start", "inset-block-end"),
+        _ => return vec![(name.to_owned(), value.to_owned())],
+    };
+    if css_wide_keyword(value).is_some() {
+        return vec![
+            (start.to_owned(), value.to_owned()),
+            (end.to_owned(), value.to_owned()),
+        ];
+    }
+    let values: Vec<&str> = split_css_components(value);
+    if values.is_empty() || values.len() > 2 {
+        return vec![(name.to_owned(), value.to_owned())];
+    }
+    let start_value = values[0];
+    let end_value = values.get(1).copied().unwrap_or(start_value);
+    vec![
+        (start.to_owned(), start_value.to_owned()),
+        (end.to_owned(), end_value.to_owned()),
+    ]
+}
+
+/// Expand `border-inline` / `border-block`, which apply one border shorthand
+/// to both sides of a logical axis.
+fn expand_border_axis_shorthand(name: &str, value: &str) -> Vec<(String, String)> {
+    let prefixes = match name {
+        "border-inline" => ["border-inline-start", "border-inline-end"],
+        "border-block" => ["border-block-start", "border-block-end"],
+        _ => return vec![(name.to_owned(), value.to_owned())],
+    };
+    if css_wide_keyword(value).is_some() {
+        return prefixes
+            .into_iter()
+            .flat_map(|prefix| {
+                ["width", "style", "color"]
+                    .into_iter()
+                    .map(move |suffix| (format!("{prefix}-{suffix}"), value.to_owned()))
+            })
+            .collect();
+    }
+    let components: Vec<_> = split_css_components(value)
+        .into_iter()
+        .map(classify_border_component)
+        .collect();
+    if components.is_empty() {
+        return vec![(name.to_owned(), value.to_owned())];
+    }
+    let mut result = Vec::new();
+    for prefix in prefixes {
+        push_border_longhands(&mut result, prefix, &components);
+    }
+    result
+}
+
 /// One component of a `border*` shorthand classified per CSS 2.1 §8.5:
 /// the three value slots are order-independent and at most one of each kind
 /// may appear.
@@ -2459,6 +2573,16 @@ fn push_border_longhands(
 }
 
 fn expand_border_shorthand(value: &str) -> Vec<(String, String)> {
+    if css_wide_keyword(value).is_some() {
+        return ["top", "right", "bottom", "left"]
+            .into_iter()
+            .flat_map(|edge| {
+                ["width", "style", "color"]
+                    .into_iter()
+                    .map(move |suffix| (format!("border-{edge}-{suffix}"), value.to_owned()))
+            })
+            .collect();
+    }
     let components: Vec<_> = split_css_components(value)
         .into_iter()
         .map(classify_border_component)
@@ -2474,6 +2598,12 @@ fn expand_border_shorthand(value: &str) -> Vec<(String, String)> {
 }
 
 fn expand_border_side_shorthand(name: &str, value: &str) -> Vec<(String, String)> {
+    if css_wide_keyword(value).is_some() {
+        return ["width", "style", "color"]
+            .into_iter()
+            .map(|suffix| (format!("{name}-{suffix}"), value.to_owned()))
+            .collect();
+    }
     let components: Vec<_> = split_css_components(value)
         .into_iter()
         .map(classify_border_component)
@@ -2491,6 +2621,25 @@ fn expand_border_part_shorthand(name: &str, value: &str) -> Vec<(String, String)
         return vec![(name.to_owned(), value.to_owned())];
     };
     let values: Vec<&str> = split_css_components(value);
+    let logical_prefixes = suffix
+        .strip_prefix("inline-")
+        .map(|suffix| ("border-inline-start", "border-inline-end", suffix))
+        .or_else(|| {
+            suffix
+                .strip_prefix("block-")
+                .map(|suffix| ("border-block-start", "border-block-end", suffix))
+        });
+    if let Some((start, end, suffix)) = logical_prefixes {
+        if values.is_empty() || values.len() > 2 {
+            return vec![(name.to_owned(), value.to_owned())];
+        }
+        let start_value = values[0];
+        let end_value = values.get(1).copied().unwrap_or(start_value);
+        return vec![
+            (format!("{start}-{suffix}"), start_value.to_owned()),
+            (format!("{end}-{suffix}"), end_value.to_owned()),
+        ];
+    }
     if values.is_empty() || values.len() > 4 {
         return vec![(name.to_owned(), value.to_owned())];
     }
@@ -4384,6 +4533,66 @@ mod tests {
         );
         assert_eq!(style.get("border-top-width"), None);
         assert_eq!(style.get("border-top-color"), None);
+    }
+
+    #[test]
+    fn logical_box_shorthands_expand_to_logical_longhands() {
+        let (dom, target) = document_and_target();
+        let sheet = parse_stylesheet(
+            "#target { \
+                margin-inline: 1px 2px; margin-block: 3px; \
+                padding-inline: 4px; padding-block: 5px 6px; \
+                inset-inline: 7px 8px; inset-block: 9px; \
+                border-inline: 10px solid red; \
+                border-block: 1px dashed green; border-block-width: thin thick; \
+             }",
+        );
+        let style = cascade_element(
+            &dom,
+            target,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+        let value = |name: &str| style.get(name).map(|value| value.value.as_str());
+
+        assert_eq!(value("margin-inline-start"), Some("1px"));
+        assert_eq!(value("margin-inline-end"), Some("2px"));
+        assert_eq!(value("margin-block-start"), Some("3px"));
+        assert_eq!(value("margin-block-end"), Some("3px"));
+        assert_eq!(value("padding-inline-start"), Some("4px"));
+        assert_eq!(value("padding-inline-end"), Some("4px"));
+        assert_eq!(value("padding-block-start"), Some("5px"));
+        assert_eq!(value("padding-block-end"), Some("6px"));
+        assert_eq!(value("inset-inline-start"), Some("7px"));
+        assert_eq!(value("inset-inline-end"), Some("8px"));
+        assert_eq!(value("inset-block-start"), Some("9px"));
+        assert_eq!(value("inset-block-end"), Some("9px"));
+        // `border-inline` applies the full side shorthand to both sides, and
+        // an omitted style is reset to `none` rather than inherited from a
+        // previous declaration.
+        for side in ["start", "end"] {
+            assert_eq!(value(&format!("border-inline-{side}-width")), Some("10px"));
+            assert_eq!(value(&format!("border-inline-{side}-style")), Some("solid"));
+            assert_eq!(value(&format!("border-inline-{side}-color")), Some("red"));
+        }
+        assert_eq!(value("border-block-start-width"), Some("thin"));
+        assert_eq!(value("border-block-end-width"), Some("thick"));
+        assert_eq!(value("border-block-start-style"), Some("dashed"));
+        assert_eq!(value("border-block-end-style"), Some("dashed"));
+        assert_eq!(value("border-block-start-color"), Some("green"));
+        assert_eq!(value("border-block-end-color"), Some("green"));
+
+        // A single CSS-wide keyword expands across every longhand instead of
+        // being classified as a border color.
+        let wide = super::expand_shorthand("border-inline", "inherit");
+        assert_eq!(wide.len(), 6);
+        assert!(wide.iter().all(|(_, value)| value == "inherit"));
+        let wide_side = super::expand_shorthand("border-inline-start", "inherit");
+        assert_eq!(wide_side.len(), 3);
+        assert!(wide_side.iter().all(|(_, value)| value == "inherit"));
     }
 
     #[test]

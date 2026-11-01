@@ -1938,26 +1938,50 @@ pub const DECLARED_GRAMMARS: &[&str] = &[
     "right",
     "bottom",
     "left",
+    "inset-inline-start",
+    "inset-inline-end",
+    "inset-block-start",
+    "inset-block-end",
     "margin-top",
     "margin-right",
     "margin-bottom",
     "margin-left",
+    "margin-inline-start",
+    "margin-inline-end",
+    "margin-block-start",
+    "margin-block-end",
     "padding-top",
     "padding-right",
     "padding-bottom",
     "padding-left",
+    "padding-inline-start",
+    "padding-inline-end",
+    "padding-block-start",
+    "padding-block-end",
     "border-top-width",
     "border-right-width",
     "border-bottom-width",
     "border-left-width",
+    "border-inline-start-width",
+    "border-inline-end-width",
+    "border-block-start-width",
+    "border-block-end-width",
     "border-top-style",
     "border-right-style",
     "border-bottom-style",
     "border-left-style",
+    "border-inline-start-style",
+    "border-inline-end-style",
+    "border-block-start-style",
+    "border-block-end-style",
     "border-top-color",
     "border-right-color",
     "border-bottom-color",
     "border-left-color",
+    "border-inline-start-color",
+    "border-inline-end-color",
+    "border-block-start-color",
+    "border-block-end-color",
     "border-spacing",
     "border-collapse",
     "empty-cells",
@@ -2000,6 +2024,103 @@ pub const DECLARED_GRAMMARS: &[&str] = &[
     "transform",
     "transform-origin",
 ];
+
+/// Every logical box longhand this engine maps onto a physical longhand, with
+/// its physical target under `direction: ltr` and `direction: rtl`.
+///
+/// The block axis is top/bottom because this engine lays out `horizontal-tb`
+/// only. A vertical writing mode would need a `writing-mode` declaration (which
+/// this slice does not parse) and would make the block axis the inline axis, so
+/// it is deliberately out of scope rather than silently approximated.
+pub const LOGICAL_LONGHANDS: &[(&str, &str, &str)] = &[
+    ("margin-inline-start", "margin-left", "margin-right"),
+    ("margin-inline-end", "margin-right", "margin-left"),
+    ("margin-block-start", "margin-top", "margin-top"),
+    ("margin-block-end", "margin-bottom", "margin-bottom"),
+    ("padding-inline-start", "padding-left", "padding-right"),
+    ("padding-inline-end", "padding-right", "padding-left"),
+    ("padding-block-start", "padding-top", "padding-top"),
+    ("padding-block-end", "padding-bottom", "padding-bottom"),
+    ("inset-inline-start", "left", "right"),
+    ("inset-inline-end", "right", "left"),
+    ("inset-block-start", "top", "top"),
+    ("inset-block-end", "bottom", "bottom"),
+    (
+        "border-inline-start-width",
+        "border-left-width",
+        "border-right-width",
+    ),
+    (
+        "border-inline-end-width",
+        "border-right-width",
+        "border-left-width",
+    ),
+    (
+        "border-block-start-width",
+        "border-top-width",
+        "border-top-width",
+    ),
+    (
+        "border-block-end-width",
+        "border-bottom-width",
+        "border-bottom-width",
+    ),
+    (
+        "border-inline-start-style",
+        "border-left-style",
+        "border-right-style",
+    ),
+    (
+        "border-inline-end-style",
+        "border-right-style",
+        "border-left-style",
+    ),
+    (
+        "border-block-start-style",
+        "border-top-style",
+        "border-top-style",
+    ),
+    (
+        "border-block-end-style",
+        "border-bottom-style",
+        "border-bottom-style",
+    ),
+    (
+        "border-inline-start-color",
+        "border-left-color",
+        "border-right-color",
+    ),
+    (
+        "border-inline-end-color",
+        "border-right-color",
+        "border-left-color",
+    ),
+    (
+        "border-block-start-color",
+        "border-top-color",
+        "border-top-color",
+    ),
+    (
+        "border-block-end-color",
+        "border-bottom-color",
+        "border-bottom-color",
+    ),
+];
+
+/// The physical longhand a logical box property resolves to for
+/// `horizontal-tb` text in `direction`.
+///
+/// This is the single mapping rule shared by computed-style resolution and the
+/// tests that pin it. `direction: rtl` swaps only the inline axis; the block
+/// axis remains top/bottom. Returns `None` for every property that is not a
+/// supported logical box longhand.
+#[must_use]
+pub fn physical_longhand_for_logical(property: &str, direction: Direction) -> Option<&'static str> {
+    let is_rtl = matches!(direction, Direction::Rtl);
+    LOGICAL_LONGHANDS.iter().find_map(|&(logical, ltr, rtl)| {
+        (logical == property).then_some(if is_rtl { rtl } else { ltr })
+    })
+}
 
 /// Parse a supported layout-facing property. `None` means that this slice does
 /// not yet claim the property's grammar; `Some(Err(_))` means the property is
@@ -2051,6 +2172,10 @@ fn parse_property<'i>(
         | "border-right-color"
         | "border-bottom-color"
         | "border-left-color"
+        | "border-inline-start-color"
+        | "border-inline-end-color"
+        | "border-block-start-color"
+        | "border-block-end-color"
         | "text-decoration-color" => parse_color(input).map(TypedPropertyValue::Color),
         "display" => parse_display(input).map(TypedPropertyValue::Display),
         "position" => parse_keyword(input, Position::parse).map(TypedPropertyValue::Position),
@@ -2114,16 +2239,40 @@ fn parse_property<'i>(
         "top" | "right" | "bottom" | "left" => {
             parse_auto_length_percentage(input, false).map(TypedPropertyValue::Inset)
         }
+        "inset-inline-start" | "inset-inline-end" | "inset-block-start" | "inset-block-end" => {
+            parse_auto_length_percentage(input, false).map(TypedPropertyValue::Inset)
+        }
         "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
+            parse_auto_length_percentage(input, false).map(TypedPropertyValue::Margin)
+        }
+        "margin-inline-start" | "margin-inline-end" | "margin-block-start" | "margin-block-end" => {
             parse_auto_length_percentage(input, false).map(TypedPropertyValue::Margin)
         }
         "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => {
             parse_length_percentage(input, true).map(TypedPropertyValue::Padding)
         }
+        "padding-inline-start"
+        | "padding-inline-end"
+        | "padding-block-start"
+        | "padding-block-end" => {
+            parse_length_percentage(input, true).map(TypedPropertyValue::Padding)
+        }
         "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => {
             parse_border_width(input).map(TypedPropertyValue::BorderWidth)
         }
+        "border-inline-start-width"
+        | "border-inline-end-width"
+        | "border-block-start-width"
+        | "border-block-end-width" => {
+            parse_border_width(input).map(TypedPropertyValue::BorderWidth)
+        }
         "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => {
+            parse_keyword(input, BorderStyle::parse).map(TypedPropertyValue::BorderStyle)
+        }
+        "border-inline-start-style"
+        | "border-inline-end-style"
+        | "border-block-start-style"
+        | "border-block-end-style" => {
             parse_keyword(input, BorderStyle::parse).map(TypedPropertyValue::BorderStyle)
         }
         "border-collapse" => {
@@ -6607,6 +6756,71 @@ mod tests {
             parse_typed_property("caption-side", "inline")
                 .expect("supported")
                 .is_err()
+        );
+    }
+
+    /// Every logical box longhand has a grammar, and every one maps to exactly
+    /// the physical side CSS Logical Properties 1 assigns it in `horizontal-tb`.
+    #[test]
+    fn logical_box_longhands_parse_and_map_to_physical_sides() {
+        use super::{Direction, LOGICAL_LONGHANDS, physical_longhand_for_logical};
+
+        assert_eq!(LOGICAL_LONGHANDS.len(), 24);
+        for &(logical, ltr_target, rtl_target) in LOGICAL_LONGHANDS {
+            assert_eq!(
+                physical_longhand_for_logical(logical, Direction::Ltr),
+                Some(ltr_target),
+                "{logical} ltr"
+            );
+            assert_eq!(
+                physical_longhand_for_logical(logical, Direction::Rtl),
+                Some(rtl_target),
+                "{logical} rtl"
+            );
+            let value = if logical.ends_with("-style") {
+                "solid"
+            } else if logical.ends_with("-color") {
+                "red"
+            } else {
+                "1px"
+            };
+            assert_eq!(parse(logical, value).kind(), {
+                if logical.starts_with("border-") {
+                    if logical.ends_with("-style") {
+                        "border-style"
+                    } else if logical.ends_with("-color") {
+                        "color"
+                    } else {
+                        "border-width"
+                    }
+                } else if logical.starts_with("inset-") {
+                    "inset"
+                } else if logical.starts_with("padding-") {
+                    "padding"
+                } else {
+                    "margin"
+                }
+            });
+        }
+
+        // The families accept their property-specific value grammars rather
+        // than a shared "any length" fallback.
+        assert_eq!(parse("margin-inline-start", "auto").to_css(), "auto");
+        assert_eq!(parse("inset-block-end", "calc(10% + 2px)").kind(), "inset");
+        assert_eq!(parse("border-inline-end-width", "thick").to_css(), "thick");
+        assert_eq!(
+            parse("border-block-start-style", "dashed").to_css(),
+            "dashed"
+        );
+        assert_eq!(
+            parse("border-inline-start-color", "red").to_css(),
+            "rgb(255, 0, 0)"
+        );
+        assert!(
+            parse_typed_property("padding-inline-end", "-1px")
+                .expect("supported")
+                .is_err(),
+            "padding cannot be negative"
         );
     }
 }
