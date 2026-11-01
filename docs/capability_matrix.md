@@ -15,9 +15,9 @@ says so. `docs/visual_fidelity_gaps.md` is the working register; this file is th
 | what | number | when |
 | --- | --- | --- |
 | `render-js` unit tests | 1,116 passed, 0 failed | 2026-10-22 |
-| `render-css` unit tests | 303 passed, 0 failed | 2026-11-01 |
+| `render-css` unit tests | 304 passed, 0 failed | 2026-11-01 |
 | `render-core` unit tests | 456 passed, 0 failed | 2026-11-01 |
-| `render-layout` unit tests | 347 passed, 1 ignored | 2026-11-01 |
+| `render-layout` unit tests | 352 passed, 1 ignored | 2026-11-01 |
 | `render-browser` unit tests | 206 passed, 0 failed | 2026-11-01 |
 | `render-browser` app tests (binary) | 114 passed, 0 failed | 2026-11-01 |
 | `render-html` unit tests | 149 passed, 0 failed | 2026-10-22 |
@@ -118,6 +118,13 @@ and atomic inlines participate as U+FFFC objects. Evidence: 12 exact-geometry te
 `solver/bidi_tests.rs`. Not implemented: UAX #9 L3/L4 (combining marks and mirroring),
 `unicode-bidi` embeddings/isolates, per-inline-element `direction`, block-axis RTL mirroring,
 `dir=auto`, and complex-script shaping.
+
+**Content visibility.** `content-visibility: hidden` keeps the element's own box but skips
+its contents: size containment makes an `auto` content height zero, layout and paint
+containment make the box independent, and no descendant fragments are produced. `auto` is
+parsed and currently lays its contents out normally; skipping off-screen content and
+`contain-intrinsic-size` are not implemented. Evidence: 5 exact-geometry tests in
+`solver/content_visibility_tests.rs`.
 
 **Table layout.** 47 tests. CSS 2.1 §17 including border-collapse conflict resolution, row groups,
 `colspan`/`rowspan`, `caption-side`, fixed layout, intrinsic widths. This is the single most-used

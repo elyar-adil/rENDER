@@ -1,3 +1,75 @@
+# 交接文档 (2026-11-01, 续五十九) — `content-visibility: hidden`
+
+这一轮补齐 CSS Containment 2 §4 的 `content-visibility: hidden`：元素保留自己的
+盒子（背景/边框/尺寸），但内容完全不布局、不生成 fragment、不绘制；同时把该属性
+接入 typed 属性系统。没有站点特判。
+
+## 属性与包含
+
+- `render-css/src/properties.rs` 新增 `ContentVisibility::{Visible,Auto,Hidden}`、
+  `TypedPropertyValue::ContentVisibility`、grammar 与序列化。
+- `render-css/src/computed.rs` 将 `content-visibility` 注册为 non-inherited、
+  initial `visible`，因此它进入 typed computed map，而不是只停留在 token 层。
+- `render-layout/src/solver/block.rs`：
+  - `content_visibility_hidden(style)` 读取 typed 值；
+  - `hidden` 时跳过整个 flow/positioned 子树（`children = []`），
+    `auto_height = 0`；
+  - `has_size_containment` / `has_inline_size_containment` 加入 hidden，
+    因此 `content-visibility: hidden` 的自动尺寸按 size containment 处理；
+  - `establishes_block_formatting_context`、absolute/fixed containing block
+    也按 layout/paint containment 处理；
+  - 指定的 `height` 仍然生效，只有 auto 内容高度被清零。
+- `render-layout/src/solver/inline.rs`：原子/文本收集遇到
+  `content-visibility: hidden` 的元素时跳过其子树，因此行内元素也不会贡献文本。
+- `content-visibility: auto` 目前按普通内容布局（屏外跳过是后续优化），
+  `contain-intrinsic-size` 尚未实现。
+
+## 测试
+
+新增 `crates/render-layout/src/solver/content_visibility_tests.rs`，5 个精确几何
+测试：
+
+- hidden 盒子保留 border+padding，auto 内容高度 0，后续兄弟从 30px 开始；
+- hidden 的指定 height 80px 保留；
+- hidden 子树没有 child fragment / 文本 fragment；
+- hidden 子树中的 absolute 后代也不生成 fragment；
+- `auto` 仍正常布局并绘制内容；
+- 行内 hidden 元素的文本从行内容中消失（`aa` + hidden `bb` + `cc` = `aacc`）。
+
+另有 `render-css` 的 `parses_content_visibility_keywords`。
+
+## 验证
+
+```
+cargo test -p render-layout --lib                 352 passed, 1 ignored
+cargo test -p render-css --lib                    304 passed, 0 failed
+cargo test -p render-core --lib                   456 passed, 0 failed
+cargo test --workspace                            all crates passed, 0 failed
+cargo fmt --all --check                           clean
+cargo clippy -p render-css -p render-layout -p render-core \
+  --all-targets -- -D warnings                    clean
+python tools/check_site_neutrality.py             0 blocking, 26 advisory
+```
+
+## 已知缺口
+
+- `content-visibility: auto` 的屏外跳过需要 viewport intersection、可重入布局和
+  scroll 触发的 relayout；当前 auto 永远渲染内容，正确但无性能收益。
+- `contain-intrinsic-size` 未实现；hidden 的 auto 尺寸固定为 0，即使作者提供
+  placeholder size。
+- `content-visibility` 的 style containment（counter/quotes 隔离）无消费者，
+  因为该引擎还没有 counters/quotes。
+- 可访问性树/文本选择仍不应看到 hidden 内容；这两条路径尚未实现，因此目前只验证
+  布局与绘制 fragment。
+
+## 下一步
+
+- `content-visibility: auto` 与 `contain-intrinsic-size`。
+- `color-scheme` 属性与 per-element `light-dark()`。
+- 继续 RTL 块轴镜像、scroll-state、`@starting-style`。
+
+---
+
 # 交接文档 (2026-11-01, 续五十八) — `direction: rtl`、UAX #9 行级 BiDi 与 RTL 对齐
 
 这一轮补齐水平书写模式下的 RTL / 双向文本基础：`direction` 成为 typed 继承属性，

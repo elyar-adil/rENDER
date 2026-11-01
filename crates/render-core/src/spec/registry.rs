@@ -644,6 +644,10 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 CSS Writing Modes 3 `direction` and UAX #9 line reordering are implemented \
                 for horizontal writing modes: paragraph level, visual level runs, odd-run \
                 reversal, start/end alignment, RTL text-indent, and the HTML `dir` attribute. \
+                `content-visibility: hidden` keeps the element's box, applies size, layout \
+                and paint containment, and omits every descendant fragment; `content-visibility: \
+                auto` currently lays its contents out normally, without off-screen skipping \
+                or `contain-intrinsic-size`. \
                 Not implemented: `column-rule`, `unicode-bidi` embeddings and isolates, \
                 per-inline-element `direction`, UAX #9 L3/L4 (combining marks and mirroring), \
                 Arabic/Indic shaping, `dir=auto`, block-axis RTL mirroring, and scrolling \
