@@ -900,6 +900,7 @@ impl<'a> Builder<'a> {
         let coordinate_space =
             fragment_coordinate_space(style, parent_space, self.fixed_is_viewport(fragment.source));
         let current_color = self.current_color(style);
+        let palette = self.palette_for(style);
         let opacity = fragment_opacity(style);
         // Transforms are anchored to the border box: percentages in the
         // transform list and the default transform-origin resolve against
@@ -953,7 +954,7 @@ impl<'a> Builder<'a> {
         let mask = css_mask_image(
             style,
             border_rect,
-            self.options.palette,
+            palette,
             current_color,
             font_size,
             self.fragments.viewport,
@@ -1200,15 +1201,27 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// The palette for an element's used color scheme.
+    ///
+    /// `color-scheme: normal` keeps the page color scheme; an explicit support
+    /// list resolves against the page preference (CSS Color Adjustment 1
+    /// §2.3). System colors and `light-dark()` both read this palette.
+    fn palette_for(&self, style: Option<&ComputedStyle>) -> SystemPalette {
+        let preferred_dark = self.options.palette.dark;
+        let used_dark = match style.and_then(|style| style.typed("color-scheme")) {
+            Some(TypedPropertyValue::ColorScheme(value)) => value.used_dark(preferred_dark),
+            _ => preferred_dark,
+        };
+        self.options.palette.for_scheme(used_dark)
+    }
+
     fn current_color(&self, style: Option<&ComputedStyle>) -> Color {
-        style.and_then(|style| typed_color(style, "color")).map_or(
-            self.options.palette.canvas_text,
-            |color| {
-                self.options
-                    .palette
-                    .resolve(color, self.options.palette.canvas_text)
-            },
-        )
+        let palette = self.palette_for(style);
+        style
+            .and_then(|style| typed_color(style, "color"))
+            .map_or(palette.canvas_text, |color| {
+                palette.resolve(color, palette.canvas_text)
+            })
     }
 
     fn paint_box(
@@ -1219,16 +1232,11 @@ impl<'a> Builder<'a> {
         current_color: Color,
         coordinate_space: PaintCoordinateSpace,
     ) {
+        let palette = self.palette_for(style);
         let (background_rect, background_space) =
             self.background_rect(fragment, geometry, coordinate_space);
         let radii = corner_radii(style, background_rect);
-        for shadow in box_shadows(
-            style,
-            geometry.border_rect(),
-            radii,
-            current_color,
-            self.options.palette,
-        ) {
+        for shadow in box_shadows(style, geometry.border_rect(), radii, current_color, palette) {
             let bounds = shadow_bounds(&shadow);
             self.push(
                 fragment,
@@ -1253,7 +1261,7 @@ impl<'a> Builder<'a> {
         }
         if let Some(background) = style
             .and_then(|style| typed_color(style, "background-color"))
-            .map(|color| self.options.palette.resolve(color, current_color))
+            .map(|color| palette.resolve(color, current_color))
             && background.alpha > 0
         {
             self.push(
@@ -1277,7 +1285,7 @@ impl<'a> Builder<'a> {
                 DisplayCommand::PopClip,
             );
         }
-        let border = border_paint(style, geometry, current_color, self.options.palette);
+        let border = border_paint(style, geometry, current_color, palette);
         if border.widths.horizontal() > 0.0 || border.widths.vertical() > 0.0 {
             self.push(
                 fragment,
@@ -1330,7 +1338,7 @@ impl<'a> Builder<'a> {
                 parse_background_gradient(
                     layer,
                     area,
-                    self.options.palette,
+                    self.palette_for(Some(style)),
                     current_color,
                     style_font_size(style),
                     self.fragments.viewport,
@@ -1566,6 +1574,7 @@ impl<'a> Builder<'a> {
         current_color: Color,
         coordinate_space: PaintCoordinateSpace,
     ) {
+        let palette = self.palette_for(style);
         let run = self.shaper.shape_font(
             &text.text,
             &text.font.request(),
@@ -1585,7 +1594,7 @@ impl<'a> Builder<'a> {
             });
             return;
         }
-        for layer in text_shadows(style, current_color, self.options.palette) {
+        for layer in text_shadows(style, current_color, palette) {
             let shadow = TextShadowPaint {
                 run: fragment.id.as_u32(),
                 font: run.font,
@@ -1662,7 +1671,7 @@ impl<'a> Builder<'a> {
                 _ => None,
             })
             .map_or(current_color, |color| {
-                self.options.palette.resolve(color, current_color)
+                self.palette_for(style).resolve(color, current_color)
             });
         let line_style = decoration_style(style);
         let thickness = decoration_thickness(style, font_size);
@@ -1738,7 +1747,7 @@ impl<'a> Builder<'a> {
             return;
         };
         let font_size = style_font_size(style);
-        let color = self.options.palette.resolve(
+        let color = self.palette_for(Some(style)).resolve(
             typed_color(style, "color").unwrap_or(CssColor::CurrentColor),
             current_color,
         );

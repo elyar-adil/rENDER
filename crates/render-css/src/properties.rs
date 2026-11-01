@@ -981,6 +981,88 @@ keyword_enum!(ContentVisibility {
     Auto => "auto",
     Hidden => "hidden",
 });
+
+/// One supported color scheme keyword. `<custom-ident>` values are retained
+/// for serialization but are not interpreted by this engine, as required by
+/// CSS Color Adjustment 1 §2.2.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ColorSchemeName {
+    Light,
+    Dark,
+    Custom(String),
+}
+
+impl ColorSchemeName {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Light => "light",
+            Self::Dark => "dark",
+            Self::Custom(value) => value,
+        }
+    }
+}
+
+/// The computed value of CSS Color Adjustment 1 §2.2 `color-scheme`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ColorSchemeValue {
+    Normal,
+    Supported {
+        schemes: Vec<ColorSchemeName>,
+        /// The `only` keyword: the UA may not override the element's scheme.
+        /// This engine has no overriding preference yet, but the flag is
+        /// retained for serialization and future use.
+        only: bool,
+    },
+}
+
+impl ColorSchemeValue {
+    #[must_use]
+    pub fn to_css(&self) -> String {
+        match self {
+            Self::Normal => "normal".to_owned(),
+            Self::Supported { schemes, only } => {
+                let mut parts = Vec::with_capacity(schemes.len() + usize::from(*only));
+                if *only {
+                    parts.push("only");
+                }
+                parts.extend(schemes.iter().map(ColorSchemeName::as_str));
+                parts.join(" ")
+            }
+        }
+    }
+
+    /// Resolve the used color scheme for this element.
+    ///
+    /// `preferred_dark` is the page color scheme's preference. Only `light` and
+    /// `dark` are schemes this engine supports; an unknown `<custom-ident>` is
+    /// ignored. If neither is present, the UA default (light) is used. `only`
+    /// does not change the result without an overriding preference, but is
+    /// preserved in the value.
+    #[must_use]
+    pub fn used_dark(&self, preferred_dark: bool) -> bool {
+        let Self::Supported { schemes, .. } = self else {
+            return preferred_dark;
+        };
+        let supports_light = schemes
+            .iter()
+            .any(|scheme| matches!(scheme, ColorSchemeName::Light));
+        let supports_dark = schemes
+            .iter()
+            .any(|scheme| matches!(scheme, ColorSchemeName::Dark));
+        if (preferred_dark && supports_dark) || (!preferred_dark && supports_light) {
+            return preferred_dark;
+        }
+        schemes
+            .iter()
+            .find_map(|scheme| match scheme {
+                ColorSchemeName::Light => Some(false),
+                ColorSchemeName::Dark => Some(true),
+                ColorSchemeName::Custom(_) => None,
+            })
+            .unwrap_or(false)
+    }
+}
 // CSS Writing Modes 3 §2.1: the two-value grammar, `Inherited: yes`.
 keyword_enum!(Direction {
     Ltr => "ltr",
@@ -1442,6 +1524,7 @@ pub enum TypedPropertyValue {
     TextAlign(TextAlign),
     Direction(Direction),
     ContentVisibility(ContentVisibility),
+    ColorScheme(ColorSchemeValue),
     WordBreak(WordBreak),
     LineBreak(LineBreak),
     Order(i32),
@@ -1504,6 +1587,7 @@ impl TypedPropertyValue {
             Self::TextAlign(_) => "text-align",
             Self::Direction(_) => "direction",
             Self::ContentVisibility(_) => "content-visibility",
+            Self::ColorScheme(_) => "color-scheme",
             Self::WordBreak(_) => "word-break",
             Self::LineBreak(_) => "line-break",
             Self::Order(_) => "order",
@@ -1565,6 +1649,7 @@ impl TypedPropertyValue {
             Self::TextAlign(value) => value.as_str().to_owned(),
             Self::Direction(value) => value.as_str().to_owned(),
             Self::ContentVisibility(value) => value.as_str().to_owned(),
+            Self::ColorScheme(value) => value.to_css(),
             Self::WordBreak(value) => value.as_str().to_owned(),
             Self::LineBreak(value) => value.as_str().to_owned(),
             Self::Order(value) => value.to_string(),
@@ -1895,6 +1980,7 @@ pub const DECLARED_GRAMMARS: &[&str] = &[
     "text-align",
     "direction",
     "content-visibility",
+    "color-scheme",
     "word-break",
     "line-break",
     "order",
@@ -1997,6 +2083,7 @@ fn parse_property<'i>(
         "direction" => parse_keyword(input, Direction::parse).map(TypedPropertyValue::Direction),
         "content-visibility" => parse_keyword(input, ContentVisibility::parse)
             .map(TypedPropertyValue::ContentVisibility),
+        "color-scheme" => parse_color_scheme(input).map(TypedPropertyValue::ColorScheme),
         "word-break" => parse_keyword(input, WordBreak::parse).map(TypedPropertyValue::WordBreak),
         "line-break" => parse_keyword(input, LineBreak::parse).map(TypedPropertyValue::LineBreak),
         "order" => parse_integer(input).map(TypedPropertyValue::Order),
@@ -2193,6 +2280,68 @@ fn parse_containment<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, Containmen
     } else {
         Ok(value)
     }
+}
+
+/// CSS Color Adjustment 1 §2.2 `color-scheme`.
+///
+/// `normal` is exclusive; otherwise at least one `<custom-ident>` or
+/// `light`/`dark` keyword is required and `only` may appear once. Custom
+/// identifiers are retained for serialization but carry no meaning here.
+fn parse_color_scheme<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, ColorSchemeValue> {
+    let location = input.current_source_location();
+    let mut only = false;
+    let mut schemes = Vec::new();
+    while !input.is_exhausted() {
+        let token = input.next()?.clone();
+        let Token::Ident(value) = token else {
+            return Err(
+                location.new_custom_error(ValueError::detail("color-scheme expects identifiers"))
+            );
+        };
+        if value.eq_ignore_ascii_case("normal") {
+            if only || !schemes.is_empty() {
+                return Err(location.new_custom_error(ValueError::detail(
+                    "'normal' cannot be combined with other color schemes",
+                )));
+            }
+            return Ok(ColorSchemeValue::Normal);
+        }
+        if value.eq_ignore_ascii_case("only") {
+            if only {
+                return Err(location.new_custom_error(ValueError::detail("'only' may appear once")));
+            }
+            only = true;
+            continue;
+        }
+        if value.eq_ignore_ascii_case("light") {
+            schemes.push(ColorSchemeName::Light);
+        } else if value.eq_ignore_ascii_case("dark") {
+            schemes.push(ColorSchemeName::Dark);
+        } else {
+            if [
+                "inherit",
+                "initial",
+                "unset",
+                "revert",
+                "revert-layer",
+                "default",
+            ]
+            .iter()
+            .any(|keyword| value.eq_ignore_ascii_case(keyword))
+            {
+                return Err(location.new_custom_error(ValueError::detail(
+                    "reserved keyword is not a color-scheme custom identifier",
+                )));
+            }
+            schemes.push(ColorSchemeName::Custom(value.to_string()));
+        }
+    }
+    if schemes.is_empty() {
+        return Err(location.new_custom_error(ValueError::detail(
+            "color-scheme requires at least one color scheme",
+        )));
+    }
+    Ok(ColorSchemeValue::Supported { schemes, only })
 }
 
 fn parse_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
@@ -5063,6 +5212,69 @@ mod tests {
         assert_eq!(
             parse("color", "rgb(10 20 30 / 25%)").to_css(),
             "rgba(10, 20, 30, 0.25)"
+        );
+    }
+
+    #[test]
+    fn parses_color_scheme_supports_and_resolves_used_scheme() {
+        assert_eq!(
+            parse("color-scheme", "normal"),
+            TypedPropertyValue::ColorScheme(super::ColorSchemeValue::Normal)
+        );
+        assert_eq!(parse("color-scheme", "light dark").to_css(), "light dark");
+        assert_eq!(parse("color-scheme", "only light").to_css(), "only light");
+        assert_eq!(
+            parse("color-scheme", "only dark light").to_css(),
+            "only dark light"
+        );
+        for invalid in [
+            "only",
+            "normal light",
+            "only only light",
+            "light, dark",
+            "inherit",
+        ] {
+            assert!(
+                parse_typed_property("color-scheme", invalid)
+                    .expect("color-scheme is supported")
+                    .is_err(),
+                "{invalid:?} must not parse"
+            );
+        }
+
+        let normal = parse("color-scheme", "normal");
+        let TypedPropertyValue::ColorScheme(normal) = normal else {
+            unreachable!();
+        };
+        assert!(normal.used_dark(true));
+        assert!(!normal.used_dark(false));
+
+        let both = parse("color-scheme", "light dark");
+        let TypedPropertyValue::ColorScheme(both) = both else {
+            unreachable!();
+        };
+        assert!(both.used_dark(true));
+        assert!(!both.used_dark(false));
+
+        let only_dark = parse("color-scheme", "only dark");
+        let TypedPropertyValue::ColorScheme(only_dark) = only_dark else {
+            unreachable!();
+        };
+        assert!(only_dark.used_dark(false));
+
+        let only_light = parse("color-scheme", "only light");
+        let TypedPropertyValue::ColorScheme(only_light) = only_light else {
+            unreachable!();
+        };
+        assert!(!only_light.used_dark(true));
+
+        let custom = parse("color-scheme", "only my-scheme");
+        let TypedPropertyValue::ColorScheme(custom) = custom else {
+            unreachable!();
+        };
+        assert!(
+            !custom.used_dark(true),
+            "unknown schemes fall back to light"
         );
     }
 

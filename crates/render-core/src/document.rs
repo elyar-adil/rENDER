@@ -2772,6 +2772,62 @@ mod tests {
         assert_eq!(typed_css(&document, &render, "#ltr", "direction"), "ltr");
     }
 
+    #[test]
+    fn per_element_color_scheme_selects_light_dark_and_system_colors() {
+        let document = Document::parse(
+            "<!doctype html><style>\
+             html, body { margin:0 }\
+             #light { display:block; width:10px; height:10px; color-scheme:light; \
+                      background-color:light-dark(rgb(1 2 3), rgb(4 5 6)); \
+                      border-top:2px solid canvas }\
+             #dark { display:block; width:10px; height:10px; color-scheme:dark; \
+                     border-top:2px solid canvas }\
+             #child { display:block; width:10px; height:10px; \
+                      background-color:light-dark(rgb(1 2 3), rgb(4 5 6)) }\
+             </style><div id=light></div><div id=dark><span id=child></span></div>",
+        );
+        let render = document.render_reference(DocumentRenderOptions {
+            color_scheme: ColorScheme::Dark,
+            ..DocumentRenderOptions::default()
+        });
+        let backgrounds = render
+            .display
+            .list
+            .items()
+            .iter()
+            .filter_map(|item| match item.command {
+                DisplayCommand::SolidRect { color, .. } => Some(color),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            backgrounds.contains(&Color::rgb(1, 2, 3)),
+            "light color-scheme selects the light light-dark() arm: {backgrounds:?}"
+        );
+        assert!(
+            backgrounds.contains(&Color::rgb(4, 5, 6)),
+            "dark color-scheme selects the dark light-dark() arm: {backgrounds:?}"
+        );
+        let borders = render
+            .display
+            .list
+            .items()
+            .iter()
+            .filter_map(|item| match &item.command {
+                DisplayCommand::Border(border) => Some(border.colors[0]),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            borders.contains(&Color::WHITE),
+            "light canvas is white: {borders:?}"
+        );
+        assert!(
+            borders.contains(&Color::BLACK),
+            "dark canvas is black: {borders:?}"
+        );
+    }
+
     /// The used color scheme is one answer for the whole frame: it drives
     /// `prefers-color-scheme`, `light-dark()`, and the paint palette.
     #[test]

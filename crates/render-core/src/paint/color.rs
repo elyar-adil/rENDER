@@ -44,10 +44,13 @@ impl Color {
 pub struct SystemPalette {
     pub canvas: Color,
     pub canvas_text: Color,
-    /// The used color scheme for `light-dark()` (CSS Color 5 §7). The default
-    /// is light; an embedding that supports a dark used scheme sets this before
-    /// building the display list.
+    /// The page color scheme's preferred darkness. An element's own
+    /// `color-scheme` may override this; [`SystemPalette::for_scheme`] selects
+    /// the matching palette before resolving a color.
     pub dark: bool,
+    /// The colors used when an element's used color scheme is dark.
+    pub dark_canvas: Color,
+    pub dark_canvas_text: Color,
 }
 
 impl Default for SystemPalette {
@@ -56,14 +59,37 @@ impl Default for SystemPalette {
             canvas: Color::WHITE,
             canvas_text: Color::BLACK,
             dark: false,
+            dark_canvas: Color::BLACK,
+            dark_canvas_text: Color::WHITE,
         }
     }
 }
 
 impl SystemPalette {
+    /// The palette for one element's used color scheme.
+    #[must_use]
+    pub fn for_scheme(self, dark: bool) -> Self {
+        let (canvas, canvas_text) = if dark {
+            (self.dark_canvas, self.dark_canvas_text)
+        } else {
+            (self.canvas, self.canvas_text)
+        };
+        Self {
+            canvas,
+            canvas_text,
+            dark,
+            dark_canvas: self.dark_canvas,
+            dark_canvas_text: self.dark_canvas_text,
+        }
+    }
+
     #[must_use]
     pub fn resolve(self, value: CssColor, current_color: Color) -> Color {
-        rgba_to_color(self.resolve_space(value, current_color).to_rgba())
+        rgba_to_color(
+            self.for_scheme(self.dark)
+                .resolve_space(value, current_color)
+                .to_rgba(),
+        )
     }
 
     /// Resolve context-dependent colors while retaining missing components so
@@ -229,6 +255,31 @@ mod tests {
                 Color::rgb(10, 20, 30)
             ),
             Color::rgba(10, 20, 30, 128)
+        );
+    }
+
+    #[test]
+    fn for_scheme_selects_system_colors_and_the_light_dark_arm() {
+        let palette = SystemPalette::default();
+        let light = palette.for_scheme(false);
+        let dark = palette.for_scheme(true);
+        assert_eq!(light.resolve(parsed("canvas"), Color::BLACK), Color::WHITE);
+        assert_eq!(
+            light.resolve(parsed("canvastext"), Color::WHITE),
+            Color::BLACK
+        );
+        assert_eq!(dark.resolve(parsed("canvas"), Color::WHITE), Color::BLACK);
+        assert_eq!(
+            dark.resolve(parsed("canvastext"), Color::BLACK),
+            Color::WHITE
+        );
+        assert_eq!(
+            dark.resolve(parsed("light-dark(rgb(1 2 3), rgb(4 5 6))"), Color::BLACK),
+            Color::rgb(4, 5, 6)
+        );
+        assert_eq!(
+            light.resolve(parsed("light-dark(rgb(1 2 3), rgb(4 5 6))"), Color::BLACK),
+            Color::rgb(1, 2, 3)
         );
     }
 

@@ -77,6 +77,7 @@ impl PropertyRegistry {
         let mut registry = Self::new();
         for (name, initial) in [
             ("color", "canvastext"),
+            ("color-scheme", "normal"),
             ("direction", "ltr"),
             ("font-size", "medium"),
             ("font-style", "normal"),
