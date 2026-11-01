@@ -372,6 +372,17 @@ pub(super) fn process_page_render(
             let compositor =
                 CompositorCache::from_display_list(Arc::clone(&display_list), raster_background)
                     .map(Arc::new);
+            if env::var_os("RENDER_DEBUG_FRAME").is_some() {
+                match &compositor {
+                    Some(cache) => eprintln!(
+                        "render-browser compositor retained layers={}",
+                        cache.layer_count()
+                    ),
+                    None => eprintln!(
+                        "render-browser compositor fallback: the scene uses a command the retained path cannot replay"
+                    ),
+                }
+            }
             let frame = surface_to_softbuffer(&output.raster.surface);
             Ok(PageRenderFrame {
                 frame,

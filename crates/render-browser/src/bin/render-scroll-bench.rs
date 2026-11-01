@@ -3,11 +3,11 @@
 //! Run with:
 //! `cargo run --release -p render-browser --bin render-scroll-bench`
 //!
-//! The fixture is a long document with ordinary content and one translated
-//! opacity layer. The benchmark warms the compositor, then scrolls the same
-//! scene through both paths and prints a JSON result. The retained numbers are
-//! the ones that matter: after the first frame, a 16px scroll should rasterize
-//! no new bands.
+//! The fixture is a long document with ordinary content, a sticky bar, a
+//! translated opacity layer, a scaled/rotated layer, and a fixed header. The
+//! benchmark warms the compositor, then scrolls the same scene through both
+//! paths and prints a JSON result. The retained numbers are the ones that
+//! matter: after the first frame, a 16px scroll should rasterize no new bands.
 
 #![allow(
     clippy::cast_precision_loss,
@@ -19,7 +19,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use render_core::dom::DomRevision;
-use render_core::layout::{FragmentId, PhysicalPoint, PhysicalRect, PhysicalSize};
+use render_core::layout::{
+    FragmentId, PhysicalPoint, PhysicalRect, PhysicalSize, StickyConstraint, StickyInsets,
+};
 use render_core::paint::{
     BlendMode, Color, CompositingReason, CompositorCache, CpuRasterizer, DisplayCommand,
     DisplayItem, DisplayItemId, DisplayList, NoGlyphMasks, PaintCoordinateSpace, PaintPhase,
@@ -56,6 +58,10 @@ fn rect(x: f32, y: f32, width: f32, height: f32, color: Color) -> DisplayCommand
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the benchmark fixture is one scene description; splitting it would hide the element mix being measured"
+)]
 fn scene() -> DisplayList {
     let mut items = Vec::new();
     let mut ordinal = 0_u32;
@@ -110,6 +116,83 @@ fn scene() -> DisplayList {
         PhysicalRect::new(0.0, 0.0, 300.0, 200.0),
         DisplayCommand::PopStackingContext,
     ));
+    ordinal += 1;
+    // A scaled and rotated layer: the retained source is untransformed, and
+    // the composite matrix carries the affine transform.
+    let angle = 0.35_f32;
+    let scale = 1.25_f32;
+    items.push(item(
+        ordinal,
+        PhysicalRect::new(500.0, 300.0, 200.0, 150.0),
+        DisplayCommand::PushStackingContext(StackingContext {
+            opacity: 1.0,
+            transform: Transform2D {
+                scale_x: scale * angle.cos(),
+                skew_x: -scale * angle.sin(),
+                skew_y: scale * angle.sin(),
+                scale_y: scale * angle.cos(),
+                translate_x: 400.0,
+                translate_y: 700.0,
+            },
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            reason: CompositingReason::Transform,
+            filter: None,
+            mask: None,
+        }),
+    ));
+    ordinal += 1;
+    items.push(item(
+        ordinal,
+        PhysicalRect::new(500.0, 300.0, 200.0, 150.0),
+        rect(500.0, 300.0, 200.0, 150.0, Color::rgb(240, 180, 40)),
+    ));
+    ordinal += 1;
+    items.push(item(
+        ordinal,
+        PhysicalRect::new(500.0, 300.0, 200.0, 150.0),
+        DisplayCommand::PopStackingContext,
+    ));
+    ordinal += 1;
+    // A sticky bar: the source band stays in document coordinates and the
+    // compositor applies the scroll-dependent displacement at composite time.
+    items.push(item(
+        ordinal,
+        PhysicalRect::new(0.0, 0.0, 800.0, 32.0),
+        DisplayCommand::PushSticky(Box::new(StickyConstraint {
+            margin_rect: PhysicalRect::new(0.0, 0.0, 800.0, 32.0),
+            containing_block: PhysicalRect::new(0.0, 0.0, 1000.0, 12_000.0),
+            insets: StickyInsets {
+                top: Some(0.0),
+                ..StickyInsets::default()
+            },
+            scrollport: VIEWPORT,
+            scrollport_origin: PhysicalPoint::default(),
+            scroll_container: None,
+        })),
+    ));
+    ordinal += 1;
+    items.push(item(
+        ordinal,
+        PhysicalRect::new(0.0, 0.0, 800.0, 32.0),
+        rect(0.0, 0.0, 800.0, 32.0, Color::rgb(30, 30, 30)),
+    ));
+    ordinal += 1;
+    items.push(item(
+        ordinal,
+        PhysicalRect::new(0.0, 0.0, 800.0, 32.0),
+        DisplayCommand::PopSticky,
+    ));
+    ordinal += 1;
+    // A fixed header lives in viewport space: its retained surface is never
+    // translated by the scroll.
+    let mut fixed = item(
+        ordinal,
+        PhysicalRect::new(0.0, 0.0, 800.0, 56.0),
+        rect(0.0, 0.0, 800.0, 56.0, Color::rgb(15, 80, 160)),
+    );
+    fixed.coordinate_space = PaintCoordinateSpace::Viewport;
+    items.push(fixed);
     DisplayList::from_items(DomRevision::default(), VIEWPORT, items)
 }
 

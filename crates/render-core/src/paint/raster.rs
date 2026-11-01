@@ -2964,6 +2964,9 @@ fn blit_translated(
                 usize::try_from(destination_y * i64::from(destination.width()) + destination_x)
                     .expect("destination index fits the surface");
             let color = source.pixels()[source_index];
+            if color.alpha == 0 {
+                continue;
+            }
             destination.pixels_mut()[destination_index] =
                 if color.alpha == u8::MAX && opacity >= 1.0 {
                     color
@@ -3035,8 +3038,13 @@ fn warp_surface(
         for x in left..right {
             if let Some(color) = sample_bilinear(source, source_x, source_y)
                 && let Some(index) = destination.index(x, y)
+                && color.alpha != 0
             {
-                destination.pixels[index] = blend(destination.pixels[index], color, opacity);
+                destination.pixels[index] = if color.alpha == u8::MAX && opacity >= 1.0 {
+                    color
+                } else {
+                    blend(destination.pixels[index], color, opacity)
+                };
             }
             source_x += inverse.scale_x;
             source_y += inverse.skew_y;

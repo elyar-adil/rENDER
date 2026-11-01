@@ -5,25 +5,32 @@
 //! into three kinds of retained surface:
 //!
 //! - **root segments**: contiguous runs of ordinary display items between
-//!   top-level stacking contexts, so paint order is preserved;
-//! - **layers**: a top-level transform/opacity stacking context, rasterized
-//!   once and composited through its own matrix and alpha;
+//!   top-level scopes, split by coordinate space so fixed content keeps
+//!   viewport coordinates and document content follows the scroll;
+//! - **layers**: a top-level stacking context (transform/opacity) or sticky
+//!   scope, rasterized once in its own space and composited through its own
+//!   matrix and alpha;
 //! - **bands**: every surface is cut into fixed-height bands, so a long
 //!   document does not need one giant allocation and a scroll only rasterizes
 //!   the bands that were not already cached.
 //!
-//! The compositor is deliberately conservative. A scene containing a sticky
-//! scope, a viewport-space item (fixed positioning), a filter, a mask, a
-//! non-normal blend mode, or a non-translation transform returns `None` and
-//! the caller keeps the existing complete-raster path. The supported subset is
-//! the common scrolling page: ordinary document content plus translated or
-//! transparent layers.
+//! Fixed content is rasterized into a viewport-sized source and composited
+//! without the scroll translation. A sticky scope is rasterized untransformed
+//! and displaced at composite time, so its bands survive a scroll. Scale,
+//! rotate and skew layers are supported by inverse-mapping the viewport into
+//! source-local coordinates when choosing bands, then compositing the
+//! untransformed source through the affine matrix.
+//!
+//! The compositor is deliberately conservative. A filter, a mask, a
+//! non-normal blend mode, an ambient clip crossing a layer boundary, nested
+//! sticky, or a layer wider than the 8192px raster ceiling returns `None` and
+//! the caller keeps the complete-raster path.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::image::ImageResources;
-use crate::layout::{PhysicalPoint, PhysicalRect, PhysicalSize};
+use crate::layout::{PhysicalPoint, PhysicalRect, PhysicalSize, StickyConstraint};
 
 use super::color::Color;
 use super::display_list::{
@@ -32,20 +39,27 @@ use super::display_list::{
 use super::raster::{
     CpuRasterOutput, CpuRasterizer, GlyphMaskProvider, RasterControl, Surface, composite_surface,
 };
+use super::sticky::sticky_displacement;
 
 /// The physical height of one retained compositor band.
 pub const DEFAULT_COMPOSITOR_BAND_HEIGHT: u32 = 512;
 
-/// A transformed or transparent top-level stacking context.
+/// A transformed, transparent or sticky top-level scope.
 #[derive(Clone, Debug, PartialEq)]
 struct CompositedLayer {
     /// The display-list range, excluding the push/pop commands themselves.
     start: usize,
     end: usize,
-    /// Untransformed document-space bounds of the items.
+    /// Untransformed bounds. Document layers use the item union; viewport
+    /// layers use the viewport rectangle so a viewport-space item keeps its
+    /// viewport coordinates.
     bounds: PhysicalRect,
     transform: Transform2D,
     opacity: f32,
+    space: PaintCoordinateSpace,
+    /// A sticky scope's displacement is resolved from the current scroll
+    /// offset at composite time; the source bands stay fixed.
+    sticky: Option<StickyConstraint>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +73,7 @@ struct RootSegment {
     start: usize,
     end: usize,
     bounds: PhysicalRect,
+    space: PaintCoordinateSpace,
 }
 
 /// Per-frame compositor counters.
@@ -104,34 +119,103 @@ impl CompositorCache {
     /// `None` means the scene uses a command the retained path cannot replay
     /// independently, and the caller must use the conservative raster path.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the extraction walk is one state machine over the display list; splitting it would duplicate the root-segment bookkeeping"
+    )]
     pub fn from_display_list(display_list: Arc<DisplayList>, background: Color) -> Option<Self> {
         let items = display_list.items();
-        if items
-            .iter()
-            .any(|item| item.coordinate_space != PaintCoordinateSpace::Document)
-        {
-            return None;
-        }
+        let viewport = display_list.viewport;
         let mut segments = Vec::new();
         let mut layers = Vec::new();
         let mut ops = Vec::new();
         let mut index = 0_usize;
         let mut root_start = 0_usize;
+        let mut root_space: Option<PaintCoordinateSpace> = None;
         let mut clip_depth = 0_usize;
         while index < items.len() {
-            match &items[index].command {
-                DisplayCommand::PushClip(_) => {
-                    clip_depth += 1;
+            let item = &items[index];
+            let space = item.coordinate_space;
+            match &item.command {
+                DisplayCommand::PushClip(_) | DisplayCommand::PopClip => {
+                    if root_space.is_none() {
+                        root_space = Some(space);
+                    }
+                    if root_space != Some(space) {
+                        if clip_depth != 0 {
+                            return None;
+                        }
+                        push_segment(
+                            items,
+                            viewport,
+                            root_start,
+                            index,
+                            root_space,
+                            &mut segments,
+                            &mut ops,
+                        )?;
+                        root_start = index;
+                        root_space = Some(space);
+                    }
+                    match item.command {
+                        DisplayCommand::PushClip(_) => clip_depth += 1,
+                        DisplayCommand::PopClip => clip_depth = clip_depth.saturating_sub(1),
+                        _ => unreachable!("matched clip commands"),
+                    }
                     index += 1;
                 }
-                DisplayCommand::PopClip => {
-                    clip_depth = clip_depth.saturating_sub(1);
-                    index += 1;
+                DisplayCommand::PushSticky(constraint) => {
+                    // A sticky scope is a retained layer with a displacement
+                    // resolved from the current scroll offset. Nested sticky or
+                    // a stacking context inside it would need the outer
+                    // displacement when rebasing the inner transform pivot, so
+                    // keep those on the complete-raster path for now.
+                    if clip_depth != 0 || space != PaintCoordinateSpace::Document {
+                        return None;
+                    }
+                    let end = matching_sticky_pop(items, index)?;
+                    if items[index + 1..end].iter().any(|item| {
+                        item.coordinate_space != PaintCoordinateSpace::Document
+                            || matches!(
+                                &item.command,
+                                DisplayCommand::PushSticky(_)
+                                    | DisplayCommand::PopSticky
+                                    | DisplayCommand::PushStackingContext(_)
+                                    | DisplayCommand::PopStackingContext
+                                    | DisplayCommand::PushTransform(_)
+                                    | DisplayCommand::PopTransform
+                            )
+                    }) {
+                        return None;
+                    }
+                    push_segment(
+                        items,
+                        viewport,
+                        root_start,
+                        index,
+                        root_space,
+                        &mut segments,
+                        &mut ops,
+                    )?;
+                    let bounds = item_bounds(&items[index + 1..end])?;
+                    if bounds.size.width > 8192.0 {
+                        return None;
+                    }
+                    let layer = layers.len();
+                    layers.push(CompositedLayer {
+                        start: index + 1,
+                        end,
+                        bounds,
+                        transform: Transform2D::default(),
+                        opacity: 1.0,
+                        space: PaintCoordinateSpace::Document,
+                        sticky: Some(**constraint),
+                    });
+                    ops.push(LayerOp::Layer(layer));
+                    index = end + 1;
+                    root_start = index;
+                    root_space = None;
                 }
-                DisplayCommand::PushSticky(_)
-                | DisplayCommand::PopSticky
-                | DisplayCommand::PushTransform(_)
-                | DisplayCommand::PopTransform => return None,
                 DisplayCommand::PushStackingContext(context) => {
                     // A context inside an ambient clip would need that clip
                     // copied into its layer and removed from the root segment.
@@ -140,33 +224,45 @@ impl CompositorCache {
                         || context.filter.is_some()
                         || context.mask.is_some()
                         || context.blend_mode != BlendMode::Normal
-                        || !context.transform.is_translation()
                     {
                         return None;
                     }
                     let start = index + 1;
                     let end = matching_pop(items, index)?;
-                    // Sticky and viewport items inside a layer are
-                    // scroll-dependent for the same reason they are at the
-                    // root: the retained surface is in document coordinates.
+                    if items[start..end]
+                        .iter()
+                        .any(|item| item.coordinate_space != space)
+                    {
+                        return None;
+                    }
                     if items[start..end].iter().any(|item| {
-                        item.coordinate_space != PaintCoordinateSpace::Document
-                            || matches!(
-                                &item.command,
-                                DisplayCommand::PushSticky(_) | DisplayCommand::PopSticky
-                            )
+                        matches!(
+                            &item.command,
+                            DisplayCommand::PushSticky(_)
+                                | DisplayCommand::PopSticky
+                                | DisplayCommand::PushTransform(_)
+                                | DisplayCommand::PopTransform
+                        )
                     }) {
                         return None;
                     }
-                    let bounds = item_bounds(&items[start..end])?;
+                    let bounds = if space == PaintCoordinateSpace::Viewport {
+                        viewport_rect(viewport)
+                    } else {
+                        item_bounds(&items[start..end])?
+                    };
                     if bounds.size.width > 8192.0 {
                         return None;
                     }
-                    if index > root_start {
-                        let segment = make_segment(items, root_start, index)?;
-                        ops.push(LayerOp::Segment(segments.len()));
-                        segments.push(segment);
-                    }
+                    push_segment(
+                        items,
+                        viewport,
+                        root_start,
+                        index,
+                        root_space,
+                        &mut segments,
+                        &mut ops,
+                    )?;
                     let layer = layers.len();
                     layers.push(CompositedLayer {
                         start,
@@ -174,20 +270,47 @@ impl CompositorCache {
                         bounds,
                         transform: context.transform,
                         opacity: context.opacity.clamp(0.0, 1.0),
+                        space,
+                        sticky: None,
                     });
                     ops.push(LayerOp::Layer(layer));
                     index = end + 1;
                     root_start = index;
+                    root_space = None;
                 }
-                _ => index += 1,
+                DisplayCommand::PushTransform(_) | DisplayCommand::PopTransform => return None,
+                _ => {
+                    if let Some(current) = root_space
+                        && current != space
+                    {
+                        if clip_depth != 0 {
+                            return None;
+                        }
+                        push_segment(
+                            items,
+                            viewport,
+                            root_start,
+                            index,
+                            Some(current),
+                            &mut segments,
+                            &mut ops,
+                        )?;
+                        root_start = index;
+                    }
+                    root_space = Some(space);
+                    index += 1;
+                }
             }
         }
-        if root_start < items.len() {
-            let segment = make_segment(items, root_start, items.len())?;
-            ops.push(LayerOp::Segment(segments.len()));
-            segments.push(segment);
-        }
-        let viewport = display_list.viewport;
+        push_segment(
+            items,
+            viewport,
+            root_start,
+            items.len(),
+            root_space,
+            &mut segments,
+            &mut ops,
+        )?;
         Some(Self {
             display_list,
             segments,
@@ -251,6 +374,8 @@ impl CompositorCache {
                         segment.bounds,
                         Transform2D::default(),
                         1.0,
+                        segment.space,
+                        None,
                         viewport_origin,
                         glyphs,
                         images,
@@ -270,6 +395,8 @@ impl CompositorCache {
                         layer.bounds,
                         layer.transform,
                         layer.opacity,
+                        layer.space,
+                        layer.sticky,
                         viewport_origin,
                         glyphs,
                         images,
@@ -292,6 +419,7 @@ impl CompositorCache {
 
     #[allow(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -306,6 +434,8 @@ impl CompositorCache {
         bounds: PhysicalRect,
         transform: Transform2D,
         opacity: f32,
+        space: PaintCoordinateSpace,
+        sticky: Option<StickyConstraint>,
         viewport_origin: PhysicalPoint,
         glyphs: &dyn GlyphMaskProvider,
         images: Option<&ImageResources>,
@@ -317,29 +447,97 @@ impl CompositorCache {
         if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
             return 0;
         }
-        let viewport_top = viewport_origin.y.max(0.0);
-        let viewport_bottom = viewport_top + self.viewport.height.max(0.0);
-        let first = ((viewport_top - bounds.origin.y) / self.band_height as f32)
-            .floor()
-            .max(0.0) as u32;
-        let last = ((viewport_bottom - bounds.origin.y) / self.band_height as f32)
-            .ceil()
-            .max(0.0) as u32;
-        let band_count = (bounds.size.height / self.band_height as f32)
-            .ceil()
-            .max(0.0) as u32;
+        let scroll = if space == PaintCoordinateSpace::Document {
+            viewport_origin
+        } else {
+            PhysicalPoint::default()
+        };
+        let sticky_offset = sticky.map_or_else(PhysicalPoint::default, |constraint| {
+            sticky_displacement(&constraint, PhysicalPoint::default(), viewport_origin)
+        });
+        let transform = Transform2D {
+            translate_x: sticky_offset.x,
+            translate_y: sticky_offset.y,
+            ..Transform2D::default()
+        }
+        .then(&transform);
+        let viewport_rect = viewport_rect(self.viewport);
+        let band_height = if space == PaintCoordinateSpace::Viewport {
+            ceil_to_u32(self.viewport.height).max(1)
+        } else {
+            self.band_height
+        };
+        let source_height = if space == PaintCoordinateSpace::Viewport {
+            self.viewport.height
+        } else {
+            bounds.size.height
+        };
+        let source_width = if space == PaintCoordinateSpace::Viewport {
+            self.viewport.width
+        } else {
+            bounds.size.width
+        };
+        if source_width <= 0.0 || source_height <= 0.0 {
+            return 0;
+        }
+        let to_viewport = Transform2D {
+            translate_x: -scroll.x,
+            translate_y: -scroll.y,
+            ..Transform2D::default()
+        };
+        let to_band = Transform2D {
+            translate_x: if space == PaintCoordinateSpace::Viewport {
+                0.0
+            } else {
+                bounds.origin.x
+            },
+            translate_y: if space == PaintCoordinateSpace::Viewport {
+                0.0
+            } else {
+                bounds.origin.y
+            },
+            ..Transform2D::default()
+        };
+        let base_mapped = to_viewport.then(&transform.then(&to_band));
+        let Some(inverse) = base_mapped.inverse() else {
+            return 0;
+        };
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for (x, y) in [
+            (0.0, 0.0),
+            (viewport_rect.size.width, 0.0),
+            (0.0, viewport_rect.size.height),
+            (viewport_rect.size.width, viewport_rect.size.height),
+        ] {
+            let (source_x, source_y) = inverse.apply(x, y);
+            min_x = min_x.min(source_x);
+            min_y = min_y.min(source_y);
+            max_x = max_x.max(source_x);
+            max_y = max_y.max(source_y);
+        }
+        let source_rect = PhysicalRect::new(0.0, 0.0, source_width, source_height);
+        let Some(visible) = intersect_rect(
+            PhysicalRect::new(min_x, min_y, max_x - min_x, max_y - min_y),
+            source_rect,
+        ) else {
+            return 0;
+        };
+        let first = (visible.origin.y / band_height as f32).floor().max(0.0) as u32;
+        let last = (visible.bottom() / band_height as f32).ceil().max(0.0) as u32;
+        let band_count = (source_height / band_height as f32).ceil().max(0.0) as u32;
         let last = last.min(band_count);
         let mut rasterized = 0_u32;
         for band in first..last {
             if control.is_some_and(RasterControl::is_cancelled) {
                 break;
             }
-            let band_y = bounds.origin.y + band as f32 * self.band_height as f32;
-            let band_height = (bounds.origin.y + bounds.size.height - band_y)
-                .min(self.band_height as f32)
-                .max(0.0);
+            let local_y = band as f32 * band_height as f32;
+            let band_height = (source_height - local_y).min(band_height as f32).max(0.0);
             let band_size = PhysicalSize {
-                width: bounds.size.width,
+                width: source_width,
                 height: band_height,
             };
             if band_size.width <= 0.0 || band_size.height <= 0.0 {
@@ -347,15 +545,20 @@ impl CompositorCache {
             }
             let key = (kind, index, band);
             if let std::collections::hash_map::Entry::Vacant(entry) = state.bands.entry(key) {
+                let raster_origin = if space == PaintCoordinateSpace::Viewport {
+                    PhysicalPoint { x: 0.0, y: 0.0 }
+                } else {
+                    PhysicalPoint {
+                        x: bounds.origin.x,
+                        y: bounds.origin.y + local_y,
+                    }
+                };
                 let raster = CpuRasterizer.rasterize_item_slice(
                     &self.display_list.items()[start..end],
                     band_size,
                     Color::TRANSPARENT,
                     glyphs,
-                    PhysicalPoint {
-                        x: bounds.origin.x,
-                        y: band_y,
-                    },
+                    raster_origin,
                     images,
                 );
                 diagnostics.extend(raster.diagnostics);
@@ -366,27 +569,17 @@ impl CompositorCache {
             let Some(source) = state.bands.get(&key) else {
                 continue;
             };
-            let to_viewport = Transform2D {
-                translate_x: -viewport_origin.x,
-                translate_y: -viewport_origin.y,
-                ..Transform2D::default()
-            };
-            let to_band = Transform2D {
-                translate_x: bounds.origin.x,
-                translate_y: band_y,
-                ..Transform2D::default()
-            };
-            let mapped = if kind == 0 {
-                to_viewport.then(&to_band)
+            let band_origin = if space == PaintCoordinateSpace::Viewport {
+                Transform2D::default()
             } else {
-                to_viewport.then(&transform.then(&to_band))
+                Transform2D {
+                    translate_x: bounds.origin.x,
+                    translate_y: bounds.origin.y + local_y,
+                    ..Transform2D::default()
+                }
             };
-            let clip = Some(PhysicalRect::new(
-                0.0,
-                0.0,
-                self.viewport.width,
-                self.viewport.height,
-            ));
+            let mapped = to_viewport.then(&transform.then(&band_origin));
+            let clip = Some(viewport_rect);
             if !composite_surface(output, source, mapped, opacity, clip, control) {
                 break;
             }
@@ -412,12 +605,80 @@ fn matching_pop(items: &[DisplayItem], push: usize) -> Option<usize> {
     None
 }
 
-fn make_segment(items: &[DisplayItem], start: usize, end: usize) -> Option<RootSegment> {
-    let bounds = item_bounds(&items[start..end])?;
+fn matching_sticky_pop(items: &[DisplayItem], push: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    for (index, item) in items.iter().enumerate().skip(push) {
+        match &item.command {
+            DisplayCommand::PushSticky(_) => depth += 1,
+            DisplayCommand::PopSticky => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn push_segment(
+    items: &[DisplayItem],
+    viewport: PhysicalSize,
+    start: usize,
+    end: usize,
+    space: Option<PaintCoordinateSpace>,
+    segments: &mut Vec<RootSegment>,
+    ops: &mut Vec<LayerOp>,
+) -> Option<()> {
+    if start >= end {
+        return Some(());
+    }
+    let segment = make_segment(items, viewport, start, end, space?)?;
+    ops.push(LayerOp::Segment(segments.len()));
+    segments.push(segment);
+    Some(())
+}
+
+fn make_segment(
+    items: &[DisplayItem],
+    viewport: PhysicalSize,
+    start: usize,
+    end: usize,
+    space: PaintCoordinateSpace,
+) -> Option<RootSegment> {
+    if items[start..end]
+        .iter()
+        .any(|item| item.coordinate_space != space)
+    {
+        return None;
+    }
+    let bounds = if space == PaintCoordinateSpace::Viewport {
+        viewport_rect(viewport)
+    } else {
+        item_bounds(&items[start..end])?
+    };
     if bounds.size.width > 8192.0 {
         return None;
     }
-    Some(RootSegment { start, end, bounds })
+    Some(RootSegment {
+        start,
+        end,
+        bounds,
+        space,
+    })
+}
+
+fn viewport_rect(viewport: PhysicalSize) -> PhysicalRect {
+    PhysicalRect::new(0.0, 0.0, viewport.width.max(0.0), viewport.height.max(0.0))
+}
+
+fn intersect_rect(first: PhysicalRect, second: PhysicalRect) -> Option<PhysicalRect> {
+    let left = first.origin.x.max(second.origin.x);
+    let top = first.origin.y.max(second.origin.y);
+    let right = first.right().min(second.right());
+    let bottom = first.bottom().min(second.bottom());
+    (right > left && bottom > top).then(|| PhysicalRect::new(left, top, right - left, bottom - top))
 }
 
 fn item_bounds(items: &[DisplayItem]) -> Option<PhysicalRect> {
@@ -463,7 +724,9 @@ mod tests {
         reason = "fixture geometry and band counters are exact small integers"
     )]
 
-    use super::{CompositorCache, DEFAULT_COMPOSITOR_BAND_HEIGHT};
+    use std::sync::Arc;
+
+    use super::CompositorCache;
     use crate::dom::DomRevision;
     use crate::layout::{PhysicalPoint, PhysicalRect, PhysicalSize};
     use crate::paint::{
@@ -753,23 +1016,170 @@ mod tests {
     }
 
     #[test]
-    fn fixed_content_falls_back_to_the_complete_raster() {
+    fn fixed_content_is_retained_in_viewport_space() {
         let viewport = PhysicalSize {
-            width: 40.0,
-            height: 40.0,
+            width: 80.0,
+            height: 60.0,
         };
         let mut fixed = item(
-            0,
-            PhysicalRect::new(0.0, 0.0, 40.0, 40.0),
-            rect(0.0, 0.0, 40.0, 40.0, Color::WHITE),
+            1,
+            PhysicalRect::new(0.0, 10.0, 20.0, 10.0),
+            rect(0.0, 10.0, 20.0, 10.0, Color::rgb(255, 0, 0)),
         );
         fixed.coordinate_space = PaintCoordinateSpace::Viewport;
-        let fixed_display = list(viewport, vec![fixed]);
-        assert!(
-            CompositorCache::from_display_list(std::sync::Arc::new(fixed_display), Color::WHITE)
-                .is_none(),
-            "a viewport-space item cannot be retained in document coordinates"
+        let items = vec![
+            item(
+                0,
+                PhysicalRect::new(0.0, 0.0, 80.0, 200.0),
+                rect(0.0, 0.0, 80.0, 200.0, Color::WHITE),
+            ),
+            item(
+                2,
+                PhysicalRect::new(0.0, 100.0, 80.0, 10.0),
+                rect(0.0, 100.0, 80.0, 10.0, Color::rgb(0, 0, 255)),
+            ),
+        ];
+        let mut all = items;
+        all.insert(1, fixed);
+        let display = std::sync::Arc::new(list(viewport, all));
+        let cache = CompositorCache::from_display_list(Arc::clone(&display), Color::WHITE)
+            .expect("a fixed item is a viewport-space segment");
+        let composited = cache.render(PhysicalPoint { x: 0.0, y: 50.0 }, &NoGlyphMasks, None, None);
+        let full = CpuRasterizer.rasterize_viewport(
+            display.as_ref(),
+            Color::WHITE,
+            &NoGlyphMasks,
+            PhysicalPoint { x: 0.0, y: 50.0 },
         );
-        assert_eq!(DEFAULT_COMPOSITOR_BAND_HEIGHT, 512);
+        assert_eq!(composited.surface, full.surface);
+        assert_eq!(composited.surface.pixel(5, 15), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(composited.surface.pixel(5, 55), Some(Color::rgb(0, 0, 255)));
+    }
+
+    #[test]
+    fn scaled_and_rotated_layers_match_the_full_raster() {
+        let viewport = PhysicalSize {
+            width: 80.0,
+            height: 60.0,
+        };
+        let transforms = [
+            Transform2D {
+                scale_x: 2.0,
+                scale_y: 2.0,
+                ..Transform2D::default()
+            },
+            Transform2D {
+                scale_x: 0.866_025_4,
+                skew_x: -0.5,
+                skew_y: 0.5,
+                scale_y: 0.866_025_4,
+                ..Transform2D::default()
+            },
+        ];
+        for transform in transforms {
+            let items = vec![
+                item(
+                    0,
+                    PhysicalRect::new(0.0, 0.0, 80.0, 60.0),
+                    rect(0.0, 0.0, 80.0, 60.0, Color::WHITE),
+                ),
+                item(
+                    1,
+                    PhysicalRect::new(0.0, 0.0, 20.0, 20.0),
+                    DisplayCommand::PushStackingContext(context(transform, 0.75)),
+                ),
+                item(
+                    2,
+                    PhysicalRect::new(0.0, 0.0, 20.0, 20.0),
+                    rect(0.0, 0.0, 20.0, 20.0, Color::rgb(255, 0, 0)),
+                ),
+                item(
+                    3,
+                    PhysicalRect::new(0.0, 0.0, 20.0, 20.0),
+                    DisplayCommand::PopStackingContext,
+                ),
+            ];
+            let display = std::sync::Arc::new(list(viewport, items));
+            let cache =
+                CompositorCache::from_display_list(std::sync::Arc::clone(&display), Color::WHITE)
+                    .expect("an affine layer is compositable");
+            let composited = cache.render(PhysicalPoint::default(), &NoGlyphMasks, None, None);
+            let full = CpuRasterizer.rasterize(display.as_ref(), Color::WHITE, &NoGlyphMasks);
+            assert_eq!(
+                composited.surface, full.surface,
+                "transform {transform:?} differs from the complete raster"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sticky_layer_is_displaced_at_composite_time() {
+        let viewport = PhysicalSize {
+            width: 80.0,
+            height: 60.0,
+        };
+        let constraint = crate::layout::StickyConstraint {
+            margin_rect: PhysicalRect::new(0.0, 0.0, 80.0, 20.0),
+            containing_block: PhysicalRect::new(0.0, 0.0, 80.0, 200.0),
+            insets: crate::layout::StickyInsets {
+                top: Some(0.0),
+                ..crate::layout::StickyInsets::default()
+            },
+            scrollport: viewport,
+            scrollport_origin: PhysicalPoint::default(),
+            scroll_container: None,
+        };
+        let items = vec![
+            item(
+                0,
+                PhysicalRect::new(0.0, 0.0, 80.0, 200.0),
+                rect(0.0, 0.0, 80.0, 200.0, Color::WHITE),
+            ),
+            item(
+                1,
+                PhysicalRect::new(0.0, 0.0, 80.0, 20.0),
+                DisplayCommand::PushSticky(Box::new(constraint)),
+            ),
+            item(
+                2,
+                PhysicalRect::new(0.0, 0.0, 80.0, 20.0),
+                rect(0.0, 0.0, 80.0, 20.0, Color::rgb(255, 0, 0)),
+            ),
+            item(
+                3,
+                PhysicalRect::new(0.0, 0.0, 80.0, 20.0),
+                DisplayCommand::PopSticky,
+            ),
+            item(
+                4,
+                PhysicalRect::new(0.0, 100.0, 80.0, 10.0),
+                rect(0.0, 100.0, 80.0, 10.0, Color::rgb(0, 0, 255)),
+            ),
+        ];
+        let display = std::sync::Arc::new(list(viewport, items));
+        let cache =
+            CompositorCache::from_display_list(std::sync::Arc::clone(&display), Color::WHITE)
+                .expect("a top-level sticky scope is compositable");
+        for offset in [0.0, 10.0, 50.0, 120.0, 300.0] {
+            let composited = cache.render(
+                PhysicalPoint { x: 0.0, y: offset },
+                &NoGlyphMasks,
+                None,
+                None,
+            );
+            let full = CpuRasterizer.rasterize_viewport(
+                display.as_ref(),
+                Color::WHITE,
+                &NoGlyphMasks,
+                PhysicalPoint { x: 0.0, y: offset },
+            );
+            assert_eq!(
+                composited.surface, full.surface,
+                "sticky scene differs from the complete raster at scroll {offset}"
+            );
+        }
+        let composited = cache.render(PhysicalPoint { x: 0.0, y: 50.0 }, &NoGlyphMasks, None, None);
+        assert_eq!(composited.surface.pixel(5, 5), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(composited.surface.pixel(5, 55), Some(Color::rgb(0, 0, 255)));
     }
 }
