@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::css::properties::BorderStyle;
 use crate::image::ImageResources;
-use crate::layout::{PhysicalPoint, PhysicalRect, StickyConstraint};
+use crate::layout::{PhysicalPoint, PhysicalRect, PhysicalSize, StickyConstraint};
 
 use super::color::{Color, clamped_rounded_u8};
 use super::display_list::{
@@ -281,6 +281,31 @@ impl CpuRasterizer {
         images: Option<&ImageResources>,
     ) -> CpuRasterOutput {
         Self::rasterize_list(list, background, glyphs, viewport_origin, images)
+    }
+
+    /// Rasterizes one slice of display items into a viewport-sized surface.
+    ///
+    /// This is the compositor's per-band entry point: the caller has already
+    /// chosen a band rectangle and the items that intersect it, and the
+    /// rasterizer translates document-space items by `viewport_origin` exactly
+    /// as the full-list path does.
+    #[must_use]
+    pub fn rasterize_item_slice(
+        &self,
+        items: &[DisplayItem],
+        viewport: PhysicalSize,
+        background: Color,
+        glyphs: &dyn GlyphMaskProvider,
+        viewport_origin: PhysicalPoint,
+        images: Option<&ImageResources>,
+    ) -> CpuRasterOutput {
+        let width = ceil_to_u32(viewport.width);
+        let height = ceil_to_u32(viewport.height);
+        let mut state = RasterState::new(width, height, background, viewport_origin, images);
+        for item in items {
+            state.process_item(item, glyphs, images);
+        }
+        state.finish()
     }
 
     /// Rasterizes an immutable paint scene with cooperative cancellation.
@@ -2852,6 +2877,102 @@ fn blur_axis(
         }
     }
     output
+}
+
+/// Composites one cached layer surface into a destination surface.
+///
+/// `transform` maps source pixel `(0, 0)` to a destination pixel, so the
+/// compositor folds the band origin and the viewport scroll into one affine
+/// matrix. `opacity` multiplies the layer's alpha, and `clip` is a
+/// destination-space rectangle. A singular transform paints nothing and
+/// returns `true`, matching the offscreen path's `scale(0)` behavior.
+pub fn composite_surface(
+    destination: &mut Surface,
+    source: &Surface,
+    transform: Transform2D,
+    opacity: f32,
+    clip: Option<PhysicalRect>,
+    control: Option<&dyn RasterControl>,
+) -> bool {
+    if let Some((x, y)) = integer_translation(&transform) {
+        return blit_translated(destination, source, x, y, opacity, clip, control);
+    }
+    warp_surface(destination, source, transform, opacity, clip, control)
+}
+
+#[allow(clippy::float_cmp)] // integer translation is an exact bit-pattern test
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the fractional part was checked, so the f32-to-i64 conversion is exact"
+)]
+fn integer_translation(transform: &Transform2D) -> Option<(i64, i64)> {
+    if transform.scale_x != 1.0
+        || transform.skew_x != 0.0
+        || transform.skew_y != 0.0
+        || transform.scale_y != 1.0
+        || transform.translate_x.fract() != 0.0
+        || transform.translate_y.fract() != 0.0
+    {
+        return None;
+    }
+    Some((transform.translate_x as i64, transform.translate_y as i64))
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "blit coordinates are bounded by the u32 surface dimensions"
+)]
+fn blit_translated(
+    destination: &mut Surface,
+    source: &Surface,
+    translate_x: i64,
+    translate_y: i64,
+    opacity: f32,
+    clip: Option<PhysicalRect>,
+    control: Option<&dyn RasterControl>,
+) -> bool {
+    let width = i64::from(source.width());
+    let height = i64::from(source.height());
+    for y in 0..height {
+        if control.is_some_and(|control| control.is_cancelled() && y % 64 == 0) {
+            return false;
+        }
+        let destination_y = y + translate_y;
+        if destination_y < 0 || destination_y >= i64::from(destination.height()) {
+            continue;
+        }
+        for x in 0..width {
+            let destination_x = x + translate_x;
+            if destination_x < 0 || destination_x >= i64::from(destination.width()) {
+                continue;
+            }
+            if let Some(clip) = clip {
+                let px = destination_x as f32 + 0.5;
+                let py = destination_y as f32 + 0.5;
+                if px < clip.origin.x
+                    || py < clip.origin.y
+                    || px >= clip.right()
+                    || py >= clip.bottom()
+                {
+                    continue;
+                }
+            }
+            let source_index =
+                usize::try_from(y * width + x).expect("source index fits the surface");
+            let destination_index =
+                usize::try_from(destination_y * i64::from(destination.width()) + destination_x)
+                    .expect("destination index fits the surface");
+            let color = source.pixels()[source_index];
+            destination.pixels_mut()[destination_index] =
+                if color.alpha == u8::MAX && opacity >= 1.0 {
+                    color
+                } else {
+                    blend(destination.pixels()[destination_index], color, opacity)
+                };
+        }
+    }
+    true
 }
 
 fn warp_surface(

@@ -11,9 +11,14 @@ use render_core::dom::NodeId;
 use render_core::dom::NodeKind;
 use render_core::html::parse_document;
 use render_core::js::RuntimeLimits;
-use render_core::layout::{PhysicalPoint, PhysicalRect};
+use render_core::layout::{FragmentId, PhysicalPoint, PhysicalRect};
 use render_core::navigation::HistoryEntry;
+use render_core::paint::CompositorCache;
+use render_core::paint::DisplayItem;
+use render_core::paint::DisplayItemId;
+use render_core::paint::DisplayList;
 use render_core::paint::PaintCoordinateSpace;
+use render_core::paint::PaintPhase;
 use render_core::paint::{ClipShape, Color, DisplayCommand, Surface, Transform2D};
 use render_core::script::ScriptDiscoveryLimits;
 use render_net::NetworkWorker;
@@ -956,6 +961,7 @@ fn script_inserted_stylesheet_is_discovered_after_initial_styles_resolve() {
             viewport: WindowSize::new(800, 600),
             display_list: None,
             paint_scene: None,
+            compositor: None,
             raster_background: Color::rgb(255, 255, 255),
             content_height: 0.0,
             viewport_height: 600.0,
@@ -1201,6 +1207,9 @@ const RENDER_TEST_VIEWPORT: WindowSize<u32> = WindowSize::new(800, 560);
 struct SubmittedRender {
     generation: u64,
     carried_style_batch: bool,
+    /// Whether the job used the retained compositor rather than layout or the
+    /// complete raster path.
+    composited_scroll: bool,
     /// Interaction state the frame's cascade saw, when the job was a full frame.
     interaction: Option<render_core::css::selector::InteractionState>,
     /// Whether the job observed that its work was superseded before it
@@ -1235,11 +1244,13 @@ fn gated_render_worker() -> (
             move |job: RenderJob<PageRenderPayload>, cancellation: &RenderCancellation| {
                 let carried_style_batch = match &job.payload {
                     PageRenderPayload::Full(full) => full.style_batch.is_some(),
-                    PageRenderPayload::RetainedRaster { .. } => false,
+                    PageRenderPayload::RetainedRaster { .. }
+                    | PageRenderPayload::CompositedScroll { .. } => false,
                 };
                 let interaction = match &job.payload {
                     PageRenderPayload::Full(full) => Some(full.interaction.clone()),
-                    PageRenderPayload::RetainedRaster { .. } => None,
+                    PageRenderPayload::RetainedRaster { .. }
+                    | PageRenderPayload::CompositedScroll { .. } => None,
                 };
                 // Only the first job is gated: the resubmission under test must
                 // be free to run so the test can observe the outcome.
@@ -1256,6 +1267,10 @@ fn gated_render_worker() -> (
                 log.lock().expect("render log lock").push(SubmittedRender {
                     generation: job.identity.generation,
                     carried_style_batch,
+                    composited_scroll: matches!(
+                        &job.payload,
+                        PageRenderPayload::CompositedScroll { .. }
+                    ),
                     interaction,
                     cancelled: cancellation.is_cancelled(),
                 });
@@ -1267,6 +1282,7 @@ fn gated_render_worker() -> (
                     viewport: WindowSize::new(width, height),
                     display_list: None,
                     paint_scene: None,
+                    compositor: None,
                     raster_background: Color::rgb(0xff, 0xff, 0xff),
                     content_height: height_css,
                     viewport_height: height_css,
@@ -1394,6 +1410,68 @@ fn second_document_source() -> PageSource {
         title: "second".to_owned(),
         target: NavigationTarget::Url(Url::parse("https://example.test/second.html").expect("URL")),
     }
+}
+
+/// A retained compositor turns a scroll repaint into a `CompositedScroll` job,
+/// not a full layout or complete raster. This is the browser-level wiring test
+/// for the core band cache.
+#[test]
+fn a_scroll_with_a_retained_compositor_uses_the_composited_payload() {
+    let (worker, started, log, gate) = gated_render_worker();
+    let fonts = Arc::new(SystemFontBackend::load().expect("system fonts load"));
+    let (mut app, tab) =
+        headless_app_with_render_worker("<main>scroll</main>", worker, Arc::clone(&fonts));
+    {
+        let page = app.pages.get_mut(&tab).expect("page state");
+        page.viewport = RENDER_TEST_VIEWPORT;
+        page.compositor = Some(simple_compositor());
+        page.scroll.update_metrics(2_000.0, 600.0);
+    }
+
+    app.schedule_page_render(tab, RENDER_TEST_VIEWPORT, true);
+    wait_for_renders(&started, 1);
+    release_first_render(&gate);
+    commit_until_logged(&mut app, &log, 1);
+
+    let renders = submitted_renders(&log);
+    assert_eq!(renders.len(), 1);
+    assert!(
+        renders[0].composited_scroll,
+        "the compositor cache should be preferred over the complete raster"
+    );
+}
+
+fn simple_compositor() -> Arc<CompositorCache> {
+    let viewport = render_core::layout::PhysicalSize {
+        width: RENDER_TEST_VIEWPORT.width as f32,
+        height: RENDER_TEST_VIEWPORT.height as f32,
+    };
+    let bounds = PhysicalRect::new(0.0, 0.0, viewport.width, viewport.height);
+    let item = DisplayItem {
+        id: DisplayItemId {
+            source: None,
+            fragment_hint: 0,
+            phase: PaintPhase::Background,
+            ordinal: 0,
+        },
+        fragment: FragmentId::from_index(0),
+        source: None,
+        bounds,
+        coordinate_space: PaintCoordinateSpace::Document,
+        command: DisplayCommand::SolidRect {
+            rect: bounds,
+            color: Color::WHITE,
+        },
+    };
+    let display = DisplayList::from_items(
+        render_core::dom::DomRevision::default(),
+        viewport,
+        vec![item],
+    );
+    Arc::new(
+        CompositorCache::from_display_list(Arc::new(display), Color::WHITE)
+            .expect("the simple scene is compositable"),
+    )
 }
 
 /// A navigation that commits while a render is running hands the tab to the

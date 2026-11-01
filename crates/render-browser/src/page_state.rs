@@ -38,6 +38,7 @@ use render_core::page::PageDomEvent;
 use render_core::page::PageJob;
 use render_core::page::PageOptions;
 use render_core::paint::Color;
+use render_core::paint::CompositorCache;
 use render_core::paint::DisplayList;
 use render_core::paint::PaintScene;
 use render_core::script::ScriptScheduling;
@@ -145,6 +146,8 @@ pub(super) struct PageState {
     pub(super) viewport: WindowSize<u32>,
     pub(super) display_list: Option<Arc<DisplayList>>,
     pub(super) paint_scene: Option<Arc<PaintScene>>,
+    /// Retained compositor for scroll frames, when the scene is compositable.
+    pub(super) compositor: Option<Arc<CompositorCache>>,
     pub(super) geometry: BTreeMap<u64, ElementRect>,
     pub(super) raster_background: Color,
     pub(super) scroll: PageScrollState,
@@ -335,6 +338,7 @@ impl PageState {
             viewport: WindowSize::new(0, 0),
             display_list: None,
             paint_scene: None,
+            compositor: None,
             geometry: BTreeMap::new(),
             raster_background: DocumentRenderOptions::default().raster_background,
             scroll: PageScrollState::default(),
@@ -462,6 +466,7 @@ impl PageState {
         self.viewport = WindowSize::new(0, 0);
         self.display_list = None;
         self.paint_scene = None;
+        self.compositor = None;
         self.geometry.clear();
         self.scroll.reset();
         self.dom_revision = self.page.document().dom().revision().as_u64();

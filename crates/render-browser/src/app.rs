@@ -496,11 +496,27 @@ impl BrowserApp {
             animation_time_millis: u32::try_from(page.created_at.elapsed().as_millis())
                 .unwrap_or(u32::MAX),
         };
+        let can_composite = prefer_retained_raster
+            && page.viewport == viewport
+            && page.style_batch.is_none()
+            && page.compositor.is_some();
         let can_raster_retained = prefer_retained_raster
             && page.viewport == viewport
             && page.style_batch.is_none()
             && page.paint_scene.is_some();
-        let payload = if can_raster_retained {
+        let payload = if can_composite {
+            PageRenderPayload::CompositedScroll {
+                compositor: Arc::clone(
+                    page.compositor
+                        .as_ref()
+                        .expect("retained compositor was checked"),
+                ),
+                raster_background: page.raster_background,
+                images: page.images.clone(),
+                content_height: page.scroll.content_height(),
+                viewport_height: page.scroll.viewport_height(),
+            }
+        } else if can_raster_retained {
             PageRenderPayload::RetainedRaster {
                 scene: Arc::clone(
                     page.paint_scene
@@ -611,6 +627,9 @@ impl BrowserApp {
             }
             if let Some(paint_scene) = frame.paint_scene {
                 page.paint_scene = Some(paint_scene);
+            }
+            if let Some(compositor) = frame.compositor {
+                page.compositor = Some(compositor);
             }
             if let Some(geometry) = frame.geometry.clone() {
                 page.geometry = geometry;

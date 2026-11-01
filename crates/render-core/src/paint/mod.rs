@@ -1,6 +1,7 @@
 //! Display-list construction, incremental diffing, and CPU reference painting.
 
 mod color;
+mod compositor;
 pub(crate) mod coverage;
 mod display_list;
 mod raster;
@@ -8,6 +9,7 @@ mod scene;
 pub(crate) mod sticky;
 
 pub use color::{Color, SystemPalette};
+pub use compositor::{CompositorCache, CompositorStats, DEFAULT_COMPOSITOR_BAND_HEIGHT};
 pub use display_list::{
     BlendMode, BorderPaint, BoxShadowPaint, ClipFillRule, ClipPathResolver, ClipShape,
     CompositingReason, ConicGradient, DisplayCommand, DisplayItem, DisplayItemId, DisplayList,
@@ -23,7 +25,7 @@ pub use display_list::{
 pub use raster::{
     CpuRasterOutput, CpuRasterizer, GlyphMask, GlyphMaskProvider, NoGlyphMasks,
     NoRasterCancellation, RasterCancelled, RasterControl, RasterDiagnostic, RasterDiagnosticCode,
-    RasterRequest, Surface,
+    RasterRequest, Surface, composite_surface,
 };
 pub use scene::{
     DEFAULT_PAINT_TILE_SIZE, PaintChunk, PaintChunkClassification, PaintDamage,

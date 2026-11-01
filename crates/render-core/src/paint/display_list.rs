@@ -511,6 +511,23 @@ pub struct DisplayList {
 }
 
 impl DisplayList {
+    /// Builds a list from an explicit item sequence.
+    ///
+    /// Used by paint-scene tests and the scrolling compositor benchmark to
+    /// construct a deterministic scene without running layout.
+    #[must_use]
+    pub fn from_items(
+        dom_revision: DomRevision,
+        viewport: PhysicalSize,
+        items: Vec<DisplayItem>,
+    ) -> Self {
+        Self {
+            dom_revision,
+            viewport,
+            items,
+        }
+    }
+
     #[must_use]
     pub fn items(&self) -> &[DisplayItem] {
         &self.items

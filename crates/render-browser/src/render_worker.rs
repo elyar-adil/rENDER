@@ -38,6 +38,7 @@ use render_core::layout::FragmentKind;
 use render_core::layout::PhysicalPoint;
 use render_core::layout::PhysicalSize;
 use render_core::paint::Color;
+use render_core::paint::CompositorCache;
 use render_core::paint::CpuRasterizer;
 use render_core::paint::DisplayCommand;
 use render_core::paint::DisplayList;
@@ -59,6 +60,15 @@ pub(super) enum PageRenderPayload {
     Full(Box<FullPageRenderPayload>),
     RetainedRaster {
         scene: Arc<PaintScene>,
+        images: ImageResources,
+        raster_background: Color,
+        content_height: f32,
+        viewport_height: f32,
+    },
+    /// Scroll/composite path: reuse the retained layer tree and bands instead
+    /// of replaying the whole display list.
+    CompositedScroll {
+        compositor: Arc<CompositorCache>,
         images: ImageResources,
         raster_background: Color,
         content_height: f32,
@@ -90,6 +100,8 @@ pub(super) struct PageRenderFrame {
     pub(super) viewport: WindowSize<u32>,
     pub(super) display_list: Option<Arc<DisplayList>>,
     pub(super) paint_scene: Option<Arc<PaintScene>>,
+    /// A fresh retained compositor for a full render.
+    pub(super) compositor: Option<Arc<CompositorCache>>,
     pub(super) raster_background: Color,
     pub(super) content_height: f32,
     pub(super) viewport_height: f32,
@@ -357,12 +369,16 @@ pub(super) fn process_page_render(
             let paint_scene = Arc::new(PaintScene::from_shared_display_list(Arc::clone(
                 &display_list,
             )));
+            let compositor =
+                CompositorCache::from_display_list(Arc::clone(&display_list), raster_background)
+                    .map(Arc::new);
             let frame = surface_to_softbuffer(&output.raster.surface);
             Ok(PageRenderFrame {
                 frame,
                 viewport,
                 display_list: Some(display_list),
                 paint_scene: Some(paint_scene),
+                compositor,
                 raster_background,
                 content_height,
                 viewport_height,
@@ -399,6 +415,44 @@ pub(super) fn process_page_render(
                 frame: surface_to_softbuffer(&raster.surface),
                 display_list: None,
                 paint_scene: None,
+                compositor: None,
+                raster_background,
+                content_height,
+                viewport_height,
+                applied_style_sheets: None,
+                style_plan: None,
+                style_diagnostics: Vec::new(),
+                font_plan: None,
+                installed_fonts: Vec::new(),
+                computed_styles: None,
+                geometry: None,
+                document_revision: job.identity.dom_revision,
+                transition_state: None,
+                transition_events: Vec::new(),
+            })
+        }
+        PageRenderPayload::CompositedScroll {
+            compositor,
+            images,
+            raster_background,
+            content_height,
+            viewport_height,
+        } => {
+            let output = compositor.render(
+                PhysicalPoint {
+                    x: job.identity.scroll_offset.x,
+                    y: job.identity.scroll_offset.y,
+                },
+                fonts,
+                Some(&images),
+                Some(&BrowserRasterControl { cancellation }),
+            );
+            Ok(PageRenderFrame {
+                viewport: WindowSize::new(output.surface.width(), output.surface.height()),
+                frame: surface_to_softbuffer(&output.surface),
+                display_list: None,
+                paint_scene: None,
+                compositor: None,
                 raster_background,
                 content_height,
                 viewport_height,
