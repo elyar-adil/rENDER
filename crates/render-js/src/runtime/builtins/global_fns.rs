@@ -1103,6 +1103,18 @@ impl JsRuntime {
                 receiver,
                 arguments,
             ),
+            NativeFunction::ErrorStackGetter => self.dispatch_object_native(
+                dom,
+                NativeFunction::ErrorStackGetter,
+                receiver,
+                arguments,
+            ),
+            NativeFunction::ErrorStackSetter => self.dispatch_object_native(
+                dom,
+                NativeFunction::ErrorStackSetter,
+                receiver,
+                arguments,
+            ),
             NativeFunction::EventPreventDefault
             | NativeFunction::EventGetCancelBubble
             | NativeFunction::EventSetCancelBubble
@@ -1616,6 +1628,12 @@ impl JsRuntime {
                 arguments,
             ),
             NativeFunction::TypedArrayIntrinsic
+            | NativeFunction::TypedArrayFromBase64
+            | NativeFunction::TypedArrayFromHex
+            | NativeFunction::TypedArraySetFromBase64
+            | NativeFunction::TypedArraySetFromHex
+            | NativeFunction::TypedArrayToBase64
+            | NativeFunction::TypedArrayToHex
             | NativeFunction::TypedArrayOf
             | NativeFunction::TypedArrayKeys
             | NativeFunction::TypedArrayEntries

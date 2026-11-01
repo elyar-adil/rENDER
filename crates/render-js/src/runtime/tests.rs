@@ -3120,6 +3120,70 @@ fn error_stack_names_active_frames_and_matches_header() {
 }
 
 #[test]
+fn error_prototype_stack_is_an_accessor_over_the_error_data_slot() {
+    // The error-stack-accessor proposal: no own `stack` on instances, an
+    // inherited getter/setter on Error.prototype, and a String setter that
+    // creates an enumerable data property or writes through an existing one.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var desc = Object.getOwnPropertyDescriptor(Error.prototype, 'stack');
+                var get = desc.get;
+                var set = desc.set;
+                var err = new TypeError('boom');
+                var threw = function (fn, kind) {
+                    try { fn(); return false; } catch (error) { return error instanceof kind; }
+                };
+                desc.enumerable === false && desc.configurable === true
+                    && typeof get === 'function' && get.name === 'get stack' && get.length === 0
+                    && typeof set === 'function' && set.name === 'set stack' && set.length === 1
+                    && !Object.prototype.hasOwnProperty.call(err, 'stack')
+                    && Object.getOwnPropertyNames(err).indexOf('stack') === -1
+                    && JSON.stringify(err) === '{}'
+                    && typeof err.stack === 'string'
+                    && err.stack === get.call(err)
+                    && typeof get.call(new Error('x')) === 'string'
+                    && typeof get.call(new (class extends RangeError {})('sub')) === 'string'
+                    && get.call(Error.prototype) === undefined
+                    && get.call({}) === undefined
+                    && get.call(new Proxy(new Error('inner'), {})) === undefined
+                    && get.call(Object.create(new Error('outer'))) === undefined
+                    && threw(function () { get.call(undefined); }, TypeError)
+                    && threw(function () { get.call(''); }, TypeError)
+                    && set.call(err, 'sentinel') === undefined
+                    && Object.prototype.hasOwnProperty.call(err, 'stack')
+                    && err.stack === 'sentinel'
+                    && Object.getOwnPropertyDescriptor(err, 'stack').enumerable === true
+                    && Object.getOwnPropertyDescriptor(err, 'stack').writable === true
+                    && Object.getOwnPropertyDescriptor(err, 'stack').configurable === true
+                    && typeof get.call(err) === 'string'
+                    && threw(function () { set.call(err, 1); }, TypeError)
+                    && threw(function () { set.call(err); }, TypeError)
+                    && threw(function () { set.call(undefined, 'x'); }, TypeError)
+                    && threw(function () { Error.prototype.stack = 'x'; }, TypeError)
+                    && (function () {
+                        var frozen = new Error('f');
+                        Object.defineProperty(frozen, 'stack', {
+                            value: 'original', writable: false, enumerable: false, configurable: false
+                        });
+                        Object.preventExtensions(frozen);
+                        try { set.call(frozen, 'next'); return false; }
+                        catch (error) {
+                            return error instanceof TypeError && frozen.stack === 'original';
+                        }
+                    })()
+                    && (function () {
+                        var sealed = Object.preventExtensions(new Error('s'));
+                        try { set.call(sealed, 'next'); return false; }
+                        catch (error) { return error instanceof TypeError; }
+                    })();
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
 fn anonymous_frames_get_stable_labels() {
     let mut parsed = parse_document("<!doctype html><p></p>");
     let mut runtime = JsRuntime::new(&parsed.dom);
@@ -5863,6 +5927,19 @@ fn aggregate_error_carries_its_reasons_as_an_own_non_enumerable_property() {
         ),
         "TypeError|2|AggregateError|AggregateError"
     );
+    // 20.5.7.1: calling it without `new` constructs the same object, and its
+    // stack is the inherited accessor rather than an own property.
+    assert_eq!(
+        eval_read(
+            r"
+                var called = AggregateError([1], 'm');
+                var prototypeIsIntrinsic = called instanceof AggregateError;
+            ",
+            r"[prototypeIsIntrinsic, Object.prototype.hasOwnProperty.call(called, 'stack'),
+                typeof called.stack].join('|')"
+        ),
+        "true|false|string"
+    );
 }
 
 #[test]
@@ -8268,6 +8345,122 @@ fn typed_array_to_locale_string_calls_each_elements_to_locale_string() {
                 var result = new Uint8Array([42, 0]).toLocaleString();
                 Number.prototype.toLocaleString = original;
                 result === 'h1,h2' && calls.length === 2;
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn uint8_array_base64_and_hex_round_trip_through_the_intrinsic_methods() {
+    // The arraybuffer-base64 proposal: Uint8Array carries fromBase64/fromHex,
+    // its prototype carries toBase64/toHex, and the encoders include padding
+    // unless omitPadding is true.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var threw = function (fn, kind) {
+                    try { fn(); return false; } catch (error) { return error instanceof kind; }
+                };
+                var standard = new Uint8Array([102, 111, 111, 98, 97, 114]);
+                var url = new Uint8Array([199, 239, 242]);
+                standard.toBase64() === 'Zm9vYmFy'
+                    && new Uint8Array([]).toBase64() === ''
+                    && new Uint8Array([255]).toBase64() === '/w=='
+                    && new Uint8Array([255]).toBase64({ omitPadding: true }) === '/w'
+                    && url.toBase64({ alphabet: 'base64url' }) === 'x-_y'
+                    && Uint8Array.fromBase64('Z g\t==').join(',') === '102'
+                    && Uint8Array.fromBase64('x-_y', { alphabet: 'base64url' }).join(',') === '199,239,242'
+                    && Uint8Array.fromBase64('ZXhhZg', { lastChunkHandling: 'stop-before-partial' }).join(',') === '101,120,97'
+                    && Uint8Array.fromBase64('ZXhhZh==').join(',') === '101,120,97,102'
+                    && threw(function () { Uint8Array.fromBase64('ZXhhZh==', { lastChunkHandling: 'strict' }); }, SyntaxError)
+                    && threw(function () { Uint8Array.fromBase64('A'); }, SyntaxError)
+                    && threw(function () { Uint8Array.fromBase64(42); }, TypeError)
+                    && threw(function () { Uint8Array.fromBase64('Zg==', { alphabet: { toString: function () { return 'base64'; } } }); }, TypeError)
+                    && Uint8Array.fromHex('666F6f').join(',') === '102,111,111'
+                    && new Uint8Array([102, 111, 111]).toHex() === '666f6f'
+                    && threw(function () { Uint8Array.fromHex('a'); }, SyntaxError)
+                    && threw(function () { Uint8Array.fromHex('a.a'); }, SyntaxError)
+                    && Uint8Array.fromBase64.length === 1
+                    && Uint8Array.fromHex.length === 1
+                    && Uint8Array.prototype.toBase64.length === 0
+                    && Uint8Array.prototype.toHex.length === 0
+                    && Uint8Array.prototype.toBase64.name === 'toBase64'
+                    && Uint8Array.prototype.toHex.name === 'toHex'
+                    && !('toBase64' in Uint8ClampedArray.prototype)
+                    && !('fromBase64' in Uint8ClampedArray);
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn uint8_array_set_from_base64_and_hex_report_progress_and_write_prefixes() {
+    // FromBase64 returns the bytes decoded before an error, and setFromBase64
+    // writes them before throwing. A zero-byte target returns before scanning
+    // its input, and an odd hex length is rejected before writing any pair.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var target = new Uint8Array([255, 255, 255, 255, 255]);
+                var result = target.setFromBase64('Zm9vYmFy');
+                var prefixThrew = false;
+                var prefix = new Uint8Array([255, 255, 255, 255, 255]);
+                try { prefix.setFromBase64('MjYyZm.9v'); }
+                catch (error) { prefixThrew = error instanceof SyntaxError; }
+                var zero = new Uint8Array(0);
+                var empty = zero.setFromBase64('#', { lastChunkHandling: 'strict' });
+                var hexTarget = new Uint8Array([255, 255]);
+                var hex = hexTarget.setFromHex('aabbcc');
+                var oddThrew = false;
+                try { new Uint8Array(0).setFromHex('1'); }
+                catch (error) { oddThrew = error instanceof SyntaxError; }
+                result.read === 4 && result.written === 3
+                    && target.join(',') === '102,111,111,255,255'
+                    && Object.getPrototypeOf(result) === Object.prototype
+                    && prefixThrew && prefix.join(',') === '50,54,50,255,255'
+                    && empty.read === 0 && empty.written === 0
+                    && hex.read === 4 && hex.written === 2 && hexTarget.join(',') === '170,187'
+                    && oddThrew;
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn uint8_array_base64_methods_validate_receivers_and_revalidate_after_options() {
+    // ValidateUint8Array runs before the options bag, so a detached receiver
+    // still runs its getters; the byte read/write then rechecks the buffer.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var typeThrew = function (fn) {
+                    try { fn(); return false; } catch (error) { return error instanceof TypeError; }
+                };
+                var detached = new Uint8Array(2);
+                detached.buffer.transfer();
+                var getterCalls = 0;
+                var options = {};
+                Object.defineProperty(options, 'alphabet', {
+                    get: function () { getterCalls += 1; return 'base64'; }
+                });
+                var detachedThrew = typeThrew(function () { detached.toBase64(options); });
+                var live = new Uint8Array(2);
+                var liveOptions = {};
+                Object.defineProperty(liveOptions, 'lastChunkHandling', {
+                    get: function () { live.buffer.transfer(); return 'loose'; }
+                });
+                var liveThrew = typeThrew(function () { live.setFromBase64('Zg==', liveOptions); });
+                detachedThrew && getterCalls === 1 && liveThrew
+                    && typeThrew(function () { detached.toHex(); })
+                    && typeThrew(function () { Uint8Array.prototype.toHex.call(new Uint8ClampedArray(2)); })
+                    && typeThrew(function () { Uint8Array.prototype.toBase64.call(new Int8Array(2)); })
+                    && typeThrew(function () { Uint8Array.prototype.setFromHex.call([], '00'); })
+                    && typeThrew(function () { Uint8Array.prototype.setFromBase64.call(null, 'Zg=='); })
+                    && typeThrew(function () { Uint8Array.fromHex({}); })
+                    && typeThrew(function () { Uint8Array.fromBase64('Zg==', 1); });
             "
         ),
         JsValue::Boolean(true)

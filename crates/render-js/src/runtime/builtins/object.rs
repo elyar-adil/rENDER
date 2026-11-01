@@ -19,6 +19,7 @@ use crate::JsSymbol;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::PropertyDescriptor;
+use crate::RealmId;
 use crate::runtime::JsRuntime;
 use crate::runtime::builtins::array::array_index;
 use crate::runtime::convert::required_argument;
@@ -145,7 +146,12 @@ fn array_length_slot(descriptor: Option<&PropertyDescriptor>) -> (u32, bool) {
 /// Built-ins whose `this` must already be an Object: a primitive or a nullish
 /// receiver is a `TypeError`, where other built-ins would wrap or coerce it.
 pub(in crate::runtime) fn requires_object_receiver(function: NativeFunction) -> bool {
-    matches!(function, NativeFunction::ErrorPrototypeToString)
+    matches!(
+        function,
+        NativeFunction::ErrorPrototypeToString
+            | NativeFunction::ErrorStackGetter
+            | NativeFunction::ErrorStackSetter
+    )
 }
 
 impl JsRuntime {
@@ -472,6 +478,8 @@ impl JsRuntime {
                 Err(_) => Ok(JsValue::Boolean(true)),
             },
             NativeFunction::ErrorPrototypeToString => self.error_to_string(dom, receiver),
+            NativeFunction::ErrorStackGetter => Ok(self.error_stack_getter(receiver)),
+            NativeFunction::ErrorStackSetter => self.error_stack_setter(dom, receiver, arguments),
             NativeFunction::ErrorIsError => Ok(Self::error_is_error(arguments, &self.realm)),
             other => self.dispatch_math_native(dom, other, receiver, arguments),
         }
@@ -684,7 +692,7 @@ impl JsRuntime {
         dom: &mut Dom,
         constructor: ObjectId,
         new_target: &JsValue,
-        _kind: ErrorKind,
+        kind: ErrorKind,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         self.ensure_heap_capacity(1)?;
@@ -699,7 +707,11 @@ impl JsRuntime {
         let prototype = match new_target {
             JsValue::Object(target) => match self.get_member(dom, *target, "prototype")? {
                 JsValue::Object(prototype) => prototype,
-                _ => fallback,
+                // 10.1.14 step 4: a non-object `prototype` falls back to the
+                // intrinsic of the *new target's* realm, not the constructor's.
+                _ => self
+                    .error_prototype_of_new_target_realm(*target, kind)
+                    .unwrap_or(fallback),
             },
             _ => fallback,
         };
@@ -730,6 +742,30 @@ impl JsRuntime {
         Ok(JsValue::Object(object))
     }
 
+    /// `GetFunctionRealm(newTarget)`'s intrinsic `%<kind>.prototype%`: the
+    /// default `Error`/`NativeError` prototype for a `new.target` from another
+    /// realm whose own `prototype` is not an object.
+    fn error_prototype_of_new_target_realm(
+        &self,
+        target: ObjectId,
+        kind: ErrorKind,
+    ) -> Option<ObjectId> {
+        let realm = self.function_realm(target).ok()?;
+        if kind == ErrorKind::Error {
+            return Some(self.realm.record(realm).error_prototype());
+        }
+        let global = self.realm.global_of(realm);
+        match self.realm.get_property(global, kind.name())? {
+            JsValue::Object(constructor) => {
+                match self.realm.get_property(constructor, "prototype")? {
+                    JsValue::Object(prototype) => Some(prototype),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// The own `stack` property of a new error: the engine-captured header
     /// ("Name: message") followed by the call-site lines, like a real engine.
     fn attach_error_stack(&mut self, object: ObjectId, message: Option<&str>) {
@@ -743,18 +779,40 @@ impl JsRuntime {
             _ => (name).to_key(),
         };
         let stack = format!("{header}{}", self.stack_frame_lines());
-        self.realm.define_property(
+        self.store_error_stack(object, stack);
+    }
+
+    /// The engine-internal `[[Stack]]` string of an error, kept in a
+    /// non-enumerable symbol-keyed property so it is invisible to
+    /// `Object.getOwnPropertyNames`, `for-in`, `JSON.stringify` and
+    /// `Object.assign`, matching the error-stack-accessor proposal's "no own
+    /// `stack`" rule while `get Error.prototype.stack` can still report it.
+    fn internal_error_stack_symbol() -> JsSymbol {
+        JsSymbol::new(u64::MAX, None)
+    }
+
+    pub(in crate::runtime) fn store_error_stack(&mut self, object: ObjectId, stack: String) {
+        let symbol = Self::internal_error_stack_symbol();
+        self.realm.define_symbol_property(
             object,
-            "stack",
+            &symbol,
             PropertyDescriptor {
                 getter: None,
                 setter: None,
                 value: JsValue::String((stack).into()),
-                writable: true,
+                writable: false,
                 enumerable: false,
-                configurable: true,
+                configurable: false,
             },
         );
+    }
+
+    fn internal_error_stack(&self, object: ObjectId) -> Option<JsString> {
+        let symbol = Self::internal_error_stack_symbol();
+        match self.realm.own_symbol_property(object, &symbol)?.value {
+            JsValue::String(stack) => Some(stack),
+            _ => None,
+        }
     }
 
     /// An error instance of `constructor` (its own `prototype`) for an error the
@@ -824,6 +882,84 @@ impl JsRuntime {
             JsValue::Undefined => Ok(JsString::from(fallback)),
             value => self.to_string_value(dom, &value),
         }
+    }
+
+    /// `get Error.prototype.stack`: a string for an object with the
+    /// `[[ErrorData]]` slot (the engine's `ErrorInstance` host), and
+    /// `undefined` for every other receiver. The exact stack text is
+    /// implementation-defined; it never consumes user code or an own
+    /// `stack` property.
+    fn error_stack_getter(&self, receiver: ObjectId) -> JsValue {
+        if !matches!(self.realm.host(receiver), Some(ObjectHost::ErrorInstance)) {
+            return JsValue::Undefined;
+        }
+        if let Some(stack) = self.internal_error_stack(receiver) {
+            return JsValue::String(stack);
+        }
+        let mut units = String::from("Error").encode_utf16().collect::<Vec<_>>();
+        if let Some(descriptor) = self.realm.own_property(receiver, "message")
+            && !descriptor.is_accessor()
+            && let JsValue::String(message) = descriptor.value
+            && !message.is_empty()
+        {
+            units.extend(": ".encode_utf16());
+            units.extend_from_slice(message.units());
+        }
+        units.extend("\n    at <anonymous>".encode_utf16());
+        JsValue::String(JsString::from_unit_vec(units))
+    }
+
+    /// `set Error.prototype.stack` (error-stack-accessor proposal):
+    /// `SetterThatIgnoresPrototypeProperties(this, %Error.prototype%, "stack", v)`.
+    /// A missing own property is created as an enumerable data property; an
+    /// existing own property is written through a throwing `[[Set]]`.
+    fn error_stack_setter(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let JsValue::String(value) = arguments.first().cloned().unwrap_or(JsValue::Undefined)
+        else {
+            return Err(JsError::type_error(
+                "Error.prototype.stack must be assigned a string",
+            ));
+        };
+        // The setter belongs to the realm of its Error prototype, so use the
+        // receiver's realm for the home check. Throwing a TypeError from that
+        // realm keeps a cross-realm call's `error.constructor` answer local.
+        let receiver_realm = self.realm.object_realm(receiver);
+        if receiver == self.realm.record(receiver_realm).error_prototype() {
+            return Err(self.type_error_in_realm(receiver_realm));
+        }
+        let key = PropertyName::String("stack".to_owned());
+        if self.own_descriptor(dom, receiver, &key)?.is_none() {
+            self.create_data_field_or_throw(dom, receiver, &key, JsValue::String(value))?;
+        } else if !self.set_property_checked(dom, receiver, &key, JsValue::String(value))? {
+            return Err(JsError::type_error(
+                "cannot assign to read only property 'stack'",
+            ));
+        }
+        Ok(JsValue::Undefined)
+    }
+
+    /// A `TypeError` object whose prototype is `realm`'s `TypeError.prototype`,
+    /// so a cross-realm `assert.throws(realm.TypeError, ...)` sees the error as
+    /// that realm's constructor.
+    fn type_error_in_realm(&mut self, realm: RealmId) -> JsError {
+        let global = self.realm.global_of(realm);
+        let prototype = match self.realm.get_property(global, "TypeError") {
+            Some(JsValue::Object(constructor)) => {
+                match self.realm.get_property(constructor, "prototype") {
+                    Some(JsValue::Object(prototype)) => Some(prototype),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+        .unwrap_or_else(|| self.realm.object_prototype());
+        let error = self.realm.create_error(prototype, None);
+        JsError::thrown(JsValue::Object(error))
     }
 
     /// ECMA-262 20.1.2.1 `Object.assign`: each enumerable own property of each

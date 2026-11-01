@@ -6860,6 +6860,11 @@ impl JsRuntime {
             Some(ObjectHost::ErrorConstructor(kind)) => {
                 self.error_constructor(dom, callee, &JsValue::Undefined, kind, arguments)
             }
+            // AggregateError (ECMA-262 20.5.7.1) may be called without `new`;
+            // its NewTarget is then the active function.
+            Some(ObjectHost::AggregateErrorConstructor) => {
+                self.aggregate_error_constructor(dom, callee, arguments)
+            }
             Some(ObjectHost::SuppressedErrorConstructor) => {
                 self.suppressed_error_constructor(dom, &JsValue::Object(callee), arguments)
             }

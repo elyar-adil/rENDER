@@ -590,8 +590,10 @@ impl JsRuntime {
         Ok(object)
     }
 
-    /// The `stack` own property engine-made errors carry: `Name: message`
-    /// followed by the current frames.
+    /// The engine-internal stack string of a `SuppressedError`: `Name: message`
+    /// followed by the current frames. It lives in a hidden symbol-keyed slot,
+    /// not an own `stack` property, so the inherited accessor is the only
+    /// observable `stack` member.
     fn install_error_stack(&mut self, object: ObjectId, fallback_name: &str) {
         let name = self.realm.get_property(object, "name").map_or_else(
             || fallback_name.to_owned(),
@@ -602,18 +604,7 @@ impl JsRuntime {
             _ => name,
         };
         let stack = format!("{header}{}", self.stack_frame_lines());
-        self.realm.define_property(
-            object,
-            "stack",
-            PropertyDescriptor {
-                getter: None,
-                setter: None,
-                value: JsValue::String((stack).into()),
-                writable: true,
-                enumerable: false,
-                configurable: true,
-            },
-        );
+        self.store_error_stack(object, stack);
     }
 
     /// `ToString(value)` (ECMA-262 7.1.17). Unlike the `String` conversion, it

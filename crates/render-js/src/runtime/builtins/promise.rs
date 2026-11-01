@@ -1497,18 +1497,7 @@ impl JsRuntime {
             };
             format!("{header}{}", self.stack_frame_lines())
         };
-        self.realm.define_property(
-            object,
-            "stack",
-            PropertyDescriptor {
-                getter: None,
-                setter: None,
-                value: JsValue::String((stack).into()),
-                writable: true,
-                enumerable: false,
-                configurable: true,
-            },
-        );
+        self.store_error_stack(object, stack);
         Ok(JsValue::Object(object))
     }
 }

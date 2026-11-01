@@ -16,6 +16,7 @@
 use super::array::callback_this_argument;
 use super::object::{AccessorField, PartialDescriptor, PropertyName};
 use crate::JsError;
+use crate::JsErrorKind;
 use crate::JsSymbol;
 use crate::JsValue;
 use crate::ObjectId;
@@ -120,6 +121,18 @@ impl JsRuntime {
             }
             NativeFunction::TypedArrayWith => self.typed_array_with(dom, receiver, arguments),
             NativeFunction::TypedArrayFrom => self.typed_array_from(dom, receiver, arguments),
+            NativeFunction::TypedArrayFromBase64 => self.uint8_array_from_base64(dom, arguments),
+            NativeFunction::TypedArrayFromHex => self.uint8_array_from_hex(arguments),
+            NativeFunction::TypedArraySetFromBase64 => {
+                self.uint8_array_set_from_base64(dom, receiver, arguments)
+            }
+            NativeFunction::TypedArraySetFromHex => {
+                self.uint8_array_set_from_hex(receiver, arguments)
+            }
+            NativeFunction::TypedArrayToBase64 => {
+                self.uint8_array_to_base64(dom, receiver, arguments)
+            }
+            NativeFunction::TypedArrayToHex => self.uint8_array_to_hex(receiver),
             NativeFunction::TypedArrayOf => self.typed_array_of(dom, receiver, arguments),
             NativeFunction::TypedArraySpecies => Ok(JsValue::Object(receiver)),
             NativeFunction::TypedArrayBufferGetter => {
@@ -1577,6 +1590,475 @@ impl JsRuntime {
         }
         Ok(true)
     }
+}
+
+/// The two base64 alphabets of RFC 4648 sections 4 and 5.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Base64Alphabet {
+    Standard,
+    Url,
+}
+
+/// `lastChunkHandling` for base64 decoding.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Base64LastChunkHandling {
+    Loose,
+    Strict,
+    StopBeforePartial,
+}
+
+impl JsRuntime {
+    /// `%Uint8Array.prototype%`, the prototype every result of the static
+    /// `fromBase64`/`fromHex` decoders gets regardless of the receiver method.
+    fn uint8_array_intrinsic_prototype(&self) -> Option<ObjectId> {
+        self.realm
+            .global("Uint8Array")
+            .and_then(|value| match value {
+                JsValue::Object(constructor) => self.realm.get_property(constructor, "prototype"),
+                _ => None,
+            })
+            .and_then(|value| match value {
+                JsValue::Object(object) => Some(object),
+                _ => None,
+            })
+    }
+
+    /// `GetOptionsObject` from the arraybuffer-base64 proposal: `undefined` is
+    /// an empty bag, an object is used as-is, and anything else is a `TypeError`.
+    fn typed_array_options_object(options: Option<&JsValue>) -> Result<Option<ObjectId>, JsError> {
+        match options {
+            None | Some(JsValue::Undefined) => Ok(None),
+            Some(JsValue::Object(object)) => Ok(Some(*object)),
+            Some(_) => Err(JsError::type_error(
+                "options must be an object or undefined",
+            )),
+        }
+    }
+
+    fn base64_alphabet_option(
+        &mut self,
+        dom: &mut Dom,
+        options: Option<ObjectId>,
+    ) -> Result<Base64Alphabet, JsError> {
+        let value = match options {
+            Some(options) => self.get_member(dom, options, "alphabet")?,
+            None => JsValue::Undefined,
+        };
+        match value {
+            JsValue::Undefined => Ok(Base64Alphabet::Standard),
+            JsValue::String(text) if text == "base64" => Ok(Base64Alphabet::Standard),
+            JsValue::String(text) if text == "base64url" => Ok(Base64Alphabet::Url),
+            _ => Err(JsError::type_error(
+                "alphabet must be \"base64\" or \"base64url\"",
+            )),
+        }
+    }
+
+    fn base64_last_chunk_option(
+        &mut self,
+        dom: &mut Dom,
+        options: Option<ObjectId>,
+    ) -> Result<Base64LastChunkHandling, JsError> {
+        let value = match options {
+            Some(options) => self.get_member(dom, options, "lastChunkHandling")?,
+            None => JsValue::Undefined,
+        };
+        match value {
+            JsValue::Undefined => Ok(Base64LastChunkHandling::Loose),
+            JsValue::String(text) if text == "loose" => Ok(Base64LastChunkHandling::Loose),
+            JsValue::String(text) if text == "strict" => Ok(Base64LastChunkHandling::Strict),
+            JsValue::String(text) if text == "stop-before-partial" => {
+                Ok(Base64LastChunkHandling::StopBeforePartial)
+            }
+            _ => Err(JsError::type_error(
+                "lastChunkHandling must be \"loose\", \"strict\", or \"stop-before-partial\"",
+            )),
+        }
+    }
+
+    /// `ValidateUint8Array`: the receiver must carry the `Uint8Array` internal
+    /// slot names. Unlike `ValidateTypedArray`, a detached buffer still passes;
+    /// the byte reads and writes perform their own witness check.
+    fn validate_uint8_array_receiver(&self, receiver: ObjectId) -> Result<(), JsError> {
+        let (kind, _, _, _) = self.typed_array_parts(receiver)?;
+        if kind != TypedArrayKind::Uint8 {
+            return Err(JsError::type_error("receiver is not a Uint8Array"));
+        }
+        Ok(())
+    }
+
+    fn create_uint8_array_from_bytes(&mut self, bytes: Vec<u8>) -> Result<JsValue, JsError> {
+        let length = bytes.len();
+        if length > Self::MAX_TYPED_ARRAY_ELEMENTS {
+            return Err(self.range_error("typed array length exceeds the engine bound"));
+        }
+        let prototype = self.uint8_array_intrinsic_prototype();
+        self.ensure_heap_capacity(1)?;
+        Ok(JsValue::Object(self.realm.typed_array(
+            TypedArrayKind::Uint8,
+            TypedBuffer::new(bytes),
+            0,
+            Some(length),
+            prototype,
+        )))
+    }
+
+    fn base64_result_record(&mut self, read: usize, written: usize) -> JsValue {
+        let result = self.realm.create_ordinary_object();
+        self.realm
+            .set_property(result, "read".to_owned(), JsValue::Number(read as f64));
+        self.realm.set_property(
+            result,
+            "written".to_owned(),
+            JsValue::Number(written as f64),
+        );
+        JsValue::Object(result)
+    }
+
+    fn uint8_array_from_base64(
+        &mut self,
+        dom: &mut Dom,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let Some(JsValue::String(text)) = arguments.first() else {
+            return Err(JsError::type_error(
+                "Uint8Array.fromBase64 requires a string",
+            ));
+        };
+        let text = text.clone();
+        let options = Self::typed_array_options_object(arguments.get(1))?;
+        let alphabet = self.base64_alphabet_option(dom, options)?;
+        let last_chunk = self.base64_last_chunk_option(dom, options)?;
+        let (_, bytes, error) = decode_base64(text.units(), alphabet, last_chunk, usize::MAX);
+        if let Some(error) = error {
+            return Err(error);
+        }
+        self.create_uint8_array_from_bytes(bytes)
+    }
+
+    fn uint8_array_from_hex(&mut self, arguments: &[JsValue]) -> Result<JsValue, JsError> {
+        let Some(JsValue::String(text)) = arguments.first() else {
+            return Err(JsError::type_error("Uint8Array.fromHex requires a string"));
+        };
+        let (_, bytes, error) = decode_hex(text.units(), usize::MAX);
+        if let Some(error) = error {
+            return Err(error);
+        }
+        self.create_uint8_array_from_bytes(bytes)
+    }
+
+    fn uint8_array_set_from_base64(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        self.validate_uint8_array_receiver(receiver)?;
+        let Some(JsValue::String(text)) = arguments.first() else {
+            return Err(JsError::type_error(
+                "Uint8Array.prototype.setFromBase64 requires a string",
+            ));
+        };
+        let text = text.clone();
+        let options = Self::typed_array_options_object(arguments.get(1))?;
+        let alphabet = self.base64_alphabet_option(dom, options)?;
+        let last_chunk = self.base64_last_chunk_option(dom, options)?;
+        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        let (read, bytes, error) = decode_base64(text.units(), alphabet, last_chunk, length);
+        let written = bytes.len();
+        buffer.write_bytes(start, &bytes);
+        if let Some(error) = error {
+            return Err(error);
+        }
+        Ok(self.base64_result_record(read, written))
+    }
+
+    fn uint8_array_set_from_hex(
+        &mut self,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        self.validate_uint8_array_receiver(receiver)?;
+        let Some(JsValue::String(text)) = arguments.first() else {
+            return Err(JsError::type_error(
+                "Uint8Array.prototype.setFromHex requires a string",
+            ));
+        };
+        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        let (read, bytes, error) = decode_hex(text.units(), length);
+        let written = bytes.len();
+        buffer.write_bytes(start, &bytes);
+        if let Some(error) = error {
+            return Err(error);
+        }
+        Ok(self.base64_result_record(read, written))
+    }
+
+    fn uint8_array_to_base64(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        self.validate_uint8_array_receiver(receiver)?;
+        let options = Self::typed_array_options_object(arguments.first())?;
+        let alphabet = self.base64_alphabet_option(dom, options)?;
+        let omit_padding = match options {
+            Some(options) => self.get_member(dom, options, "omitPadding")?.is_truthy(),
+            None => false,
+        };
+        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        let bytes = buffer.read_bytes(start, length)?;
+        Ok(JsValue::String(encode_base64(
+            &bytes,
+            alphabet,
+            !omit_padding,
+        )))
+    }
+
+    fn uint8_array_to_hex(&self, receiver: ObjectId) -> Result<JsValue, JsError> {
+        self.validate_uint8_array_receiver(receiver)?;
+        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        let bytes = buffer.read_bytes(start, length)?;
+        Ok(JsValue::String(encode_hex(&bytes)))
+    }
+}
+
+fn base64_syntax_error() -> JsError {
+    JsError::new(JsErrorKind::Syntax, "invalid base64 string", None)
+}
+
+fn hex_syntax_error() -> JsError {
+    JsError::new(JsErrorKind::Syntax, "invalid hex string", None)
+}
+
+fn skip_ascii_whitespace(input: &[u16], mut index: usize) -> usize {
+    while let Some(&unit) = input.get(index) {
+        if !matches!(unit, 0x0009 | 0x000A | 0x000C | 0x000D | 0x0020) {
+            break;
+        }
+        index += 1;
+    }
+    index
+}
+
+/// A code unit of the standard base64 alphabet as its six-bit value.
+fn standard_base64_value(unit: u16) -> Option<u8> {
+    match unit {
+        0x41..=0x5A => Some((unit - 0x41) as u8),
+        0x61..=0x7A => Some((unit - 0x61 + 26) as u8),
+        0x30..=0x39 => Some((unit - 0x30 + 52) as u8),
+        0x2B => Some(62),
+        0x2F => Some(63),
+        _ => None,
+    }
+}
+
+/// `DecodeBase64Chunk`: `chunk` has two, three or four standard alphabet
+/// characters. Two- and three-character chunks are padded with `A` and, when
+/// `throw_on_extra_bits` is set, their unused trailing bits must be zero.
+fn decode_base64_chunk(chunk: &[u16], throw_on_extra_bits: bool) -> Result<Vec<u8>, JsError> {
+    let chunk_length = chunk.len();
+    let mut padded = [0x41u16; 4];
+    padded[..chunk_length].copy_from_slice(chunk);
+    let mut values = [0u8; 4];
+    for (index, unit) in padded.iter().enumerate() {
+        values[index] = standard_base64_value(*unit).ok_or_else(base64_syntax_error)?;
+    }
+    let bytes = [
+        (values[0] << 2) | (values[1] >> 4),
+        ((values[1] & 0x0F) << 4) | (values[2] >> 2),
+        ((values[2] & 0x03) << 6) | values[3],
+    ];
+    match chunk_length {
+        2 => {
+            if throw_on_extra_bits && bytes[1] != 0 {
+                return Err(base64_syntax_error());
+            }
+            Ok(vec![bytes[0]])
+        }
+        3 => {
+            if throw_on_extra_bits && bytes[2] != 0 {
+                return Err(base64_syntax_error());
+            }
+            Ok(vec![bytes[0], bytes[1]])
+        }
+        _ => Ok(bytes.to_vec()),
+    }
+}
+
+/// `FromBase64`: the decoded prefix, the input position reached, and a
+/// `SyntaxError` when the input is invalid. The prefix is still returned with
+/// an error so `setFromBase64` can write it before throwing.
+fn decode_base64(
+    input: &[u16],
+    alphabet: Base64Alphabet,
+    last_chunk_handling: Base64LastChunkHandling,
+    max_length: usize,
+) -> (usize, Vec<u8>, Option<JsError>) {
+    if max_length == 0 {
+        return (0, Vec::new(), None);
+    }
+    let length = input.len();
+    let mut read = 0;
+    let mut bytes = Vec::new();
+    let mut chunk: Vec<u16> = Vec::with_capacity(4);
+    let mut index = 0;
+    loop {
+        index = skip_ascii_whitespace(input, index);
+        if index == length {
+            if !chunk.is_empty() {
+                match last_chunk_handling {
+                    Base64LastChunkHandling::StopBeforePartial => {
+                        return (read, bytes, None);
+                    }
+                    Base64LastChunkHandling::Loose => {
+                        if chunk.len() == 1 {
+                            return (read, bytes, Some(base64_syntax_error()));
+                        }
+                        match decode_base64_chunk(&chunk, false) {
+                            Ok(decoded) => bytes.extend(decoded),
+                            Err(error) => return (read, bytes, Some(error)),
+                        }
+                    }
+                    Base64LastChunkHandling::Strict => {
+                        return (read, bytes, Some(base64_syntax_error()));
+                    }
+                }
+            }
+            return (length, bytes, None);
+        }
+        let mut character = input[index];
+        index += 1;
+        if character == u16::from(b'=') {
+            if chunk.len() < 2 {
+                return (read, bytes, Some(base64_syntax_error()));
+            }
+            index = skip_ascii_whitespace(input, index);
+            if chunk.len() == 2 {
+                if index == length {
+                    if last_chunk_handling == Base64LastChunkHandling::StopBeforePartial {
+                        return (read, bytes, None);
+                    }
+                    return (read, bytes, Some(base64_syntax_error()));
+                }
+                // The second `=` is inspected but not consumed here; the
+                // whitespace skip below advances past it.
+                if input[index] != u16::from(b'=') {
+                    return (read, bytes, Some(base64_syntax_error()));
+                }
+                index = skip_ascii_whitespace(input, index + 1);
+            }
+            if index < length {
+                return (read, bytes, Some(base64_syntax_error()));
+            }
+            let throw_on_extra_bits = last_chunk_handling == Base64LastChunkHandling::Strict;
+            match decode_base64_chunk(&chunk, throw_on_extra_bits) {
+                Ok(decoded) => bytes.extend(decoded),
+                Err(error) => return (read, bytes, Some(error)),
+            }
+            return (length, bytes, None);
+        }
+        if alphabet == Base64Alphabet::Url {
+            if character == u16::from(b'+') || character == u16::from(b'/') {
+                return (read, bytes, Some(base64_syntax_error()));
+            }
+            if character == u16::from(b'-') {
+                character = u16::from(b'+');
+            } else if character == u16::from(b'_') {
+                character = u16::from(b'/');
+            }
+        }
+        if standard_base64_value(character).is_none() {
+            return (read, bytes, Some(base64_syntax_error()));
+        }
+        let remaining = max_length - bytes.len();
+        if (remaining == 1 && chunk.len() == 2) || (remaining == 2 && chunk.len() == 3) {
+            return (read, bytes, None);
+        }
+        chunk.push(character);
+        if chunk.len() == 4 {
+            match decode_base64_chunk(&chunk, false) {
+                Ok(decoded) => bytes.extend(decoded),
+                Err(error) => return (read, bytes, Some(error)),
+            }
+            chunk.clear();
+            read = index;
+            if bytes.len() == max_length {
+                return (read, bytes, None);
+            }
+        }
+    }
+}
+
+/// `FromHex`: unlike base64 there is no whitespace skipping, and an odd input
+/// length is rejected before any pair is decoded.
+fn decode_hex(input: &[u16], max_length: usize) -> (usize, Vec<u8>, Option<JsError>) {
+    let length = input.len();
+    let mut read = 0;
+    let mut bytes = Vec::new();
+    if !length.is_multiple_of(2) {
+        return (0, bytes, Some(hex_syntax_error()));
+    }
+    while read < length && bytes.len() < max_length {
+        let Some(high) = hex_value(input[read]) else {
+            return (read, bytes, Some(hex_syntax_error()));
+        };
+        let Some(low) = hex_value(input[read + 1]) else {
+            return (read, bytes, Some(hex_syntax_error()));
+        };
+        read += 2;
+        bytes.push((high << 4) | low);
+    }
+    (read, bytes, None)
+}
+
+fn hex_value(unit: u16) -> Option<u8> {
+    match unit {
+        0x30..=0x39 => Some((unit - 0x30) as u8),
+        0x41..=0x46 => Some((unit - 0x41 + 10) as u8),
+        0x61..=0x66 => Some((unit - 0x61 + 10) as u8),
+        _ => None,
+    }
+}
+
+fn encode_base64(bytes: &[u8], alphabet: Base64Alphabet, padding: bool) -> JsString {
+    const STANDARD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let table = match alphabet {
+        Base64Alphabet::Standard => STANDARD,
+        Base64Alphabet::Url => URL,
+    };
+    let mut units = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = u32::from(chunk[0]);
+        let second = chunk.get(1).copied().map_or(0, u32::from);
+        let third = chunk.get(2).copied().map_or(0, u32::from);
+        let packed = (first << 16) | (second << 8) | third;
+        units.push(u16::from(table[((packed >> 18) & 0x3F) as usize]));
+        units.push(u16::from(table[((packed >> 12) & 0x3F) as usize]));
+        if chunk.len() > 1 {
+            units.push(u16::from(table[((packed >> 6) & 0x3F) as usize]));
+        } else if padding {
+            units.push(u16::from(b'='));
+        }
+        if chunk.len() > 2 {
+            units.push(u16::from(table[(packed & 0x3F) as usize]));
+        } else if padding {
+            units.push(u16::from(b'='));
+        }
+    }
+    JsString::from_unit_vec(units)
+}
+
+fn encode_hex(bytes: &[u8]) -> JsString {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut units = Vec::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        units.push(u16::from(HEX[usize::from(*byte >> 4)]));
+        units.push(u16::from(HEX[usize::from(*byte & 0x0F)]));
+    }
+    JsString::from_unit_vec(units)
 }
 
 /// Store `values`, each already converted to `kind`, from element `first` on.

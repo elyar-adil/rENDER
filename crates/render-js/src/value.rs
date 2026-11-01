@@ -1238,6 +1238,10 @@ pub(crate) enum NativeFunction {
     DateToString,
     ErrorIsError,
     ErrorPrototypeToString,
+    /// The `get`/`set` pair of the `Error.prototype.stack` accessor
+    /// (error-stack-accessor proposal).
+    ErrorStackGetter,
+    ErrorStackSetter,
     /// The `name`, `message` and `code` accessors of `DOMException.prototype`.
     /// One native per member because `WebIDL` attributes are separate accessors,
     /// and the three read different internal slots.
@@ -1311,6 +1315,16 @@ pub(crate) enum NativeFunction {
     TypedArrayJoin,
     TypedArrayToLocaleString,
     TypedArrayFrom,
+    /// `Uint8Array.fromBase64` and `Uint8Array.fromHex` (the arraybuffer-base64
+    /// proposal), which ignore their receiver and always build a `Uint8Array`.
+    TypedArrayFromBase64,
+    TypedArrayFromHex,
+    /// `Uint8Array.prototype.setFromBase64`, `setFromHex`, `toBase64` and
+    /// `toHex`, which exist only on `Uint8Array.prototype`.
+    TypedArraySetFromBase64,
+    TypedArraySetFromHex,
+    TypedArrayToBase64,
+    TypedArrayToHex,
     TypedArrayIncludes,
     TypedArrayForEach,
     TypedArrayMap,
@@ -3037,6 +3051,10 @@ pub struct RealmRecord {
     global: ObjectId,
     document: ObjectId,
     object_prototype: ObjectId,
+    /// `%Error.prototype%`, the home object the `stack` setter checks against
+    /// (the error-stack-accessor proposal's
+    /// `SetterThatIgnoresPrototypeProperties`).
+    error_prototype: ObjectId,
     function_prototype: ObjectId,
     /// `%ThrowTypeError%` (ECMA-262 10.2.4.1), the getter and setter of an
     /// unmapped arguments object's `callee`.
@@ -3557,6 +3575,7 @@ impl Realm {
             global,
             document,
             object_prototype,
+            error_prototype,
             function_prototype,
             throw_type_error,
             array_prototype,
@@ -5777,6 +5796,39 @@ impl Realm {
                     configurable: true,
                 },
             );
+            // The arraybuffer-base64 proposal adds four methods to
+            // `Uint8Array.prototype` and two static decoders to `Uint8Array`
+            // itself; no other typed array has them.
+            if kind == TypedArrayKind::Uint8 {
+                for (name, function, arity) in [
+                    ("fromBase64", NativeFunction::TypedArrayFromBase64, 1.0),
+                    ("fromHex", NativeFunction::TypedArrayFromHex, 1.0),
+                ] {
+                    let method =
+                        Self::install_native_method(objects, function_prototype, function, arity);
+                    objects[constructor.0].properties.insert(
+                        name.to_owned(),
+                        PropertyDescriptor::builtin(JsValue::Object(method)),
+                    );
+                }
+                for (name, function, arity) in [
+                    (
+                        "setFromBase64",
+                        NativeFunction::TypedArraySetFromBase64,
+                        1.0,
+                    ),
+                    ("setFromHex", NativeFunction::TypedArraySetFromHex, 1.0),
+                    ("toBase64", NativeFunction::TypedArrayToBase64, 0.0),
+                    ("toHex", NativeFunction::TypedArrayToHex, 0.0),
+                ] {
+                    let method =
+                        Self::install_native_method(objects, function_prototype, function, arity);
+                    objects[prototype.0].properties.insert(
+                        name.to_owned(),
+                        PropertyDescriptor::builtin(JsValue::Object(method)),
+                    );
+                }
+            }
         }
     }
 
@@ -7001,6 +7053,10 @@ impl Realm {
             | "copyWithin"
             | "toSpliced"
             | "with"
+            | "fromBase64"
+            | "fromHex"
+            | "setFromBase64"
+            | "setFromHex"
             | "hasOwn"
             | "__defineGetter__"
             | "__defineSetter__"
@@ -7020,7 +7076,7 @@ impl Realm {
             | "getMinutes" | "getUTCMinutes" | "getSeconds" | "getUTCSeconds"
             | "getMilliseconds" | "getUTCMilliseconds" | "getTimezoneOffset" | "pop" | "shift"
             | "clear" | "next" | "return" | "random" | "flat" | "keys" | "values" | "entries"
-            | "toArray" | "toLowerCase" | "toUpperCase" => 0,
+            | "toArray" | "toLowerCase" | "toUpperCase" | "toBase64" | "toHex" => 0,
             "Object" | "Function" | "Array" | "String" | "Number" | "Boolean" | "Error"
             | "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError" | "EvalError"
             | "URIError" | "Promise" | "ArrayBuffer" | "DataView" | "Symbol" | "Map" | "Set"
@@ -8815,6 +8871,10 @@ impl Realm {
     /// derived constructors hang off. `DOMException` installs against that
     /// object rather than against `Object.prototype`, which is the whole of
     /// `WebIDL` §3.14.1's JavaScript binding for it.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the Error family, its stack accessor and its metadata install together"
+    )]
     fn install_errors(
         objects: &mut Vec<JsObject>,
         global: ObjectId,
@@ -8835,6 +8895,34 @@ impl Realm {
         objects[error_prototype.0].properties.insert(
             "toString".to_owned(),
             PropertyDescriptor::builtin(JsValue::Object(to_string)),
+        );
+        // The error-stack-accessor proposal replaces the old own `stack` data
+        // property with one accessor pair on %Error.prototype%; instances have
+        // no own `stack` and the getter reads their [[ErrorData]] slot.
+        let getter = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::ErrorStackGetter),
+            properties: Self::function_metadata("get stack", 0.0),
+            ..JsObject::default()
+        });
+        let setter = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::ErrorStackSetter),
+            properties: Self::function_metadata("set stack", 1.0),
+            ..JsObject::default()
+        });
+        objects[error_prototype.0].properties.insert(
+            "stack".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Undefined,
+                writable: false,
+                getter: Some(getter),
+                setter: Some(setter),
+                enumerable: false,
+                configurable: true,
+            },
         );
 
         // §20.5.6.2: every NativeError constructor inherits from `Error`, so its
@@ -11018,6 +11106,12 @@ impl Realm {
 }
 
 impl RealmRecord {
+    /// `%Error.prototype%` of this realm, the home object of the `stack`
+    /// accessor's setter.
+    pub(crate) const fn error_prototype(&self) -> ObjectId {
+        self.error_prototype
+    }
+
     /// The identity roots of this realm (see [`Realm::gc_identity_roots`]).
     fn identity_roots(&self) -> Vec<ObjectId> {
         let mut roots = Vec::with_capacity(
@@ -11033,6 +11127,7 @@ impl RealmRecord {
         );
         roots.push(self.global);
         roots.push(self.document);
+        roots.push(self.error_prototype);
         roots.push(self.throw_type_error);
         roots.push(self.array_prototype_values);
         // The iterator prototypes are only reachable through helper objects,
