@@ -90,6 +90,14 @@ pub(super) struct FullPageRenderPayload {
     pub(super) frame_documents: FrameDocuments,
 }
 
+/// A completed stylesheet transfer's event, deferred until the frame that
+/// applies the sheet is committed so the event observes the new CSSOM.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct StylesheetLoadEvent {
+    pub(super) owner: NodeId,
+    pub(super) loaded: bool,
+}
+
 #[derive(Debug)]
 pub(super) struct PageRenderFrame {
     pub(super) frame: Vec<u32>,
@@ -105,6 +113,8 @@ pub(super) struct PageRenderFrame {
     pub(super) applied_style_sheets: Option<ExternalStyleSheets>,
     pub(super) style_plan: Option<StylesheetFetchPlan>,
     pub(super) style_diagnostics: Vec<StylesheetResourceDiagnostic>,
+    /// `load`/`error` events for the stylesheet batch this frame applied.
+    pub(super) style_events: Vec<StylesheetLoadEvent>,
     /// Webfont URLs the next render needs to fetch.
     pub(super) font_plan: Option<FontFetchPlan>,
     /// Font URLs whose bodies this render decoded and installed.
@@ -180,7 +190,7 @@ pub(super) fn process_page_render(
             // elapsed time. Repeating the key within one document is a no-op.
             font_loader.begin_document((job.identity.tab_id, document_serial));
             let installed_fonts = font_loader.install_fetched_map(&font_resources);
-            let (style_sheets, applied_style_sheets, style_diagnostics) =
+            let (style_sheets, applied_style_sheets, style_events, style_diagnostics) =
                 if let Some((plan, results)) = style_batch {
                     // Page scripts mutate the DOM while a large stylesheet is
                     // in flight, so the plan's revision routinely lags the
@@ -210,9 +220,28 @@ pub(super) fn process_page_render(
                         &external_style_sheets,
                         &application.style_sheets,
                     );
-                    (merged.clone(), Some(merged), application.diagnostics)
+                    let mut events = Vec::with_capacity(
+                        application
+                            .loaded
+                            .len()
+                            .saturating_add(application.failed.len()),
+                    );
+                    events.extend(application.loaded.iter().map(|loaded| StylesheetLoadEvent {
+                        owner: loaded.key.owner,
+                        loaded: true,
+                    }));
+                    events.extend(application.failed.iter().map(|key| StylesheetLoadEvent {
+                        owner: key.owner,
+                        loaded: false,
+                    }));
+                    (
+                        merged.clone(),
+                        Some(merged),
+                        events,
+                        application.diagnostics,
+                    )
                 } else {
-                    (external_style_sheets, None, Vec::new())
+                    (external_style_sheets, None, Vec::new(), Vec::new())
                 };
             cancellation.check()?;
             let style_plan = discover_external_styles.then(|| {
@@ -421,6 +450,7 @@ pub(super) fn process_page_render(
                 applied_style_sheets,
                 style_plan,
                 style_diagnostics,
+                style_events,
                 font_plan,
                 installed_fonts,
                 computed_styles: Some(output.styles),
@@ -465,6 +495,7 @@ pub(super) fn process_page_render(
                 applied_style_sheets: None,
                 style_plan: None,
                 style_diagnostics: Vec::new(),
+                style_events: Vec::new(),
                 font_plan: None,
                 installed_fonts: Vec::new(),
                 computed_styles: None,

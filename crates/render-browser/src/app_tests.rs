@@ -97,6 +97,7 @@ fn empty_render_frame(viewport: WindowSize<u32>, pixel: u32, revision: u64) -> P
         applied_style_sheets: None,
         style_plan: None,
         style_diagnostics: Vec::new(),
+        style_events: Vec::new(),
         font_plan: None,
         installed_fonts: Vec::new(),
         computed_styles: None,
@@ -1224,6 +1225,7 @@ fn script_inserted_stylesheet_is_discovered_after_initial_styles_resolve() {
             applied_style_sheets: None,
             style_plan: Some(fresh),
             style_diagnostics: Vec::new(),
+            style_events: Vec::new(),
             font_plan: None,
             installed_fonts: Vec::new(),
             computed_styles: None,
@@ -1248,6 +1250,68 @@ fn script_inserted_stylesheet_is_discovered_after_initial_styles_resolve() {
             .ends_with("/b.css")
     );
     assert_eq!(page.started_style_sheets.len(), 2);
+}
+
+#[test]
+fn committed_stylesheet_batch_fires_load_and_error_at_its_link() {
+    let (mut app, tab) = headless_app_with(
+        "<!doctype html><html><head>\
+         <link id='good' rel='stylesheet' href='good.css'>\
+         <link id='bad' rel='stylesheet' href='bad.css'>\
+         </head><body id='body'></body></html>",
+    );
+    let (good, bad, revision) = {
+        let page = app.pages.get_mut(&tab).expect("page state");
+        page.page
+            .queue_script(
+                "document.getElementById('good').onload = function () { \
+                   document.body.setAttribute('data-good', '1'); }; \
+                 document.getElementById('bad').onerror = function () { \
+                   document.body.setAttribute('data-bad', '1'); };",
+            )
+            .expect("listener script queues");
+        page.run_page_turns();
+        let dom = page.page.document().dom();
+        (find_id(dom, "good"), find_id(dom, "bad"), page.dom_revision)
+    };
+
+    app.schedule_page_render(tab, WindowSize::new(800, 600), false);
+    let identity = app.pages.get(&tab).unwrap().expected_render.unwrap();
+    let mut frame = empty_render_frame(WindowSize::new(800, 600), 0, revision);
+    frame.applied_style_sheets = Some(render_core::document::ExternalStyleSheets::default());
+    frame.style_events = vec![
+        crate::render_worker::StylesheetLoadEvent {
+            owner: good,
+            loaded: true,
+        },
+        crate::render_worker::StylesheetLoadEvent {
+            owner: bad,
+            loaded: false,
+        },
+    ];
+    app.commit_render(CompletedRender {
+        identity,
+        result: Ok(frame),
+    });
+
+    app.pages
+        .get_mut(&tab)
+        .expect("page state")
+        .run_page_turns();
+    let page = app.pages.get(&tab).expect("page state");
+    let dom = page.page.document().dom();
+    assert_eq!(
+        dom.attribute(find_id(dom, "body"), "data-good")
+            .ok()
+            .flatten(),
+        Some("1")
+    );
+    assert_eq!(
+        dom.attribute(find_id(dom, "body"), "data-bad")
+            .ok()
+            .flatten(),
+        Some("1")
+    );
 }
 
 #[test]
@@ -1607,6 +1671,7 @@ fn gated_render_worker() -> (
                     applied_style_sheets: None,
                     style_plan: None,
                     style_diagnostics: Vec::new(),
+                    style_events: Vec::new(),
                     font_plan: None,
                     installed_fonts: Vec::new(),
                     computed_styles: None,

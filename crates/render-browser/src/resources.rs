@@ -102,7 +102,14 @@ pub struct LoadedStylesheet {
 pub struct StylesheetBatchApplication {
     pub revision: DomRevision,
     pub style_sheets: ExternalStyleSheets,
+    /// Slots whose stylesheet was decoded, parsed, and injected. Each one fires
+    /// `load` at its owner element once the frame carrying it becomes current.
     pub loaded: Vec<LoadedStylesheet>,
+    /// Slots whose stylesheet transfer or decode failed. Each one fires
+    /// `error` at its owner element. Kept apart from `diagnostics` because a
+    /// diagnostic may describe a slot that was never requested or is still
+    /// pending, and only a completed failed request fires the event.
+    pub failed: Vec<ExternalStyleSheetKey>,
     pub diagnostics: Vec<StylesheetResourceDiagnostic>,
 }
 
@@ -178,6 +185,7 @@ pub fn apply_stylesheet_batch(
         revision: plan.revision,
         style_sheets: ExternalStyleSheets::default(),
         loaded: Vec::new(),
+        failed: Vec::new(),
         diagnostics: plan.diagnostics.clone(),
     };
 
@@ -195,6 +203,9 @@ pub fn apply_stylesheet_batch(
                 current_revision.as_u64()
             ),
         });
+        application
+            .failed
+            .extend(plan.resources.iter().map(|resource| resource.key.clone()));
         return application;
     }
 
@@ -202,16 +213,20 @@ pub fn apply_stylesheet_batch(
     for (resource, result) in plan.resources.iter().zip(results) {
         match result {
             Ok(response) => apply_response(resource, response, &mut application),
-            Err(error) => application.diagnostics.push(resource_diagnostic(
-                resource,
-                StylesheetDiagnosticSeverity::Error,
-                StylesheetDiagnosticCode::Transport,
-                format!("stylesheet transfer failed: {error}"),
-            )),
+            Err(error) => {
+                application.failed.push(resource.key.clone());
+                application.diagnostics.push(resource_diagnostic(
+                    resource,
+                    StylesheetDiagnosticSeverity::Error,
+                    StylesheetDiagnosticCode::Transport,
+                    format!("stylesheet transfer failed: {error}"),
+                ));
+            }
         }
     }
 
     for resource in plan.resources.iter().skip(result_count) {
+        application.failed.push(resource.key.clone());
         application.diagnostics.push(resource_diagnostic(
             resource,
             StylesheetDiagnosticSeverity::Error,
@@ -261,6 +276,7 @@ pub fn apply_stylesheet_batch_rematched(
         revision: plan.revision,
         style_sheets: ExternalStyleSheets::default(),
         loaded: Vec::new(),
+        failed: Vec::new(),
         diagnostics: plan.diagnostics.clone(),
     };
 
@@ -294,12 +310,15 @@ pub fn apply_stylesheet_batch_rematched(
                     .expect("matched pending result is present");
                 match result {
                     Ok(response) => apply_response(resource, response, &mut application),
-                    Err(error) => application.diagnostics.push(resource_diagnostic(
-                        resource,
-                        StylesheetDiagnosticSeverity::Error,
-                        StylesheetDiagnosticCode::Transport,
-                        format!("stylesheet transfer failed: {error}"),
-                    )),
+                    Err(error) => {
+                        application.failed.push(resource.key.clone());
+                        application.diagnostics.push(resource_diagnostic(
+                            resource,
+                            StylesheetDiagnosticSeverity::Error,
+                            StylesheetDiagnosticCode::Transport,
+                            format!("stylesheet transfer failed: {error}"),
+                        ));
+                    }
                 }
             }
             None => application.diagnostics.push(StylesheetResourceDiagnostic {
@@ -324,6 +343,7 @@ fn apply_response(
     application: &mut StylesheetBatchApplication,
 ) {
     if response.requested_url != resource.key.requested_url {
+        application.failed.push(resource.key.clone());
         application.diagnostics.push(resource_diagnostic(
             resource,
             StylesheetDiagnosticSeverity::Error,
@@ -336,6 +356,7 @@ fn apply_response(
         return;
     }
     if !response.status.is_success() {
+        application.failed.push(resource.key.clone());
         application.diagnostics.push(resource_diagnostic(
             resource,
             StylesheetDiagnosticSeverity::Error,
@@ -350,6 +371,7 @@ fn apply_response(
 
     match response.content_type.as_ref() {
         Some(content_type) if !content_type.media_type.eq_ignore_ascii_case("text/css") => {
+            application.failed.push(resource.key.clone());
             application.diagnostics.push(resource_diagnostic(
                 resource,
                 StylesheetDiagnosticSeverity::Error,
@@ -773,6 +795,18 @@ mod tests {
                 .count(),
             2
         );
+        assert_eq!(
+            transport_failure
+                .failed
+                .iter()
+                .map(|key| key.owner)
+                .collect::<Vec<_>>(),
+            plan.resources
+                .iter()
+                .map(|resource| resource.key.owner)
+                .collect::<Vec<_>>(),
+            "every failed transfer reports its own slot for the link error event"
+        );
     }
 
     #[test]
@@ -805,6 +839,18 @@ mod tests {
             diagnostic.code == StylesheetDiagnosticCode::UnsupportedContentType
                 && diagnostic.source_order == Some(1)
         }));
+        assert_eq!(
+            application
+                .failed
+                .iter()
+                .map(|key| key.owner)
+                .collect::<Vec<_>>(),
+            plan.resources
+                .iter()
+                .map(|resource| resource.key.owner)
+                .collect::<Vec<_>>()
+        );
+        assert!(application.loaded.is_empty());
     }
 
     #[test]

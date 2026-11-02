@@ -930,6 +930,17 @@ impl BrowserApp {
                 page.styles_resolved = true;
                 self.tabs.set_loading(id, false);
             }
+            // HTML's "update the style sheet" steps fire `load` after the
+            // sheet is applied and `error` when its fetch fails. Deferring
+            // the events to the commit that installs the new sheets means an
+            // `onload` handler already sees the updated CSSOM, which is what
+            // CSS capability probes and preload polyfills inspect.
+            for event in frame.style_events {
+                let event_type = if event.loaded { "load" } else { "error" };
+                let _ = page
+                    .page
+                    .queue_dom_event(PageDomEvent::new(event.owner, event_type));
+            }
             if !frame.installed_fonts.is_empty() {
                 let resources = Arc::make_mut(&mut page.font_resources);
                 for url in &frame.installed_fonts {
