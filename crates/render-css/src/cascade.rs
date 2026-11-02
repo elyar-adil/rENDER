@@ -250,6 +250,18 @@ impl CascadedValue {
         self.priority > other.priority
     }
 
+    /// A copy of this declaration's cascade rank carrying a different value.
+    ///
+    /// A shorthand deferred for `var()` substitution expands to longhands at
+    /// computed-value time; each longhand inherits the shorthand's rank so it
+    /// still loses to a more specific longhand declaration from the cascade.
+    pub(crate) fn with_value(&self, value: String) -> Self {
+        Self {
+            value,
+            ..self.clone()
+        }
+    }
+
     /// Whether a declaration from the document produced this value, rather
     /// than the user agent's own styling.
     ///
@@ -276,6 +288,16 @@ pub struct CascadedStyle {
 }
 
 impl CascadedStyle {
+    /// Build a style around a property map.
+    ///
+    /// Computed-value resolution uses this after substituting a deferred
+    /// shorthand: the expansion produces ordinary longhand candidates that
+    /// must go through the same inheritance, grammar and typed-value stages as
+    /// declarations the cascade expanded directly.
+    pub(crate) fn from_properties(properties: BTreeMap<String, CascadedValue>) -> Self {
+        Self { properties }
+    }
+
     #[must_use]
     pub fn get(&self, property: &str) -> Option<&CascadedValue> {
         self.properties.get(property)
@@ -900,7 +922,7 @@ fn cascade_element_with_origins_impl(
                     source_order,
                 };
                 for (name, specified_value) in
-                    expanded_declaration(&declaration.name, &declaration.value)
+                    cascaded_declaration(&declaration.name, &declaration.value)
                 {
                     let value = CascadedValue {
                         value: specified_value,
@@ -956,7 +978,7 @@ fn cascade_element_with_origins_impl(
             proximity: Reverse(u32::MAX),
             source_order,
         };
-        for (name, specified_value) in expanded_declaration(&declaration.name, &declaration.value) {
+        for (name, specified_value) in cascaded_declaration(&declaration.name, &declaration.value) {
             candidates.entry(name).or_default().push(Candidate {
                 priority,
                 value: CascadedValue {
@@ -1003,7 +1025,7 @@ fn cascade_element_with_origins_impl(
             proximity: Reverse(u32::MAX),
             source_order,
         };
-        for (name, specified_value) in expanded_declaration(&declaration.name, &declaration.value) {
+        for (name, specified_value) in cascaded_declaration(&declaration.name, &declaration.value) {
             candidates.entry(name).or_default().push(Candidate {
                 priority,
                 value: CascadedValue {
@@ -1854,6 +1876,88 @@ fn parse_media_resolution(value: &str) -> Option<f32> {
 #[must_use]
 pub fn expand_shorthand(name: &str, value: &str) -> Vec<(String, String)> {
     expanded_declaration(name, value)
+}
+
+/// Whether `name` is a shorthand this cascade expands into longhands.
+///
+/// A shorthand whose value contains `var()` cannot be expanded until the
+/// custom property has been substituted at computed-value time, so the cascade
+/// has to recognise it before calling [`expanded_declaration`].
+pub(crate) fn is_shorthand(name: &str) -> bool {
+    matches!(
+        name,
+        "container"
+            | "background"
+            | "margin"
+            | "padding"
+            | "margin-inline"
+            | "margin-block"
+            | "padding-inline"
+            | "padding-block"
+            | "inset-inline"
+            | "inset-block"
+            | "border-inline"
+            | "border-block"
+            | "border"
+            | "border-top"
+            | "border-right"
+            | "border-bottom"
+            | "border-left"
+            | "border-inline-start"
+            | "border-inline-end"
+            | "border-block-start"
+            | "border-block-end"
+            | "border-width"
+            | "border-style"
+            | "border-color"
+            | "border-inline-width"
+            | "border-inline-style"
+            | "border-inline-color"
+            | "border-block-width"
+            | "border-block-style"
+            | "border-block-color"
+            | "font"
+            | "text-decoration"
+            | "gap"
+            | "grid-gap"
+            | "grid-column"
+            | "grid-row"
+            | "grid-row-gap"
+            | "grid-column-gap"
+            | "flex"
+            | "flex-flow"
+            | "overflow"
+            | "columns"
+            | "animation"
+            | "transition"
+    )
+}
+
+/// Whether a declaration value still contains a `var()` substitution.
+///
+/// The test is deliberately textual: it runs on the specified value before
+/// tokenization, where a comment or string that spells `var(` can only cause
+/// the harmless conservative choice of deferring expansion to the same
+/// substitution stage every value reaches anyway.
+pub(crate) fn mentions_variable(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("var(")
+}
+
+/// Expand one declaration for the cascade, deferring shorthands whose value
+/// depends on a custom property.
+///
+/// `background: var(--surface)` has no longhand value until `--surface` is
+/// substituted. Expanding it here would find no `<color>` component and reset
+/// `background-color` to `transparent`, which is how a themed icon button lost
+/// its background even though the same declaration worked in every browser
+/// (CSS Variables 1 §3 resolves `var()` at computed-value time, not when the
+/// stylesheet is parsed).
+fn cascaded_declaration(name: &str, value: &str) -> Vec<(String, String)> {
+    if mentions_variable(value) && is_shorthand(name) {
+        vec![(name.to_owned(), value.to_owned())]
+    } else {
+        expanded_declaration(name, value)
+    }
 }
 
 fn expanded_declaration(name: &str, value: &str) -> Vec<(String, String)> {

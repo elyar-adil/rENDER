@@ -14,8 +14,9 @@ use cssparser::{ParseError, Parser, ParserInput, Token};
 use render_dom::{Dom, Node, NodeId, NodeKind};
 
 use super::cascade::{
-    CascadeInput, CascadeLookup, CascadeRuleIndex, CascadedStyle,
-    cascade_element_with_origins_indexed, media_query_list_matches,
+    CascadeInput, CascadeLookup, CascadeRuleIndex, CascadedStyle, CascadedValue,
+    cascade_element_with_origins_indexed, is_shorthand, media_query_list_matches,
+    mentions_variable,
 };
 use super::container::{StyleFeature, StyleQueryEnvironment, parse_container_names};
 use super::properties::{
@@ -682,6 +683,17 @@ impl TokenStream {
         let mut output = String::new();
         self.write_css(&mut output, true);
         output
+    }
+
+    /// Serialize a substituted value for shorthand expansion.
+    ///
+    /// `var()` boundaries become spaces rather than the synthetic comments
+    /// [`Self::to_parseable_css`] needs for typed longhands: a shorthand
+    /// expander splits on components, so `background: var(--surface)` must
+    /// read as one `<color>`, while a substitution next to a token must still
+    /// not fuse into a different token.
+    fn to_expansion_css(&self) -> String {
+        self.to_parseable_css().replace("/**/", " ")
     }
 
     fn write_css(&self, output: &mut String, preserve_substitution_boundaries: bool) {
@@ -1669,6 +1681,97 @@ fn apply_registered_property(
     }
 }
 
+/// Expand shorthands the cascade had to defer because their value contained
+/// `var()`.
+///
+/// CSS Variables 1 §3 substitutes custom properties at computed-value time,
+/// after the cascade has picked a winner. A shorthand is therefore still one
+/// declaration at cascade time, but its longhands are only known after
+/// substitution. This pass substitutes each deferred shorthand, expands the
+/// result, and merges the longhands into the cascaded map at the shorthand's
+/// own cascade rank, so a more specific longhand still wins.
+fn expand_deferred_shorthands(
+    cascaded: &CascadedStyle,
+    resolver: &mut CustomResolver<'_>,
+    limits: &ComputationLimits,
+) -> CascadedStyle {
+    let deferred = cascaded
+        .properties()
+        .iter()
+        .filter(|(name, value)| is_shorthand(name) && mentions_variable(&value.value))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    if deferred.is_empty() {
+        return cascaded.clone();
+    }
+    let mut properties = cascaded.properties().clone();
+    for (name, shorthand) in deferred {
+        properties.remove(&name);
+        let substituted = tokenize(&shorthand.value, limits)
+            .ok()
+            .and_then(|tokens| resolver.substitute(&tokens, 0))
+            .map(|tokens| tokens.to_expansion_css().trim().to_owned());
+        let Some(substituted) = substituted else {
+            reset_deferred_longhands(&mut properties, &name, &shorthand, "unset");
+            continue;
+        };
+        if let Some(keyword) = css_wide_keyword(&substituted) {
+            let keyword = match keyword {
+                CssWideKeyword::Inherit => "inherit",
+                CssWideKeyword::Initial => "initial",
+                CssWideKeyword::Unset => "unset",
+                CssWideKeyword::Revert => "revert",
+                CssWideKeyword::RevertLayer => "revert-layer",
+            };
+            reset_deferred_longhands(&mut properties, &name, &shorthand, keyword);
+            continue;
+        }
+        let expansion = super::cascade::expand_shorthand(&name, &substituted);
+        if expansion.len() == 1 && expansion[0].0 == name {
+            // The substituted value is not a valid shorthand. CSS Variables 1
+            // §3 makes every longhand unset rather than falling back to a
+            // lower-ranked declaration the shorthand had already beaten.
+            reset_deferred_longhands(&mut properties, &name, &shorthand, "unset");
+            continue;
+        }
+        for (longhand, value) in expansion {
+            if longhand == name {
+                continue;
+            }
+            let candidate = shorthand.with_value(value);
+            if properties
+                .get(&longhand)
+                .is_none_or(|existing| candidate.outranks(existing))
+            {
+                properties.insert(longhand, candidate);
+            }
+        }
+    }
+    CascadedStyle::from_properties(properties)
+}
+
+/// Write `keyword` to every longhand a shorthand controls, but only where the
+/// shorthand outranks the longhand declaration already in the map.
+fn reset_deferred_longhands(
+    properties: &mut BTreeMap<String, CascadedValue>,
+    name: &str,
+    shorthand: &CascadedValue,
+    keyword: &str,
+) {
+    for (longhand, _) in super::cascade::expand_shorthand(name, "unset") {
+        if longhand == name {
+            continue;
+        }
+        let candidate = shorthand.with_value(keyword.to_owned());
+        if properties
+            .get(&longhand)
+            .is_none_or(|existing| candidate.outranks(existing))
+        {
+            properties.insert(longhand, candidate);
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)] // Kept linear to mirror the ordered CSS computed-value stages.
 fn compute_style_with_initials(
     cascaded: &CascadedStyle,
@@ -1890,6 +1993,7 @@ fn compute_style_with_initials(
         diagnostics: &mut diagnostics,
         diagnosed: BTreeSet::new(),
     };
+    let cascaded = expand_deferred_shorthands(cascaded, &mut resolver, limits);
     if !inherits_custom {
         // Resolve only the names this element declares. Everything else keeps
         // the parent layer, so no inherited value is copied or re-substituted.
@@ -1931,7 +2035,7 @@ fn compute_style_with_initials(
         apply_registered_property(
             name,
             definition,
-            cascaded,
+            &cascaded,
             parent,
             &mut resolver,
             limits,
@@ -1960,7 +2064,7 @@ fn compute_style_with_initials(
         apply_registered_property(
             name,
             definition,
-            cascaded,
+            &cascaded,
             parent,
             &mut resolver,
             limits,
@@ -2029,7 +2133,7 @@ fn compute_style_with_initials(
         &mut properties,
         &mut typed_properties,
         &mut specified,
-        cascaded,
+        &cascaded,
         parent,
     );
     invalid.extend(resolution_invalid);
@@ -2753,6 +2857,77 @@ mod tests {
                 "{property}"
             );
         }
+    }
+
+    #[test]
+    fn shorthand_var_substitution_happens_before_expansion() {
+        let output = parse_document(
+            "<!doctype html><html id='root'><body><div id='target'></div></body></html>",
+        );
+        // The later shorthand must beat the earlier longhand even though the
+        // shorthand has no longhand values until --surface is substituted.
+        let sheet = parse_stylesheet(
+            "html { --surface: #f8f8fa } \
+             #target { background-color: red; background: var(--surface) }",
+        );
+        let mut registry = PropertyRegistry::new();
+        registry.define("background-color", false, "transparent");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &registry,
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let target = &styles[&target_id(&output.dom, "#target")];
+        assert_eq!(
+            target
+                .get("background-color")
+                .map(super::ComputedValue::css_text),
+            Some("#f8f8fa")
+        );
+
+        // A more specific longhand still outranks the deferred shorthand, and
+        // an invalid substitution unsets the longhands instead of exposing the
+        // lower-ranked declaration the shorthand beat.
+        let sheet = parse_stylesheet(
+            "html { --surface: #f8f8fa } \
+             #target.special { background-color: blue } \
+             #target { background-color: red; background: var(--surface) } \
+             #invalid { background: var(--missing) }",
+        );
+        let output = parse_document(
+            "<!doctype html><html id='root'><body>\
+             <div id='target' class='special'></div><div id='invalid'></div>\
+             </body></html>",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &registry,
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let target = &styles[&target_id(&output.dom, "#target")];
+        assert_eq!(
+            target
+                .get("background-color")
+                .map(super::ComputedValue::css_text),
+            Some("blue")
+        );
+        let invalid = &styles[&target_id(&output.dom, "#invalid")];
+        assert_eq!(
+            invalid
+                .get("background-color")
+                .map(super::ComputedValue::css_text),
+            Some("transparent")
+        );
     }
 
     #[test]
