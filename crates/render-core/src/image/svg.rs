@@ -728,10 +728,11 @@ impl Raster {
                         winding += direction;
                         if previous == 0 && winding != 0 {
                             span_start = Some(x);
-                        } else if previous != 0 && winding == 0 {
-                            if let Some(start) = span_start.take() {
-                                self.fill_span(row, start, x, &color_at);
-                            }
+                        } else if previous != 0
+                            && winding == 0
+                            && let Some(start) = span_start.take()
+                        {
+                            self.fill_span(row, start, x, &color_at);
                         }
                     }
                 }
