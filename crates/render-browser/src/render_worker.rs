@@ -93,6 +93,7 @@ pub(super) struct FullPageRenderPayload {
 #[derive(Debug)]
 pub(super) struct PageRenderFrame {
     pub(super) frame: Vec<u32>,
+    /// Physical dimensions of `frame`, as presented.
     pub(super) viewport: WindowSize<u32>,
     pub(super) display_list: Option<Arc<DisplayList>>,
     pub(super) paint_scene: Option<Arc<PaintScene>>,
@@ -235,10 +236,20 @@ pub(super) fn process_page_render(
             if env::var_os("RENDER_DEBUG_FRAME").is_some() {
                 eprintln!("render-browser animation time={animation_time:.3}s");
             }
+            let device_scale =
+                if job.identity.device_scale.is_finite() && job.identity.device_scale > 0.0 {
+                    job.identity.device_scale
+                } else {
+                    1.0
+                };
             let mut options = DocumentRenderOptions {
                 animation_time,
+                device_scale,
                 ..DocumentRenderOptions::default()
             };
+            // Identity dimensions are CSS pixels. Layout and the returned
+            // display list stay in that space; the document pipeline scales
+            // only the copy it hands to the rasterizer.
             options.layout.viewport = PhysicalSize {
                 width: viewport_dimension(job.identity.viewport.width),
                 height: viewport_dimension(job.identity.viewport.height),
@@ -368,13 +379,24 @@ pub(super) fn process_page_render(
                     pending.extend(dom.children(node).unwrap_or_default().iter().copied());
                 }
             }
+            // The returned list is the CSS-pixel one the shell keeps for hit
+            // testing and script geometry. The retained paint scene and
+            // compositor are physical device buffers, so they receive the
+            // scaled copy.
             let display_list = Arc::new(output.display.list);
+            let paint_display_list = if (device_scale - 1.0).abs() > f32::EPSILON {
+                Arc::new(display_list.scaled(device_scale))
+            } else {
+                Arc::clone(&display_list)
+            };
             let paint_scene = Arc::new(PaintScene::from_shared_display_list(Arc::clone(
-                &display_list,
+                &paint_display_list,
             )));
-            let compositor =
-                CompositorCache::from_display_list(Arc::clone(&display_list), raster_background)
-                    .map(Arc::new);
+            let compositor = CompositorCache::from_display_list(
+                Arc::clone(&paint_display_list),
+                raster_background,
+            )
+            .map(Arc::new);
             if env::var_os("RENDER_DEBUG_FRAME").is_some() {
                 match &compositor {
                     Some(cache) => eprintln!(
@@ -415,11 +437,18 @@ pub(super) fn process_page_render(
             content_height,
             viewport_height,
         } => {
+            let device_scale =
+                if job.identity.device_scale.is_finite() && job.identity.device_scale > 0.0 {
+                    job.identity.device_scale
+                } else {
+                    1.0
+                };
             let request = RasterRequest::new(&scene, raster_background, fonts)
                 .with_images(&images)
                 .with_viewport_origin(PhysicalPoint {
-                    x: job.identity.scroll_offset.x,
-                    y: job.identity.scroll_offset.y,
+                    // The retained scene is physical; identity scroll is CSS.
+                    x: job.identity.scroll_offset.x * device_scale,
+                    y: job.identity.scroll_offset.y * device_scale,
                 });
             let raster = CpuRasterizer
                 .rasterize_request(request, &BrowserRasterControl { cancellation })
@@ -738,4 +767,126 @@ pub(super) fn display_declaration(
         || "no matching author declaration (user-agent origin or inherited)".to_owned(),
         |(_, _, _, text)| text,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+
+    use render_browser::font_backend::SystemFontBackend;
+    use render_browser::font_faces::DocumentFontLoader;
+    use render_browser::worker::{
+        RenderCancellation, RenderIdentity, RenderJob, RenderOffset, RenderViewport,
+    };
+    use render_core::css::selector::InteractionState;
+    use render_core::css::transition::TransitionState;
+    use render_core::document::{Document, ExternalStyleSheets};
+    use render_core::image::ImageResources;
+    use render_core::paint::DisplayCommand;
+    use render_net::Url;
+
+    use super::{FullPageRenderPayload, PageRenderPayload, process_page_render};
+
+    /// The shell-level contract: identity and layout are CSS pixels, the
+    /// presented surface and every raster coordinate are physical.
+    #[test]
+    fn a_two_x_full_frame_lays_out_in_css_pixels_and_rasters_at_device_size() {
+        let fonts = SystemFontBackend::load().expect("system fonts load");
+        let loader = DocumentFontLoader::new();
+        let base_url = Url::parse("https://example.test/viewport.html").expect("base URL");
+        let document = Document::parse(
+            "<!doctype html><style>html, body { margin: 0 }\
+             @media (min-width: 2000px) { body { background: rgb(255, 0, 0) } }\
+             </style><p style='font: 14px monospace'>Hello</p>",
+        );
+        let identity = RenderIdentity {
+            tab_id: 1,
+            generation: 1,
+            document_serial: 1,
+            dom_revision: 1,
+            viewport: RenderViewport {
+                width: 1_180,
+                height: 684,
+            },
+            scroll_offset: RenderOffset { x: 0.0, y: 0.0 },
+            device_scale: 2.0,
+            external_styles_generation: 0,
+            animation_time_millis: 0,
+        };
+        let payload = PageRenderPayload::Full(Box::new(FullPageRenderPayload {
+            document,
+            base_url,
+            document_serial: 1,
+            external_style_sheets: ExternalStyleSheets::default(),
+            style_batch: None,
+            font_resources: Arc::new(HashMap::new()),
+            discover_external_styles: false,
+            images: ImageResources::default(),
+            interaction: InteractionState::default(),
+            transition_state: TransitionState::default(),
+            frame_documents: BTreeMap::default(),
+        }));
+        let frame = process_page_render(
+            RenderJob {
+                identity,
+                source_snapshot: Arc::from("fixture"),
+                payload,
+            },
+            &RenderCancellation::default(),
+            &fonts,
+            &loader,
+        )
+        .expect("the fixture renders");
+
+        assert_eq!(
+            (frame.viewport.width, frame.viewport.height),
+            (2_360, 1_368)
+        );
+        assert_eq!(frame.frame.len(), 2_360 * 1_368);
+        assert!(
+            (frame.viewport_height - 684.0).abs() < f32::EPSILON,
+            "scroll metrics stay CSS"
+        );
+        let display = frame.display_list.as_ref().expect("logical display list");
+        assert_eq!(
+            (display.viewport.width, display.viewport.height),
+            (1_180.0, 684.0),
+            "hit testing and script geometry consume the CSS-pixel list"
+        );
+        let runs = display
+            .items()
+            .iter()
+            .filter_map(|item| match &item.command {
+                DisplayCommand::GlyphRun(run) => Some(run),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!runs.is_empty(), "the fixture paints text");
+        assert!(
+            runs.iter()
+                .all(|run| (run.font_size - 14.0).abs() < f32::EPSILON),
+            "the retained list keeps the CSS font size"
+        );
+        assert!(
+            runs[0]
+                .glyphs
+                .iter()
+                .all(|glyph| glyph.position.x < 1_180.0 && glyph.position.y < 684.0),
+            "glyph positions in the retained list are CSS pixels"
+        );
+        assert!(
+            frame
+                .geometry
+                .as_ref()
+                .expect("element geometry")
+                .values()
+                .all(|rect| rect.x < 1_180.0 && rect.y < 684.0),
+            "ElementRects exposed to script are CSS pixels"
+        );
+        assert!(
+            frame.frame.iter().any(|pixel| *pixel != 0x00ff_ffff),
+            "the physical surface contains the painted text"
+        );
+    }
 }

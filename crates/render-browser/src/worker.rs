@@ -26,6 +26,10 @@ pub struct RenderIdentity {
     pub dom_revision: u64,
     pub viewport: RenderViewport,
     pub scroll_offset: RenderOffset,
+    /// Native window device pixel ratio. `viewport` and `scroll_offset` are
+    /// CSS pixels; the render worker lays out there and converts the display
+    /// list to physical pixels only for rasterization.
+    pub device_scale: f32,
     pub external_styles_generation: u64,
     /// CSS animation timeline position for this frame, in milliseconds since
     /// the document started. The render worker samples `@keyframes` there.
@@ -145,6 +149,14 @@ pub struct CompletedRender<R> {
 #[derive(Clone, Debug)]
 pub struct RenderCancellation {
     cancelled: Arc<AtomicBool>,
+}
+
+impl Default for RenderCancellation {
+    /// A token that is not cancelled. Render workers create their own; this
+    /// exists for a caller that wants to invoke a processing function directly.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RenderCancellation {
@@ -575,6 +587,7 @@ mod tests {
                 x: 0.0,
                 y: scroll_y,
             },
+            device_scale: 1.0,
             external_styles_generation: 3,
             animation_time_millis: 0,
         }

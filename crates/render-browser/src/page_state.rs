@@ -153,8 +153,12 @@ pub(super) struct PageState {
     /// instead of rendering the document the request was made for.
     pub(super) render_dirty_viewport: Option<WindowSize<u32>>,
     pub(super) frame: Vec<u32>,
-    /// The viewport of the currently presented frame.
+    /// CSS-pixel viewport this document is laid out in. Script geometry, media
+    /// queries, hit testing and scroll offsets all use this unit.
     pub(super) viewport: WindowSize<u32>,
+    /// Physical pixel dimensions of `frame`. The device scale converts between
+    /// this and `viewport`; they differ on a high-DPI window.
+    pub(super) surface_size: WindowSize<u32>,
     /// The viewport the newest full-render request was made for. A frame for a
     /// different size must not be installed merely because it finished after a
     /// resize.
@@ -359,6 +363,7 @@ impl PageState {
             render_dirty_viewport: None,
             frame: Vec::new(),
             viewport: WindowSize::new(0, 0),
+            surface_size: WindowSize::new(0, 0),
             requested_viewport: WindowSize::new(0, 0),
             committed_render: None,
             display_list: None,
@@ -490,6 +495,7 @@ impl PageState {
         self.render_dirty_viewport = None;
         self.frame.clear();
         self.viewport = WindowSize::new(0, 0);
+        self.surface_size = WindowSize::new(0, 0);
         self.requested_viewport = WindowSize::new(0, 0);
         self.committed_render = None;
         self.display_list = None;

@@ -36,6 +36,7 @@ use crate::app::HistoryMode;
 use crate::app::HostPlatform;
 use crate::app::RawKeyInput;
 use crate::app::address_shortcut;
+use crate::app::css_content_viewport;
 use crate::app::primary_modifier_for;
 use crate::app::wheel_document_delta_y;
 use crate::content_interaction;
@@ -126,6 +127,7 @@ fn test_render_identity(
             x: 0.0,
             y: scroll_y,
         },
+        device_scale: 1.0,
         external_styles_generation: 0,
         animation_time_millis: 0,
     }
@@ -416,6 +418,83 @@ fn content_hit_test_accounts_for_chrome_scroll_and_paint_order() {
         ),
         None
     );
+}
+
+#[test]
+fn a_two_x_window_submits_a_css_viewport_and_device_scale() {
+    let fonts = Arc::new(SystemFontBackend::load().expect("system fonts load"));
+    let (worker, _started, _log, _gate) = gated_render_worker();
+    let (mut app, tab) = headless_app_with_render_worker("<main>2x</main>", worker, fonts);
+    let tabs = app.tabs.tabs();
+    app.layout = Some(ChromeLayout::new(2_360, 1_560, 2.0, tabs));
+    let chrome_height = app.layout.as_ref().expect("chrome layout").chrome_height;
+    let viewport = css_content_viewport(WindowSize::new(2_360, 1_560), chrome_height, 2.0);
+    assert_eq!(viewport.width, 1_180);
+    app.schedule_page_render(tab, viewport, false);
+    let identity = app
+        .pages
+        .get(&tab)
+        .and_then(|page| page.expected_render)
+        .expect("the frame is submitted");
+    assert_eq!(
+        (identity.viewport.width, identity.viewport.height),
+        (viewport.width, viewport.height),
+        "RenderIdentity carries the CSS viewport"
+    );
+    assert!((identity.device_scale - 2.0).abs() < f32::EPSILON);
+    assert_eq!(app.pages[&tab].requested_viewport, viewport);
+}
+
+#[test]
+fn content_hit_testing_converts_physical_pointer_to_page_css_pixels() {
+    let (mut app, tab) = headless_app_with("<!doctype html><div id=target></div>");
+    let node = {
+        let page = app.pages.get(&tab).expect("page");
+        find_id(page.page.document().dom(), "target")
+    };
+    let tabs = app.tabs.tabs();
+    app.layout = Some(ChromeLayout::new(2_360, 1_560, 2.0, tabs));
+    let chrome_height = app.layout.as_ref().expect("chrome layout").chrome_height;
+    {
+        let page = app.pages.get_mut(&tab).expect("page");
+        page.viewport = WindowSize::new(1_180, 684);
+        let bounds = PhysicalRect::new(10.0, 10.0, 100.0, 50.0);
+        let display = DisplayList::from_items(
+            render_core::dom::DomRevision::default(),
+            render_core::layout::PhysicalSize {
+                width: 1_180.0,
+                height: 684.0,
+            },
+            vec![DisplayItem {
+                id: DisplayItemId {
+                    source: Some(node),
+                    fragment_hint: 0,
+                    phase: PaintPhase::Background,
+                    ordinal: 0,
+                },
+                fragment: FragmentId::from_index(0),
+                source: Some(node),
+                bounds,
+                coordinate_space: PaintCoordinateSpace::Document,
+                command: DisplayCommand::SolidRect {
+                    rect: bounds,
+                    color: Color::BLACK,
+                },
+            }],
+        );
+        page.display_list = Some(Arc::new(display));
+    }
+    // Physical (40, chrome+40) on a 2x window is CSS (20,20) in the page.
+    app.cursor = Point {
+        x: 40.0,
+        y: chrome_height as f32 + 40.0,
+    };
+    assert_eq!(app.content_cursor(), Some(Point { x: 20.0, y: 20.0 }));
+    assert_eq!(app.content_node_at_cursor(), Some(node));
+    // The same physical point read as CSS would miss the 10..110 box.
+    app.cursor.x = 400.0;
+    assert_eq!(app.content_cursor(), Some(Point { x: 200.0, y: 20.0 }));
+    assert_eq!(app.content_node_at_cursor(), None);
 }
 
 #[test]
@@ -759,15 +838,25 @@ fn page_states_own_independent_session_histories() {
 #[test]
 fn wheel_deltas_map_to_document_scroll_direction() {
     assert!(
-        (wheel_document_delta_y(MouseScrollDelta::LineDelta(0.0, -2.0)) - 80.0).abs()
+        (wheel_document_delta_y(MouseScrollDelta::LineDelta(0.0, -2.0), 1.0) - 80.0).abs()
             < f32::EPSILON
     );
     assert!(
-        (wheel_document_delta_y(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
-            0.0, 12.5
-        ))) + 12.5)
+        (wheel_document_delta_y(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 12.5)),
+            1.0,
+        ) + 12.5)
             .abs()
             < f32::EPSILON
+    );
+    assert!(
+        (wheel_document_delta_y(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 25.0)),
+            2.0,
+        ) + 12.5)
+            .abs()
+            < f32::EPSILON,
+        "a physical pixel delta scrolls CSS pixels"
     );
 }
 

@@ -143,10 +143,18 @@ where
                 viewport_height,
                 page_origin,
             } = job.payload;
+            // The retained cache is a physical-pixel scene; the identity's
+            // scroll offset stays in CSS pixels like every other page metric.
+            let device_scale =
+                if job.identity.device_scale.is_finite() && job.identity.device_scale > 0.0 {
+                    job.identity.device_scale
+                } else {
+                    1.0
+                };
             let output = compositor.render(
                 PhysicalPoint {
-                    x: job.identity.scroll_offset.x,
-                    y: job.identity.scroll_offset.y,
+                    x: job.identity.scroll_offset.x * device_scale,
+                    y: job.identity.scroll_offset.y * device_scale,
                 },
                 fonts.as_ref() as &dyn GlyphMaskProvider,
                 Some(&images),
@@ -318,6 +326,7 @@ mod tests {
                 x: 0.0,
                 y: scroll_y,
             },
+            device_scale: 1.0,
             external_styles_generation: 0,
             animation_time_millis: 0,
         }

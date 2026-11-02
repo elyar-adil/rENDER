@@ -167,6 +167,7 @@ fn identity(generation: u64, scroll_y: f32) -> RenderIdentity {
             x: 0.0,
             y: scroll_y,
         },
+        device_scale: 1.0,
         external_styles_generation: 0,
         animation_time_millis: 0,
     }

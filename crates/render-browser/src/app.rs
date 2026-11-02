@@ -503,15 +503,25 @@ impl BrowserApp {
         }
         self.frame_damage.mark_full();
         let layout = ChromeLayout::new(size.width, size.height, scale, self.tabs.tabs());
+        let viewport = css_content_viewport(size, layout.chrome_height, scale);
+        self.layout = Some(layout);
+        self.sync_page_device_metrics(scale);
         if render_page {
-            let viewport =
-                WindowSize::new(size.width, size.height.saturating_sub(layout.chrome_height));
             self.schedule_page_render(self.tabs.active_id(), viewport, false);
         }
-        self.layout = Some(layout);
         self.mark_chrome_damage(size);
         self.compose_frame(size);
         self.update_window_title();
+    }
+
+    /// Publishes the window's device scale to every document, so a script that
+    /// reads `devicePixelRatio` before its first frame sees the real display
+    /// rather than the initial `1`.
+    fn sync_page_device_metrics(&mut self, scale: f32) {
+        let ratio = f64::from(scale);
+        for page in self.pages.values_mut() {
+            page.page.runtime_mut().install_device_pixel_ratio(ratio);
+        }
     }
 
     #[allow(
@@ -524,6 +534,16 @@ impl BrowserApp {
         viewport: WindowSize<u32>,
         prefer_retained_raster: bool,
     ) {
+        let device_scale = self
+            .layout
+            .as_ref()
+            .map_or(1.0, |layout| layout.scale)
+            .max(f32::EPSILON);
+        if let Some(page) = self.pages.get_mut(&id) {
+            page.page
+                .runtime_mut()
+                .install_device_pixel_ratio(f64::from(device_scale));
+        }
         let Some(page) = self.pages.get_mut(&id) else {
             return;
         };
@@ -532,6 +552,7 @@ impl BrowserApp {
             page.render_generation = page.render_generation.saturating_add(1);
             page.frame.clear();
             page.viewport = viewport;
+            page.surface_size = WindowSize::new(0, 0);
             page.expected_render = None;
             page.expected_compositor = None;
             self.forget_dirty_render(id);
@@ -574,6 +595,7 @@ impl BrowserApp {
                 x: 0.0,
                 y: page.scroll.offset_y(),
             },
+            device_scale,
             external_styles_generation: page.external_styles_generation,
             animation_time_millis: u32::try_from(page.created_at.elapsed().as_millis())
                 .unwrap_or(u32::MAX),
@@ -728,17 +750,20 @@ impl BrowserApp {
             return;
         }
         page.expected_compositor = None;
-        let viewport = WindowSize::new(frame.surface.width(), frame.surface.height());
+        page.surface_size = WindowSize::new(frame.surface.width(), frame.surface.height());
+        page.viewport = WindowSize::new(
+            completed.identity.viewport.width,
+            completed.identity.viewport.height,
+        );
         page.frame = surface_to_softbuffer(&frame.surface);
-        page.viewport = viewport;
-        page.scroll
-            .update_metrics(frame.content_height, frame.viewport_height);
         page.page.runtime_mut().install_viewport(
-            viewport.width as f32,
-            viewport.height as f32,
+            page.viewport.width as f32,
+            page.viewport.height as f32,
             0.0,
             page.scroll.offset_y(),
         );
+        page.scroll
+            .update_metrics(frame.content_height, frame.viewport_height);
         let render_time = frame.render_time;
         let present_time = frame.present_time;
         let active = id == self.tabs.active_id();
@@ -802,10 +827,14 @@ impl BrowserApp {
         // currently requested, and is newer than the last frame installed.
         // It does not have to be the newest *submitted* generation: waiting for
         // that frame is what left heavy sites frozen on a pre-hydration image.
+        let window_scale = self.layout.as_ref().map(|layout| layout.scale);
         let accepted = self.pages.get(&id).is_some_and(|page| {
             completed.identity.document_serial == page.document_serial
                 && completed.identity.viewport.width == page.requested_viewport.width
                 && completed.identity.viewport.height == page.requested_viewport.height
+                && window_scale.is_none_or(|scale| {
+                    (completed.identity.device_scale - scale).abs() <= f32::EPSILON
+                })
                 && page
                     .committed_render
                     .is_none_or(|previous| completed.identity.generation > previous.generation)
@@ -839,7 +868,11 @@ impl BrowserApp {
                 worker.cancel_tab(id.as_u64());
             }
             page.frame = frame.frame;
-            page.viewport = frame.viewport;
+            page.surface_size = frame.viewport;
+            page.viewport = WindowSize::new(
+                completed.identity.viewport.width,
+                completed.identity.viewport.height,
+            );
             if let Some(display_list) = frame.display_list {
                 page.display_list = Some(display_list);
             }
@@ -1026,7 +1059,7 @@ impl BrowserApp {
                 &mut self.frame,
                 size,
                 &page.frame,
-                page.viewport,
+                page.surface_size,
                 layout.chrome_height,
             );
         }
@@ -1158,21 +1191,23 @@ impl BrowserApp {
         let cursor_x = base_x.mul_add(1.0, cursor_width).clamp(min_x, max_x);
 
         let scroll_y = page.scroll.offset_y();
-        let viewport_y = chrome_height as f32 + rect.y - scroll_y;
+        // Page geometry is CSS; the native frame is physical.
+        let scale = self.layout.as_ref().map_or(1.0, |layout| layout.scale);
+        let viewport_y = chrome_height as f32 + (rect.y - scroll_y) * scale;
         let caret_height = font_size.min((rect.height - 2.0).max(1.0));
-        let caret_y = viewport_y + (rect.height - caret_height).max(0.0) * 0.5;
+        let caret_y = viewport_y + (rect.height - caret_height).max(0.0) * 0.5 * scale;
         Some(ContentCaret {
             clip: Rect {
-                x: rect.x,
+                x: rect.x * scale,
                 y: viewport_y,
-                width: rect.width,
-                height: rect.height,
+                width: rect.width * scale,
+                height: rect.height * scale,
             },
             rect: Rect {
-                x: cursor_x,
+                x: cursor_x * scale,
                 y: caret_y,
-                width: 1.5,
-                height: caret_height,
+                width: 1.5 * scale,
+                height: caret_height * scale,
             },
         })
     }
@@ -1247,19 +1282,20 @@ impl BrowserApp {
             .min(rect.x + rect.width - border_left)
             .max(left);
         let scroll_y = page.scroll.offset_y();
-        let viewport_y = chrome_height as f32 + rect.y - scroll_y;
+        let scale = self.layout.as_ref().map_or(1.0, |layout| layout.scale);
+        let viewport_y = chrome_height as f32 + (rect.y - scroll_y) * scale;
         Some(ContentSelection {
             clip: Rect {
-                x: rect.x,
+                x: rect.x * scale,
                 y: viewport_y,
-                width: rect.width,
-                height: rect.height,
+                width: rect.width * scale,
+                height: rect.height * scale,
             },
             rect: Rect {
-                x: left,
+                x: left * scale,
                 y: viewport_y,
-                width: right - left,
-                height: rect.height,
+                width: (right - left) * scale,
+                height: rect.height * scale,
             },
         })
     }
@@ -2540,6 +2576,18 @@ impl BrowserApp {
     }
 
     pub(super) fn start_images(&mut self, id: TabId) {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a window scale factor is a small positive finite number"
+        )]
+        let device_pixel_ratio_milli = (self
+            .layout
+            .as_ref()
+            .map_or(1.0, |layout| layout.scale)
+            .max(0.001)
+            * 1_000.0)
+            .round() as u32;
         let (plan, requests) = {
             let Some(page) = self.pages.get_mut(&id) else {
                 return;
@@ -2556,7 +2604,7 @@ impl BrowserApp {
                 ImageSelectionContext {
                     viewport_width: page.viewport.width.max(1),
                     viewport_height: page.viewport.height.max(1),
-                    device_pixel_ratio_milli: 1_000,
+                    device_pixel_ratio_milli,
                 },
             );
             page.attempted_images
@@ -2911,10 +2959,7 @@ impl BrowserApp {
 
         if id == self.tabs.active_id() {
             let viewport = self.layout.as_ref().map(|layout| {
-                WindowSize::new(
-                    self.frame_size.width,
-                    self.frame_size.height.saturating_sub(layout.chrome_height),
-                )
+                css_content_viewport(self.frame_size, layout.chrome_height, layout.scale)
             });
             if let Some(viewport) = viewport {
                 self.schedule_page_render(id, viewport, false);
@@ -2959,10 +3004,7 @@ impl BrowserApp {
         };
         if installed && id == self.tabs.active_id() {
             let viewport = self.layout.as_ref().map(|layout| {
-                WindowSize::new(
-                    self.frame_size.width,
-                    self.frame_size.height.saturating_sub(layout.chrome_height),
-                )
+                css_content_viewport(self.frame_size, layout.chrome_height, layout.scale)
             });
             if let Some(viewport) = viewport {
                 self.schedule_page_render(id, viewport, false);
@@ -3230,10 +3272,7 @@ impl BrowserApp {
             return;
         }
         let viewport = self.layout.as_ref().map(|layout| {
-            WindowSize::new(
-                self.frame_size.width,
-                self.frame_size.height.saturating_sub(layout.chrome_height),
-            )
+            css_content_viewport(self.frame_size, layout.chrome_height, layout.scale)
         });
         if let Some(viewport) = viewport {
             self.schedule_page_render(id, viewport, false);
@@ -4407,10 +4446,24 @@ impl BrowserApp {
         self.content_hover_node_at_cursor()
     }
 
+    /// The pointer in page CSS coordinates, with the native chrome row removed.
+    ///
+    /// Window input arrives in physical pixels; every value in the page's
+    /// display list and element geometry is CSS. Converting once here keeps
+    /// hit testing independent of the device ratio.
+    pub(super) fn content_cursor(&self) -> Option<Point> {
+        let layout = self.layout.as_ref()?;
+        let scale = layout.scale.max(f32::EPSILON);
+        Some(Point {
+            x: self.cursor.x / scale,
+            y: (self.cursor.y - layout.chrome_height as f32) / scale,
+        })
+    }
+
     fn content_hover_node_at_cursor(&self) -> Option<render_core::dom::NodeId> {
         let id = self.tabs.active_id();
         let page = self.pages.get(&id)?;
-        let layout = self.layout.as_ref()?;
+        let content_cursor = self.content_cursor()?;
         let display_hit = page.display_list.as_ref().and_then(|display_list| {
             content_interaction::hit_test_content_regions(
                 display_list
@@ -4422,8 +4475,8 @@ impl BrowserApp {
                         coordinate_space: item.coordinate_space,
                         hit_testable: content_interaction::is_content_hit_command(&item.command),
                     }),
-                self.cursor,
-                layout.chrome_height,
+                content_cursor,
+                0,
                 PhysicalPoint {
                     x: 0.0,
                     y: page.scroll.offset_y(),
@@ -4434,8 +4487,8 @@ impl BrowserApp {
             return display_hit;
         }
         let point = PhysicalPoint {
-            x: self.cursor.x,
-            y: self.cursor.y - layout.chrome_height as f32 + page.scroll.offset_y(),
+            x: content_cursor.x,
+            y: content_cursor.y + page.scroll.offset_y(),
         };
         page.geometry
             .iter()
@@ -4477,6 +4530,7 @@ impl BrowserApp {
     pub(super) fn content_node_at_cursor(&self) -> Option<render_core::dom::NodeId> {
         let id = self.tabs.active_id();
         let page = self.pages.get(&id)?;
+        let content_cursor = self.content_cursor()?;
         let editable = page
             .geometry
             .iter()
@@ -4484,9 +4538,8 @@ impl BrowserApp {
                 let node = render_core::dom::NodeId::from_u64(*raw_node);
                 self.content_text_input_value(id, node)?;
                 let point = PhysicalPoint {
-                    x: self.cursor.x,
-                    y: self.cursor.y - self.layout.as_ref()?.chrome_height as f32
-                        + page.scroll.offset_y(),
+                    x: content_cursor.x,
+                    y: content_cursor.y + page.scroll.offset_y(),
                 };
                 (point.x >= rect.x
                     && point.x < rect.x + rect.width
@@ -4503,8 +4556,8 @@ impl BrowserApp {
         // background is supplied by an unsupported CSS image), so retain a
         // geometry-based hit target for all HTML interactive elements.
         let point = PhysicalPoint {
-            x: self.cursor.x,
-            y: self.cursor.y - self.layout.as_ref()?.chrome_height as f32 + page.scroll.offset_y(),
+            x: content_cursor.x,
+            y: content_cursor.y + page.scroll.offset_y(),
         };
         let geometry_hit = page
             .geometry
@@ -4543,8 +4596,8 @@ impl BrowserApp {
                         coordinate_space: item.coordinate_space,
                         hit_testable: content_interaction::is_content_hit_command(&item.command),
                     }),
-                self.cursor,
-                self.layout.as_ref()?.chrome_height,
+                content_cursor,
+                0,
                 PhysicalPoint {
                     x: 0.0,
                     y: page.scroll.offset_y(),
@@ -4583,6 +4636,9 @@ impl BrowserApp {
         let Some(rect) = page.geometry.get(&node.as_u64()) else {
             return value.len();
         };
+        // The pointer arrives in physical pixels; glyph origins and advances
+        // from the display list are CSS.
+        let x = x / self.layout.as_ref().map_or(1.0, |layout| layout.scale);
         let mut base_x = rect.x + 1.0 + 4.0;
         let mut font_size = 16.0;
         let mut has_glyph_run = false;
@@ -4848,7 +4904,8 @@ impl BrowserApp {
         {
             return;
         }
-        let delta_y = wheel_document_delta_y(delta);
+        let scale = self.layout.as_ref().map_or(1.0, |layout| layout.scale);
+        let delta_y = wheel_document_delta_y(delta, scale);
         if !delta_y.is_finite() || delta_y == 0.0 {
             return;
         }
@@ -4897,10 +4954,7 @@ impl BrowserApp {
                     .queue_dom_event(PageDomEvent::new(document, "scroll"));
             }
             let viewport = self.layout.as_ref().map(|layout| {
-                WindowSize::new(
-                    self.frame_size.width,
-                    self.frame_size.height.saturating_sub(layout.chrome_height),
-                )
+                css_content_viewport(self.frame_size, layout.chrome_height, layout.scale)
             });
             // Scrolling moves the content under a stationary pointer, so the
             // hover chain changes even without a CursorMoved event.
@@ -5834,10 +5888,12 @@ pub(super) fn primary_modifier_active(modifiers: ModifiersState) -> bool {
     primary_modifier_for(platform, modifiers.control_key(), modifiers.super_key())
 }
 
-pub(super) fn wheel_document_delta_y(delta: MouseScrollDelta) -> f32 {
+pub(super) fn wheel_document_delta_y(delta: MouseScrollDelta, scale: f32) -> f32 {
     match delta {
         MouseScrollDelta::LineDelta(_, y) => -y * SCROLL_LINE_PIXELS,
-        MouseScrollDelta::PixelDelta(position) => -finite_f32(position.y),
+        // Pixel deltas are physical on a high-DPI window; the document scrolls
+        // in CSS pixels.
+        MouseScrollDelta::PixelDelta(position) => -finite_f32(position.y) / scale.max(f32::EPSILON),
     }
 }
 
@@ -5861,6 +5917,34 @@ pub(super) fn address_shortcut(key: &Key, shift: bool) -> Option<AddressCommand>
     } else {
         None
     }
+}
+
+/// Converts the native content area from physical to CSS pixels.
+///
+/// The window's `inner_size` and `ChromeLayout` are physical; layout, media
+/// queries, script geometry and scroll offsets are CSS. Rounding at this one
+/// boundary keeps a 2x 2360px window a 1180px viewport without accumulating a
+/// per-frame error in the scroll position.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "window dimensions are positive integers bounded by the native surface limit"
+)]
+pub(super) fn css_content_viewport(
+    size: WindowSize<u32>,
+    chrome_height: u32,
+    scale: f32,
+) -> WindowSize<u32> {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        f64::from(scale)
+    } else {
+        1.0
+    };
+    let width = (f64::from(size.width) / scale).round().max(1.0) as u32;
+    let height = (f64::from(size.height.saturating_sub(chrome_height)) / scale)
+        .round()
+        .max(1.0) as u32;
+    WindowSize::new(width, height)
 }
 
 #[allow(
