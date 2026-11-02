@@ -757,9 +757,9 @@ mod tests {
         assert!(!evaluates("(backdrop-filter: blur(2px))"));
         assert!(!evaluates("(-moz-box-shadow: 0 0 2px black)"));
         assert!(!evaluates("(text-overflow: ellipsis)"));
-        // `font-family` is the sharpest of those: `render-layout`'s `TextStyle`
-        // carries no family, so no engine grammar for it exists at all.
-        assert!(!evaluates("(font-family: Arial)"));
+        // `font-family` has metadata and the layout pipeline reads it, so the
+        // declaration is supported even though no grammar validates the value.
+        assert!(evaluates("(font-family: Arial)"));
         // An empty value is a valid condition and an unsupported one.
         assert!(!evaluates("(display:)"));
     }

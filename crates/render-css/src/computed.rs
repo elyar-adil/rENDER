@@ -81,6 +81,7 @@ impl PropertyRegistry {
             ("color", "canvastext"),
             ("color-scheme", "normal"),
             ("direction", "ltr"),
+            ("font-family", "system-ui"),
             ("font-size", "medium"),
             ("font-style", "normal"),
             ("font-weight", "normal"),
@@ -2492,7 +2493,7 @@ mod tests {
     /// | `display` | grammar | `Some("inline")` |
     /// | `text-indent` | metadata only, no grammar | `Some("0px")` |
     /// | `backdrop-filter` | unknown | `None` |
-    /// | `font-family` | unknown, and a real page asks about it | `None` |
+    /// | `-webkit-line-clamp` | unknown, and a real page asks about it | `None` |
     ///
     /// So `get(p).is_some()` is **true** for a fully implemented property and
     /// for one this engine can only hold the initial value of, and is false for
@@ -2591,7 +2592,7 @@ mod tests {
             ("letter-spacing", "normal", PropertySupport::MetadataOnly),
             ("z-index", "auto", PropertySupport::MetadataOnly),
             ("backdrop-filter", "blur(2px)", PropertySupport::Unsupported),
-            ("font-family", "Arial", PropertySupport::Unsupported),
+            ("font-family", "Arial", PropertySupport::MetadataOnly),
             ("text-overflow", "ellipsis", PropertySupport::Unsupported),
             ("nonesuch-property", "1px", PropertySupport::Unsupported),
         ] {
@@ -3334,6 +3335,37 @@ mod tests {
         );
         // ... but did not set it.
         assert!(!child.specified("color"));
+    }
+
+    /// CSS Fonts 4 §2.2 lists `font-family` as inherited. Without it in the
+    /// registry every nested element fell back to `system-ui`, so a parent's
+    /// family stopped at its direct text and icon fonts or webfonts vanished
+    /// inside ordinary `<span>`/`<b>` wrappers.
+    #[test]
+    fn font_family_inherits_to_nested_elements() {
+        let output = parse_document("<!doctype html><div id='p'><span id='c'>nested</span></div>");
+        let sheet = parse_stylesheet("#p { font-family: Arial, sans-serif }");
+        let registry = PropertyRegistry::standard_baseline();
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &registry,
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let child = &styles[&target_id(&output.dom, "#c")];
+
+        assert_eq!(
+            child.get("font-family").map(super::ComputedValue::css_text),
+            Some("Arial, sans-serif")
+        );
+        assert!(
+            !child.specified("font-family"),
+            "the child inherited the value; it did not author one"
+        );
     }
 
     /// `inherit` was written by the document, so it counts even though the
