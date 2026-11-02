@@ -66,17 +66,41 @@
 2. **`ReadableStream` 缺失**：X 的 TSR router 在顶层 `new ReadableStream`，缺失导致 hydration 数据不生成。
 3. **`Intl` 缺失**：startup chunk 顶层 `new Intl.Segmenter`，缺失导致整个 module graph 中止。
 
-第 2、3 项已经实现并合并：`45018b5`/`e8a8da9`/`a593c2f`。`ReadableStream` 覆盖 default stream、reader、队列/背压、`tee`、async iteration（byte stream/BYOB/pipeTo 仍显式缺失）；`Intl` 覆盖 `Segmenter`（真实 UAX #29 grapheme/word/sentence）、`NumberFormat`、`DateTimeFormat`、`PluralRules`、`Collator`、`getCanonicalLocales`（仅 en/en-US 数据，无时区库）。`render-js` 1257 passed。
+第 2、3 项已经实现并合并：`45018b5`/`e8a8da9`/`a593c2f`。`ReadableStream` 覆盖 default stream、reader、队列/背压、`tee`、async iteration（byte stream/BYOB/pipeTo 仍显式缺失）；`Intl` 覆盖 `Segmenter`（真实 UAX #29 grapheme/word/sentence）、`NumberFormat`、`DateTimeFormat`、`PluralRules`、`Collator`、`getCanonicalLocales`（仅 en/en-US 数据，无时区库）。`render-js` 1266 passed。
 
 合并后 X 的启动链不再抛 `ReadableStream`/`Intl`：`__INITIAL_DATA__`、`$_TSR.router`、hydration stream 都存在，`streamEnded=true`，但 `router.hydrated` 仍未置位、`#react-root` 不存在、表单仍为 0。下一个具体证据是 `api.x.com/1.1/guest/activate.json` 经诊断代理返回 404；`x-hydration` agent 正在对比 Edge 与 rENDER 的请求头/credentials/响应，随后修通用 fetch/hydration 语义。X 的 CSS 本身没有问题：把 Edge 的 post-JS DOM + 捕获 CSS 交给 rENDER，表单可见。
 
-## hao123：动态样式表被 BigPipe 的 loaded 列表跳过
+## hao123：真正的根因是 intrinsic sizing，不是缺 CSS
 
-1× 验证（`/tmp/hao123-lowdpi.png`）下 hao123 的 inline CSS 布局基本正常，但主样式表 `aio-all.c43b43d.css` 没有加载：DOM 里只有 5 个 `dns-prefetch` link，`active_sheets=0`。页面先用 `BigPipe.loadedResource([...,"500d3d9_1c8f"])` 记录 ID，再 `BigPipe.setResourceMap(...)`；`getResource()` 看到 ID 已在 loaded 列表就把资源标成 `loaded=true`，`Resource.load()` 直接 resolve，CSSLoader 从未创建 `<link>`。Edge 打开同一份 `/tmp/hao123.html` 能加载该 CSS（`/tmp/hao123-edge-file.png`），所以这是通用 JS/DOM 语义差异，不是 CSS 解析问题。`hao123-css` agent 正在用 reduced BigPipe repro 定位并修复。另有两张图片因服务器字节与声明 content-type 不符而失败，是独立的资源解码问题。
+之前的“`aio-all.css` 没加载”判断被纠正：保存的 HTML 里那段 258,432 字节的 inline `<style>` 与 `/tmp/hao-aio.css` 完全相同；Edge 打开同一份 HTML 也没有外部 stylesheet link（只有 5 个 dns-prefetch），BigPipe 的 `loadedResource` 短路是页面自己的逻辑，Edge 与 rENDER 行为一致。
+
+101px 搜索框的真正原因是三处通用 intrinsic sizing：
+
+1. `atomic_outer_intrinsic_width` 对 inline-flex 子项取 `max` 而不是按 flex row 求和，`.searchForm` 只量到 697.5px（应为 796.5px），提交按钮被挤到下一行。
+2. flex intrinsic 把 absolutely positioned 子项算作 flex item，隐藏的 `.hotword` 把 row 撑宽 18px。
+3. inline sequence 的 measurement atoms 包含 absolutely positioned 子项，`.tabs-toggle` 把 shrink-to-fit 的 `.search` 撑宽 66px。
+
+修复：`43a281e`（`solver/inline.rs`、`solver/flex.rs`）以及 `c9b81a0`（动态 `<link rel=stylesheet>` 在 CSS 应用后补发 `load`/`error`；`data:text/css` 探测 link 的 `onload` 从此能完成）。1× 几何：
+
+| 元素 | 修复前 | 修复后 | Edge |
+| --- | ---: | ---: | ---: |
+| `.searchForm` | 700.5×101 @(305,76) | **799.5×52 @(239,76)** | 798.5×51 @(239,86) |
+| `.search` | 909.5×101 | **942.5×52** | 941.5×51 |
+| `.textWrapper` | 704 | **686** | 686 |
+| submit | 换行 y=126.5 | **同一行 y=77.5** | 同一行 |
+
+截图 `/tmp/hao123-final.png`。仍差：`.search` 比 Edge 高 10px（绝对定位 flex 子项的 static position 未计入 `search-group` 的 `padding-top:10px`）；1px/1.5px 边框取整；文本输入框的 UA `box-sizing` 与 Chrome 不同。图片 `Content-Type` 与字节不符的问题由 `a854242` 改为按嗅探格式解码。
 
 ## 知乎登录页
 
-独立 worktree `zhihu-signin` 正在诊断“出现小问题”、二维码不显示、验证码按钮缺失；要求同样给通用修复和 reduced test，尚未合并。
+四个通用修复已合并：
+
+- `647cede`：`document.styleSheets`、`style.sheet`/`link.sheet`、`insertRule`/`deleteRule` 和 CSSOM 规则拆分。emotion 的 `sheetForTag` 不再对 `undefined.length` 抛错，React 不会被全局 error boundary 卸载。
+- `cf58098`：canvas 每次给 `width`/`height` 赋值都重置 2D 状态（qrcode.react 依赖 `canvas.width=canvas.width` 清空 transform）。
+- `305e1d1`：页面 canvas 像素发布到 render worker 的 image store；canvas draw 也算一次需要重绘的原因。
+- `3aade6d`：匿名 line box 不再输出 `overflow:hidden` clip，绝对定位的“获取短信验证码”按钮不再被父级 `.SignFlow` 的 line box 裁掉。
+
+最终 live 页（1180×780 CSS / DPR 2）连续 3 次：`ready=Interactive dom_elements=235–236 boxes=95`，表单、二维码、短信按钮都在；截图 `/tmp/zhihu-detail.png` / `/tmp/zhihu-run1.png`。有一次早期运行仍落到“出了一点问题”，随后无法复现，记为 script/CSSOM 插入时序的残留风险。剩余：CSSOM 只是功能子集（`media`/`disabled`/`replace` 等未实现，link sheet 的 insertRule 不进 cascade）；`getComputedStyle()` 仍返回空值；第三方验证码 bundle 仍有一个 `callee[] undefined` 的独立语义 lead。
 
 ## 包体与内存
 
@@ -86,17 +110,17 @@ macOS release：`render-browser` **16 MB**，gzip **7.8 MB**，xz **5.3 MB**；�
 
 ```text
 cargo test --workspace                                     all ok
-cargo test -p render-core --lib                            538 passed, 1 ignored
-cargo test -p render-browser --bin render-browser           121 passed
+cargo test -p render-core --lib                            546 passed, 1 ignored
+cargo test -p render-browser --bin render-browser           126 passed
 cargo test -p render-browser --lib                          232 passed
-cargo test -p render-css                                    320 passed
-cargo test -p render-layout                                 392 passed, 1 ignored
-cargo test -p render-js                                     1235 passed
+cargo test -p render-css                                    328 passed
+cargo test -p render-layout                                 395 passed, 1 ignored
+cargo test -p render-js                                     1266 passed
 cargo clippy --workspace --all-targets -- -D warnings       clean
 cargo fmt --all --check                                     clean
 ```
 
-未完成：DPR/viewport 架构、字体懒加载、X 的 Streams/Intl 合并、知乎修复合并、Baidu/Google 在真实 Retina 屏上的 Chrome 对比复测。
+未完成：字体懒加载、Google/知乎/X 的最终 Chrome 对比复测、CSSOM 子集（`media`/`disabled`/`replace`、link sheet 规则进 cascade）、绝对定位 flex 子项 static position 忽略 `padding-top` 的 10px、X 的 hydration/API 路径。
 
 ---
 
