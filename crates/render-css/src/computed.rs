@@ -2393,6 +2393,117 @@ pub fn compute_document_styles_with_hints_from_root(
     hints: &dyn Fn(NodeId) -> Vec<Declaration>,
 ) -> BTreeMap<NodeId, ComputedStyle> {
     let mut styles = BTreeMap::new();
+    compute_styles_for_starts(
+        dom,
+        &mut styles,
+        vec![(root, None)],
+        false,
+        sources,
+        registry,
+        limits,
+        context,
+        hints,
+    );
+    styles
+}
+
+/// Recomputes styles only for the subtrees under `roots`, keeping every other
+/// entry of `styles`.
+///
+/// Container-query feedback changes geometry for a handful of query
+/// containers. Re-cascading the whole document for each pass made a page with
+/// many design-token elements pay several full style passes; the containers
+/// that actually changed are the only subtrees whose `@container` conditions
+/// and `cq*` units can resolve differently. Nested roots are folded into their
+/// nearest changed ancestor.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the style pass carries the cascade inputs, limits, match context and existing map"
+)]
+pub fn recompute_document_styles_with_hints_from_roots(
+    dom: &Dom,
+    sources: &[CascadeInput<'_>],
+    registry: &PropertyRegistry,
+    limits: &ComputationLimits,
+    context: &MatchContext,
+    hints: &dyn Fn(NodeId) -> Vec<Declaration>,
+    styles: &mut BTreeMap<NodeId, ComputedStyle>,
+    roots: &BTreeSet<NodeId>,
+) {
+    if roots.is_empty() {
+        return;
+    }
+    let mut ordered = roots.iter().copied().collect::<Vec<_>>();
+    ordered.sort_by_key(|node| element_depth(dom, *node));
+    let mut selected: Vec<NodeId> = Vec::new();
+    for root in ordered {
+        if selected
+            .iter()
+            .any(|ancestor| inclusive_ancestor(dom, *ancestor, root))
+        {
+            continue;
+        }
+        selected.push(root);
+    }
+    let starts = selected
+        .into_iter()
+        .map(|node| (node, nearest_element_ancestor(dom, node)))
+        .collect();
+    compute_styles_for_starts(
+        dom, styles, starts, true, sources, registry, limits, context, hints,
+    );
+}
+
+fn inclusive_ancestor(dom: &Dom, ancestor: NodeId, node: NodeId) -> bool {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if candidate == ancestor {
+            return true;
+        }
+        current = dom.parent(candidate);
+    }
+    false
+}
+
+fn element_depth(dom: &Dom, node: NodeId) -> usize {
+    let mut depth = 0;
+    let mut current = dom.parent(node);
+    while let Some(parent) = current {
+        depth += 1;
+        current = dom.parent(parent);
+    }
+    depth
+}
+
+fn nearest_element_ancestor(dom: &Dom, node: NodeId) -> Option<NodeId> {
+    let mut current = dom.parent(node);
+    while let Some(candidate) = current {
+        if matches!(
+            dom.node(candidate).map(Node::kind),
+            Some(NodeKind::Element(_))
+        ) {
+            return Some(candidate);
+        }
+        current = dom.parent(candidate);
+    }
+    None
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one shared walk serves the full document and incremental subtree passes"
+)]
+fn compute_styles_for_starts(
+    dom: &Dom,
+    styles: &mut BTreeMap<NodeId, ComputedStyle>,
+    starts: Vec<(NodeId, Option<NodeId>)>,
+    clear_pseudo: bool,
+    sources: &[CascadeInput<'_>],
+    registry: &PropertyRegistry,
+    limits: &ComputationLimits,
+    context: &MatchContext,
+    hints: &dyn Fn(NodeId) -> Vec<Declaration>,
+) {
     let initials = Arc::new(InitialValues::new(registry, limits));
     let registered =
         RegisteredProperties::new(collect_registered_properties(sources, context), limits);
@@ -2422,12 +2533,16 @@ pub fn compute_document_styles_with_hints_from_root(
                 .any(|selector| selector.has_pseudo_element("after"))
         })
     });
-    let mut stack = vec![(root, None)];
+    let mut stack = starts;
     let mut cascade_time = std::time::Duration::ZERO;
     let mut compute_time = std::time::Duration::ZERO;
     let mut pseudo_cascade_time = std::time::Duration::ZERO;
     let mut pseudo_compute_time = std::time::Duration::ZERO;
     while let Some((node, parent_element)) = stack.pop() {
+        if clear_pseudo {
+            styles.remove(&pseudo::style_source(node, PseudoElement::Before));
+            styles.remove(&pseudo::style_source(node, PseudoElement::After));
+        }
         let current_parent = if matches!(dom.node(node).map(Node::kind), Some(NodeKind::Element(_)))
         {
             let inline = dom
@@ -2447,7 +2562,7 @@ pub fn compute_document_styles_with_hints_from_root(
                 &CascadeLookup {
                     rule_index: Some(&rule_index),
                     style_queries: &ComputedStyleQueries {
-                        styles: &styles,
+                        styles,
                         current: None,
                         registered: &registered,
                         limits,
@@ -2490,7 +2605,7 @@ pub fn compute_document_styles_with_hints_from_root(
                     &CascadeLookup {
                         rule_index: Some(&rule_index),
                         style_queries: &ComputedStyleQueries {
-                            styles: &styles,
+                            styles,
                             current: Some((node, &style)),
                             registered: &registered,
                             limits,
@@ -2547,9 +2662,7 @@ pub fn compute_document_styles_with_hints_from_root(
             loop_started.map_or(std::time::Duration::ZERO, |started| started.elapsed())
         );
     }
-    styles
 }
-
 /// Compute the [starting style](https://drafts.csswg.org/css-transitions-2/#starting-style)
 /// of `nodes` (CSS Transitions 2 §3.3).
 ///
@@ -2653,6 +2766,7 @@ mod tests {
     use super::{
         ComputationLimits, PropertyRegistry, compute_document_styles,
         compute_document_styles_with_hints, compute_starting_styles, compute_style,
+        recompute_document_styles_with_hints_from_roots,
     };
     use crate::cascade::{CascadeInput, CascadeOrigin, cascade_element};
     use crate::container::{ContainerContext, ContainerGeometry, ContainerType};
@@ -2663,6 +2777,7 @@ mod tests {
     use crate::stylesheet::parse_stylesheet;
     use render_html::parse_document;
     use std::collections::BTreeSet;
+    use std::sync::Arc;
 
     fn target_id(dom: &render_dom::Dom, selector: &str) -> render_dom::NodeId {
         let selector = parse_selector_list(selector).expect("valid test selector");
@@ -3942,6 +4057,94 @@ mod tests {
         MatchContext {
             containers: std::sync::Arc::new(context),
             ..MatchContext::default()
+        }
+    }
+
+    /// An incremental container-feedback pass must produce the same values as
+    /// a full cascade for a nested container whose size changed inside the
+    /// changed root.
+    #[test]
+    fn incremental_container_feedback_matches_a_full_recompute_for_nested_containers() {
+        let output = parse_document(
+            "<!doctype html><div id='outer'><div id='inner'><div id='leaf'></div></div></div>",
+        );
+        let sheet = parse_stylesheet(
+            "#outer { container-type: size } \
+             #inner { container-type: inline-size } \
+             #leaf { width: 50cqw } \
+             @container (width > 450px) { #inner { border-top-width: 7px } } \
+             @container (width > 150px) { #leaf { color: rgb(1, 2, 3) } }",
+        );
+        let outer = target_id(&output.dom, "#outer");
+        let inner = target_id(&output.dom, "#inner");
+        let leaf = target_id(&output.dom, "#leaf");
+        let context = |outer_width: f32, inner_width: f32| {
+            let mut containers = ContainerContext {
+                viewport_width: 1000.0,
+                viewport_height: 800.0,
+                root_font_size: 16.0,
+                ..ContainerContext::default()
+            };
+            containers.containers.insert(
+                outer,
+                ContainerGeometry {
+                    container_type: ContainerType::Size,
+                    names: Vec::new(),
+                    width: outer_width,
+                    height: 300.0,
+                    font_size: 16.0,
+                },
+            );
+            containers.containers.insert(
+                inner,
+                ContainerGeometry {
+                    container_type: ContainerType::InlineSize,
+                    names: Vec::new(),
+                    width: inner_width,
+                    height: 300.0,
+                    font_size: 16.0,
+                },
+            );
+            MatchContext {
+                containers: Arc::new(containers),
+                ..MatchContext::default()
+            }
+        };
+        let before = context(400.0, 100.0);
+        let after = context(500.0, 200.0);
+        let sources = [CascadeInput {
+            sheet: &sheet,
+            origin: CascadeOrigin::Author,
+        }];
+        let registry = PropertyRegistry::standard_baseline();
+        let limits = ComputationLimits::default();
+        let mut incremental =
+            compute_document_styles(&output.dom, &sources, &registry, &limits, &before);
+        let full = compute_document_styles(&output.dom, &sources, &registry, &limits, &after);
+
+        recompute_document_styles_with_hints_from_roots(
+            &output.dom,
+            &sources,
+            &registry,
+            &limits,
+            &after,
+            &|_node| Vec::new(),
+            &mut incremental,
+            &BTreeSet::from([outer]),
+        );
+
+        for node in [outer, inner, leaf] {
+            for property in ["width", "color", "border-top-width"] {
+                assert_eq!(
+                    incremental[&node]
+                        .get(property)
+                        .map(super::ComputedValue::css_text),
+                    full[&node]
+                        .get(property)
+                        .map(super::ComputedValue::css_text),
+                    "incremental style differs for {property} on {node:?}"
+                );
+            }
         }
     }
 
