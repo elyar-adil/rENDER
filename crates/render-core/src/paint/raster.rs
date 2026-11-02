@@ -1386,7 +1386,17 @@ impl<'a> RasterState<'a> {
                 control,
             )
         } else {
-            warp_surface(parent, &layer, bounds, mapped, opacity, clip, control)
+            warp_surface(
+                parent,
+                &layer,
+                bounds,
+                mapped,
+                opacity,
+                clip,
+                None,
+                PhysicalPoint::default(),
+                control,
+            )
         };
         if !composited {
             self.cancelled = true;
@@ -3708,9 +3718,61 @@ pub fn composite_surface(
     clip: Option<PhysicalRect>,
     control: Option<&dyn RasterControl>,
 ) -> bool {
+    composite_surface_with_source_clip(
+        destination,
+        source,
+        transform,
+        opacity,
+        clip,
+        None,
+        PhysicalPoint::default(),
+        control,
+    )
+}
+
+/// Composites one cached layer surface and limits bilinear sampling to
+/// `source_clip`, a rectangle in the reference offscreen's coordinates.
+///
+/// The complete rasterizer paints a stacking context into a viewport-sized
+/// offscreen surface, so content that was outside the viewport when the scope
+/// was pushed never participates in the warp. A retained layer keeps its whole
+/// document-anchored source. `transform` maps reference-surface coordinates to
+/// the destination and `source_offset` converts a reference coordinate into
+/// the layer surface's own pixel coordinates. Neighboring texels outside the
+/// clip read as transparent, matching the reference offscreen's boundary.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    reason = "the layer compositor carries source, transform, destination clip and reference clip; the offset is integral at this call site"
+)]
+pub fn composite_surface_with_source_clip(
+    destination: &mut Surface,
+    source: &Surface,
+    transform: Transform2D,
+    opacity: f32,
+    clip: Option<PhysicalRect>,
+    source_clip: Option<PhysicalRect>,
+    source_offset: PhysicalPoint,
+    control: Option<&dyn RasterControl>,
+) -> bool {
     let bounds = (0, 0, source.width(), source.height());
-    if let Some((x, y)) = integer_translation(&transform) {
-        return blit_translated(destination, source, bounds, x, y, opacity, clip, control);
+    if let Some((x, y)) = integer_translation(&transform)
+        && source_offset.x.fract() == 0.0
+        && source_offset.y.fract() == 0.0
+    {
+        // The transform maps reference-surface coordinates to the
+        // destination; the layer's own pixel baseline is shifted by
+        // `source_offset`, so compose both translations into one blit.
+        return blit_translated(
+            destination,
+            source,
+            bounds,
+            x + source_offset.x as i64,
+            y + source_offset.y as i64,
+            opacity,
+            clip,
+            control,
+        );
     }
     warp_surface(
         destination,
@@ -3719,6 +3781,8 @@ pub fn composite_surface(
         transform,
         opacity,
         clip,
+        source_clip,
+        source_offset,
         control,
     )
 }
@@ -3851,6 +3915,8 @@ fn warp_surface(
     transform: Transform2D,
     opacity: f32,
     clip: Option<PhysicalRect>,
+    source_clip: Option<PhysicalRect>,
+    source_offset: PhysicalPoint,
     control: Option<&dyn RasterControl>,
 ) -> bool {
     let Some(inverse) = transform.inverse() else {
@@ -3861,18 +3927,29 @@ fn warp_surface(
     // A destination sample is bilinearly interpolated from the four source
     // pixels around it, so one transparent pixel beyond the tight content box
     // still carries weight for a sample outside it. Grow the box by one pixel
-    // and let the surface bounds clamp it.
-    let (source_left, source_top, source_width, source_height) = source_bounds;
-    let source_left = source_left.saturating_sub(1);
-    let source_top = source_top.saturating_sub(1);
-    let source_right = (source_left + source_width + 2).min(source.width);
-    let source_bottom = (source_top + source_height + 2).min(source.height);
-    let corners = [
-        (u32_to_f32(source_left), u32_to_f32(source_top)),
-        (u32_to_f32(source_right), u32_to_f32(source_top)),
-        (u32_to_f32(source_left), u32_to_f32(source_bottom)),
-        (u32_to_f32(source_right), u32_to_f32(source_bottom)),
-    ];
+    // and let the surface bounds clamp it. When a reference source clip is
+    // present, the reference surface is exactly that clip, so the pinned clip
+    // corners are used instead; growing would exceed the reference surface.
+    let corners = if let Some(source_clip) = source_clip {
+        [
+            (source_clip.origin.x, source_clip.origin.y),
+            (source_clip.right(), source_clip.origin.y),
+            (source_clip.origin.x, source_clip.bottom()),
+            (source_clip.right(), source_clip.bottom()),
+        ]
+    } else {
+        let (source_left, source_top, source_width, source_height) = source_bounds;
+        let source_left = source_left.saturating_sub(1);
+        let source_top = source_top.saturating_sub(1);
+        let source_right = (source_left + source_width + 2).min(source.width);
+        let source_bottom = (source_top + source_height + 2).min(source.height);
+        [
+            (u32_to_f32(source_left), u32_to_f32(source_top)),
+            (u32_to_f32(source_right), u32_to_f32(source_top)),
+            (u32_to_f32(source_left), u32_to_f32(source_bottom)),
+            (u32_to_f32(source_right), u32_to_f32(source_bottom)),
+        ]
+    };
     let mut min_x = f32::INFINITY;
     let mut min_y = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
@@ -3899,20 +3976,42 @@ fn warp_surface(
     let top = floor_to_u32(visible.origin.y);
     let right = ceil_to_u32(visible.right().min(u32_to_f32(destination.width)));
     let bottom = ceil_to_u32(visible.bottom().min(u32_to_f32(destination.height)));
+    // The reference clip is stored in reference-surface coordinates; the
+    // source surface's own pixels are offset from them by `source_offset`.
+    let local_source_clip = source_clip.map(|clip| {
+        PhysicalRect::new(
+            clip.origin.x - source_offset.x,
+            clip.origin.y - source_offset.y,
+            clip.size.width,
+            clip.size.height,
+        )
+    });
     for y in top..bottom {
         if control.is_some_and(RasterControl::is_cancelled) {
             return false;
         }
         // Inverse-map the row start once, then step along the row with the x
         // coefficients; moving down a row only advances the y coefficients.
-        let mut source_x = inverse.scale_x * u32_to_f32(left)
+        let mut reference_x = inverse.scale_x * u32_to_f32(left)
             + inverse.skew_x * u32_to_f32(y)
             + inverse.translate_x;
-        let mut source_y = inverse.skew_y * u32_to_f32(left)
+        let mut reference_y = inverse.skew_y * u32_to_f32(left)
             + inverse.scale_y * u32_to_f32(y)
             + inverse.translate_y;
         for x in left..right {
-            if let Some(color) = sample_bilinear(source, source_x, source_y)
+            let inside_source = source_clip.is_none_or(|clip| {
+                reference_x >= clip.origin.x
+                    && reference_x < clip.right()
+                    && reference_y >= clip.origin.y
+                    && reference_y < clip.bottom()
+            });
+            if inside_source
+                && let Some(color) = sample_bilinear(
+                    source,
+                    reference_x - source_offset.x,
+                    reference_y - source_offset.y,
+                    local_source_clip,
+                )
                 && let Some(index) = destination.index(x, y)
                 && color.alpha != 0
             {
@@ -3922,8 +4021,8 @@ fn warp_surface(
                     blend(destination.pixels[index], color, opacity)
                 };
             }
-            source_x += inverse.scale_x;
-            source_y += inverse.skew_y;
+            reference_x += inverse.scale_x;
+            reference_y += inverse.skew_y;
         }
     }
     true
@@ -3936,11 +4035,21 @@ fn warp_surface(
 /// the interpolated color. Integer coordinates shortcut to the exact pixel,
 /// which keeps identity and whole-pixel warps lossless.
 #[allow(clippy::float_cmp)] // integer coordinates are an exact bit-pattern test
-fn sample_bilinear(surface: &Surface, x: f32, y: f32) -> Option<Color> {
+fn sample_bilinear(
+    surface: &Surface,
+    x: f32,
+    y: f32,
+    source_clip: Option<PhysicalRect>,
+) -> Option<Color> {
     let width = u32_to_f32(surface.width);
     let height = u32_to_f32(surface.height);
     // The range test also rejects NaN, which would poison the weights.
     if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 || x >= width || y >= height {
+        return None;
+    }
+    if let Some(clip) = source_clip
+        && (x < clip.origin.x || x >= clip.right() || y < clip.origin.y || y >= clip.bottom())
+    {
         return None;
     }
     let left = floor_to_u32(x);
@@ -3951,6 +4060,17 @@ fn sample_bilinear(surface: &Surface, x: f32, y: f32) -> Option<Color> {
         return surface.pixel(left, top);
     }
     let sample = |column: u32, row: u32| {
+        if let Some(clip) = source_clip {
+            let column = u32_to_f32(column);
+            let row = u32_to_f32(row);
+            if column < clip.origin.x
+                || column >= clip.right()
+                || row < clip.origin.y
+                || row >= clip.bottom()
+            {
+                return PREMULTIPLIED_TRANSPARENT;
+            }
+        }
         surface
             .pixel(column, row)
             .map_or(PREMULTIPLIED_TRANSPARENT, premultiplied)

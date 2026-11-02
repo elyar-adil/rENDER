@@ -29,10 +29,20 @@
 //! by the filter's reach, which costs more memory than a band but keeps the
 //! result pixel-identical to the complete raster's offscreen pass.
 //!
-//! The compositor is deliberately conservative. A non-normal blend mode, an
-//! ambient clip crossing a layer boundary, nested sticky, a layer wider than
-//! the 8192px raster ceiling, or an effect surface above the retained-effect
-//! limits returns `None` and the caller keeps the complete-raster path.
+//! A top-level stacking context that is open inside an ambient clip is retained
+//! when every inherited clip is a pixel-aligned rectangle and the scope has no
+//! filter or mask. Document scopes replay the clips into their cached source,
+//! then clip the composite result; identity viewport scopes apply the clips at
+//! composite time. A transformed document scope also reproduces the reference's
+//! viewport-sized offscreen: the warp is expressed in reference coordinates
+//! and samples the document-anchored source through a per-frame offset, so
+//! content the reference clipped before transforming cannot appear.
+//!
+//! The compositor is deliberately conservative. A non-normal blend mode, a
+//! rounded or viewport-space inherited clip on an extracted scope, nested
+//! sticky, a layer wider than the 8192px raster ceiling, or an effect surface
+//! above the retained-effect limits returns `None` and the caller keeps the
+//! complete-raster path.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -47,7 +57,7 @@ use super::display_list::{
 };
 use super::raster::{
     CpuRasterOutput, CpuRasterizer, FilterOutset, GlyphMaskProvider, RasterControl, Surface,
-    apply_layer_effects, composite_surface, filter_outset,
+    apply_layer_effects, composite_surface, composite_surface_with_source_clip, filter_outset,
 };
 use super::sticky::sticky_displacement;
 
@@ -105,6 +115,12 @@ struct CompositedLayer {
     /// A top-level `mask-image`, sampled in document or viewport coordinates
     /// and applied after the filter.
     mask: Option<MaskLayer>,
+    /// Clips that were open when this scope started.
+    ///
+    /// A document layer replays them while rasterizing its source and also
+    /// clips the composite result; an identity viewport layer applies them at
+    /// composite time in viewport coordinates.
+    clips: Vec<InheritedClip>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,6 +151,14 @@ struct InheritedClip {
     shape: ClipShape,
     space: PaintCoordinateSpace,
 }
+
+/// Transparent padding around a transformed layer's retained source.
+///
+/// Bilinear sampling at a source edge reads the neighboring texel. A layer
+/// surface that ends exactly at its content bounds would drop that sample,
+/// while the complete raster's viewport-sized offscreen supplies transparent
+/// padding. One physical pixel reproduces it.
+const LAYER_SAMPLING_MARGIN: f32 = 1.0;
 
 /// Per-frame compositor counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -264,7 +288,7 @@ impl CompositorCache {
                         &mut segments,
                         &mut ops,
                     )?;
-                    let bounds = item_bounds(&items[index + 1..end])?;
+                    let bounds = pixel_aligned_rect(item_bounds(&items[index + 1..end])?);
                     if bounds.size.width > MAX_EFFECT_SURFACE_WIDTH {
                         return None;
                     }
@@ -279,6 +303,7 @@ impl CompositorCache {
                         sticky: Some(**constraint),
                         filter: None,
                         mask: None,
+                        clips: Vec::new(),
                     });
                     ops.push(LayerOp::Layer(layer));
                     index = end + 1;
@@ -303,7 +328,7 @@ impl CompositorCache {
                         index = end + 1;
                         continue;
                     }
-                    if clip_depth != 0 || context.blend_mode != BlendMode::Normal {
+                    if context.blend_mode != BlendMode::Normal {
                         return None;
                     }
                     if items[start..end]
@@ -323,20 +348,68 @@ impl CompositorCache {
                     }) {
                         return None;
                     }
-                    let bounds = if space == PaintCoordinateSpace::Viewport {
+                    let raw_bounds = if space == PaintCoordinateSpace::Viewport {
                         viewport_rect(viewport)
                     } else {
                         item_bounds(&items[start..end])?
                     };
                     let has_effect = context.filter.is_some() || context.mask.is_some();
+                    let content_bounds = if space == PaintCoordinateSpace::Document && !has_effect {
+                        pixel_aligned_rect(raw_bounds)
+                    } else {
+                        raw_bounds
+                    };
+                    let inherited = if clip_depth == 0 {
+                        Vec::new()
+                    } else {
+                        // A scope inside an ambient clip is extracted only when
+                        // that clip can be reproduced exactly. Document layers
+                        // replay it into their source and clip the composite
+                        // result; an identity viewport layer applies it at
+                        // composite time. Effects would need the clip applied
+                        // before the filter, so they keep the fallback.
+                        if has_effect
+                            || active_clips.iter().any(|clip| {
+                                !matches!(clip.shape, ClipShape::Rect(rect) if rect_is_pixel_aligned(rect))
+                            })
+                        {
+                            return None;
+                        }
+                        match space {
+                            PaintCoordinateSpace::Document => {
+                                if active_clips
+                                    .iter()
+                                    .any(|clip| clip.space != PaintCoordinateSpace::Document)
+                                {
+                                    return None;
+                                }
+                            }
+                            PaintCoordinateSpace::Viewport => {
+                                if !context.transform.is_identity() {
+                                    return None;
+                                }
+                            }
+                        }
+                        active_clips.clone()
+                    };
+                    let bounds = if has_effect || space == PaintCoordinateSpace::Viewport {
+                        content_bounds
+                    } else {
+                        inflate_rect(content_bounds, LAYER_SAMPLING_MARGIN)
+                    };
                     if has_effect {
                         // The effect surface must be one allocation: a banded
                         // filter would either clip a blur at a band edge or
                         // repeat the effect over overlapping inputs. Reject a
                         // layer that would exceed the retention budget so the
                         // caller keeps the complete-raster path.
-                        effect_surface_bounds(bounds, space, context.filter.as_ref(), viewport)?;
-                    } else if bounds.size.width > MAX_EFFECT_SURFACE_WIDTH {
+                        effect_surface_bounds(
+                            content_bounds,
+                            space,
+                            context.filter.as_ref(),
+                            viewport,
+                        )?;
+                    } else if content_bounds.size.width > MAX_EFFECT_SURFACE_WIDTH {
                         return None;
                     }
                     push_segment(
@@ -360,11 +433,13 @@ impl CompositorCache {
                         sticky: None,
                         filter: context.filter.clone(),
                         mask: context.mask.clone(),
+                        clips: inherited,
                     });
                     ops.push(LayerOp::Layer(layer));
                     index = end + 1;
                     root_start = index;
                     root_space = None;
+                    root_clips.clone_from(&active_clips);
                 }
                 DisplayCommand::PushTransform(_) | DisplayCommand::PopTransform => return None,
                 _ => {
@@ -503,7 +578,7 @@ impl CompositorCache {
                             layer.opacity,
                             layer.space,
                             layer.sticky,
-                            &[],
+                            &layer.clips,
                             viewport_origin,
                             glyphs,
                             images,
@@ -578,12 +653,16 @@ impl CompositorCache {
         // surface scroll-independent, so its inherited clips are applied here
         // in viewport coordinates. Document segments replay clips while
         // rasterizing their bands instead.
-        let composite_clip = if space == PaintCoordinateSpace::Viewport {
+        let composite_clip = if clips.is_empty() {
+            viewport_rect
+        } else if space == PaintCoordinateSpace::Viewport || kind == 1 {
             let Some(clip) = inherited_viewport_clip(clips, viewport_origin, viewport_rect) else {
                 return 0;
             };
             clip
         } else {
+            // Document root segments replay inherited clips while rasterizing
+            // their bands, so the baked pixels already respect them.
             viewport_rect
         };
         let band_height = if space == PaintCoordinateSpace::Viewport {
@@ -729,7 +808,52 @@ impl CompositorCache {
             };
             let mapped = to_viewport.then(&transform.then(&band_origin));
             let clip = Some(composite_clip);
-            if !composite_surface(output, source, mapped, opacity, clip, control) {
+            // A transformed stacking context is painted into a viewport-sized
+            // offscreen by the complete raster before it is warped. The layer's
+            // own pixels are anchored at `band_origin`, so sample through the
+            // reference coordinate system: compute the reference coordinate
+            // with the reference matrix order, then shift into layer-local
+            // coordinates. That keeps viewport-edge decisions bit-identical.
+            let reference_offset = PhysicalPoint {
+                x: band_origin.translate_x - scroll.x,
+                y: band_origin.translate_y - scroll.y,
+            };
+            let reference_bounds = PhysicalRect::new(
+                reference_offset.x,
+                reference_offset.y,
+                bounds.size.width,
+                bounds.size.height,
+            );
+            let reference_inside_viewport = reference_bounds.origin.x >= 0.0
+                && reference_bounds.origin.y >= 0.0
+                && reference_bounds.right() <= viewport_rect.size.width
+                && reference_bounds.bottom() <= viewport_rect.size.height;
+            let uses_reference_clip = kind == 1
+                && sticky.is_none()
+                && !(transform.is_translation() && opacity >= 1.0)
+                && !reference_inside_viewport
+                && reference_offset.x.fract() == 0.0
+                && reference_offset.y.fract() == 0.0;
+            let composited = if uses_reference_clip {
+                let reference_mapped = to_viewport.then(&transform.then(&Transform2D {
+                    translate_x: scroll.x,
+                    translate_y: scroll.y,
+                    ..Transform2D::default()
+                }));
+                composite_surface_with_source_clip(
+                    output,
+                    source,
+                    reference_mapped,
+                    opacity,
+                    clip,
+                    Some(viewport_rect),
+                    reference_offset,
+                    control,
+                )
+            } else {
+                composite_surface(output, source, mapped, opacity, clip, control)
+            };
+            if !composited {
                 break;
             }
         }
@@ -1090,7 +1214,10 @@ fn make_segment(
     let bounds = if space == PaintCoordinateSpace::Viewport {
         viewport_rect(viewport)
     } else {
-        item_bounds(&items[start..end])?
+        // Anchor document bands on whole pixels. Rasterizing at a fractional
+        // band origin and then resampling during the blit antialiases content
+        // the complete raster paints on its absolute pixel grid.
+        pixel_aligned_rect(item_bounds(&items[start..end])?)
     };
     if bounds.size.width > 8192.0 {
         return None;
@@ -1108,12 +1235,51 @@ fn viewport_rect(viewport: PhysicalSize) -> PhysicalRect {
     PhysicalRect::new(0.0, 0.0, viewport.width.max(0.0), viewport.height.max(0.0))
 }
 
+/// Grows a rectangle outward to the surrounding whole-pixel grid.
+///
+/// Rasterizing at a fractional origin is equivalent to rasterizing on the
+/// absolute pixel grid shifted by that origin; compositing the result back at
+/// an integer offset then preserves the reference pixel values. Keeping the
+/// origin fractional would force every band through bilinear resampling.
+fn pixel_aligned_rect(rect: PhysicalRect) -> PhysicalRect {
+    let left = rect.origin.x.floor();
+    let top = rect.origin.y.floor();
+    let right = rect.right().ceil();
+    let bottom = rect.bottom().ceil();
+    PhysicalRect::new(left, top, right - left, bottom - top)
+}
+
+fn inflate_rect(rect: PhysicalRect, margin: f32) -> PhysicalRect {
+    // The raster state treats its origin as a non-negative scroll offset, so a
+    // negative layer origin would be clamped and shift the content. Keep the
+    // padding on the side the surface can represent: a box at the document
+    // origin has no reference padding to its left or above either.
+    let left = (rect.origin.x - margin).max(0.0);
+    let top = (rect.origin.y - margin).max(0.0);
+    let right = rect.right() + margin;
+    let bottom = rect.bottom() + margin;
+    PhysicalRect::new(left, top, right - left, bottom - top)
+}
+
 fn intersect_rect(first: PhysicalRect, second: PhysicalRect) -> Option<PhysicalRect> {
     let left = first.origin.x.max(second.origin.x);
     let top = first.origin.y.max(second.origin.y);
     let right = first.right().min(second.right());
     let bottom = first.bottom().min(second.bottom());
     (right > left && bottom > top).then(|| PhysicalRect::new(left, top, right - left, bottom - top))
+}
+
+/// Whether every edge of `rect` lies on the integer pixel grid.
+///
+/// The all-rect fast path of the complete rasterizer uses integer cell tests
+/// while the retained blit uses pixel centres. Pixel-aligned clip edges make
+/// the two agree exactly; a fractional edge keeps the conservative fallback
+/// for an extracted scope.
+#[allow(clippy::float_cmp)] // clip edges are layout coordinates, not measured values
+fn rect_is_pixel_aligned(rect: PhysicalRect) -> bool {
+    [rect.origin.x, rect.origin.y, rect.right(), rect.bottom()]
+        .iter()
+        .all(|value| value.is_finite() && value.fract() == 0.0)
 }
 
 /// Resolves inherited clips into one viewport-space rectangle.
@@ -2128,6 +2294,139 @@ mod tests {
                 .is_none(),
             "the complete-raster fallback must remain for an unsupported clip shape"
         );
+    }
+
+    /// A transformed stacking context is painted into a viewport-sized
+    /// offscreen by the complete rasterizer before it is warped. Across scroll
+    /// offsets that offscreen clips the source at the viewport edge, so the
+    /// retained source must map the reference viewport back into layer-local
+    /// coordinates and mask bilinear neighbors outside it. These cases cover
+    /// the Baidu-shaped triggers: a vertical flip, a half-scale scope and an
+    /// identity opacity scope, inside a document clip and outside one.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the case table is one parameterized scene; splitting it would hide which transform each row covers"
+    )]
+    fn transformed_contexts_match_the_complete_raster_across_scroll_offsets() {
+        let viewport = PhysicalSize {
+            width: 100.0,
+            height: 100.0,
+        };
+        let clip = PhysicalRect::new(0.0, 0.0, 100.0, 300.0);
+        let body = PhysicalRect::new(20.0, 20.0, 40.0, 40.0);
+        let cases = [
+            (
+                "flip",
+                PaintCoordinateSpace::Document,
+                Transform2D {
+                    scale_x: -1.0,
+                    scale_y: -1.0,
+                    translate_x: 100.0,
+                    translate_y: 100.0,
+                    ..Transform2D::default()
+                },
+                1.0,
+                true,
+            ),
+            (
+                "half-scale",
+                PaintCoordinateSpace::Document,
+                Transform2D {
+                    scale_x: 0.5,
+                    scale_y: 0.5,
+                    ..Transform2D::default()
+                },
+                1.0,
+                true,
+            ),
+            (
+                "document-opacity",
+                PaintCoordinateSpace::Document,
+                Transform2D::default(),
+                0.85,
+                true,
+            ),
+            (
+                "viewport-opacity",
+                PaintCoordinateSpace::Viewport,
+                Transform2D::default(),
+                0.85,
+                true,
+            ),
+            (
+                "flip-without-clip",
+                PaintCoordinateSpace::Document,
+                Transform2D {
+                    scale_x: -1.0,
+                    scale_y: -1.0,
+                    translate_x: 100.0,
+                    translate_y: 100.0,
+                    ..Transform2D::default()
+                },
+                1.0,
+                false,
+            ),
+        ];
+        for (label, space, transform, opacity, clipped) in cases {
+            let mut items = vec![item(
+                0,
+                PhysicalRect::new(0.0, 0.0, 100.0, 100.0),
+                rect(0.0, 0.0, 100.0, 100.0, Color::rgb(250, 250, 250)),
+            )];
+            if clipped {
+                items.push(item(
+                    1,
+                    clip,
+                    DisplayCommand::PushClip(ClipShape::Rect(clip)),
+                ));
+            }
+            let mut push = item(
+                2,
+                body,
+                DisplayCommand::PushStackingContext(context(transform, opacity)),
+            );
+            push.coordinate_space = space;
+            items.push(push);
+            let mut content = item(
+                3,
+                body,
+                rect(
+                    body.origin.x,
+                    body.origin.y,
+                    40.0,
+                    40.0,
+                    Color::rgb(10, 120, 200),
+                ),
+            );
+            content.coordinate_space = space;
+            content.bounds = body;
+            items.push(content);
+            let mut pop = item(4, body, DisplayCommand::PopStackingContext);
+            pop.coordinate_space = space;
+            items.push(pop);
+            if clipped {
+                items.push(item(5, clip, DisplayCommand::PopClip));
+            }
+            items.push(item(
+                6,
+                PhysicalRect::new(0.0, 100.0, 100.0, 100.0),
+                rect(0.0, 100.0, 100.0, 100.0, Color::rgb(10, 120, 10)),
+            ));
+            let display = std::sync::Arc::new(list(viewport, items));
+            let cache =
+                CompositorCache::from_display_list(std::sync::Arc::clone(&display), Color::WHITE)
+                    .expect("the transformed scope is retainable");
+            for y in [0.0, 10.0, 30.0, 55.0, 80.0] {
+                assert_matches_complete_raster(
+                    &cache,
+                    &display,
+                    Color::WHITE,
+                    PhysicalPoint { x: 0.0, y },
+                    label,
+                );
+            }
+        }
     }
 
     /// The all-rect fast path of the complete rasterizer admits integer pixel
