@@ -265,24 +265,77 @@ impl GpuPresenter {
             return Err("GPU base frame and surface sizes differ".to_owned());
         }
         fill_rgba(&self.base, width, height, &mut self.rgba)?;
+        self.upload_rgba_region(0, 0, width, height)
+    }
+
+    /// Uploads one rectangle of the CPU frame and presents the window.
+    ///
+    /// A scroll frame differs from the previous one only inside the page
+    /// rectangle, so rewriting the whole upload buffer and re-uploading the
+    /// whole texture would convert and transfer the unchanged chrome again.
+    fn upload_rgba_region(
+        &mut self,
+        origin_x: u32,
+        origin_y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        let row_bytes = rgba_row_bytes(self.width)?;
+        let expected = row_bytes
+            .checked_mul(
+                usize::try_from(self.height)
+                    .map_err(|_| "the GPU frame height does not fit in memory".to_owned())?,
+            )
+            .ok_or_else(|| "the GPU upload buffer overflows memory".to_owned())?;
+        if self.rgba.len() != expected {
+            return Err("GPU upload buffer and surface sizes differ".to_owned());
+        }
+        let start = usize::try_from(origin_y)
+            .map_err(|_| "the GPU upload origin does not fit in memory".to_owned())?
+            .checked_mul(row_bytes)
+            .and_then(|offset| offset.checked_add(usize::try_from(origin_x).ok()?.checked_mul(4)?))
+            .ok_or_else(|| "the GPU upload origin overflows memory".to_owned())?;
+        let height = usize::try_from(height)
+            .map_err(|_| "the GPU upload height does not fit in memory".to_owned())?;
+        let end = start
+            .checked_add(
+                row_bytes
+                    .checked_mul(height)
+                    .ok_or_else(|| "the GPU upload region overflows memory".to_owned())?,
+            )
+            .ok_or_else(|| "the GPU upload region overflows memory".to_owned())?;
+        let Some(data) = self.rgba.get(start..end) else {
+            return Err("the GPU upload region lies outside the frame".to_owned());
+        };
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.texture,
                 mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                origin: wgpu::Origin3d {
+                    x: origin_x,
+                    y: origin_y,
+                    z: 0,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
-            &self.rgba,
+            data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(u32::try_from(rgba_row_bytes(width)?).map_err(|_| {
+                bytes_per_row: Some(u32::try_from(row_bytes).map_err(|_| {
                     "the GPU row stride does not fit in a texture copy layout".to_owned()
                 })?),
-                rows_per_image: Some(height),
+                rows_per_image: Some(
+                    u32::try_from(height)
+                        .map_err(|_| "the GPU row count does not fit in u32".to_owned())?,
+                ),
             },
             wgpu::Extent3d {
                 width,
-                height,
+                height: u32::try_from(height)
+                    .map_err(|_| "the GPU row count does not fit in u32".to_owned())?,
                 depth_or_array_layers: 1,
             },
         );
@@ -558,33 +611,83 @@ impl PlatformPresenter for GpuPresenter {
         origin_y: u32,
     ) -> Result<Duration, String> {
         let started = Instant::now();
-        if self.width == 0 || self.height == 0 || self.base.is_empty() {
+        if self.width == 0 || self.height == 0 || self.rgba.is_empty() {
             return Err("no full window frame has been presented yet".to_owned());
         }
-        let page_width = page.width() as usize;
-        let copy_width = page_width.min((self.width.saturating_sub(origin_x)) as usize);
-        let copy_height =
-            (page.height() as usize).min((self.height.saturating_sub(origin_y)) as usize);
-        let pixels = page.pixels();
-        for row in 0..copy_height {
-            let source_start = row * page_width;
-            let destination_start =
-                (origin_y as usize + row) * self.width as usize + origin_x as usize;
-            for column in 0..copy_width {
-                let color = pixels[source_start + column];
-                self.base[destination_start + column] = (u32::from(color.red) << 16)
-                    | (u32::from(color.green) << 8)
-                    | u32::from(color.blue);
-            }
-        }
-        self.upload_and_present()?;
+        let row_bytes = rgba_row_bytes(self.width)?;
+        let (copy_width, copy_height) = write_page_rgba(
+            &mut self.rgba,
+            row_bytes,
+            self.width,
+            self.height,
+            page,
+            origin_x,
+            origin_y,
+        )?;
+        // `base` is only the source for a later full-window upload; the scroll
+        // path updates the upload buffer directly so the unchanged chrome is
+        // neither converted nor transferred again.
+        self.upload_rgba_region(origin_x, origin_y, copy_width, copy_height)?;
         Ok(started.elapsed())
     }
 }
 
+/// Converts one page rectangle into the padded RGBA upload buffer.
+///
+/// Returns the copied width and height. The page's opaque pixels replace the
+/// corresponding window pixels; padding bytes and untouched chrome rows keep
+/// the buffer's existing contents.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "page and window dimensions are bounded physical pixel counts"
+)]
+fn write_page_rgba(
+    rgba: &mut [u8],
+    row_bytes: usize,
+    frame_width: u32,
+    frame_height: u32,
+    page: &Surface,
+    origin_x: u32,
+    origin_y: u32,
+) -> Result<(u32, u32), String> {
+    if frame_width == 0 || frame_height == 0 {
+        return Err("cannot upload a page into a zero-sized frame".to_owned());
+    }
+    let expected = row_bytes
+        .checked_mul(frame_height as usize)
+        .ok_or_else(|| "the GPU upload buffer overflows memory".to_owned())?;
+    if rgba.len() != expected {
+        return Err("GPU upload buffer and surface sizes differ".to_owned());
+    }
+    let page_width = page.width() as usize;
+    let copy_width = page_width.min(frame_width.saturating_sub(origin_x) as usize);
+    let copy_height = (page.height() as usize).min(frame_height.saturating_sub(origin_y) as usize);
+    let pixels = page.pixels();
+    for row in 0..copy_height {
+        let source_start = row * page_width;
+        let destination_start = (origin_y as usize + row) * row_bytes + origin_x as usize * 4;
+        let destination = &mut rgba[destination_start..destination_start + copy_width * 4];
+        for (color, output) in pixels[source_start..source_start + copy_width]
+            .iter()
+            .zip(destination.chunks_exact_mut(4))
+        {
+            output[0] = color.red;
+            output[1] = color.green;
+            output[2] = color.blue;
+            output[3] = 0xff;
+        }
+    }
+    Ok((
+        u32::try_from(copy_width).map_err(|_| "the page width does not fit in u32".to_owned())?,
+        u32::try_from(copy_height).map_err(|_| "the page height does not fit in u32".to_owned())?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{COPY_BYTES_PER_ROW_ALIGNMENT, SHADER, fill_rgba, rgba_row_bytes};
+    use render_core::paint::{Color, Surface};
+
+    use super::{COPY_BYTES_PER_ROW_ALIGNMENT, SHADER, fill_rgba, rgba_row_bytes, write_page_rgba};
 
     /// The shader is validated by naga during module creation in the live
     /// path; this cheap test catches an accidental edit before a GPU run.
@@ -632,5 +735,35 @@ mod tests {
         let mut rgba = Vec::new();
         let error = fill_rgba(&[0x0011_2233], 2, 2, &mut rgba).expect_err("short frame");
         assert!(error.contains("needs 4"));
+    }
+
+    /// A scroll frame updates only the page rectangle of the upload buffer.
+    /// The conversion must leave the chrome rows and row padding untouched,
+    /// and it must clip a page that extends past the window.
+    #[test]
+    fn a_page_region_is_written_into_the_padded_frame_buffer() {
+        let row_bytes = COPY_BYTES_PER_ROW_ALIGNMENT;
+        let page = Surface::new(2, 2, Color::rgb(0x11, 0x22, 0x33));
+        let mut rgba = vec![0_u8; row_bytes * 3];
+        let copied = write_page_rgba(&mut rgba, row_bytes, 3, 3, &page, 1, 1)
+            .expect("the page fits the frame");
+        assert_eq!(copied, (2, 2));
+        for row in 0..2 {
+            for column in 0..2 {
+                let offset = (1 + row) * row_bytes + (1 + column) * 4;
+                assert_eq!(&rgba[offset..offset + 4], &[0x11, 0x22, 0x33, 0xff]);
+            }
+        }
+        assert!(
+            rgba[..4].iter().all(|byte| *byte == 0),
+            "a pixel outside the page keeps the previous frame"
+        );
+
+        let oversized = Surface::new(4, 4, Color::rgb(1, 2, 3));
+        let clipped = write_page_rgba(&mut rgba, row_bytes, 3, 3, &oversized, 2, 2)
+            .expect("the overlap is still written");
+        assert_eq!(clipped, (1, 1));
+        let offset = 2 * row_bytes + 2 * 4;
+        assert_eq!(&rgba[offset..offset + 4], &[1, 2, 3, 0xff]);
     }
 }
