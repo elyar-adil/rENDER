@@ -271,6 +271,68 @@ fn auto_inline_block_max_content_includes_fixed_atomic_children() {
 }
 
 #[test]
+fn inline_flex_intrinsic_width_sums_items_inside_an_inline_block() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='form'><div id='row'><div id='left'></div><div id='right'></div></div><div id='submit'></div></div></body>",
+        "html, body { display:block; margin:0 } \
+         #form { display:inline-block } \
+         #row { display:inline-flex } \
+         #left { display:block; width:100px; height:20px; margin-right:10px } \
+         #right { display:block; width:50px; height:20px } \
+         #submit { display:inline-block; width:50px; height:20px }",
+        800.0,
+    );
+    let form = find(&output.dom, "#form");
+    let fragment = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(form))
+        .expect("form fragment");
+    // The row's main size is 100 + 10 + 50, not its widest item; the submit
+    // button then shares the same anonymous line, for 160 + 50.
+    assert_eq!(fragment.rect.size.width, 210.0);
+}
+
+#[test]
+fn absolutely_positioned_flex_item_does_not_grow_intrinsic_width() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='row'><div id='item'></div><div id='badge'></div></div></body>",
+        "html, body { display:block; margin:0 } \
+         #row { display:inline-flex } \
+         #item { display:block; width:100px; height:20px } \
+         #badge { position:absolute; display:block; width:30px; height:20px }",
+        800.0,
+    );
+    let row = find(&output.dom, "#row");
+    let fragment = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(row))
+        .expect("row fragment");
+    assert_eq!(fragment.rect.size.width, 100.0);
+}
+
+#[test]
+fn absolutely_positioned_inline_child_does_not_contribute_to_shrink_to_fit_width() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='search'><div id='logo'></div><div id='toggle'></div><div id='form'></div></div></body>",
+        "html, body { display:block; margin:0 } \
+         #search { display:block; position:absolute; left:0; top:0 } \
+         #logo { display:inline-block; width:100px; height:20px; margin-right:10px } \
+         #toggle { position:absolute; display:inline-block; left:0; width:30px; height:20px } \
+         #form { display:inline-block; width:50px; height:20px }",
+        800.0,
+    );
+    let search = find(&output.dom, "#search");
+    let fragment = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(search))
+        .expect("search fragment");
+    assert_eq!(fragment.rect.size.width, 160.0);
+}
+
+#[test]
 fn border_box_min_max_width_constrain_the_border_box() {
     let (output, _, layout) = pipeline(
         "<!doctype html><body><div id='min'></div><div id='max'></div></body>",

@@ -2210,6 +2210,12 @@ impl<'a> Solver<'a> {
         let Some(node) = self.formatting.get(node_id).cloned() else {
             return;
         };
+        // CSS 2.1 §9.3.1: absolutely positioned boxes are taken out of the
+        // inline formatting context. They neither participate in its line
+        // breaking nor contribute to its max-content or min-content width.
+        if self.is_out_of_flow(node_id) {
+            return;
+        }
         if content_visibility_hidden(
             node.style_source
                 .and_then(|source| self.styles.get(&source)),
@@ -2504,6 +2510,13 @@ impl<'a> Solver<'a> {
                 // size plus the padding, border, and margin below.
                 if contained {
                     return 0.0;
+                }
+                // An inline-flex container's content is the sum of its flex
+                // items along the main axis, not the widest child. Folding
+                // `max` here under-measured a search row by one item's width
+                // and then wrapped the last item onto a second line.
+                if self.is_row_flex_container(node_id) {
+                    return self.flex_intrinsic_size(node_id, true, basis, 0, minimum);
                 }
                 children
                     .into_iter()

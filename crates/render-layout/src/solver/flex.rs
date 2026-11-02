@@ -983,7 +983,14 @@ impl Solver<'_> {
                 context: FormattingContextKind::Flex
             }
         );
-        let children = entry.children.clone();
+        // §4: absolutely positioned children are not flex items and do not
+        // contribute to a flex container's intrinsic main size.
+        let children: Vec<_> = entry
+            .children
+            .iter()
+            .copied()
+            .filter(|child| !self.is_out_of_flow(*child))
+            .collect();
         let mut line: f32 = 0.0;
         let mut widest: f32 = 0.0;
         let mut broadest: f32 = 0.0;
