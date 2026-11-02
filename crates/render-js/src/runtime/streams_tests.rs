@@ -44,6 +44,37 @@ fn ok(source: &str) -> String {
     run(source)
 }
 
+/// Evaluate `source` and return its completion value (not `log`).
+fn eval_value(source: &str) -> String {
+    let mut dom = parse_document("<!doctype html><html><body></body></html>").dom;
+    let mut runtime = JsRuntime::new(&dom);
+    let outcome = runtime
+        .execute(&mut dom, source)
+        .unwrap_or_else(|error| panic!("{source}\n=> {error}"));
+    assert!(runtime.prelude_error().is_none());
+    outcome.value.to_js_string().to_lossy()
+}
+
+fn throws_name(expression: &str) -> String {
+    eval_value(&format!(
+        "var r; try {{ {expression}; r = 'no error' }} catch (e) {{ r = e.name }} r"
+    ))
+}
+
+#[test]
+fn constructor_validation_uses_type_and_range_errors() {
+    assert_eq!(
+        throws_name("new ReadableStream({}, { highWaterMark: -1 })"),
+        "RangeError"
+    );
+    assert_eq!(
+        throws_name("new ReadableStream({ type: 'bytes' })"),
+        "TypeError"
+    );
+    assert_eq!(throws_name("new ReadableStream({ start: 1 })"), "TypeError");
+    assert_eq!(throws_name("ReadableStream()"), "TypeError");
+}
+
 #[test]
 fn a_start_callback_that_enqueues_then_closes_delivers_chunks_in_order() {
     assert_eq!(

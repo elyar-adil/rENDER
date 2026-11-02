@@ -2803,7 +2803,7 @@ Implemented for default (non-byte) streams:
 Deliberately absent (a call throws rather than doing something else):
 byte streams/BYOB readers, `pipeTo`, `pipeThrough`, `TransformStream`,
 `WritableStream` and `ReadableStream.from`. The reduced tests are
-`crates/render-js/src/runtime/streams_tests.rs` (10 tests); they cover ordered
+`crates/render-js/src/runtime/streams_tests.rs` (11 tests); they cover ordered
 start enqueues, pull backpressure, `desiredSize`, error rejection, pending-read
 delivery, lock release, `for await`, `tee`, cancellation and the exact X
 listener shape.
@@ -2837,7 +2837,7 @@ and `String.prototype.localeCompare` still use the engine's pre-existing fixed
 formatter/comparator instead of routing through these Intl objects; that wiring
 is a separate gap.
 
-Evidence: 11 tests in `builtins/intl.rs`; `cargo test -p render-js` 1256 passed.
+Evidence: 11 tests in `builtins/intl.rs`; `cargo test -p render-js` 1257 passed.
 A live X replay loads the page, entry bundle and all initial chunks with
 `scripts_failed=0 scripts_threw=0`; it still shows the shell because the
 guest-activation request (`https://api.x.com/1.1/guest/activate.json`) returns
