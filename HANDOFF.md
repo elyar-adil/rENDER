@@ -10,7 +10,7 @@
 | --- | ---: | ---: |
 | retained compositor | 1909 µs/帧 | **581–640 µs/帧** |
 | full raster | 3450 µs/帧 | **725 µs/帧** |
-| Baidu retained 回退 | ~254 ms/帧 | 已修掉 fixed-in-clip 触发点；剩余问题是非空 `scale(-1)` stacking context，尚未安全提取 |
+| Baidu retained | ~254 ms/帧 full raster | **13 layers，3.33 ms/帧**（`072426c`/`11fa52a`，snapshot 18.5×）；±1 channel 差异为既有 band rounding |
 
 主要提交：`cbee346`、`2c43a6a`、`0a0c971`、`398be99`、`a2dd631`。修复内容：
 - retained band blit 预计算 clip 边界并整行拷贝，去掉逐像素 clip 测试；
@@ -102,6 +102,28 @@
 
 最终 live 页（1180×780 CSS / DPR 2）连续 3 次：`ready=Interactive dom_elements=235–236 boxes=95`，表单、二维码、短信按钮都在；截图 `/tmp/zhihu-detail.png` / `/tmp/zhihu-run1.png`。有一次早期运行仍落到“出了一点问题”，随后无法复现，记为 script/CSSOM 插入时序的残留风险。剩余：CSSOM 只是功能子集（`media`/`disabled`/`replace` 等未实现，link sheet 的 insertRule 不进 cascade）；`getComputedStyle()` 仍返回空值；第三方验证码 bundle 仍有一个 `callee[] undefined` 的独立语义 lead。
 
+## 首次绘制：样式表现在是 render-blocking
+
+用户看到的“先纯文本、再变有布局”是首帧在外部 CSS 应用前就提交。`3196fb1` 后，文档的第一帧如果带有非空 `style_plan` 且还没有 `applied_style_sheets`，就不再安装；页面保持空白/旧页，等样式批次完成并提交已样式化的帧。后续动态新增的样式表仍保留旧页面，不闪白。
+
+实测百度 `?wd=abc`：1s 时 DOM 只有 3 个节点（白页），2.5s 时 `dom_elements=1287` 且 AI 卡片背景/右栏/字号一次到位，不再出现文字重叠后再 reflow。新增 `app_tests::first_paint_waits_for_blocking_stylesheets`。
+
+## SVG：设备尺寸栅格、even-odd 多子路径、椭圆弧
+
+`fe4bda5` 修了三处通用 SVG 缺陷：
+
+1. inline SVG 之前按 CSS 尺寸栅格化，2× 屏上再被 display list 放大；现在 `discover_inline_svgs_with_colors_at_scale` 在 `device_scale` 下生成 48×48 raster，layout/几何仍是 24 CSS px。
+2. 一个 `<path>` 的多个 subpath 之前各自独立填色，even-odd 的孔洞被填成色块；现在所有 subpath 合成一个 fill，`fill-rule: evenodd/nonzero` 正确。
+3. `A/a` 椭圆弧之前直接连到终点；现在按 SVG 2 §B.2.4 endpoint→center 参数化、半径修正和 large-arc/sweep 展平。知乎的微信/QQ/微博图标从色块恢复成正确轮廓。
+
+知乎 24px 图标已可辨认；仍缺 Edge 的浅灰圆形底（CSS 背景/圆角路径），交给 `svg-fidelity` agent。相关测试：`device_scale_rasterises_inline_svg_at_device_size`、`fill_rule_evenodd_cuts_a_hole_in_a_multi_subpath_path`、`parse_path_flattens_an_elliptical_arc_off_the_chord`。
+
+## X：从“完全不启动”推进到 hydration error boundary
+
+已合并 `2d999d8`（URLSearchParams/URL.searchParams）、`832f64e`（对象/数组字面量在求值后续成员时 root 住已构造值，避免 GC 丢成员）、`49c94bf`（`modulepreload`/preload/stylesheet link 补发 `load`，lazy import 不再永久 pending）。
+
+本地 replay 已经走到 `ENTRY hydrated`，但 React 随后渲染 root error boundary（“Something went wrong”），live 仍 blank。错误被 app 送到 Sentry 而非 console，`x-errors` agent 正在注入探针取具体 render error；这已不是 Streams/Intl/URL 的启动缺失。
+
 ## 包体与内存
 
 macOS release：`render-browser` **16 MB**，gzip **7.8 MB**，xz **5.3 MB**；额外 Homebrew `libdav1d` 0.78 MB。Edge.app 实测 1.7 GB，Chrome 未安装（典型 1.5–2 GB）。体积约 1/100，启动也更快；但峰值 RSS 仍高于 Chromium headless（~760–850MB vs ~267MB），字体懒加载是下一个目标。目前没有 `.app`/安装器/公证。
@@ -110,17 +132,17 @@ macOS release：`render-browser` **16 MB**，gzip **7.8 MB**，xz **5.3 MB**；�
 
 ```text
 cargo test --workspace                                     all ok
-cargo test -p render-core --lib                            546 passed, 1 ignored
-cargo test -p render-browser --bin render-browser           126 passed
+cargo test -p render-core --lib                            550 passed, 1 ignored
+cargo test -p render-browser --bin render-browser           128 passed
 cargo test -p render-browser --lib                          232 passed
 cargo test -p render-css                                    328 passed
 cargo test -p render-layout                                 395 passed, 1 ignored
-cargo test -p render-js                                     1266 passed
+cargo test -p render-js                                     1274 passed
 cargo clippy --workspace --all-targets -- -D warnings       clean
 cargo fmt --all --check                                     clean
 ```
 
-未完成：字体懒加载、Google/知乎/X 的最终 Chrome 对比复测、CSSOM 子集（`media`/`disabled`/`replace`、link sheet 规则进 cascade）、绝对定位 flex 子项 static position 忽略 `padding-top` 的 10px、X 的 hydration/API 路径。
+未完成：字体懒加载、Google/X 的最终可用性、CSSOM 子集（`media`/`disabled`/`replace`、link sheet 规则进 cascade）、绝对定位 flex 子项 static position 忽略 `padding-top` 的 10px、知乎图标圆形底、原生 chrome 的细节打磨。
 
 ---
 
