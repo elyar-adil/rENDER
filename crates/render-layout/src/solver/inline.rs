@@ -1338,6 +1338,37 @@ impl<'a> Solver<'a> {
                 .measure_spaced(text, style.style, style.spacing)
                 .advance;
         }
+        // With no letter or word spacing the total is the plain sum of the
+        // run's advances. Collapse the white space exactly as the per-character
+        // path below does and measure the result in one call: the measurer
+        // accumulates advances left to right, so this is the same f32 sum it
+        // would produce one character at a time, without a measurement call per
+        // character. Spacing still takes the per-character path because §7
+        // tracking depends on the neighbours of each unit.
+        if style.spacing.letter_spacing == 0.0 && style.spacing.word_spacing == 0.0 {
+            let mut collapsed = String::with_capacity(text.len());
+            let mut pending_space = false;
+            let mut has_content = false;
+            for character in text.chars() {
+                if character.is_whitespace() {
+                    pending_space |= has_content;
+                    continue;
+                }
+                if pending_space {
+                    collapsed.push(' ');
+                    pending_space = false;
+                }
+                collapsed.push(character);
+                has_content = true;
+            }
+            if !has_content {
+                return 0.0;
+            }
+            return self
+                .text_measurer
+                .measure_spaced(&collapsed, style.style, style.spacing)
+                .advance;
+        }
         let mut width = 0.0;
         if std::env::var_os("RENDER_DEBUG_TEXT").is_some() {
             eprintln!(
@@ -1380,7 +1411,30 @@ impl<'a> Solver<'a> {
     /// The typography text measurement needs for `source`: the font inputs the
     /// measurer resolves advances from, plus the CSS Text 3 §7 spacing that
     /// changes the total.
+    ///
+    /// The answer depends only on the computed style of `source`, which is
+    /// immutable during a layout pass, so one resolution is reused by every
+    /// atom, intrinsic measurement and line in the subtree. Diagnostics are
+    /// replayed on a hit so a repeated call reports what the first one did.
     pub(super) fn inline_text_style(&mut self, source: Option<NodeId>) -> InlineTextStyle<'a> {
+        if let Some((style, diagnostics)) = self.inline_text_styles.get(&source) {
+            if !diagnostics.is_empty() {
+                self.diagnostics.extend(diagnostics.iter().cloned());
+            }
+            return *style;
+        }
+        let (style, diagnostics) = self.compute_inline_text_style(source);
+        if !diagnostics.is_empty() {
+            self.diagnostics.extend(diagnostics.iter().cloned());
+        }
+        self.inline_text_styles.insert(source, (style, diagnostics));
+        style
+    }
+
+    fn compute_inline_text_style(
+        &mut self,
+        source: Option<NodeId>,
+    ) -> (InlineTextStyle<'a>, Vec<LayoutDiagnostic>) {
         // Copied out of `self` so the resulting borrows carry `'a` rather than
         // the `&mut self` this method holds: the style outlives the call, and
         // `text_spacing` below still needs the receiver mutably.
@@ -1396,14 +1450,18 @@ impl<'a> Solver<'a> {
             .and_then(|value| parse_line_height(value.css_text(), font_size))
             .unwrap_or(font_size * 1.2)
             .clamp(font_size, 1_024.0);
-        InlineTextStyle {
-            style: TextStyle {
-                font_size,
-                line_height,
-                font: self.font_request(computed, source),
+        let (spacing, diagnostics) = self.text_spacing(computed, source, font_size);
+        (
+            InlineTextStyle {
+                style: TextStyle {
+                    font_size,
+                    line_height,
+                    font: self.font_request(computed, source),
+                },
+                spacing,
             },
-            spacing: self.text_spacing(computed, source, font_size),
-        }
+            diagnostics,
+        )
     }
 
     /// The CSS Fonts 4 font request for `source`.
@@ -1484,11 +1542,12 @@ impl<'a> Solver<'a> {
     /// no additional spacing - which is the conservative reading, and the one
     /// that keeps a malformed declaration from moving text.
     fn text_spacing(
-        &mut self,
+        &self,
         computed: Option<&ComputedStyle>,
         source: Option<NodeId>,
         font_size: f32,
-    ) -> TextSpacing {
+    ) -> (TextSpacing, Vec<LayoutDiagnostic>) {
+        let mut diagnostics = Vec::new();
         let context = text_length_context(
             font_size,
             None,
@@ -1509,14 +1568,14 @@ impl<'a> Solver<'a> {
             ("word-spacing", spacing.word_spacing),
         ] {
             if !value.is_finite() {
-                self.diagnostics.push(LayoutDiagnostic {
+                diagnostics.push(LayoutDiagnostic {
                     node: source,
                     code: LayoutDiagnosticCode::UnresolvedUsedValue,
                     message: format!("could not resolve '{property}': not a finite length"),
                 });
             }
         }
-        spacing
+        (spacing, diagnostics)
     }
 
     pub(super) fn collect_inline_atoms(
@@ -1946,6 +2005,15 @@ impl<'a> Solver<'a> {
     }
 
     pub(super) fn max_content_width(&mut self, node_id: FormattingNodeId) -> f32 {
+        if let Some(width) = self.max_content_widths.get(&node_id) {
+            return *width;
+        }
+        let width = self.max_content_width_uncached(node_id);
+        self.max_content_widths.insert(node_id, width);
+        width
+    }
+
+    fn max_content_width_uncached(&mut self, node_id: FormattingNodeId) -> f32 {
         let Some(node) = self.formatting.get(node_id).cloned() else {
             return 0.0;
         };
@@ -2052,7 +2120,12 @@ impl<'a> Solver<'a> {
     /// [`Self::max_content_width`] is it: a line with no break taken at all, so
     /// the two only differ where there is an opportunity to take.
     pub(super) fn min_content_width(&mut self, node_id: FormattingNodeId) -> f32 {
-        self.min_content_width_at(node_id, 0)
+        if let Some(width) = self.min_content_widths.get(&node_id) {
+            return *width;
+        }
+        let width = self.min_content_width_at(node_id, 0);
+        self.min_content_widths.insert(node_id, width);
+        width
     }
 
     fn min_content_width_at(&mut self, node_id: FormattingNodeId, depth: usize) -> f32 {

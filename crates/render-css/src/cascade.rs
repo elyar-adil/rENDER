@@ -49,6 +49,10 @@ pub struct CascadeInput<'a> {
 #[derive(Debug, Default)]
 pub(crate) struct CascadeRuleIndex {
     sources: Vec<RuleBuckets>,
+    /// The document-wide `@layer` order per origin, which every element's
+    /// cascade compares against. Building it once keeps a page with many
+    /// elements from cloning every layer name per element.
+    layer_orders: HashMap<CascadeOrigin, Vec<GlobalLayerKey>>,
     rules: usize,
     keyed_entries: usize,
     universal_entries: usize,
@@ -67,16 +71,52 @@ struct RuleBuckets {
 
 #[derive(Clone, Debug, Default)]
 struct ContextBuckets {
-    keyed: HashMap<SubjectKey, Vec<usize>>,
+    /// One bucket per key kind. Splitting them lets an element's own strings
+    /// look a key up by `&str` instead of materializing a lowercased `String`
+    /// for every class, id, tag and attribute name on every element.
+    by_type: HashMap<String, Vec<usize>>,
+    by_id: HashMap<String, Vec<usize>>,
+    by_class: HashMap<String, Vec<usize>>,
+    by_attribute: HashMap<String, Vec<usize>>,
     /// Rules whose subject has no id, class, type or attribute key (`*`,
     /// `:root`, a bare `:not(...)`).
     universal: Vec<usize>,
+}
+
+impl ContextBuckets {
+    fn insert(&mut self, key: &SubjectKey, rule_index: usize) -> bool {
+        let list = match key {
+            SubjectKey::Type(name) => self.by_type.entry(name.clone()).or_default(),
+            SubjectKey::Id(name) => self.by_id.entry(name.clone()).or_default(),
+            SubjectKey::Class(name) => self.by_class.entry(name.clone()).or_default(),
+            SubjectKey::Attribute(name) => self.by_attribute.entry(name.clone()).or_default(),
+        };
+        // Rules arrive in ascending order, so a duplicate from another
+        // selector in the same rule is always the tail.
+        if list.last() == Some(&rule_index) {
+            return false;
+        }
+        list.push(rule_index);
+        true
+    }
+
+    fn extend_for(&self, key: &str, map: &HashMap<String, Vec<usize>>, out: &mut Vec<usize>) {
+        if key.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            let lower = key.to_ascii_lowercase();
+            if let Some(list) = map.get(&lower) {
+                out.extend_from_slice(list);
+            }
+        } else if let Some(list) = map.get(key) {
+            out.extend_from_slice(list);
+        }
+    }
 }
 
 impl CascadeRuleIndex {
     pub(crate) fn new(sources: &[CascadeInput<'_>]) -> Self {
         let mut indexed = Self {
             sources: Vec::with_capacity(sources.len()),
+            layer_orders: collect_layer_orders(sources),
             debug: std::env::var_os("RENDER_DEBUG_CSS_INDEX").is_some(),
             ..Self::default()
         };
@@ -105,11 +145,7 @@ impl CascadeRuleIndex {
                         continue;
                     }
                     for key in keys {
-                        let list = context.keyed.entry(key).or_default();
-                        // Rules arrive in ascending order, so a duplicate from
-                        // another selector in the same rule is always the tail.
-                        if list.last() != Some(&rule_index) {
-                            list.push(rule_index);
+                        if context.insert(&key, rule_index) {
                             indexed.keyed_entries += 1;
                         }
                     }
@@ -132,13 +168,14 @@ impl CascadeRuleIndex {
         )
     }
 
-    /// Appends every rule of `source_index` whose subject could match `keys` in
-    /// the `pseudo` context (`""` for ordinary elements).
+    /// Appends every rule of `source_index` whose subject could match
+    /// `element` in the `pseudo` context (`""` for ordinary elements).
     fn candidates(
         &self,
         source_index: usize,
         pseudo: &str,
-        keys: &[SubjectKey],
+        dom: &Dom,
+        element: NodeId,
         out: &mut Vec<usize>,
     ) {
         let Some(buckets) = self.sources.get(source_index) else {
@@ -148,37 +185,36 @@ impl CascadeRuleIndex {
             return;
         };
         out.extend_from_slice(&context.universal);
-        for key in keys {
-            if let Some(list) = context.keyed.get(key) {
-                out.extend_from_slice(list);
+        let Some(NodeKind::Element(data)) = dom.node(element).map(Node::kind) else {
+            return;
+        };
+        let attribute = |name: &str| {
+            data.attributes
+                .iter()
+                .find(|attribute| {
+                    attribute.namespace.is_none() && attribute.local_name.eq_ignore_ascii_case(name)
+                })
+                .map(|attribute| attribute.value.as_str())
+        };
+        context.extend_for(&data.local_name, &context.by_type, out);
+        if let Some(id) = attribute("id")
+            && !id.is_empty()
+        {
+            context.extend_for(id, &context.by_id, out);
+        }
+        if let Some(classes) = attribute("class") {
+            for class in classes.split_ascii_whitespace() {
+                context.extend_for(class, &context.by_class, out);
             }
         }
-    }
-}
-
-/// The id, class and type keys carried by one element.
-fn element_subject_keys(dom: &Dom, element: NodeId) -> Vec<SubjectKey> {
-    let mut keys = Vec::new();
-    let Some(NodeKind::Element(data)) = dom.node(element).map(Node::kind) else {
-        return keys;
-    };
-    keys.push(SubjectKey::Type(data.local_name.to_ascii_lowercase()));
-    if let Ok(Some(id)) = dom.attribute(element, "id")
-        && !id.is_empty()
-    {
-        keys.push(SubjectKey::Id(id.to_ascii_lowercase()));
-    }
-    if let Ok(Some(class)) = dom.attribute(element, "class") {
-        for name in class.split_ascii_whitespace() {
-            keys.push(SubjectKey::Class(name.to_ascii_lowercase()));
+        for attribute in &data.attributes {
+            context.extend_for(&attribute.local_name, &context.by_attribute, out);
         }
     }
-    for attribute in &data.attributes {
-        keys.push(SubjectKey::Attribute(
-            attribute.local_name.to_ascii_lowercase(),
-        ));
+
+    fn layer_orders(&self) -> &HashMap<CascadeOrigin, Vec<GlobalLayerKey>> {
+        &self.layer_orders
     }
-    keys
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -659,7 +695,13 @@ fn cascade_element_with_origins_impl(
     inline_declarations: &[Declaration],
     lookup: &CascadeLookup<'_>,
 ) -> CascadedStyle {
-    let layer_orders = collect_layer_orders(sources);
+    let fallback_layer_orders;
+    let layer_orders = if let Some(index) = lookup.rule_index {
+        index.layer_orders()
+    } else {
+        fallback_layer_orders = collect_layer_orders(sources);
+        &fallback_layer_orders
+    };
     let mut candidates: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
     let mut source_order = 0_u64;
 
@@ -673,14 +715,12 @@ fn cascade_element_with_origins_impl(
     let element_tree_is_shadow = dom.shadow_host(element_tree).is_some();
     let element_tree_depth = tree_depth(dom, element_tree);
     let element_host_root = dom.shadow_root(element);
-    let subject_keys = lookup
-        .rule_index
-        .map(|_| element_subject_keys(dom, element));
     if let Some(index) = lookup.rule_index
         && index.debug
     {
         index.elements.fetch_add(1, Ordering::Relaxed);
     }
+    let mut candidate_rules = Vec::new();
     for (source_index, source) in sources.iter().enumerate() {
         let sheet_tree = source.sheet.tree_root.unwrap_or_else(|| dom.document());
         // A light-DOM element can be styled by `::slotted()` rules of a tree
@@ -735,18 +775,13 @@ fn cascade_element_with_origins_impl(
         };
         let source_context = owned_context.as_ref().unwrap_or(context);
         let match_element = slot.unwrap_or(element);
-        let slot_keys = slot.and_then(|_| {
-            lookup
-                .rule_index
-                .map(|_| element_subject_keys(dom, match_element))
-        });
-        let source_keys = slot_keys.as_ref().or(subject_keys.as_ref());
-        let mut candidate_rules = Vec::new();
-        if let (Some(index), Some(keys)) = (lookup.rule_index, source_keys) {
+        candidate_rules.clear();
+        if let Some(index) = lookup.rule_index {
             index.candidates(
                 source_index,
                 context.pseudo_element.as_deref().unwrap_or(""),
-                keys,
+                dom,
+                match_element,
                 &mut candidate_rules,
             );
             candidate_rules.sort_unstable();
@@ -761,7 +796,7 @@ fn cascade_element_with_origins_impl(
             candidate_rules.extend(0..source.sheet.rules.len());
         }
         let source_tree_depth = tree_depth(dom, sheet_tree);
-        for candidate_rule in candidate_rules {
+        for &candidate_rule in &candidate_rules {
             let rule = &source.sheet.rules[candidate_rule];
             // CSS Transitions 2 §3.3: `@starting-style` declarations are only
             // part of the starting style, never of the after-change style.
@@ -854,7 +889,7 @@ fn cascade_element_with_origins_impl(
                     // the reverse. Tree depth is the shadow-including depth.
                     context: context_rank(source_tree_depth, declaration.important),
                     layer: layer_rank(
-                        &layer_orders,
+                        layer_orders,
                         source.origin,
                         source_index,
                         rule.layer.as_ref(),
@@ -911,7 +946,7 @@ fn cascade_element_with_origins_impl(
             // is compared before context anyway.
             context: context_rank(0, false),
             layer: layer_rank(
-                &layer_orders,
+                layer_orders,
                 CascadeOrigin::UserAgent,
                 sources.len(),
                 None,
@@ -958,7 +993,7 @@ fn cascade_element_with_origins_impl(
             // A `style` attribute belongs to the element's own tree context.
             context: context_rank(element_tree_depth, declaration.important),
             layer: layer_rank(
-                &layer_orders,
+                layer_orders,
                 CascadeOrigin::Author,
                 sources.len(),
                 None,

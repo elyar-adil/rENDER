@@ -1518,6 +1518,39 @@ impl Document {
     }
 }
 
+/// Wall-clock time one render spent in each pipeline stage, in microseconds.
+///
+/// The fields are measured independently: `style` is the whole cascade stage,
+/// while `style_match`, `container_feedback`, `transitions` and `animations`
+/// are the parts of it that are timed separately. A caller that only needs the
+/// pipeline split can read `formatting`, `layout`, `display` and `raster`;
+/// `total` covers the complete `render_dom` call and includes stage boundaries
+/// that are not attributed to any field.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderStageTimings {
+    pub ua_parse: u64,
+    pub collect_sheets: u64,
+    pub install_font_faces: u64,
+    pub style: u64,
+    pub style_match: u64,
+    pub container_feedback: u64,
+    pub transitions: u64,
+    pub animations: u64,
+    pub inline_svg: u64,
+    pub formatting: u64,
+    pub layout: u64,
+    /// Rendering the nested documents of `<iframe>` elements, which happens
+    /// between the parent layout and the parent display list.
+    pub nested_frames: u64,
+    pub display: u64,
+    pub raster: u64,
+    pub total: u64,
+}
+
+fn stage_micros(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
 #[derive(Clone, Debug)]
 pub struct DocumentRenderOutput {
     pub revision: DomRevision,
@@ -1529,6 +1562,8 @@ pub struct DocumentRenderOutput {
     pub display: DisplayListBuildOutput,
     pub raster: CpuRasterOutput,
     pub diagnostics: DocumentRenderDiagnostics,
+    /// Wall-clock split of the stages that produced this output.
+    pub stage_timings: RenderStageTimings,
     /// `transitionend` events observed while this frame sampled the timeline.
     pub transition_events: Vec<TransitionEvent>,
     /// The nested documents displayed by direct-child `<iframe>` elements of
@@ -1827,20 +1862,24 @@ fn render_dom(
     transitions: &mut TransitionState,
 ) -> DocumentRenderOutput {
     let stage_timing = std::env::var_os("RENDER_STAGE_TIMING").is_some();
+    let render_started = std::time::Instant::now();
+    let mut stages = RenderStageTimings::default();
     let mut stage_mark = std::time::Instant::now();
     let mut options = options;
     // The used color scheme is a single answer for the frame: media queries,
     // `light-dark()` and the palette's system colors must not disagree.
     options.display_list.palette.dark = options.color_scheme == ColorScheme::Dark;
     let stage_elapsed = |name: &str, mark: &mut std::time::Instant| {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(*mark);
         if stage_timing {
-            let now = std::time::Instant::now();
-            eprintln!("stage {}: {:?}", name, now.duration_since(*mark));
-            *mark = now;
+            eprintln!("stage {name}: {elapsed:?}");
         }
+        *mark = now;
+        elapsed
     };
     let ua_sheet = parse_stylesheet(&ua_style_sheet(quirks_mode, options.scripting_enabled));
-    stage_elapsed("ua-parse", &mut stage_mark);
+    stages.ua_parse = stage_micros(stage_elapsed("ua-parse", &mut stage_mark));
     // The same environment answers a stylesheet's `media` attribute, the
     // `@media` rules inside it, and selector matching, so the three cannot
     // disagree about which rules apply at this viewport or in this document
@@ -1871,7 +1910,7 @@ fn render_dom(
         options.document_limits,
         &match_context,
     );
-    stage_elapsed("collect-sheets", &mut stage_mark);
+    stages.collect_sheets = stage_micros(stage_elapsed("collect-sheets", &mut stage_mark));
     // CSS Fonts 4 §5.2: a document face must be in the matcher's table before
     // the first measurement. The installer runs here, after discovery and
     // before any layout pass, so measured advances and painted glyphs both see
@@ -1879,7 +1918,7 @@ fn render_dom(
     if let Some(installer) = backends.font_face_installer {
         installer.install_font_faces(&collected.font_faces);
     }
-    stage_elapsed("install-font-faces", &mut stage_mark);
+    stages.install_font_faces = stage_micros(stage_elapsed("install-font-faces", &mut stage_mark));
     let mut cascade_inputs = Vec::with_capacity(collected.sheets.len().saturating_add(1));
     cascade_inputs.push(CascadeInput {
         sheet: &ua_sheet,
@@ -1921,6 +1960,7 @@ fn render_dom(
         &match_context,
         &|node| presentational_hint_declarations(dom, node, quirks_mode),
     );
+    stages.style_match = stage_micros(cascade_match_started.elapsed());
     if stage_timing {
         eprintln!("stage cascade-match: {:?}", cascade_match_started.elapsed());
     }
@@ -1959,6 +1999,7 @@ fn render_dom(
                 &|node| presentational_hint_declarations(dom, node, quirks_mode),
             );
         }
+        stages.container_feedback = stage_micros(container_started.elapsed());
         if stage_timing {
             eprintln!(
                 "stage container-feedback: {:?}",
@@ -1998,6 +2039,7 @@ fn render_dom(
         transitions,
         options.animation_time,
     );
+    stages.transitions = stage_micros(transitions_started.elapsed());
     if stage_timing {
         eprintln!("stage transitions: {:?}", transitions_started.elapsed());
     }
@@ -2008,10 +2050,11 @@ fn render_dom(
         &match_context,
         options.animation_time,
     );
+    stages.animations = stage_micros(animations_started.elapsed());
     if stage_timing {
         eprintln!("stage animations: {:?}", animations_started.elapsed());
     }
-    stage_elapsed("cascade", &mut stage_mark);
+    stages.style = stage_micros(stage_elapsed("cascade", &mut stage_mark));
     // An inline `svg` is rasterised from its own markup, so it needs no fetch
     // and is discovered here, after the cascade has given every `svg` element
     // its `color` for `currentColor`. The rasters are layered over the
@@ -2022,10 +2065,10 @@ fn render_dom(
     });
     let (inline_images, inline_svg_diagnostics) = with_inline_svgs(environment.images, &inline_svg);
     let images = inline_images.as_ref().or(environment.images);
-    stage_elapsed("inline-svg", &mut stage_mark);
+    stages.inline_svg = stage_micros(stage_elapsed("inline-svg", &mut stage_mark));
     let formatting =
         build_formatting_tree_from_root(dom, root, &styles, &options.formatting_limits);
-    stage_elapsed("formatting", &mut stage_mark);
+    stages.formatting = stage_micros(stage_elapsed("formatting", &mut stage_mark));
     let layout_options = root_layout_options(root, dom, &styles, options.layout);
     let layout = layout_formatting_tree_with_images_and_containers(
         dom,
@@ -2036,7 +2079,7 @@ fn render_dom(
         images,
         Some(match_context.containers.as_ref()),
     );
-    stage_elapsed("layout", &mut stage_mark);
+    stages.layout = stage_micros(stage_elapsed("layout", &mut stage_mark));
     if std::env::var_os("RENDER_DEBUG_FRAGMENT").is_some() && layout.fragments.iter().count() > 20 {
         eprintln!(
             "fragment tree: {} fragments",
@@ -2049,6 +2092,7 @@ fn render_dom(
     // Their viewports become surface images in `image_resources`, and the
     // parent display list then paints each one through its ordinary image
     // command. Node ids stay shared, but no child item joins the parent list.
+    let frames_started = std::time::Instant::now();
     let (frame_images, frames) = render_nested_frames(
         dom,
         quirks_mode,
@@ -2058,6 +2102,7 @@ fn render_dom(
         images,
         &environment,
     );
+    stages.nested_frames = stage_micros(frames_started.elapsed());
     let images = frame_images.as_ref().or(images);
     let clip_path_resolver = DomClipPathResolver::new(dom);
     let display = build_display_list_with_images_clip_paths_and_containers(
@@ -2071,7 +2116,7 @@ fn render_dom(
         Some(&clip_path_resolver),
         Some(match_context.containers.as_ref()),
     );
-    stage_elapsed("display", &mut stage_mark);
+    stages.display = stage_micros(stage_elapsed("display", &mut stage_mark));
     let paint_viewport_origin = layout.fragments.clamp_scroll_offset(options.scroll_offset);
     let raster = CpuRasterizer.rasterize_viewport_with_images(
         &display.list,
@@ -2080,7 +2125,8 @@ fn render_dom(
         paint_viewport_origin,
         images,
     );
-    stage_elapsed("raster", &mut stage_mark);
+    stages.raster = stage_micros(stage_elapsed("raster", &mut stage_mark));
+    stages.total = stage_micros(render_started.elapsed());
 
     let mut document_diagnostics = collected.diagnostics;
     if quirks_mode != QuirksMode::NoQuirks {
@@ -2140,6 +2186,7 @@ fn render_dom(
         display,
         raster,
         diagnostics,
+        stage_timings: stages,
         transition_events,
         frames,
     }

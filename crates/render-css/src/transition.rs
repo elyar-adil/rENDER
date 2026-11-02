@@ -29,9 +29,13 @@ pub struct TransitionState {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct NodeTransitions {
-    /// The computed target value of each transitionable property at the last
-    /// render, before any transition sampling replaced it.
-    targets: BTreeMap<String, String>,
+    /// The computed values at the end of the previous style change event,
+    /// before any transition sampling replaced them.
+    ///
+    /// A [`ComputedStyle`] is a handful of `Arc` handles, so keeping one per
+    /// node costs a few refcount bumps and avoids materializing a `String` for
+    /// every transitionable property of every element on every render.
+    previous: ComputedStyle,
     active: BTreeMap<String, ActiveTransition>,
 }
 
@@ -166,11 +170,26 @@ pub fn sample_transitions_in_rendered_document(
     let mut live = BTreeSet::new();
     for (node, style) in styles.iter_mut() {
         live.insert(*node);
-        let plan = TransitionPlan::from_style(style);
         let entering = rendered
             .is_some_and(|rendered| rendered.contains(node) && !state.rendered.contains(node));
         let node_state = state.nodes.entry(*node).or_default();
-        let candidates = plan.candidates(style, node_state);
+        // Most elements never declare a positive transition duration. Nothing
+        // can start, advance or end for them, so the only work this style
+        // change event owes the next one is the values it computed. Cloning a
+        // `ComputedStyle` is a handful of refcount bumps; materializing the
+        // transition plan would split five value lists and allocate a string
+        // per candidate property.
+        let may_transition = !node_state.active.is_empty()
+            || style
+                .get("transition-duration")
+                .is_some_and(|value| duration_list_has_positive(value.css_text()));
+        if !may_transition {
+            node_state.previous = style.clone();
+            continue;
+        }
+        let plan = TransitionPlan::from_style(style);
+        let previous_style = std::mem::replace(&mut node_state.previous, style.clone());
+        let candidates = plan.candidates(style, &node_state.active);
         let mut cancel = Vec::new();
         for property in candidates {
             let Some(target) = style
@@ -179,7 +198,9 @@ pub fn sample_transitions_in_rendered_document(
             else {
                 continue;
             };
-            let previous = node_state.targets.insert(property.clone(), target.clone());
+            let previous = previous_style
+                .get(&property)
+                .map(|value| value.css_text().trim().to_owned());
             let covered = plan.covers(&property);
             if entering {
                 // §3.3: the starting style replaces the before-change style,
@@ -571,7 +592,11 @@ impl TransitionPlan {
             .is_some_and(|value| value.eq_ignore_ascii_case("allow-discrete"))
     }
 
-    fn candidates(&self, style: &ComputedStyle, node_state: &NodeTransitions) -> Vec<String> {
+    fn candidates(
+        &self,
+        style: &ComputedStyle,
+        active: &BTreeMap<String, ActiveTransition>,
+    ) -> Vec<String> {
         let mut candidates = BTreeSet::new();
         match &self.properties {
             PropertyList::All => {
@@ -591,10 +616,8 @@ impl TransitionPlan {
             }
         }
         // An active transition keeps being sampled even when the property list
-        // changed under it, and old targets must keep tracking the base value
-        // so a later re-enable has a truthful starting point.
-        candidates.extend(node_state.active.keys().cloned());
-        candidates.extend(node_state.targets.keys().cloned());
+        // changed under it.
+        candidates.extend(active.keys().cloned());
         candidates.into_iter().collect()
     }
 }
@@ -611,6 +634,18 @@ fn time_list(text: &str) -> Vec<f32> {
         .iter()
         .filter_map(|value| parse_time(value))
         .collect()
+}
+
+/// Whether a `transition-duration` list contains a positive time.
+///
+/// This is the sampler's cheap gate: when no property can run for a positive
+/// time and nothing is active, the style change has no transition work beyond
+/// remembering its computed values. A `<time>` cannot contain a top-level
+/// comma, so a plain split parses the same list [`time_list`] does.
+fn duration_list_has_positive(value: &str) -> bool {
+    value
+        .split(',')
+        .any(|part| parse_time(part).is_some_and(|seconds| seconds > 0.0))
 }
 
 fn parse_time(text: &str) -> Option<f32> {
@@ -834,6 +869,50 @@ mod tests {
             Some("0")
         );
     }
+    /// A render that cannot start a transition still has to remember its
+    /// computed values: the next render's before-change style is this one,
+    /// even when the duration only becomes positive together with the value
+    /// change.
+    #[test]
+    fn a_later_duration_change_transitions_from_the_previous_value() {
+        let node = NodeId::from_u64(30);
+        let base = |opacity: &str, duration: &str| {
+            style_with(&[
+                ("opacity", opacity),
+                ("transition-property", "opacity"),
+                ("transition-duration", duration),
+                ("transition-timing-function", "linear"),
+            ])
+        };
+        let mut styles = BTreeMap::new();
+        styles.insert(node, base("1", "0s"));
+        let mut state = TransitionState::default();
+        assert!(sample_transitions(&mut styles, &mut state, 0.0).is_empty());
+
+        styles.insert(node, base("0.5", "1s"));
+        let events = sample_transitions(&mut styles, &mut state, 0.0);
+        assert_eq!(events[0].kind, TransitionEventKind::Run);
+        assert_eq!(
+            events.last().map(|event| event.kind),
+            Some(TransitionEventKind::Start)
+        );
+        assert_eq!(
+            styles[&node].get("opacity").map(|value| value.css_text()),
+            Some("1"),
+            "the first sample is the remembered before-change value"
+        );
+
+        // A real render recomputes the cascade before sampling, so the style
+        // under the active transition holds the target again.
+        styles.insert(node, base("0.5", "1s"));
+        let halfway = sample_transitions(&mut styles, &mut state, 0.5);
+        assert!(halfway.is_empty(), "{halfway:?}");
+        assert_eq!(
+            styles[&node].get("opacity").map(|value| value.css_text()),
+            Some("0.75")
+        );
+    }
+
     #[test]
     fn reversing_an_interrupted_transition_shortens_its_duration() {
         let node = NodeId::from_u64(4);

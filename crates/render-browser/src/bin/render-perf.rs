@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use render_browser::font_backend::SystemFontBackend;
 use render_core::document::{
-    Document, DocumentBackends, DocumentRenderOptions, DocumentRenderOutput,
+    Document, DocumentBackends, DocumentRenderOptions, DocumentRenderOutput, RenderStageTimings,
 };
 use render_core::layout::{LayoutOptions, PhysicalPoint, PhysicalSize};
 use render_core::paint::{CpuRasterizer, PaintScene, RasterRequest};
@@ -78,6 +78,7 @@ struct FixtureResult {
     first_render_micros: Vec<u128>,
     first_visible_micros: Vec<u128>,
     scroll_render_micros: Vec<u128>,
+    stage_samples: Vec<RenderStageTimings>,
     shape: OutputShape,
 }
 
@@ -271,6 +272,7 @@ fn run_fixture(fixture: &Fixture, options: &Options) -> FixtureResult {
     let mut first_visible_micros = Vec::with_capacity(options.iterations);
     let mut scroll_render_micros =
         Vec::with_capacity(options.iterations.saturating_mul(options.scroll_steps));
+    let mut stage_samples = Vec::with_capacity(options.iterations);
     let mut shape = OutputShape {
         fragments: 0,
         display_items: 0,
@@ -301,6 +303,7 @@ fn run_fixture(fixture: &Fixture, options: &Options) -> FixtureResult {
         let output = document.render(render_options, backends);
         first_render_micros.push(render_started.elapsed().as_micros());
         first_visible_micros.push(first_visible_started.elapsed().as_micros());
+        stage_samples.push(output.stage_timings);
         shape = output_shape(&document, &output);
 
         let maximum_scroll = output.layout.fragments.max_scroll_offset().y;
@@ -330,6 +333,7 @@ fn run_fixture(fixture: &Fixture, options: &Options) -> FixtureResult {
         first_render_micros,
         first_visible_micros,
         scroll_render_micros,
+        stage_samples,
         shape,
     }
 }
@@ -405,6 +409,8 @@ fn print_result(result: &FixtureResult) {
     print_distribution(&result.first_visible_micros);
     print!(",\"scroll_render\":");
     print_distribution(&result.scroll_render_micros);
+    print!(",\"stages\":");
+    print_stage_distributions(&result.stage_samples);
     println!(
         ",\"output\":{{\"fragments\":{},\"display_items\":{},\"surface\":{{\"width\":{},\"height\":{}}},\"diagnostics\":{},\"html_errors\":{}}}}}",
         result.shape.fragments,
@@ -414,6 +420,40 @@ fn print_result(result: &FixtureResult) {
         result.shape.diagnostics,
         result.shape.html_errors,
     );
+}
+
+/// Print one distribution per pipeline stage. The stage fields are already in
+/// microseconds, so they use the same `{unit,samples,min,median,p95,max}`
+/// shape as the end-to-end measurements and no caller has to know which
+/// stages are nested inside which.
+fn print_stage_distributions(samples: &[RenderStageTimings]) {
+    type StageField = fn(&RenderStageTimings) -> u64;
+    let stages: [(&str, StageField); 11] = [
+        ("style", |stage| stage.style),
+        ("style_match", |stage| stage.style_match),
+        ("container_feedback", |stage| stage.container_feedback),
+        ("transitions", |stage| stage.transitions),
+        ("animations", |stage| stage.animations),
+        ("formatting", |stage| stage.formatting),
+        ("layout", |stage| stage.layout),
+        ("nested_frames", |stage| stage.nested_frames),
+        ("display", |stage| stage.display),
+        ("raster", |stage| stage.raster),
+        ("total", |stage| stage.total),
+    ];
+    print!("{{");
+    for (index, (name, field)) in stages.into_iter().enumerate() {
+        if index > 0 {
+            print!(",");
+        }
+        let values: Vec<u128> = samples
+            .iter()
+            .map(|sample| u128::from(field(sample)))
+            .collect();
+        print!("\"{name}\":");
+        print_distribution(&values);
+    }
+    print!("}}");
 }
 
 fn print_distribution(values: &[u128]) {

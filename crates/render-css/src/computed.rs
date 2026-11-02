@@ -1190,6 +1190,12 @@ const DEFAULT_ROOT_FONT_SIZE: f32 = 16.0;
 #[derive(Debug, PartialEq)]
 struct InitialValues {
     values: BTreeMap<String, InitialValue>,
+    /// Registry properties that still need per-element work when the element
+    /// does not declare them: inherited properties take the parent's computed
+    /// value, and a non-inherited property without a usable shared initial has
+    /// to run its fallback and diagnostics. Everything else is answered by
+    /// [`ComputedStyle::initial`] at read time.
+    per_element: Vec<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1203,7 +1209,7 @@ struct InitialValue {
 
 impl InitialValues {
     fn new(registry: &PropertyRegistry, limits: &ComputationLimits) -> Self {
-        let values = registry
+        let values: BTreeMap<String, InitialValue> = registry
             .iter()
             .filter(|(_, definition)| !definition.inherited)
             .map(|(name, definition)| {
@@ -1228,7 +1234,17 @@ impl InitialValues {
                 )
             })
             .collect();
-        Self { values }
+        let per_element = registry
+            .iter()
+            .filter(|(name, definition)| {
+                definition.inherited || values.get(*name).is_none_or(|initial| initial.rejected)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        Self {
+            values,
+            per_element,
+        }
     }
 }
 
@@ -1534,6 +1550,63 @@ pub fn compute_style(
     )
 }
 
+/// Apply one registry property's computed value to an element's maps.
+///
+/// The registry loop and the declared-property loop both end here so the
+/// grammar fallback, authored tracking and typed-map maintenance stay in one
+/// place.
+#[allow(clippy::too_many_arguments)]
+fn apply_registered_property(
+    name: &str,
+    definition: &PropertyDefinition,
+    cascaded: &CascadedStyle,
+    parent: Option<&ComputedStyle>,
+    resolver: &mut CustomResolver<'_>,
+    limits: &ComputationLimits,
+    properties: &mut BTreeMap<String, ComputedValue>,
+    typed_properties: &mut BTreeMap<String, TypedPropertyValue>,
+    specified: &mut BTreeSet<String>,
+) {
+    let mut computed =
+        compute_registered_property(name, definition, cascaded, parent, resolver, limits);
+    // Whether the document supplied this property at all, decided before the
+    // grammar check below can discard the value.
+    let authored = cascaded
+        .get(name)
+        .is_some_and(super::cascade::CascadedValue::is_authored);
+    let mut accepted = true;
+    if let Some(value) = computed.as_ref()
+        && let Some(typed) = parse_typed_property(name, &value.parseable_css())
+    {
+        match typed {
+            Ok(value) => {
+                typed_properties.insert(name.to_owned(), value);
+            }
+            Err(error) => {
+                resolver.diagnostics.push(ComputationDiagnostic {
+                    property: Some(name.to_owned()),
+                    message: format!("{error}; using the unset fallback"),
+                });
+                computed = registered_unset_value(name, definition, parent, limits);
+                // A value the grammar rejected is not a value the document
+                // successfully set, so it does not count as specified.
+                accepted = false;
+                if let Some(fallback) = computed.as_ref()
+                    && let Some(Ok(value)) = parse_typed_property(name, &fallback.parseable_css())
+                {
+                    typed_properties.insert(name.to_owned(), value);
+                }
+            }
+        }
+    }
+    if let Some(value) = computed {
+        properties.insert(name.to_owned(), value);
+    }
+    if authored && accepted {
+        specified.insert(name.to_owned());
+    }
+}
+
 #[allow(clippy::too_many_lines)] // Kept linear to mirror the ordered CSS computed-value stages.
 fn compute_style_with_initials(
     cascaded: &CascadedStyle,
@@ -1785,76 +1858,58 @@ fn compute_style_with_initials(
     let mut properties = BTreeMap::new();
     let mut typed_properties = BTreeMap::new();
     let mut specified = BTreeSet::new();
-    for (name, definition) in registry.iter() {
-        // An unspecified, non-inherited property is its initial value, and the
-        // table already holds that value and its typed parse. The inherited and
-        // specified cases need the element's own parent or declarations.
-        if cascaded.get(name).is_none() {
-            if !definition.inherited {
-                if let Some(initial) = initials.values.get(name)
-                    && !initial.rejected
-                {
-                    // Initial values are shared through `ComputedStyle::initial`,
-                    // so they are not copied into every element's property maps.
-                    continue;
-                }
-            } else if let Some(parent) = parent
-                && let Some(value) = parent.get(name)
-            {
-                // No declaration on this element: the inherited computed value
-                // is exactly the parent's. Copy it together with its already
-                // parsed typed value instead of re-tokenizing and re-parsing
-                // the CSS text for every descendant.
-                properties.insert(name.clone(), value.clone());
-                if let Some(typed) = parent.typed(name) {
-                    typed_properties.insert(name.clone(), typed.clone());
-                }
-                continue;
-            }
+    // An element declares a handful of properties out of a 145-entry registry.
+    // Walking the declarations first keeps the common path from looking every
+    // registry name up in the cascade for every element; the second pass only
+    // visits the inherited and fallback properties that genuinely need the
+    // element's parent or grammar.
+    for name in cascaded.properties().keys() {
+        if name.starts_with("--") {
+            continue;
         }
-        let mut computed =
-            compute_registered_property(name, definition, cascaded, parent, &mut resolver, limits);
-        // Whether the document supplied this property at all, decided before
-        // the grammar check below can discard the value.
-        let authored = cascaded
-            .get(name)
-            .is_some_and(super::cascade::CascadedValue::is_authored);
-        let mut accepted = true;
-        if let Some(value) = computed.as_ref()
-            && let Some(typed) = parse_typed_property(name, &value.parseable_css())
+        let Some(definition) = registry.get(name) else {
+            continue;
+        };
+        apply_registered_property(
+            name,
+            definition,
+            cascaded,
+            parent,
+            &mut resolver,
+            limits,
+            &mut properties,
+            &mut typed_properties,
+            &mut specified,
+        );
+    }
+    for name in &initials.per_element {
+        if cascaded.get(name).is_some() {
+            continue;
+        }
+        let Some(definition) = registry.get(name) else {
+            continue;
+        };
+        if definition.inherited
+            && let Some(parent) = parent
+            && let Some(value) = parent.get(name)
         {
-            match typed {
-                Ok(value) => {
-                    typed_properties.insert(name.clone(), value);
-                }
-                Err(error) => {
-                    resolver.diagnostics.push(ComputationDiagnostic {
-                        property: Some(name.clone()),
-                        message: format!("{error}; using the unset fallback"),
-                    });
-                    computed = registered_unset_value(name, definition, parent, limits);
-                    // A value the grammar rejected is not a value the document
-                    // successfully set, so it does not count as specified: the
-                    // element ends up holding the initial or inherited value,
-                    // and a consumer asking "did the document say so?" should
-                    // hear no. Reporting yes here would reintroduce exactly the
-                    // confusion this query exists to remove.
-                    accepted = false;
-                    if let Some(fallback) = computed.as_ref()
-                        && let Some(Ok(value)) =
-                            parse_typed_property(name, &fallback.parseable_css())
-                    {
-                        typed_properties.insert(name.clone(), value);
-                    }
-                }
+            properties.insert(name.clone(), value.clone());
+            if let Some(typed) = parent.typed(name) {
+                typed_properties.insert(name.clone(), typed.clone());
             }
+            continue;
         }
-        if let Some(value) = computed {
-            properties.insert(name.clone(), value);
-        }
-        if authored && accepted {
-            specified.insert(name.clone());
-        }
+        apply_registered_property(
+            name,
+            definition,
+            cascaded,
+            parent,
+            &mut resolver,
+            limits,
+            &mut properties,
+            &mut typed_properties,
+            &mut specified,
+        );
     }
     // CSS 2.1 §6.1.1: the computed value of `font-size` is an absolute
     // length. Absolutizing it here means descendants inherit pixels (so a

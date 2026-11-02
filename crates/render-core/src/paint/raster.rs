@@ -68,6 +68,46 @@ impl Surface {
         &mut self.pixels
     }
 
+    /// The tight bounding box of non-transparent pixels as
+    /// `(x, y, width, height)`, or `None` when the surface is fully
+    /// transparent.
+    ///
+    /// An offscreen stacking-context layer starts transparent and usually
+    /// contains one small element. Compositing it only over this box keeps a
+    /// 1280x720 warp from sampling 900k transparent pixels to move a tooltip.
+    #[must_use]
+    fn content_bounds(&self) -> Option<(u32, u32, u32, u32)> {
+        let width = usize::try_from(self.width).ok()?;
+        if width == 0 || self.pixels.len() < width {
+            return None;
+        }
+        let mut top = None;
+        let mut bottom = 0_usize;
+        let mut left = self.width;
+        let mut right = 0_u32;
+        for (row, pixels) in self.pixels.chunks_exact(width).enumerate() {
+            let Some(first) = pixels.iter().position(|pixel| pixel.alpha != 0) else {
+                continue;
+            };
+            let last = pixels
+                .iter()
+                .rposition(|pixel| pixel.alpha != 0)
+                .unwrap_or(first);
+            top.get_or_insert(row);
+            bottom = row + 1;
+            left = left.min(u32::try_from(first).unwrap_or(0));
+            right = right.max(u32::try_from(last + 1).unwrap_or(self.width));
+        }
+        let top = u32::try_from(top?).unwrap_or(0);
+        let bottom = u32::try_from(bottom).unwrap_or(self.height);
+        Some((
+            left,
+            top,
+            right.saturating_sub(left),
+            bottom.saturating_sub(top),
+        ))
+    }
+
     #[must_use]
     pub fn pixel(&self, x: u32, y: u32) -> Option<Color> {
         self.index(x, y)
@@ -826,36 +866,73 @@ impl<'a> RasterState<'a> {
         let top = floor_to_u32(visible.origin.y);
         let right = ceil_to_u32(visible.right().min(u32_to_f32(self.width)));
         let bottom = ceil_to_u32(visible.bottom().min(u32_to_f32(self.height)));
+        let rect_clip = clip.as_ref().and_then(RectCellClip::of);
+        let inner_max_radius = max_corner_radius(inner_radii);
         let control = self.control;
         for y in top..bottom {
             if control.is_some_and(RasterControl::is_cancelled) {
                 self.cancelled = true;
                 return;
             }
-            for x in left..right {
-                let point = PhysicalPoint {
-                    x: u32_to_f32(x) + 0.5,
-                    y: u32_to_f32(y) + 0.5,
+            // The ring is `outer - inner`, so every pixel well inside the
+            // inner box cannot contribute. A border on a 1200x100 box would
+            // otherwise sample its whole interior: the ring is a few percent
+            // of the box, and the 16-sample ring test is the expensive part of
+            // painting an ordinary 1px border.
+            //
+            // Pixels in the middle of the inner box are skipped. Rows in the
+            // inner corner bands keep `inner_max_radius` of margin so a sample
+            // the rounded corner cuts away is still painted.
+            let y_origin = u32_to_f32(y);
+            let hole = if inner.size.width > 0.0
+                && inner.size.height > 0.0
+                && y_origin >= inner.origin.y
+                && y_origin + 1.0 <= inner.bottom()
+            {
+                let margin = if y_origin < inner.origin.y + inner_max_radius
+                    || y_origin + 1.0 > inner.bottom() - inner_max_radius
+                {
+                    inner_max_radius
+                } else {
+                    0.0
                 };
-                let coverage = clip_coverage(clip.as_ref(), point.x, point.y);
-                if coverage <= 0.0 {
-                    continue;
+                let start = ceil_to_u32(inner.origin.x + margin);
+                let end = floor_to_u32(inner.right() - margin);
+                if end > start {
+                    Some((start.max(left).min(right), end.max(left).min(right)))
+                } else {
+                    None
                 }
-                let border_coverage =
-                    rounded_ring_coverage(rect, border.radii, inner, inner_radii, point.x, point.y);
-                if border_coverage <= 0.0 {
-                    continue;
-                }
-                let Some(edge) = border_edge_at(rect, border, point) else {
-                    continue;
-                };
-                let color = border.colors[edge];
-                if let Some(index) = self.current_surface().index(x, y) {
-                    self.current_surface().pixels[index] = blend(
-                        self.current_surface().pixels[index],
-                        color,
-                        border_coverage * coverage,
-                    );
+            } else {
+                None
+            };
+            let (hole_start, hole_end) = hole.unwrap_or((right, right));
+            for (start, end) in [(left, hole_start), (hole_end, right)] {
+                for x in start..end {
+                    let point = PhysicalPoint {
+                        x: u32_to_f32(x) + 0.5,
+                        y: y_origin + 0.5,
+                    };
+                    let coverage = pixel_coverage(clip.as_ref(), rect_clip, x, y);
+                    if coverage <= 0.0 {
+                        continue;
+                    }
+                    let border_coverage =
+                        rounded_ring_cell_coverage(rect, border.radii, inner, inner_radii, x, y);
+                    if border_coverage <= 0.0 {
+                        continue;
+                    }
+                    let Some(edge) = border_edge_at(rect, border, point) else {
+                        continue;
+                    };
+                    let color = border.colors[edge];
+                    if let Some(index) = self.current_surface().index(x, y) {
+                        self.current_surface().pixels[index] = blend(
+                            self.current_surface().pixels[index],
+                            color,
+                            border_coverage * coverage,
+                        );
+                    }
                 }
             }
         }
@@ -1064,6 +1141,8 @@ impl<'a> RasterState<'a> {
             if self.is_cancelled() {
                 return;
             }
+            let clip = self.current_clip();
+            let rect_clip = clip.as_ref().and_then(RectCellClip::of);
             for x in left..right {
                 let alpha = layer
                     .pixel(x.saturating_sub(origin_x), y.saturating_sub(origin_y))
@@ -1071,11 +1150,7 @@ impl<'a> RasterState<'a> {
                 if alpha <= 0.0 {
                     continue;
                 }
-                let coverage = clip_coverage(
-                    self.current_clip().as_ref(),
-                    u32_to_f32(x) + 0.5,
-                    u32_to_f32(y) + 0.5,
-                );
+                let coverage = pixel_coverage(clip.as_ref(), rect_clip, x, y);
                 if coverage <= 0.0 {
                     continue;
                 }
@@ -1125,6 +1200,8 @@ impl<'a> RasterState<'a> {
         let top = floor_to_u32(visible.origin.y);
         let right = ceil_to_u32(visible.right().min(u32_to_f32(self.width)));
         let bottom = ceil_to_u32(visible.bottom().min(u32_to_f32(self.height)));
+        let clip = self.current_clip();
+        let rect_clip = clip.as_ref().and_then(RectCellClip::of);
         for y in top..bottom {
             if self.is_cancelled() {
                 return;
@@ -1134,7 +1211,7 @@ impl<'a> RasterState<'a> {
                     x: u32_to_f32(x) + 0.5,
                     y: u32_to_f32(y) + 0.5,
                 };
-                let coverage = clip_coverage(self.current_clip().as_ref(), point.x, point.y);
+                let coverage = pixel_coverage(clip.as_ref(), rect_clip, x, y);
                 if coverage <= 0.0 {
                     continue;
                 }
@@ -1278,6 +1355,11 @@ impl<'a> RasterState<'a> {
             PaintCoordinateSpace::Viewport => PhysicalPoint::default(),
         };
         apply_layer_effects(&mut layer, filter, mask, mask_offset, self.images);
+        // Effects can only add pixels where the mask/filter put them, so the
+        // tight box is taken after them.
+        let Some(bounds) = layer.content_bounds() else {
+            return;
+        };
         let into_layer = Transform2D {
             translate_x: -offset.x,
             translate_y: -offset.y,
@@ -1292,7 +1374,21 @@ impl<'a> RasterState<'a> {
         let clip = self.current_clip().map(|clip| clip.rect);
         let control = self.control;
         let parent = self.layers.last_mut().expect("parent surface");
-        if !warp_surface(parent, &layer, mapped, opacity, clip, control) {
+        let composited = if let Some((translate_x, translate_y)) = integer_translation(&mapped) {
+            blit_translated(
+                parent,
+                &layer,
+                bounds,
+                translate_x,
+                translate_y,
+                opacity,
+                clip,
+                control,
+            )
+        } else {
+            warp_surface(parent, &layer, bounds, mapped, opacity, clip, control)
+        };
+        if !composited {
             self.cancelled = true;
         }
     }
@@ -1717,7 +1813,23 @@ fn pixel_coverage(clip: Option<&ClipRegion>, rect: Option<RectCellClip>, x: u32,
     match (clip, rect) {
         (None, _) => 1.0,
         (Some(_), Some(rect)) => rect.coverage(x, y),
-        (Some(clip), None) => clip_coverage(Some(clip), u32_to_f32(x) + 0.5, u32_to_f32(y) + 0.5),
+        (Some(clip), None) => {
+            // A single rounded rectangle is the common clip for a card or an
+            // image with a border radius. Its 16 samples factor into two axis
+            // tests away from the corner arcs, and the exact rounded helper
+            // already implements that reduction.
+            if clip.shape_count == 1 {
+                match clip.shapes[0] {
+                    ClipShape::Rect(rect) => rect_cell_coverage(rect, x, y),
+                    ClipShape::RoundedRect { rect, radii } => {
+                        rounded_rect_cell_coverage(rect, radii, x, y)
+                    }
+                    _ => clip_coverage(Some(clip), u32_to_f32(x) + 0.5, u32_to_f32(y) + 0.5),
+                }
+            } else {
+                clip_coverage(Some(clip), u32_to_f32(x) + 0.5, u32_to_f32(y) + 0.5)
+            }
+        }
     }
 }
 
@@ -1751,23 +1863,137 @@ fn clip_coverage(clip: Option<&ClipRegion>, x: f32, y: f32) -> f32 {
     u32_to_f32(covered) / 16.0
 }
 
-fn rounded_ring_coverage(
+/// The 16 sample positions of one pixel cell, as fractions of the cell.
+const CELL_SAMPLES: [f32; 4] = [0.125, 0.375, 0.625, 0.875];
+
+fn max_corner_radius(radii: CornerRadii) -> f32 {
+    radii
+        .top_left
+        .max(radii.top_right)
+        .max(radii.bottom_right)
+        .max(radii.bottom_left)
+}
+
+/// How many of the four cell sample columns fall inside `[low, high)`.
+fn axis_sample_count(index: u32, low: f32, high: f32) -> u32 {
+    let base = u32_to_f32(index);
+    let mut count = 0_u32;
+    for sample in CELL_SAMPLES {
+        let value = base + sample;
+        if value >= low && value < high {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// The exact 16-sample coverage of an axis-aligned rectangle over one pixel
+/// cell. The samples are a Cartesian product, so the two axes factor.
+fn rect_cell_coverage(rect: PhysicalRect, x: u32, y: u32) -> f32 {
+    if rect.size.width <= 0.0 || rect.size.height <= 0.0 {
+        return 0.0;
+    }
+    let columns = axis_sample_count(x, rect.origin.x, rect.right());
+    if columns == 0 {
+        return 0.0;
+    }
+    let rows = axis_sample_count(y, rect.origin.y, rect.bottom());
+    u32_to_f32(columns * rows) / 16.0
+}
+
+/// Whether every sample of the cell is inside `rect` inset by `margin`.
+fn cell_inside_inset(rect: PhysicalRect, margin: f32, x: u32, y: u32) -> bool {
+    if rect.size.width <= 0.0 || rect.size.height <= 0.0 {
+        return false;
+    }
+    let x_origin = u32_to_f32(x);
+    let y_origin = u32_to_f32(y);
+    x_origin >= rect.origin.x + margin
+        && x_origin + 1.0 <= rect.right() - margin
+        && y_origin >= rect.origin.y + margin
+        && y_origin + 1.0 <= rect.bottom() - margin
+}
+
+/// Whether every sample of the cell is outside `rect`.
+fn cell_outside(rect: PhysicalRect, x: u32, y: u32) -> bool {
+    let x_origin = u32_to_f32(x);
+    let y_origin = u32_to_f32(y);
+    x_origin + 1.0 <= rect.origin.x
+        || x_origin >= rect.right()
+        || y_origin + 1.0 <= rect.origin.y
+        || y_origin >= rect.bottom()
+}
+
+/// The 16-sample coverage of a rounded rectangle over one pixel cell.
+///
+/// A cell outside the corner bands is an axis-aligned rectangle test, which
+/// factors into eight comparisons. Only the few cells that straddle a corner
+/// arc pay for point sampling.
+fn rounded_rect_cell_coverage(rect: PhysicalRect, radii: CornerRadii, x: u32, y: u32) -> f32 {
+    if rect.size.width <= 0.0 || rect.size.height <= 0.0 {
+        return 0.0;
+    }
+    let radius = max_corner_radius(radii);
+    if radius <= 0.0 {
+        return rect_cell_coverage(rect, x, y);
+    }
+    if cell_inside_inset(rect, radius, x, y) {
+        return 1.0;
+    }
+    if cell_outside(rect, x, y) {
+        return 0.0;
+    }
+    let x_origin = u32_to_f32(x);
+    let y_origin = u32_to_f32(y);
+    let mut covered = 0_u32;
+    for sample_y in CELL_SAMPLES {
+        for sample_x in CELL_SAMPLES {
+            if point_in_rounded_rect(
+                rect,
+                radii,
+                PhysicalPoint {
+                    x: x_origin + sample_x,
+                    y: y_origin + sample_y,
+                },
+            ) {
+                covered += 1;
+            }
+        }
+    }
+    u32_to_f32(covered) / 16.0
+}
+
+/// The 16-sample coverage of the ring between `outer` and `inner`.
+fn rounded_ring_cell_coverage(
     outer: PhysicalRect,
     outer_radii: CornerRadii,
     inner: PhysicalRect,
     inner_radii: CornerRadii,
-    x: f32,
-    y: f32,
+    x: u32,
+    y: u32,
 ) -> f32 {
-    let point = PhysicalPoint { x, y };
-    let _ = point;
-    let samples = [0.125_f32, 0.375, 0.625, 0.875];
+    let outer_coverage = rounded_rect_cell_coverage(outer, outer_radii, x, y);
+    if outer_coverage <= 0.0 {
+        return 0.0;
+    }
+    let inner_coverage = rounded_rect_cell_coverage(inner, inner_radii, x, y);
+    // The inner shape lies inside the outer one. When either boundary covers
+    // the whole cell, the other one alone answers the ring without sampling
+    // both predicates together.
+    if outer_coverage >= 1.0 {
+        return (1.0 - inner_coverage).max(0.0);
+    }
+    if inner_coverage <= 0.0 {
+        return outer_coverage;
+    }
+    let x_origin = u32_to_f32(x);
+    let y_origin = u32_to_f32(y);
     let mut covered = 0_u32;
-    for sample_y in samples {
-        for sample_x in samples {
+    for sample_y in CELL_SAMPLES {
+        for sample_x in CELL_SAMPLES {
             let point = PhysicalPoint {
-                x: x.floor() + sample_x,
-                y: y.floor() + sample_y,
+                x: x_origin + sample_x,
+                y: y_origin + sample_y,
             };
             if point_in_rounded_rect(outer, outer_radii, point)
                 && !point_in_rounded_rect(inner, inner_radii, point)
@@ -1777,25 +2003,6 @@ fn rounded_ring_coverage(
         }
     }
     u32_to_f32(covered) / 16.0
-    /*
-    // Signed distance to the outer boundary: positive inside the outer shape.
-    let outer_signed = if point_in_rounded_rect(outer, outer_radii, point) {
-        distance_inside_to_rounded_edge(outer, outer_radii, point)
-    } else {
-        -distance_to_rounded_rect(outer, outer_radii, point)
-    };
-    // Signed distance to the inner boundary: positive inside the hole.
-    let inner_signed = if point_in_rounded_rect(inner, inner_radii, point) {
-        distance_inside_to_rounded_edge(inner, inner_radii, point)
-    } else {
-        -distance_to_rounded_rect(inner, inner_radii, point)
-    };
-    // The ring is the region inside the outer shape but outside the inner
-    // hole. Approximate the distance to that band; a 1px linear step keeps
-    // thin borders smooth where point sampling would leave gaps.
-    let band_distance = inner_signed.max(-outer_signed);
-    (0.5 - band_distance).clamp(0.0, 1.0)
-    */
 }
 
 fn border_edge_at(rect: PhysicalRect, border: &BorderPaint, point: PhysicalPoint) -> Option<usize> {
@@ -2279,6 +2486,7 @@ fn paint_box_shadow(
 
     let mask_height_i64 = i64::try_from(mask_height).unwrap_or(i64::MAX);
     let mask_width_i64 = i64::try_from(mask_width).unwrap_or(i64::MAX);
+    let rect_clip = clip.and_then(RectCellClip::of);
     for y in top..bottom {
         if control.is_some_and(RasterControl::is_cancelled) {
             return false;
@@ -2307,7 +2515,7 @@ fn paint_box_shadow(
             if alpha <= 0.0 {
                 continue;
             }
-            let clip_alpha = clip_coverage(clip, u32_to_f32(x) + 0.5, u32_to_f32(y) + 0.5);
+            let clip_alpha = pixel_coverage(clip, rect_clip, x, y);
             if clip_alpha <= 0.0 {
                 continue;
             }
@@ -2335,6 +2543,7 @@ fn paint_box_shadow_exact(
     clip: Option<&ClipRegion>,
     control: Option<&dyn RasterControl>,
 ) -> bool {
+    let rect_clip = clip.and_then(RectCellClip::of);
     for y in top..bottom {
         if control.is_some_and(RasterControl::is_cancelled) {
             return false;
@@ -2347,7 +2556,7 @@ fn paint_box_shadow_exact(
             if alpha <= 0.0 {
                 continue;
             }
-            let clip_alpha = clip_coverage(clip, u32_to_f32(x) + 0.5, u32_to_f32(y) + 0.5);
+            let clip_alpha = pixel_coverage(clip, rect_clip, x, y);
             if clip_alpha <= 0.0 {
                 continue;
             }
@@ -2397,6 +2606,7 @@ fn paint_box_shadow_analytic(
         rect: shadow_rect,
         radii: shadow_radii,
     };
+    let rect_clip = clip.and_then(RectCellClip::of);
     for y in top..bottom {
         if control.is_some_and(RasterControl::is_cancelled) {
             return false;
@@ -2406,7 +2616,7 @@ fn paint_box_shadow_analytic(
                 x: u32_to_f32(x) + 0.5,
                 y: u32_to_f32(y) + 0.5,
             };
-            let clip_alpha = clip_coverage(clip, point.x, point.y);
+            let clip_alpha = pixel_coverage(clip, rect_clip, x, y);
             if clip_alpha <= 0.0 {
                 continue;
             }
@@ -2453,17 +2663,72 @@ fn fill_rect(
     let right = ceil_to_u32(rect.right().min(u32_to_f32(surface.width)));
     let bottom = ceil_to_u32(rect.bottom().min(u32_to_f32(surface.height)));
     let rect_clip = clip.and_then(RectCellClip::of);
+    // An axis-aligned clip answers coverage exactly 0 or 1 per pixel cell. The
+    // interior therefore needs no per-pixel coverage test at all: paint those
+    // rows as slices and leave only the clip's fractional edge cells to the
+    // sampled path. Large backgrounds are the common case, and this is the
+    // difference between a bounds check per pixel and a row copy.
+    let (fast_left, fast_right, fast_top, fast_bottom) = match (clip, rect_clip) {
+        (None, _) => (left, right, top, bottom),
+        // A rounded clip needs its coverage samples everywhere.
+        (Some(_), None) => (left, left, top, top),
+        (Some(_), Some(rect_clip)) => (
+            left.max(ceil_to_u32(rect_clip.left)),
+            right.min(ceil_to_u32(rect_clip.right)),
+            top.max(ceil_to_u32(rect_clip.top)),
+            bottom.min(ceil_to_u32(rect_clip.bottom)),
+        ),
+    };
+    let width = usize::try_from(surface.width).unwrap_or(usize::MAX);
+    for y in fast_top..fast_bottom {
+        if control.is_some_and(RasterControl::is_cancelled) {
+            return false;
+        }
+        let Some(start) = usize::try_from(y)
+            .ok()
+            .and_then(|row| row.checked_mul(width))
+            .and_then(|row| row.checked_add(usize::try_from(fast_left).ok()?))
+        else {
+            continue;
+        };
+        let Some(end) = usize::try_from(y)
+            .ok()
+            .and_then(|row| row.checked_mul(width))
+            .and_then(|row| row.checked_add(usize::try_from(fast_right).ok()?))
+        else {
+            continue;
+        };
+        let Some(row) = surface.pixels.get_mut(start..end) else {
+            continue;
+        };
+        if color.alpha == u8::MAX {
+            row.fill(color);
+        } else {
+            for pixel in row {
+                *pixel = blend(*pixel, color, 1.0);
+            }
+        }
+    }
+    // The clip edge cells, plus everything when the clip is not rect-only.
     for y in top..bottom {
         if control.is_some_and(RasterControl::is_cancelled) {
             return false;
         }
-        for x in left..right {
-            let coverage = pixel_coverage(clip, rect_clip, x, y);
-            if coverage <= 0.0 {
-                continue;
-            }
-            if let Some(index) = surface.index(x, y) {
-                surface.pixels[index] = blend(surface.pixels[index], color, coverage);
+        let interior_row = y >= fast_top && y < fast_bottom;
+        let (first_end, second_start) = if interior_row {
+            (fast_left, fast_right)
+        } else {
+            (right, right)
+        };
+        for (start, end) in [(left, first_end), (second_start, right)] {
+            for x in start..end {
+                let coverage = pixel_coverage(clip, rect_clip, x, y);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                if let Some(index) = surface.index(x, y) {
+                    surface.pixels[index] = blend(surface.pixels[index], color, coverage);
+                }
             }
         }
     }
@@ -2493,12 +2758,13 @@ fn paint_linear_gradient(
     let top = floor_to_u32(visible.origin.y);
     let right = ceil_to_u32(visible.right().min(u32_to_f32(surface.width)));
     let bottom = ceil_to_u32(visible.bottom().min(u32_to_f32(surface.height)));
+    let rect_clip = clip.and_then(RectCellClip::of);
     for y in top..bottom {
         if control.is_some_and(RasterControl::is_cancelled) {
             return false;
         }
         for x in left..right {
-            let coverage = clip_coverage(clip, u32_to_f32(x) + 0.5, u32_to_f32(y) + 0.5);
+            let coverage = pixel_coverage(clip, rect_clip, x, y);
             if coverage <= 0.0 {
                 continue;
             }
@@ -2533,12 +2799,13 @@ fn paint_radial_gradient(
     let top = floor_to_u32(visible.origin.y);
     let right = ceil_to_u32(visible.right().min(u32_to_f32(surface.width)));
     let bottom = ceil_to_u32(visible.bottom().min(u32_to_f32(surface.height)));
+    let rect_clip = clip.and_then(RectCellClip::of);
     for y in top..bottom {
         if control.is_some_and(RasterControl::is_cancelled) {
             return false;
         }
         for x in left..right {
-            let coverage = clip_coverage(clip, u32_to_f32(x) + 0.5, u32_to_f32(y) + 0.5);
+            let coverage = pixel_coverage(clip, rect_clip, x, y);
             if coverage <= 0.0 {
                 continue;
             }
@@ -2570,12 +2837,13 @@ fn paint_conic_gradient(
     let top = floor_to_u32(visible.origin.y);
     let right = ceil_to_u32(visible.right().min(u32_to_f32(surface.width)));
     let bottom = ceil_to_u32(visible.bottom().min(u32_to_f32(surface.height)));
+    let rect_clip = clip.and_then(RectCellClip::of);
     for y in top..bottom {
         if control.is_some_and(RasterControl::is_cancelled) {
             return false;
         }
         for x in left..right {
-            let coverage = clip_coverage(clip, u32_to_f32(x) + 0.5, u32_to_f32(y) + 0.5);
+            let coverage = pixel_coverage(clip, rect_clip, x, y);
             if coverage <= 0.0 {
                 continue;
             }
@@ -2855,6 +3123,12 @@ fn paint_glyph(
             let Some(coverage) = mask.coverage.get(index).copied() else {
                 continue;
             };
+            // A blank mask cell cannot change the destination; skipping it
+            // before resolving the target avoids the blend for the majority
+            // of a glyph mask, whose box is mostly empty.
+            if coverage == 0 || color.alpha == 0 {
+                continue;
+            }
             let Some(target_x) = i32::try_from(x).ok().and_then(|x| base_x.checked_add(x)) else {
                 continue;
             };
@@ -2871,12 +3145,17 @@ fn paint_glyph(
             if clip_alpha <= 0.0 {
                 continue;
             }
+            let opacity = f32::from(coverage) / 255.0 * clip_alpha;
             if let Some(surface_index) = surface.index(target_x, target_y) {
-                surface.pixels[surface_index] = blend(
-                    surface.pixels[surface_index],
-                    color.with_opacity(f32::from(coverage) / 255.0 * clip_alpha),
-                    1.0,
-                );
+                if opacity >= 1.0 && color.alpha == u8::MAX {
+                    surface.pixels[surface_index] = color;
+                } else {
+                    surface.pixels[surface_index] = blend(
+                        surface.pixels[surface_index],
+                        color.with_opacity(opacity),
+                        1.0,
+                    );
+                }
             }
         }
     }
@@ -2906,12 +3185,13 @@ fn paint_image(
     let top = floor_to_u32(visible.origin.y);
     let right = ceil_to_u32(visible.right().min(u32_to_f32(surface.width)));
     let bottom = ceil_to_u32(visible.bottom().min(u32_to_f32(surface.height)));
+    let rect_clip = clip.and_then(RectCellClip::of);
     for y in top..bottom {
         if control.is_some_and(RasterControl::is_cancelled) {
             return false;
         }
         for x in left..right {
-            let coverage = clip_coverage(clip, u32_to_f32(x) + 0.5, u32_to_f32(y) + 0.5);
+            let coverage = pixel_coverage(clip, rect_clip, x, y);
             if coverage <= 0.0 {
                 continue;
             }
@@ -3428,10 +3708,19 @@ pub fn composite_surface(
     clip: Option<PhysicalRect>,
     control: Option<&dyn RasterControl>,
 ) -> bool {
+    let bounds = (0, 0, source.width(), source.height());
     if let Some((x, y)) = integer_translation(&transform) {
-        return blit_translated(destination, source, x, y, opacity, clip, control);
+        return blit_translated(destination, source, bounds, x, y, opacity, clip, control);
     }
-    warp_surface(destination, source, transform, opacity, clip, control)
+    warp_surface(
+        destination,
+        source,
+        bounds,
+        transform,
+        opacity,
+        clip,
+        control,
+    )
 }
 
 #[allow(clippy::float_cmp)] // integer translation is an exact bit-pattern test
@@ -3457,9 +3746,11 @@ fn integer_translation(transform: &Transform2D) -> Option<(i64, i64)> {
     clippy::cast_possible_truncation,
     reason = "blit coordinates are bounded by the u32 surface dimensions"
 )]
+#[allow(clippy::too_many_arguments)]
 fn blit_translated(
     destination: &mut Surface,
     source: &Surface,
+    source_bounds: (u32, u32, u32, u32),
     translate_x: i64,
     translate_y: i64,
     opacity: f32,
@@ -3473,15 +3764,27 @@ fn blit_translated(
     if left >= right || top >= bottom {
         return true;
     }
+    let (source_left, source_top, bounds_width, bounds_height) = source_bounds;
+    let source_right = i64::from(source_left) + i64::from(bounds_width);
+    let source_bottom = i64::from(source_top) + i64::from(bounds_height);
     let source_width = i64::from(source.width());
     let source_height = i64::from(source.height());
     // The destination range that both remains inside the clip and has a
-    // corresponding source texel. Computing it once removes every per-pixel
-    // bounds test from the row loop below.
-    let column_start = left.saturating_sub(translate_x).max(0);
-    let column_end = right.saturating_sub(translate_x).min(source_width);
-    let row_start = top.saturating_sub(translate_y).max(0);
-    let row_end = bottom.saturating_sub(translate_y).min(source_height);
+    // corresponding source texel. The source layer may be smaller than the
+    // full surface, so its bounds are part of the same intersection; computing
+    // it once removes every per-pixel bounds test from the row loop below.
+    let column_start = (left - translate_x)
+        .max(i64::from(source_left))
+        .max(0);
+    let column_end = (right - translate_x)
+        .min(source_right)
+        .min(source_width);
+    let row_start = (top - translate_y)
+        .max(i64::from(source_top))
+        .max(0);
+    let row_end = (bottom - translate_y)
+        .min(source_bottom)
+        .min(source_height);
     if column_start >= column_end || row_start >= row_end {
         return true;
     }
@@ -3548,9 +3851,11 @@ fn integer_clip_bounds(
     (left, top, right, bottom)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn warp_surface(
     destination: &mut Surface,
     source: &Surface,
+    source_bounds: (u32, u32, u32, u32),
     transform: Transform2D,
     opacity: f32,
     clip: Option<PhysicalRect>,
@@ -3561,11 +3866,20 @@ fn warp_surface(
         // point or line, which has no area to paint.
         return true;
     };
+    // A destination sample is bilinearly interpolated from the four source
+    // pixels around it, so one transparent pixel beyond the tight content box
+    // still carries weight for a sample outside it. Grow the box by one pixel
+    // and let the surface bounds clamp it.
+    let (source_left, source_top, source_width, source_height) = source_bounds;
+    let source_left = source_left.saturating_sub(1);
+    let source_top = source_top.saturating_sub(1);
+    let source_right = (source_left + source_width + 2).min(source.width);
+    let source_bottom = (source_top + source_height + 2).min(source.height);
     let corners = [
-        (0.0, 0.0),
-        (u32_to_f32(source.width), 0.0),
-        (0.0, u32_to_f32(source.height)),
-        (u32_to_f32(source.width), u32_to_f32(source.height)),
+        (u32_to_f32(source_left), u32_to_f32(source_top)),
+        (u32_to_f32(source_right), u32_to_f32(source_top)),
+        (u32_to_f32(source_left), u32_to_f32(source_bottom)),
+        (u32_to_f32(source_right), u32_to_f32(source_bottom)),
     ];
     let mut min_x = f32::INFINITY;
     let mut min_y = f32::INFINITY;
@@ -4823,6 +5137,53 @@ mod tests {
         println!(
             "box-shadow 1000x100 blur 40 on 1200x800: old analytic={old_elapsed:?}, new mask={new_elapsed:?}"
         );
+    }
+
+    /// The ring fast path skips the inner box and still classifies each edge
+    /// with the per-pixel miter rule.
+    #[test]
+    fn solid_border_paints_edges_and_leaves_the_interior_untouched() {
+        let rect = PhysicalRect::new(4.0, 4.0, 12.0, 10.0);
+        let border = BorderPaint {
+            rect,
+            widths: EdgeSizes {
+                top: 2.0,
+                right: 2.0,
+                bottom: 2.0,
+                left: 2.0,
+            },
+            colors: [
+                Color::rgb(220, 30, 30),
+                Color::rgb(30, 180, 60),
+                Color::rgb(40, 70, 220),
+                Color::rgb(20, 20, 20),
+            ],
+            styles: [BorderStyle::Solid; 4],
+            radii: CornerRadii::default(),
+        };
+        let list = item_list(24.0, vec![command_item(0, DisplayCommand::Border(border))]);
+
+        let output = CpuRasterizer.rasterize(&list, Color::WHITE, &NoGlyphMasks);
+
+        // Top, right, bottom and left bands each carry their own colour.
+        assert_eq!(output.surface.pixel(9, 4), Some(Color::rgb(220, 30, 30)));
+        assert_eq!(output.surface.pixel(15, 9), Some(Color::rgb(30, 180, 60)));
+        assert_eq!(output.surface.pixel(9, 13), Some(Color::rgb(40, 70, 220)));
+        assert_eq!(output.surface.pixel(4, 9), Some(Color::rgb(20, 20, 20)));
+        // The whole inner box stays background; the ring pass must not have
+        // painted the interior it skips.
+        for y in 6..12 {
+            for x in 6..14 {
+                assert_eq!(
+                    output.surface.pixel(x, y),
+                    Some(Color::WHITE),
+                    "interior ({x}, {y})"
+                );
+            }
+        }
+        // Outside the border box is untouched.
+        assert_eq!(output.surface.pixel(2, 2), Some(Color::WHITE));
+        assert_eq!(output.surface.pixel(17, 9), Some(Color::WHITE));
     }
 
     #[test]

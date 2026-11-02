@@ -431,6 +431,9 @@ fn run_reference_layout(
         flex_intrinsic_cache: HashMap::new(),
         flex_intrinsic_hits: 0,
         flex_intrinsic_misses: 0,
+        inline_text_styles: HashMap::new(),
+        min_content_widths: HashMap::new(),
+        max_content_widths: HashMap::new(),
         sticky_boxes: Vec::new(),
         clipping_boxes: Vec::new(),
         fixed_positioning_containing: None,
@@ -546,6 +549,18 @@ struct Solver<'a> {
     flex_intrinsic_cache: HashMap<FlexIntrinsicKey, f32>,
     flex_intrinsic_hits: u64,
     flex_intrinsic_misses: u64,
+    /// Typography (font request, line height, spacing) already resolved for a
+    /// style source. Layout asks for it while collecting atoms, measuring
+    /// min/max-content widths, breaking lines and painting text nodes, and
+    /// resolving it walks several computed properties plus a font-family
+    /// request key each time.
+    inline_text_styles:
+        HashMap<Option<NodeId>, (inline::InlineTextStyle<'a>, Vec<LayoutDiagnostic>)>,
+    /// Min/max-content widths already measured for a formatting node. Table
+    /// sizing asks for the same cell's intrinsic widths in several passes, and
+    /// each miss recursively measures the cell's whole subtree.
+    min_content_widths: HashMap<FormattingNodeId, f32>,
+    max_content_widths: HashMap<FormattingNodeId, f32>,
     /// Boxes whose computed `position` is `sticky`, in allocation order. The
     /// displacement itself is not applied here (§4.1): it depends on the scroll
     /// offset, which layout never sees, so these are resolved into constraints
