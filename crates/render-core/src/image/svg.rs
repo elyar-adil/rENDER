@@ -615,12 +615,29 @@ fn decode_viewport(
         &gradient_index,
     );
     let stroke = root_paint(root, "stroke", root_color, Paint::None, &gradient_index);
+    let root_fill_opacity = property(root, "fill-opacity")
+        .and_then(parse_opacity)
+        .unwrap_or(1.0);
+    let root_stroke_opacity = property(root, "stroke-opacity")
+        .and_then(parse_opacity)
+        .unwrap_or(1.0);
+    let root_fill_rule = match property(root, "fill-rule") {
+        Some(value) if value.trim().eq_ignore_ascii_case("evenodd") => FillRule::EvenOdd,
+        _ => FillRule::NonZero,
+    };
+    let root_stroke_width = property(root, "stroke-width")
+        .and_then(parse_length)
+        .unwrap_or(1.0);
     walk(
         root,
         root_transform,
         fill,
         stroke,
         root_color,
+        root_fill_opacity,
+        root_stroke_opacity,
+        root_fill_rule,
+        root_stroke_width,
         &gradients,
         &gradient_index,
         &clip_paths,
@@ -657,9 +674,62 @@ enum FillRule {
     EvenOdd,
 }
 
+/// Add the horizontal overlap of `[left, right)` with each pixel cell to a
+/// row's coverage buffer, scaled by one sub-scanline's weight.
+fn accumulate_span(coverage: &mut [f32], left: f32, right: f32, weight: f32) {
+    if !left.is_finite() || !right.is_finite() || coverage.is_empty() {
+        return;
+    }
+    let width = coverage.len() as f32;
+    let left = left.max(0.0);
+    let right = right.min(width);
+    if right <= left {
+        return;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let first = left.floor() as usize;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let end = (right.ceil() as usize).min(coverage.len());
+    for (offset, covered) in coverage[first..end].iter_mut().enumerate() {
+        let pixel = (first + offset) as f32;
+        let overlap = right.min(pixel + 1.0) - left.max(pixel);
+        if overlap > 0.0 {
+            *covered += overlap * weight;
+        }
+    }
+}
+
+/// Shortest distance from a point to a line segment.
+fn segment_distance(x: f32, y: f32, from: (f32, f32), to: (f32, f32)) -> f32 {
+    let (x1, y1) = from;
+    let (x2, y2) = to;
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let length_squared = dx.mul_add(dx, dy * dy);
+    if length_squared <= f32::EPSILON {
+        return (x - x1).hypot(y - y1);
+    }
+    let t = ((x - x1).mul_add(dx, (y - y1) * dy) / length_squared).clamp(0.0, 1.0);
+    (x - (x1 + t * dx)).hypot(y - (y1 + t * dy))
+}
+
+/// Vertical samples per device pixel row used by the scanline filler.
+///
+/// Four sub-scanlines plus exact horizontal span overlap give the 24-48px
+/// icon sizes intermediate edge coverage without turning every SVG into a
+/// supersampled bitmap. Larger SVG artwork is scaled smoothly again when the
+/// raster is drawn, so this is a quality/cost point rather than a resolution
+/// claim.
+const SUBSCANLINES: usize = 4;
+
 impl Raster {
-    fn fill_polygon(&mut self, points: &[(f32, f32)], color_at: impl Fn(f32, f32) -> Color) {
-        self.fill_subpaths(&[points.to_vec()], FillRule::NonZero, color_at);
+    fn fill_polygon(
+        &mut self,
+        points: &[(f32, f32)],
+        opacity: f32,
+        color_at: impl Fn(f32, f32) -> Color,
+    ) {
+        self.fill_subpaths(&[points.to_vec()], FillRule::NonZero, opacity, color_at);
     }
 
     /// Fill every subpath of one SVG path with one fill rule.
@@ -673,8 +743,13 @@ impl Raster {
         &mut self,
         subpaths: &[Vec<(f32, f32)>],
         fill_rule: FillRule,
+        opacity: f32,
         color_at: impl Fn(f32, f32) -> Color,
     ) {
+        let opacity = opacity.clamp(0.0, 1.0);
+        if opacity <= 0.0 {
+            return;
+        }
         let edges: Vec<&[(f32, f32)]> = subpaths
             .iter()
             .map(Vec::as_slice)
@@ -693,79 +768,124 @@ impl Raster {
             .fold(f32::MIN, f32::max);
         let first_row = (min_y.floor().max(0.0)) as i64;
         let last_row = (max_y.ceil().min(f32::from(u16::MAX))) as i64;
+        let subscanline_weight = 1.0 / SUBSCANLINES as f32;
+        let mut coverage = vec![0.0_f32; self.width as usize];
         for row in first_row..=last_row {
-            let sample = row as f32 + 0.5;
-            let mut crossings: Vec<(f32, i32)> = Vec::new();
-            for points in &edges {
-                for index in 0..points.len() {
-                    let (x1, y1) = points[index];
-                    let (x2, y2) = points[(index + 1) % points.len()];
-                    if (y1 <= sample && y2 > sample) || (y2 <= sample && y1 > sample) {
-                        let t = (sample - y1) / (y2 - y1);
-                        let direction = if y1 <= sample && y2 > sample { 1 } else { -1 };
-                        crossings.push((x1 + t * (x2 - x1), direction));
+            coverage.fill(0.0);
+            for subscanline in 0..SUBSCANLINES {
+                let sample = row as f32 + (subscanline as f32 + 0.5) * subscanline_weight;
+                let mut crossings: Vec<(f32, i32)> = Vec::new();
+                for points in &edges {
+                    for index in 0..points.len() {
+                        let (x1, y1) = points[index];
+                        let (x2, y2) = points[(index + 1) % points.len()];
+                        if (y1 <= sample && y2 > sample) || (y2 <= sample && y1 > sample) {
+                            let t = (sample - y1) / (y2 - y1);
+                            let direction = if y1 <= sample && y2 > sample { 1 } else { -1 };
+                            crossings.push((x1 + t * (x2 - x1), direction));
+                        }
+                    }
+                }
+                crossings.sort_by(|left, right| {
+                    left.0
+                        .partial_cmp(&right.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                match fill_rule {
+                    FillRule::EvenOdd => {
+                        for pair in crossings.chunks(2) {
+                            if let [(left, _), (right, _)] = pair {
+                                accumulate_span(&mut coverage, *left, *right, subscanline_weight);
+                            }
+                        }
+                    }
+                    FillRule::NonZero => {
+                        let mut winding = 0_i32;
+                        let mut span_start = None;
+                        for (x, direction) in crossings {
+                            let previous = winding;
+                            winding += direction;
+                            if previous == 0 && winding != 0 {
+                                span_start = Some(x);
+                            } else if previous != 0
+                                && winding == 0
+                                && let Some(start) = span_start.take()
+                            {
+                                accumulate_span(&mut coverage, start, x, subscanline_weight);
+                            }
+                        }
                     }
                 }
             }
-            crossings.sort_by(|left, right| {
-                left.0
-                    .partial_cmp(&right.0)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            match fill_rule {
-                FillRule::EvenOdd => {
-                    for pair in crossings.chunks(2) {
-                        if let [(left, _), (right, _)] = pair {
-                            self.fill_span(row, *left, *right, &color_at);
-                        }
-                    }
+            let sample_y = row as f32 + 0.5;
+            for (x, covered) in coverage.iter().enumerate() {
+                if *covered <= 0.0 {
+                    continue;
                 }
-                FillRule::NonZero => {
-                    let mut winding = 0_i32;
-                    let mut span_start = None;
-                    for (x, direction) in crossings {
-                        let previous = winding;
-                        winding += direction;
-                        if previous == 0 && winding != 0 {
-                            span_start = Some(x);
-                        } else if previous != 0
-                            && winding == 0
-                            && let Some(start) = span_start.take()
-                        {
-                            self.fill_span(row, start, x, &color_at);
-                        }
-                    }
-                }
+                let color = color_at(x as f32 + 0.5, sample_y);
+                self.put(
+                    i64::try_from(x).unwrap_or(i64::MAX),
+                    row,
+                    color.with_opacity((covered * opacity).min(1.0)),
+                );
             }
         }
     }
 
-    fn fill_span(
+    /// Paint a stroke as the union of capsules around its segments.
+    ///
+    /// Distance-to-segment coverage gives the same intermediate edge pixels a
+    /// filled shape gets. Looking at all segments before writing avoids the
+    /// double-darkened joint a per-segment draw would produce for a
+    /// translucent stroke.
+    fn stroke_segments(
         &mut self,
-        row: i64,
-        left: f32,
-        right: f32,
-        color_at: &impl Fn(f32, f32) -> Color,
+        segments: &[Segment],
+        radius: f32,
+        opacity: f32,
+        color_at: impl Fn(f32, f32) -> Color,
     ) {
-        // Pixel x is covered when its center (x + 0.5) lies in [x0, x1):
-        // start = ceil(x0 - 0.5), end = ceil(x1 - 0.5)-1.
-        let start = (left - 0.5).ceil().max(0.0) as i64;
-        let end = ((right - 0.5).ceil() as i64)
-            .saturating_sub(1)
-            .min(i64::from(self.width.saturating_sub(1)));
-        for x in start..=end {
-            self.put(x, row, color_at(x as f32 + 0.5, row as f32 + 0.5));
+        let opacity = opacity.clamp(0.0, 1.0);
+        if segments.is_empty() || !radius.is_finite() || radius <= 0.0 || opacity <= 0.0 {
+            return;
         }
-    }
-
-    fn stroke_segments(&mut self, segments: &[Segment], color_at: impl Fn(f32, f32) -> Color) {
+        let radius = radius.min(self.width as f32 + self.height as f32);
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
         for ((x1, y1), (x2, y2)) in segments {
-            let steps = ((x2 - x1).abs().max((y2 - y1).abs()).ceil() as i64).clamp(1, 4096);
-            for step in 0..=steps {
-                let t = step as f32 / steps as f32;
-                let x = (x1 + t * (x2 - x1)).round() as i64;
-                let y = (y1 + t * (y2 - y1)).round() as i64;
-                self.put(x, y, color_at(x as f32 + 0.5, y as f32 + 0.5));
+            min_x = min_x.min(*x1).min(*x2);
+            min_y = min_y.min(*y1).min(*y2);
+            max_x = max_x.max(*x1).max(*x2);
+            max_y = max_y.max(*y1).max(*y2);
+        }
+        if !min_x.is_finite() || !min_y.is_finite() || !max_x.is_finite() || !max_y.is_finite() {
+            return;
+        }
+        let first_x = (min_x - radius - 1.0).floor().max(0.0) as i64;
+        let first_y = (min_y - radius - 1.0).floor().max(0.0) as i64;
+        let last_x =
+            ((max_x + radius + 1.0).ceil() as i64).min(i64::from(self.width.saturating_sub(1)));
+        let last_y =
+            ((max_y + radius + 1.0).ceil() as i64).min(i64::from(self.height.saturating_sub(1)));
+        for y in first_y..=last_y {
+            for x in first_x..=last_x {
+                let sample_x = x as f32 + 0.5;
+                let sample_y = y as f32 + 0.5;
+                let distance = segments
+                    .iter()
+                    .map(|(from, to)| segment_distance(sample_x, sample_y, *from, *to))
+                    .fold(f32::MAX, f32::min);
+                let coverage = (radius + 0.5 - distance).clamp(0.0, 1.0);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                self.put(
+                    x,
+                    y,
+                    color_at(sample_x, sample_y).with_opacity(coverage * opacity),
+                );
             }
         }
     }
@@ -1133,6 +1253,10 @@ fn walk(
     fill: Paint,
     stroke: Paint,
     current_color: Color,
+    fill_opacity: f32,
+    stroke_opacity: f32,
+    fill_rule: FillRule,
+    stroke_width: f32,
     gradients: &[Gradient],
     gradient_index: &BTreeMap<String, usize>,
     clip_paths: &BTreeMap<String, &XmlNode>,
@@ -1165,6 +1289,21 @@ fn walk(
         let child_stroke = presentation("stroke").map_or(stroke, |raw| {
             inherited_paint(raw, stroke, child_color, gradient_index)
         });
+        let child_fill_opacity = presentation("fill-opacity")
+            .and_then(parse_opacity)
+            .unwrap_or(fill_opacity);
+        let child_stroke_opacity = presentation("stroke-opacity")
+            .and_then(parse_opacity)
+            .unwrap_or(stroke_opacity);
+        let child_fill_rule = match presentation("fill-rule") {
+            Some(value) if value.eq_ignore_ascii_case("evenodd") => FillRule::EvenOdd,
+            Some(value) if value.eq_ignore_ascii_case("nonzero") => FillRule::NonZero,
+            _ => fill_rule,
+        };
+        let child_stroke_width = presentation("stroke-width")
+            .and_then(parse_length)
+            .filter(|width| *width >= 0.0)
+            .unwrap_or(stroke_width);
         let child_transform = match presentation("transform") {
             Some(specification) => transform.then(parse_transform(specification)),
             None => transform,
@@ -1178,7 +1317,11 @@ fn walk(
             transform,
             child_fill,
             child_stroke,
-            current_color,
+            child_color,
+            child_fill_opacity,
+            child_stroke_opacity,
+            child_fill_rule,
+            child_stroke_width,
             gradients,
             gradient_index,
             clip_paths,
@@ -1196,7 +1339,11 @@ fn walk(
             child_transform,
             child_fill,
             child_stroke,
-            current_color,
+            child_color,
+            child_fill_opacity,
+            child_stroke_opacity,
+            child_fill_rule,
+            child_stroke_width,
             gradients,
             gradient_index,
             clip_paths,
@@ -1214,7 +1361,11 @@ fn walk(
             child_transform,
             child_fill,
             child_stroke,
-            current_color,
+            child_color,
+            child_fill_opacity,
+            child_stroke_opacity,
+            child_fill_rule,
+            child_stroke_width,
             gradients,
             gradient_index,
             clip_paths,
@@ -1250,6 +1401,7 @@ fn walk(
                     &device,
                     child_transform,
                     child_fill.resolve(None),
+                    child_fill_opacity,
                     gradients,
                 );
                 stroke_outline(
@@ -1258,6 +1410,8 @@ fn walk(
                     &device,
                     child_transform,
                     child_stroke.resolve(None),
+                    child_stroke_width,
+                    child_stroke_opacity,
                     gradients,
                 );
                 if clipped {
@@ -1298,6 +1452,7 @@ fn walk(
                     &device,
                     child_transform,
                     child_fill.resolve(None),
+                    child_fill_opacity,
                     gradients,
                 );
                 stroke_outline(
@@ -1306,6 +1461,8 @@ fn walk(
                     &device,
                     child_transform,
                     child_stroke.resolve(None),
+                    child_stroke_width,
+                    child_stroke_opacity,
                     gradients,
                 );
                 if clipped {
@@ -1333,6 +1490,7 @@ fn walk(
                     &device,
                     child_transform,
                     child_fill.resolve(None),
+                    child_fill_opacity,
                     gradients,
                 );
                 let segments = polyline_segments(&device, child_node.name == "polygon");
@@ -1342,6 +1500,8 @@ fn walk(
                     &segments,
                     child_transform,
                     child_stroke.resolve(None),
+                    child_stroke_width,
+                    child_stroke_opacity,
                     gradients,
                 );
                 if clipped {
@@ -1373,6 +1533,8 @@ fn walk(
                     &[(from, to)],
                     child_transform,
                     child_stroke.resolve(None),
+                    child_stroke_width,
+                    child_stroke_opacity,
                     gradients,
                 );
                 if clipped {
@@ -1397,10 +1559,7 @@ fn walk(
                 );
                 // All subpaths of one `<path>` are one shape. Painting them
                 // independently fills holes such as the counters in an icon.
-                let fill_rule = match presentation("fill-rule") {
-                    Some(value) if value.eq_ignore_ascii_case("evenodd") => FillRule::EvenOdd,
-                    _ => FillRule::NonZero,
-                };
+                let fill_rule = child_fill_rule;
                 let local_subpaths: Vec<Vec<(f32, f32)>> = subpaths
                     .iter()
                     .filter(|(subpath, _)| subpath.len() >= 2)
@@ -1417,6 +1576,7 @@ fn walk(
                     child_transform,
                     child_fill.resolve(None),
                     fill_rule,
+                    child_fill_opacity,
                     gradients,
                 );
                 for (subpath, closed) in &subpaths {
@@ -1431,6 +1591,8 @@ fn walk(
                         &segments,
                         child_transform,
                         child_stroke.resolve(None),
+                        child_stroke_width,
+                        child_stroke_opacity,
                         gradients,
                     );
                 }
@@ -1541,6 +1703,10 @@ fn walk(
                     child_fill,
                     child_stroke,
                     child_color,
+                    child_fill_opacity,
+                    child_stroke_opacity,
+                    child_fill_rule,
+                    child_stroke_width,
                     gradients,
                     gradient_index,
                     clip_paths,
@@ -1566,6 +1732,10 @@ fn walk(
                     child_fill,
                     child_stroke,
                     child_color,
+                    child_fill_opacity,
+                    child_stroke_opacity,
+                    child_fill_rule,
+                    child_stroke_width,
                     gradients,
                     gradient_index,
                     clip_paths,
@@ -1584,6 +1754,10 @@ fn walk(
                     child_fill,
                     child_stroke,
                     child_color,
+                    child_fill_opacity,
+                    child_stroke_opacity,
+                    child_fill_rule,
+                    child_stroke_width,
                     gradients,
                     gradient_index,
                     clip_paths,
@@ -1612,6 +1786,10 @@ fn paint_opacity_group(
     fill: Paint,
     stroke: Paint,
     current_color: Color,
+    fill_opacity: f32,
+    stroke_opacity: f32,
+    fill_rule: FillRule,
+    stroke_width: f32,
     gradients: &[Gradient],
     gradient_index: &BTreeMap<String, usize>,
     clip_paths: &BTreeMap<String, &XmlNode>,
@@ -1664,6 +1842,10 @@ fn paint_opacity_group(
         fill,
         stroke,
         current_color,
+        fill_opacity,
+        stroke_opacity,
+        fill_rule,
+        stroke_width,
         gradients,
         gradient_index,
         clip_paths,
@@ -1739,6 +1921,10 @@ fn paint_masked_element(
     fill: Paint,
     stroke: Paint,
     current_color: Color,
+    fill_opacity: f32,
+    stroke_opacity: f32,
+    fill_rule: FillRule,
+    stroke_width: f32,
     gradients: &[Gradient],
     gradient_index: &BTreeMap<String, usize>,
     clip_paths: &BTreeMap<String, &XmlNode>,
@@ -1788,6 +1974,10 @@ fn paint_masked_element(
         fill,
         stroke,
         current_color,
+        fill_opacity,
+        stroke_opacity,
+        fill_rule,
+        stroke_width,
         gradients,
         gradient_index,
         clip_paths,
@@ -1832,6 +2022,10 @@ fn paint_masked_element(
         Paint::Color(Color::BLACK),
         Paint::None,
         current_color,
+        1.0,
+        1.0,
+        FillRule::NonZero,
+        1.0,
         gradients,
         gradient_index,
         clip_paths,
@@ -1973,6 +2167,10 @@ fn paint_filtered_element(
     fill: Paint,
     stroke: Paint,
     current_color: Color,
+    fill_opacity: f32,
+    stroke_opacity: f32,
+    fill_rule: FillRule,
+    stroke_width: f32,
     gradients: &[Gradient],
     gradient_index: &BTreeMap<String, usize>,
     clip_paths: &BTreeMap<String, &XmlNode>,
@@ -2022,6 +2220,10 @@ fn paint_filtered_element(
         fill,
         stroke,
         current_color,
+        fill_opacity,
+        stroke_opacity,
+        fill_rule,
+        stroke_width,
         gradients,
         gradient_index,
         clip_paths,
@@ -3312,6 +3514,7 @@ fn apply_color_matrix(pixel: Color, matrix: &[f32; 20]) -> Color {
 ///
 /// Fill every subpath of one `<path>` as one shape, with the element's
 /// `fill-rule`. Strokes stay per-subpath because a stroke follows each contour.
+#[allow(clippy::too_many_arguments)]
 fn paint_subpaths(
     raster: &mut Raster,
     local_subpaths: &[Vec<(f32, f32)>],
@@ -3319,6 +3522,7 @@ fn paint_subpaths(
     transform: Affine,
     paint: Option<Paint>,
     fill_rule: FillRule,
+    fill_opacity: f32,
     gradients: &[Gradient],
 ) {
     let Some(paint) = paint else {
@@ -3326,7 +3530,7 @@ fn paint_subpaths(
     };
     match paint {
         Paint::Color(color) => {
-            raster.fill_subpaths(device_subpaths, fill_rule, |_, _| color);
+            raster.fill_subpaths(device_subpaths, fill_rule, fill_opacity, |_, _| color);
         }
         Paint::Gradient(index) => {
             let Some(gradient) = gradients.get(index) else {
@@ -3339,7 +3543,9 @@ fn paint_subpaths(
             let Some(sampler) = GradientSampler::new(&local_points, transform, gradient) else {
                 return;
             };
-            raster.fill_subpaths(device_subpaths, fill_rule, |x, y| sampler.color_at(x, y));
+            raster.fill_subpaths(device_subpaths, fill_rule, fill_opacity, |x, y| {
+                sampler.color_at(x, y)
+            });
         }
         Paint::Inherit | Paint::None => {}
     }
@@ -3356,13 +3562,14 @@ fn paint_shape(
     device_points: &[(f32, f32)],
     transform: Affine,
     paint: Option<Paint>,
+    opacity: f32,
     gradients: &[Gradient],
 ) {
     let Some(paint) = paint else {
         return;
     };
     match paint {
-        Paint::Color(color) => raster.fill_polygon(device_points, |_, _| color),
+        Paint::Color(color) => raster.fill_polygon(device_points, opacity, |_, _| color),
         Paint::Gradient(index) => {
             let Some(gradient) = gradients.get(index) else {
                 return;
@@ -3370,7 +3577,7 @@ fn paint_shape(
             let Some(sampler) = GradientSampler::new(local_points, transform, gradient) else {
                 return;
             };
-            raster.fill_polygon(device_points, |x, y| sampler.color_at(x, y));
+            raster.fill_polygon(device_points, opacity, |x, y| sampler.color_at(x, y));
         }
         Paint::Inherit | Paint::None => {}
     }
@@ -3406,19 +3613,26 @@ fn points_bounds(points: &[(f32, f32)]) -> Option<Bounds> {
 }
 
 /// Paint one shape's stroke with a solid colour or a gradient.
+#[allow(clippy::too_many_arguments)]
 fn paint_stroke(
     raster: &mut Raster,
     local_points: &[(f32, f32)],
     segments: &[Segment],
     transform: Affine,
     paint: Option<Paint>,
+    stroke_width: f32,
+    opacity: f32,
     gradients: &[Gradient],
 ) {
     let Some(paint) = paint else {
         return;
     };
+    // A uniform transform scales the user-space width exactly; for a
+    // non-uniform transform an average axis scale is the closest a round
+    // capsule can get without tessellating an elliptical pen.
+    let radius = stroke_width * transform_scale(transform) * 0.5;
     match paint {
-        Paint::Color(color) => raster.stroke_segments(segments, |_, _| color),
+        Paint::Color(color) => raster.stroke_segments(segments, radius, opacity, |_, _| color),
         Paint::Gradient(index) => {
             let Some(gradient) = gradients.get(index) else {
                 return;
@@ -3426,10 +3640,17 @@ fn paint_stroke(
             let Some(sampler) = GradientSampler::new(local_points, transform, gradient) else {
                 return;
             };
-            raster.stroke_segments(segments, |x, y| sampler.color_at(x, y));
+            raster.stroke_segments(segments, radius, opacity, |x, y| sampler.color_at(x, y));
         }
         Paint::Inherit | Paint::None => {}
     }
+}
+
+/// The average scale a transform applies to a unit vector in each axis.
+fn transform_scale(transform: Affine) -> f32 {
+    let horizontal = transform.a.hypot(transform.b);
+    let vertical = transform.c.hypot(transform.d);
+    ((horizontal + vertical) * 0.5).max(f32::EPSILON)
 }
 
 /// A gradient resolved against one shape: the maps from device pixels back to
@@ -3483,27 +3704,51 @@ fn transform_points(points: &[(f32, f32)], transform: Affine) -> Vec<(f32, f32)>
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stroke_outline(
     raster: &mut Raster,
     local_points: &[(f32, f32)],
     device_points: &[(f32, f32)],
     transform: Affine,
     paint: Option<Paint>,
+    stroke_width: f32,
+    opacity: f32,
     gradients: &[Gradient],
 ) {
     let segments = polyline_segments(device_points, true);
-    paint_stroke(raster, local_points, &segments, transform, paint, gradients);
+    paint_stroke(
+        raster,
+        local_points,
+        &segments,
+        transform,
+        paint,
+        stroke_width,
+        opacity,
+        gradients,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stroke_outline_segments(
     raster: &mut Raster,
     local_points: &[(f32, f32)],
     segments: &[Segment],
     transform: Affine,
     paint: Option<Paint>,
+    stroke_width: f32,
+    opacity: f32,
     gradients: &[Gradient],
 ) {
-    paint_stroke(raster, local_points, segments, transform, paint, gradients);
+    paint_stroke(
+        raster,
+        local_points,
+        segments,
+        transform,
+        paint,
+        stroke_width,
+        opacity,
+        gradients,
+    );
 }
 
 fn polyline_segments(points: &[(f32, f32)], closed: bool) -> Vec<Segment> {
@@ -5036,7 +5281,7 @@ mod tests {
     /// root's own attributes were read, this shape was filled black.
     #[test]
     fn a_root_fill_none_is_inherited_by_its_children() {
-        let svg = br#"<svg width="10" height="10" fill="none" stroke="red"><rect width="4" height="4"/><line x1="6" y1="1" x2="8" y2="1"/></svg>"#;
+        let svg = br#"<svg width="10" height="10" fill="none" stroke="red"><rect width="4" height="4"/><line x1="6" y1="1.5" x2="8" y2="1.5"/></svg>"#;
         let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
         assert_eq!(image.pixel(2, 2), Some(Color::rgba(0, 0, 0, 0)));
         assert_eq!(image.pixel(7, 1), Some(Color::rgb(255, 0, 0)));
@@ -5046,7 +5291,7 @@ mod tests {
     /// stroke alike, and not a fixed black.
     #[test]
     fn current_color_resolves_to_the_callers_colour() {
-        let svg = br#"<svg width="8" height="8"><rect width="4" height="8" fill="currentColor"/><line x1="5" y1="1" x2="7" y2="1" stroke="CurrentColor" stroke-width="1"/></svg>"#;
+        let svg = br#"<svg width="8" height="8"><rect width="4" height="8" fill="currentColor"/><line x1="5" y1="1.5" x2="7" y2="1.5" stroke="CurrentColor" stroke-width="1"/></svg>"#;
         let green = Color::rgb(0, 128, 0);
         let image = decode_svg_viewport(svg, 8, 8, green, ImageLimits::default()).expect("decodes");
         assert_eq!(image.pixel(1, 1), Some(green));
@@ -5157,7 +5402,7 @@ mod tests {
         let svg = br#"<svg width="10" height="10"><defs>
             <clipPath id="c"><rect width="5" height="10"/></clipPath></defs>
             <g clip-path="url(#c)"><rect width="10" height="10" fill="red"/>
-            <line x1="0" y1="5" x2="10" y2="5" stroke="blue"/></g></svg>""#;
+            <line x1="0" y1="5.5" x2="10" y2="5.5" stroke="blue"/></g></svg>""#;
         let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
         assert_eq!(image.pixel(2, 2), Some(Color::rgb(255, 0, 0)));
         assert_eq!(image.pixel(7, 2), Some(Color::TRANSPARENT));
@@ -5639,6 +5884,70 @@ mod tests {
     }
 
     #[test]
+    fn fill_rule_is_inherited_from_a_group() {
+        let svg = br#"<svg width="8" height="8"><g fill-rule="evenodd">
+            <path fill="red" d="M0 0H8V8H0Z M2 2H6V6H2Z"/></g></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(1, 1), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(
+            image.pixel(4, 4),
+            Some(Color::TRANSPARENT),
+            "the descendant path inherits the group's evenodd fill rule"
+        );
+    }
+
+    #[test]
+    fn small_shapes_have_antialiased_edge_coverage() {
+        let svg = br##"<svg width="24" height="24">
+            <circle cx="12" cy="12" r="10" fill="#1772f6"/></svg>"##;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        let mut partial = 0;
+        let mut opaque = 0;
+        for y in 0..24 {
+            for x in 0..24 {
+                let alpha = image.pixel(x, y).expect("inside image").alpha;
+                if alpha == 255 {
+                    opaque += 1;
+                } else if alpha > 0 {
+                    partial += 1;
+                }
+            }
+        }
+        assert!(opaque > 100, "the circle interior stays opaque");
+        assert!(
+            partial > 20,
+            "a 24px circle must have antialiased edge pixels, found {partial}"
+        );
+    }
+
+    #[test]
+    fn fill_and_stroke_opacity_are_honoured() {
+        let svg = br#"<svg width="8" height="12">
+            <g fill-opacity="0.5"><rect width="8" height="6" fill="red"/></g>
+            <line x1="0" y1="10.5" x2="8" y2="10.5" stroke="blue"
+                  stroke-width="2" stroke-opacity="0.5"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(4, 3).expect("fill pixel").alpha, 128);
+        assert_eq!(
+            image.pixel(4, 10).expect("stroke pixel"),
+            Color::rgba(0, 0, 255, 128)
+        );
+    }
+
+    #[test]
+    fn stroke_width_scales_with_the_transform() {
+        let svg = br#"<svg width="16" height="16">
+            <g transform="scale(2)"><line x1="1" y1="4" x2="7" y2="4"
+                stroke="black" stroke-width="1"/></g></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        // A 1-unit stroke under scale(2) covers two device rows, not one.
+        assert!(image.pixel(4, 7).expect("row above").alpha > 0);
+        assert!(image.pixel(4, 8).expect("row below").alpha > 0);
+        assert_eq!(image.pixel(4, 6).expect("outside").alpha, 0);
+        assert_eq!(image.pixel(4, 9).expect("outside").alpha, 0);
+    }
+
+    #[test]
     fn clip_rule_evenodd_cuts_a_hole_while_nonzero_fills_it() {
         let evenodd = br#"<svg width="10" height="10"><defs>
             <clipPath id="c" clip-rule="evenodd"><path d="M0 0H10V10H0Z M3 3H7V7H3Z"/></clipPath>
@@ -5836,7 +6145,7 @@ mod tests {
 
     #[test]
     fn stroke_only_line_draws_its_pixels() {
-        let svg = br#"<svg width="6" height="6"><line x1="1" y1="1" x2="5" y2="1" stroke="black" stroke-width="1"/></svg>"#;
+        let svg = br#"<svg width="6" height="6"><line x1="1" y1="1.5" x2="5" y2="1.5" stroke="black" stroke-width="1"/></svg>"#;
         let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
         assert_eq!(image.pixel(3, 1), Some(Color::rgb(0, 0, 0)));
         assert_eq!(image.pixel(3, 3), Some(Color::rgba(0, 0, 0, 0)));

@@ -3207,16 +3207,72 @@ fn paint_image(
             }
             let unit_x = (u32_to_f32(x) + 0.5 - destination.origin.x) / destination.size.width;
             let unit_y = (u32_to_f32(y) + 0.5 - destination.origin.y) / destination.size.height;
-            let source_x = floor_to_u32(source.origin.x + unit_x * source.size.width);
-            let source_y = floor_to_u32(source.origin.y + unit_y * source.size.height);
-            if let (Some(color), Some(index)) =
-                (image.pixel(source_x, source_y), surface.index(x, y))
-            {
+            // Pixel centres sit half a unit inside a source pixel in the
+            // bilinear sampler's coordinate system.
+            let source_x = source.origin.x + unit_x * source.size.width - 0.5;
+            let source_y = source.origin.y + unit_y * source.size.height - 0.5;
+            if let (Some(color), Some(index)) = (
+                sample_image_bilinear(image, source_x, source_y, source),
+                surface.index(x, y),
+            ) {
                 surface.pixels[index] = blend(surface.pixels[index], color, coverage);
             }
         }
     }
     true
+}
+
+/// Sample a decoded image at a fractional source coordinate.
+///
+/// `clip` is the source rectangle the paint command selected; sampling clamps
+/// to its edges, so an `object-fit: cover` crop cannot read pixels that were
+/// excluded from the source rect. Interpolation happens in premultiplied
+/// alpha, so transparent edges do not darken the result.
+#[allow(
+    clippy::float_cmp,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)] // integer coordinates are an exact bit-pattern test; clamped source coordinates are non-negative
+fn sample_image_bilinear(
+    image: &crate::image::DecodedImage,
+    x: f32,
+    y: f32,
+    clip: PhysicalRect,
+) -> Option<Color> {
+    if !x.is_finite() || !y.is_finite() || clip.size.width <= 0.0 || clip.size.height <= 0.0 {
+        return None;
+    }
+    let right = clip.right();
+    let bottom = clip.bottom();
+    let max_x = (right - 1.0).max(clip.origin.x);
+    let max_y = (bottom - 1.0).max(clip.origin.y);
+    let x = x.clamp(clip.origin.x, max_x);
+    let y = y.clamp(clip.origin.y, max_y);
+    let left = floor_to_u32(x);
+    let top = floor_to_u32(y);
+    let fraction_x = x - u32_to_f32(left);
+    let fraction_y = y - u32_to_f32(top);
+    if fraction_x == 0.0 && fraction_y == 0.0 {
+        return image.pixel(left, top);
+    }
+    // Outside the selected source rectangle, clamp to its edge. That is the
+    // texture behavior images use; returning transparent would fade the last
+    // destination pixel of an upscaled image.
+    let sample = |column: u32, row: u32| {
+        let column = u32_to_f32(column).clamp(clip.origin.x, max_x);
+        let row = u32_to_f32(row).clamp(clip.origin.y, max_y);
+        image
+            .pixel(column as u32, row as u32)
+            .map_or(PREMULTIPLIED_TRANSPARENT, premultiplied)
+    };
+    Some(unpremultiplied(PremultipliedColor::mix(
+        sample(left, top),
+        sample(left + 1, top),
+        sample(left, top + 1),
+        sample(left + 1, top + 1),
+        fraction_x,
+        fraction_y,
+    )))
 }
 
 /// The number of physical pixels a filter can add on each side of its input.
@@ -4273,6 +4329,7 @@ mod tests {
     use super::{
         Color, CpuRasterizer, NoGlyphMasks, NoRasterCancellation, PreparedRoundedShape,
         RasterCancelled, Surface, paint_box_shadow, paint_box_shadow_analytic,
+        sample_image_bilinear,
     };
 
     #[derive(Clone, Copy, Debug)]
@@ -5858,6 +5915,35 @@ mod tests {
         // Red source pixels warp here too, but the clip cuts them off.
         assert_eq!(output.surface.pixel(9, 9), Some(Color::WHITE));
         assert!(output.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn image_sampling_interpolates_between_source_pixels() {
+        let image = crate::image::DecodedImage::from_pixels(
+            2,
+            2,
+            vec![Color::BLACK, Color::WHITE, Color::WHITE, Color::BLACK],
+        )
+        .expect("2x2 image");
+        let source = PhysicalRect::new(0.0, 0.0, 2.0, 2.0);
+        assert_eq!(
+            sample_image_bilinear(&image, 0.0, 0.0, source),
+            Some(Color::BLACK)
+        );
+        assert_eq!(
+            sample_image_bilinear(&image, 1.0, 0.0, source),
+            Some(Color::WHITE)
+        );
+        let middle = sample_image_bilinear(&image, 0.5, 0.5, source).expect("midpoint");
+        assert_eq!(middle, Color::rgb(128, 128, 128));
+
+        // A source crop clamps to its own edge rather than reading pixels the
+        // paint command excluded.
+        let crop = PhysicalRect::new(0.0, 0.0, 1.0, 1.0);
+        assert_eq!(
+            sample_image_bilinear(&image, 0.75, 0.75, crop),
+            Some(Color::BLACK)
+        );
     }
 
     /// An integer translation is blitted directly, so the fast row path must
