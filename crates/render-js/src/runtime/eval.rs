@@ -3564,6 +3564,11 @@ impl JsRuntime {
     /// error, so a bundle failure maps to its byte position. A thrown error
     /// object keeps its stack; only its `message` gains the suffix.
     fn locate_error(&mut self, error: JsError, offset: usize, callee: &Expr) -> JsError {
+        // The optional-chain sentinel is internal control flow, not a script
+        // error: annotating it would replace the flag the `?.` handler tests.
+        if error.is_optional_short_circuit() {
+            return error;
+        }
         // The innermost call site wins (`at_offset` keeps the first span).
         let error = error.at_offset(offset);
         if !matches!(error.kind(), JsErrorKind::Type | JsErrorKind::Throw) {

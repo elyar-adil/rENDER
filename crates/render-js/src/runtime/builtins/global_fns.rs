@@ -33,6 +33,7 @@ use crate::utf16::JsString;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use render_dom::Dom;
+use sha1::Digest as _;
 
 impl JsRuntime {
     fn base64_encode(bytes: &[u8]) -> String {
@@ -184,6 +185,8 @@ impl JsRuntime {
             NativeFunction::GlobalFetch
             | NativeFunction::ResponseText
             | NativeFunction::ResponseJson
+            | NativeFunction::ResponseArrayBuffer
+            | NativeFunction::ResponseClone
             | NativeFunction::ResponseHeadersGet
             | NativeFunction::BlobText
             | NativeFunction::BlobArrayBuffer
@@ -542,6 +545,45 @@ impl JsRuntime {
                 getrandom::fill(&mut bytes)
                     .map_err(|error| JsError::dom(format!("no entropy source: {error}")))?;
                 let values: Vec<JsValue> = bytes
+                    .into_iter()
+                    .map(|byte| JsValue::Number(f64::from(byte)))
+                    .collect();
+                Ok(JsValue::Object(self.create_array_from_values(&values)?))
+            }
+            NativeFunction::GlobalDigest => {
+                // The prelude's `SubtleCrypto.digest` converts the buffer
+                // source and takes this host hook off the global object before
+                // page scripts run, so an algorithm name and byte array cross
+                // the boundary in one direction only.
+                let algorithm = required_argument(arguments, 0, "digest")?
+                    .to_js_string()
+                    .to_lossy();
+                let JsValue::Object(input) = required_argument(arguments, 1, "digest")? else {
+                    return Err(JsError::type_error("digest requires a byte array"));
+                };
+                let values = self.array_elements_for(dom, *input)?;
+                let mut bytes = Vec::with_capacity(values.len());
+                for value in values {
+                    let number = match value {
+                        JsValue::Undefined => 0.0,
+                        value => self.to_number_value(dom, &value)?,
+                    };
+                    let byte = if number.is_finite() {
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            clippy::cast_sign_loss,
+                            reason = "ToUint8 wraps the value into 0..=255 before the cast"
+                        )]
+                        {
+                            number.trunc().rem_euclid(256.0) as u8
+                        }
+                    } else {
+                        0
+                    };
+                    bytes.push(byte);
+                }
+                let digest = digest_bytes(&algorithm, &bytes)?;
+                let values: Vec<JsValue> = digest
                     .into_iter()
                     .map(|byte| JsValue::Number(f64::from(byte)))
                     .collect();
@@ -2021,6 +2063,21 @@ impl JsRuntime {
         }
         self.console_messages.push(ConsoleMessage { level, text });
         Ok(JsValue::Undefined)
+    }
+}
+
+/// Web Crypto §3.1.2 `SubtleCrypto.digest` over the four standard hash
+/// functions. The prelude has already validated the name, so the fallthrough
+/// only guards an embedder calling the host hook directly.
+fn digest_bytes(algorithm: &str, bytes: &[u8]) -> Result<Vec<u8>, JsError> {
+    match algorithm.to_ascii_uppercase().as_str() {
+        "SHA-1" => Ok(sha1::Sha1::digest(bytes).to_vec()),
+        "SHA-256" => Ok(sha2::Sha256::digest(bytes).to_vec()),
+        "SHA-384" => Ok(sha2::Sha384::digest(bytes).to_vec()),
+        "SHA-512" => Ok(sha2::Sha512::digest(bytes).to_vec()),
+        _ => Err(JsError::dom(format!(
+            "unrecognized digest algorithm {algorithm:?}"
+        ))),
     }
 }
 

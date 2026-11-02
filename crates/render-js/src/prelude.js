@@ -974,8 +974,9 @@
 
   // ------------------------------------------------------------------ crypto
   // Web Crypto §10 `getRandomValues` and `randomUUID`, drawn from the operating
-  // system's generator. `crypto.subtle` is absent: there is no digest, key or
-  // cipher implementation behind it, and a stub that answers would be wrong.
+  // system's generator, plus §3 `SubtleCrypto.digest` with the platform hash
+  // behind a host hook. The rest of `crypto.subtle` (keys, ciphers, signatures)
+  // is absent: a stub that answers would be wrong.
   if (typeof crypto === 'undefined' && typeof global.__render_random_bytes === 'function') {
     var randomBytes = global.__render_random_bytes;
     delete global.__render_random_bytes;
@@ -1013,6 +1014,59 @@
       var hex = b.map(function (v) { return (v + 256).toString(16).slice(1); }).join('');
       return hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20);
     });
+    // Web Crypto §3 `SubtleCrypto.digest`: the four standard hash functions,
+    // with the platform hash computed by the host hook. Buffer-source
+    // conversion and the promise shape stay here, where IDL conversion errors
+    // reject the returned promise instead of throwing from `digest` itself.
+    var digestAlgorithms = { 'SHA-1': true, 'SHA-256': true, 'SHA-384': true, 'SHA-512': true };
+    var renderDigest = global.__render_digest;
+    delete global.__render_digest;
+    var SubtleCryptoImpl = function SubtleCrypto() {
+      throw new TypeError('Illegal constructor');
+    };
+    define(SubtleCryptoImpl.prototype, 'digest', function digest(algorithm, data) {
+      var name;
+      try {
+        name = typeof algorithm === 'string' ? algorithm : String(algorithm && algorithm.name);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      name = name.toUpperCase();
+      if (digestAlgorithms[name] !== true) {
+        return Promise.reject(new DOMException("Failed to execute 'digest' on 'SubtleCrypto': Unrecognized algorithm name", 'NotSupportedError'));
+      }
+      var bytes;
+      try {
+        var source;
+        if (data instanceof ArrayBuffer) {
+          source = new Uint8Array(data);
+        } else if (ArrayBuffer.isView(data)) {
+          source = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        } else {
+          throw new TypeError("Failed to execute 'digest' on 'SubtleCrypto': The provided value is not of type '(ArrayBuffer or ArrayBufferView)'");
+        }
+        bytes = [];
+        for (var index = 0; index < source.length; index++) bytes.push(source[index]);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      return new Promise(function (resolve, reject) {
+        try {
+          if (typeof renderDigest !== 'function') throw new Error('digest is unavailable');
+          var output = renderDigest(name, bytes);
+          var buffer = new ArrayBuffer(output.length);
+          var view = new Uint8Array(buffer);
+          for (var index = 0; index < output.length; index++) view[index] = output[index];
+          resolve(buffer);
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    defineProperty(SubtleCryptoImpl.prototype, Symbol.toStringTag, { value: 'SubtleCrypto', configurable: true });
+    defineProperty(global, 'SubtleCrypto', { value: SubtleCryptoImpl, writable: true, configurable: true, enumerable: false });
+    var subtle = Object.create(SubtleCryptoImpl.prototype);
+    defineGetter(CryptoImpl.prototype, 'subtle', function () { return subtle; });
     defineProperty(CryptoImpl.prototype, Symbol.toStringTag, { value: 'Crypto', configurable: true });
     defineProperty(global, 'Crypto', { value: CryptoImpl, writable: true, configurable: true, enumerable: false });
     defineProperty(global, 'crypto', {

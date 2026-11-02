@@ -363,7 +363,66 @@ fn crypto_random_values_and_uuid() {
     );
     assert_eq!(
         ok("typeof __render_random_bytes + typeof crypto.subtle"),
-        "undefinedundefined"
+        "undefinedobject"
+    );
+}
+
+#[test]
+fn crypto_subtle_digest_hashes_buffer_sources() {
+    let mut dom = parse_document("<!doctype html><p></p>").dom;
+    let mut runtime = JsRuntime::new(&dom);
+    runtime
+        .execute(
+            &mut dom,
+            r"
+                var digestLog = [];
+                function hex(buffer) {
+                    return Array.from(new Uint8Array(buffer), function (byte) {
+                        return (byte + 256).toString(16).slice(1);
+                    }).join('');
+                }
+                crypto.subtle.digest('SHA-256', new TextEncoder().encode('abc')).then(function (buffer) {
+                    digestLog.push('sha256:' + hex(buffer));
+                });
+                crypto.subtle.digest('SHA-1', new Uint8Array([0x61, 0x62, 0x63]).buffer).then(function (buffer) {
+                    digestLog.push('sha1:' + hex(buffer));
+                });
+                crypto.subtle.digest('SHA-384', new TextEncoder().encode('abc')).then(function (buffer) {
+                    digestLog.push('sha384:' + hex(buffer).slice(0, 16));
+                });
+                crypto.subtle.digest('SHA-512', new TextEncoder().encode('abc')).then(function (buffer) {
+                    digestLog.push('sha512:' + hex(buffer).slice(0, 16));
+                });
+                crypto.subtle.digest('MD5', new TextEncoder().encode('abc')).catch(function (error) {
+                    digestLog.push('md5:' + error.name);
+                });
+                crypto.subtle.digest('SHA-256', 7).catch(function (error) {
+                    digestLog.push('bad:' + error.name);
+                });
+            ",
+        )
+        .expect("digest script executes");
+    while let Some(microtask) = runtime.take_next_microtask() {
+        runtime
+            .invoke_microtask(&mut dom, microtask)
+            .expect("digest microtask executes");
+    }
+    let value = runtime
+        .execute(&mut dom, "digestLog.join('|')")
+        .expect("digest log reads")
+        .value
+        .to_js_string()
+        .to_lossy();
+    assert_eq!(
+        value,
+        concat!(
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad|",
+            "sha1:a9993e364706816aba3e25717850c26c9cd0d89d|",
+            "sha384:cb00753f45a35e8b|",
+            "sha512:ddaf35a193617aba|",
+            "md5:NotSupportedError|",
+            "bad:TypeError"
+        )
     );
 }
 

@@ -698,6 +698,26 @@ impl JsRuntime {
                 *target,
             );
         }
+        // A pending promise's reaction list is the only reference to the
+        // `AsyncResume` callback that continues an async function. The promise
+        // object itself can be unreachable after `await` while a host transfer
+        // still holds the promise by index (the awaited promise of an async
+        // helper is the common shape), so trace the reactions directly. A
+        // settled promise has already drained this list in `resolve_promise`.
+        for index in 0..self.promises.len() {
+            let Some(record) = self.promises.get(index) else {
+                continue;
+            };
+            if matches!(record.state, PromiseState::Pending) && !record.reactions.is_empty() {
+                mark_promise(
+                    self,
+                    &mut marked,
+                    &mut work,
+                    &mut marked_environments,
+                    index,
+                );
+            }
+        }
         for microtask in &self.pending_microtasks {
             match microtask {
                 JsMicrotask::Callback(callback) => {

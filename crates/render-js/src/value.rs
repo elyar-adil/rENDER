@@ -852,6 +852,9 @@ pub(crate) enum NativeFunction {
     GlobalAtob,
     GlobalBtoa,
     GlobalRandomBytes,
+    /// Web Crypto `SubtleCrypto.digest`: the prelude converts the buffer
+    /// source to bytes and this computes the platform hash.
+    GlobalDigest,
     GlobalEval,
     GlobalImport,
     /// `import.defer(specifier)`: the deferred namespace, without evaluation.
@@ -1484,6 +1487,10 @@ pub(crate) enum NativeFunction {
     ShadowRealmImportValue,
     ResponseText,
     ResponseJson,
+    /// `Response.prototype.arrayBuffer`: the exact transferred bytes.
+    ResponseArrayBuffer,
+    /// `Response.prototype.clone`: an independent copy of status, headers and body.
+    ResponseClone,
     ResponseHeadersGet,
     BlobText,
     BlobArrayBuffer,
@@ -2797,8 +2804,9 @@ pub(crate) enum ObjectHost {
         status: u16,
         status_text: String,
         headers: Vec<(String, String)>,
-        /// Body decoded lossily as UTF-8; `text()` and `json()` read this.
-        body: String,
+        /// The exact transferred bytes. `text()` and `json()` decode them as
+        /// UTF-8 at read time, and `arrayBuffer()` hands them back unchanged.
+        body: Vec<u8>,
     },
     /// A `response.headers` instance reading through its owning `Response`.
     ResponseHeaders {
@@ -3881,18 +3889,25 @@ impl Realm {
     /// `onload = f` throws a `ReferenceError` instead of installing the handler;
     /// event dispatch reads them back as ordinary `on<type>` properties.
     fn install_window_event_handlers(objects: &mut [JsObject], global: ObjectId) {
+        Self::install_event_handler_attributes(objects, global);
+    }
+
+    /// Installs the `GlobalEventHandlers` IDL attributes on a prototype. The
+    /// names are shared with `Window`; a duplicate on a more specific
+    /// prototype is skipped so it cannot shadow a script-defined accessor.
+    fn install_event_handler_attributes(objects: &mut [JsObject], target: ObjectId) {
         for name in Self::WINDOW_EVENT_HANDLER_NAMES {
-            objects[global.0].properties.insert(
-                (*name).to_owned(),
-                PropertyDescriptor {
+            objects[target.0]
+                .properties
+                .entry((*name).to_owned())
+                .or_insert_with(|| PropertyDescriptor {
                     getter: None,
                     setter: None,
                     value: JsValue::Null,
                     writable: true,
                     enumerable: true,
                     configurable: true,
-                },
-            );
+                });
         }
     }
 
@@ -3983,6 +3998,10 @@ impl Realm {
             prototype: Some(element_prototype),
             ..JsObject::default()
         });
+        // `Document` implements `GlobalEventHandlers`; feature detection such
+        // as React's `'oninput' in document` depends on the IDL attributes
+        // existing even before a listener is assigned.
+        Self::install_event_handler_attributes(objects, document_prototype);
         Self::dom_interface(
             objects,
             global,
@@ -4113,6 +4132,7 @@ impl Realm {
             ("atob", NativeFunction::GlobalAtob),
             ("btoa", NativeFunction::GlobalBtoa),
             ("__render_random_bytes", NativeFunction::GlobalRandomBytes),
+            ("__render_digest", NativeFunction::GlobalDigest),
             ("__render_noop", NativeFunction::GlobalNoop),
         ] {
             Self::define_global_function(objects, global, name, function);
@@ -4988,12 +5008,16 @@ impl Realm {
             element,
             &[("attachShadow", NativeFunction::AttachShadow)],
         );
-        derive(
+        let html_element = derive(
             "HTMLElement",
             "Element",
             ObjectHost::DomConstructor,
             objects,
         );
+        // HTML §8.1.7.2: `HTMLElement` includes `GlobalEventHandlers`. The
+        // `on<type>` IDL attributes exist as `null` before assignment, which
+        // framework input-support probes test with `'oninput' in element`.
+        Self::install_event_handler_attributes(objects, html_element);
         derive("SVGElement", "Element", ObjectHost::DomConstructor, objects);
         derive(
             "SVGSVGElement",
@@ -9998,6 +10022,8 @@ impl Realm {
         for (name, function) in [
             ("text", NativeFunction::ResponseText),
             ("json", NativeFunction::ResponseJson),
+            ("arrayBuffer", NativeFunction::ResponseArrayBuffer),
+            ("clone", NativeFunction::ResponseClone),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {

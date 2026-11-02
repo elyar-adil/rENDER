@@ -647,7 +647,7 @@ impl JsRuntime {
 
     /// A new `ArrayBuffer` object over `buffer`. The object becomes the store's
     /// identity, so every view of the buffer reports this object as its `buffer`.
-    fn new_array_buffer(
+    pub(in crate::runtime) fn new_array_buffer(
         &mut self,
         prototype: Option<ObjectId>,
         buffer: &TypedBuffer,
@@ -659,6 +659,23 @@ impl JsRuntime {
         }
         buffer.identify(object);
         Ok(object)
+    }
+
+    /// An `ArrayBuffer` object holding exactly `bytes`, for APIs that expose
+    /// byte payloads (`Response.arrayBuffer`, `Blob.arrayBuffer`).
+    pub(in crate::runtime) fn array_buffer_from_bytes(
+        &mut self,
+        bytes: Vec<u8>,
+    ) -> Result<ObjectId, JsError> {
+        let Some(JsValue::Object(constructor)) = self.realm.global("ArrayBuffer") else {
+            return Err(JsError::type_error("ArrayBuffer is unavailable"));
+        };
+        let prototype = match self.realm.get_property(constructor, "prototype") {
+            Some(JsValue::Object(prototype)) => Some(prototype),
+            _ => None,
+        };
+        let buffer = TypedBuffer::new(bytes);
+        self.new_array_buffer(prototype, &buffer)
     }
 
     /// The `ArrayBuffer` object of `buffer`. A store that a typed array made

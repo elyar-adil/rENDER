@@ -67,6 +67,8 @@ impl JsRuntime {
             }
             NativeFunction::ResponseText => self.response_text(receiver),
             NativeFunction::ResponseJson => self.response_json(receiver),
+            NativeFunction::ResponseArrayBuffer => self.response_array_buffer(receiver),
+            NativeFunction::ResponseClone => self.response_clone(receiver),
             NativeFunction::ResponseHeadersGet => self.response_headers_get(receiver, arguments),
             NativeFunction::BlobText
             | NativeFunction::BlobArrayBuffer
@@ -507,7 +509,7 @@ impl JsRuntime {
             outcome.status,
             outcome.status_text.clone(),
             outcome.headers.clone(),
-            String::from_utf8_lossy(&outcome.body).into_owned(),
+            outcome.body.clone(),
         );
         Ok(JsValue::Object(response))
     }
@@ -520,8 +522,8 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let prototype = self.constructor_prototype(constructor)?;
         let body = match arguments.first() {
-            None | Some(JsValue::Undefined | JsValue::Null) => String::new(),
-            Some(value) => (value.to_js_string()).to_lossy(),
+            None | Some(JsValue::Undefined | JsValue::Null) => Vec::new(),
+            Some(value) => (value.to_js_string()).to_lossy().into_bytes(),
         };
         self.ensure_heap_capacity(3)?;
         let response = self.realm.create_object(Some(prototype));
@@ -536,7 +538,7 @@ impl JsRuntime {
         status: u16,
         status_text: String,
         headers: Vec<(String, String)>,
-        body: String,
+        body: Vec<u8>,
     ) {
         for (name, value) in [
             ("status", JsValue::Number(f64::from(status))),
@@ -578,7 +580,7 @@ impl JsRuntime {
 
     fn response_text(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
         let body = match self.realm.host(receiver) {
-            Some(ObjectHost::Response { body, .. }) => body.clone(),
+            Some(ObjectHost::Response { body, .. }) => String::from_utf8_lossy(&body).into_owned(),
             _ => return Err(JsError::type_error("incompatible Response method receiver")),
         };
         // The body is already available, so the promise settles immediately;
@@ -588,9 +590,44 @@ impl JsRuntime {
         Ok(value)
     }
 
+    /// `Response.prototype.arrayBuffer()`: the transferred bytes as an
+    /// `ArrayBuffer`. No lossy string round-trip, so binary payloads survive.
+    fn response_array_buffer(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
+        let bytes = match self.realm.host(receiver) {
+            Some(ObjectHost::Response { body, .. }) => body.clone(),
+            _ => return Err(JsError::type_error("incompatible Response method receiver")),
+        };
+        let buffer = self.array_buffer_from_bytes(bytes)?;
+        let (promise, value) = self.create_promise()?;
+        self.resolve_promise(promise, &JsValue::Object(buffer));
+        Ok(value)
+    }
+
+    /// `Response.prototype.clone()` (Fetch §6.4): a new response with the same
+    /// status, headers and a copy of the body.
+    fn response_clone(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
+        let (status, status_text, headers, body) = match self.realm.host(receiver) {
+            Some(ObjectHost::Response {
+                status,
+                status_text,
+                headers,
+                body,
+            }) => (status, status_text.clone(), headers.clone(), body.clone()),
+            _ => return Err(JsError::type_error("incompatible Response method receiver")),
+        };
+        let Some(JsValue::Object(constructor)) = self.realm.global("Response") else {
+            return Err(JsError::type_error("Response constructor is unavailable"));
+        };
+        let prototype = self.constructor_prototype(constructor)?;
+        self.ensure_heap_capacity(3)?;
+        let response = self.realm.create_object(Some(prototype));
+        self.install_response_state(response, status, status_text, headers, body);
+        Ok(JsValue::Object(response))
+    }
+
     fn response_json(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
         let body = match self.realm.host(receiver) {
-            Some(ObjectHost::Response { body, .. }) => body.clone(),
+            Some(ObjectHost::Response { body, .. }) => String::from_utf8_lossy(&body).into_owned(),
             _ => return Err(JsError::type_error("incompatible Response method receiver")),
         };
         let (promise, value) = self.create_promise()?;
@@ -1162,6 +1199,47 @@ mod tests {
             observed,
             JsValue::String("duplicate-blocked|true|17|true|https://example.test/data".into())
         );
+    }
+
+    #[test]
+    fn response_array_buffer_keeps_binary_bytes_and_clone_copies_the_body() {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        runtime
+            .execute(
+                &mut parsed.dom,
+                r"
+                    var binary = 'pending';
+                    var cloneText = 'pending';
+                    fetch('https://example.test/binary').then(function (response) {
+                        var copy = response.clone();
+                        copy.text().then(function (text) { cloneText = text.length; });
+                        return response.arrayBuffer();
+                    }).then(function (buffer) {
+                        var bytes = new Uint8Array(buffer);
+                        binary = bytes.length + ':' + bytes[0] + ':' + bytes[1] + ':' + bytes[3];
+                    });
+                ",
+            )
+            .expect("binary response script executes");
+        let requests = runtime.take_pending_fetch_requests();
+        assert_eq!(requests.len(), 1);
+        runtime.settle_fetch(
+            &mut parsed.dom,
+            requests[0].id,
+            Ok(FetchOutcome {
+                status: 200,
+                status_text: "OK".to_owned(),
+                headers: Vec::new(),
+                body: vec![0, 255, 10, 128],
+            }),
+        );
+        drain(&mut runtime, &mut parsed.dom);
+        let observed = runtime
+            .execute(&mut parsed.dom, "binary + '|' + cloneText")
+            .expect("binary result reads")
+            .value;
+        assert_eq!(observed, JsValue::String("4:0:255:128|4".into()));
     }
 
     #[test]

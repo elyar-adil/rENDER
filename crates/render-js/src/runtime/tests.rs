@@ -224,6 +224,67 @@ fn url_search_params_updates_its_owning_url() {
 }
 
 #[test]
+fn async_function_returning_a_promise_adopts_its_state() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var asyncLog = [];
+                async function asyncInner() { await 1; return 42; }
+                async function asyncMiddle() { return asyncInner(); }
+                async function asyncOuter() { var value = await asyncMiddle(); asyncLog.push('outer=' + value); }
+                asyncOuter();
+                asyncLog.push('sync');
+            ",
+        )
+        .expect("async chain executes");
+    runtime.collect_garbage();
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    let value = runtime
+        .execute(&mut parsed.dom, "asyncLog.join('|')")
+        .expect("async log reads")
+        .value;
+    assert_eq!(value, JsValue::String("sync|outer=42".into()));
+}
+
+#[test]
+fn awaited_promise_reactions_survive_garbage_collection() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var gateLog = [];
+                var resolveGate;
+                async function gateInner() {
+                    await new Promise(function (resolve) { resolveGate = resolve; });
+                    return 42;
+                }
+                async function gateMiddle() { return gateInner(); }
+                async function gateOuter() {
+                    var value = await gateMiddle();
+                    gateLog.push('outer=' + value);
+                }
+                gateOuter();
+            ",
+        )
+        .expect("gated async chain executes");
+    runtime.collect_garbage();
+    runtime
+        .execute(&mut parsed.dom, "resolveGate(42)")
+        .expect("gate resolves");
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    let value = runtime
+        .execute(&mut parsed.dom, "gateLog.join('|')")
+        .expect("gate log reads")
+        .value;
+    assert_eq!(value, JsValue::String("outer=42".into()));
+}
+
+#[test]
 fn url_parse_returns_null_instead_of_throwing() {
     let mut parsed = parse_document("<!doctype html><p></p>");
     let mut runtime = JsRuntime::new(&parsed.dom);
@@ -238,7 +299,13 @@ fn url_parse_returns_null_instead_of_throwing() {
                 URL.parse("http://[::1") === null &&
                 URL.canParse("/a", "https://example.test") === true &&
                 URL.canParse("/a") === false &&
-                URL.canParse("https://example.test/x") === true;
+                URL.canParse("https://example.test/x") === true &&
+                URL.parse("/a?b=1", new URL("https://example.test/base")).href === "https://example.test/a?b=1" &&
+                URL.canParse("/a", new URL("https://example.test/base")) === true &&
+                new URL("/a", new URL("https://example.test/base")).pathname === "/a" &&
+                URL.parse({ toString() { return "https://example.test/object"; } }).pathname === "/object" &&
+                URL.parse("https://example.test/x", "not a base") === null &&
+                (() => { try { new URL("https://example.test/x", "not a base"); return false; } catch (error) { return error instanceof TypeError; } })();
             "#,
         )
         .expect("URL.parse should execute");
@@ -4723,6 +4790,47 @@ fn fetch_resolves_relative_urls_against_the_document_base() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].url, "https://example.test/app/api/v1?id=7");
     assert_eq!(requests[0].method, "GET");
+}
+
+#[test]
+fn awaited_fetch_reactions_survive_garbage_collection() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var awaitedFetch = 'pending';
+                async function fetchStatus() {
+                    var response = await fetch('https://example.test/data');
+                    return response.status;
+                }
+                async function awaitFetch() {
+                    awaitedFetch = 'status:' + await fetchStatus();
+                }
+                awaitFetch();
+            ",
+        )
+        .expect("awaited fetch executes");
+    let requests = runtime.take_pending_fetch_requests();
+    assert_eq!(requests.len(), 1);
+    let id = requests[0].id;
+    runtime.collect_garbage();
+    runtime.settle_fetch(
+        &mut parsed.dom,
+        id,
+        Ok(FetchOutcome {
+            status: 201,
+            status_text: "Created".to_owned(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }),
+    );
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    let outcome = runtime
+        .execute(&mut parsed.dom, "awaitedFetch")
+        .expect("awaited fetch result reads");
+    assert_eq!(outcome.value, JsValue::String("status:201".into()));
 }
 
 #[test]

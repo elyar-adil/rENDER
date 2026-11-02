@@ -28,6 +28,16 @@ fn eval(source: &str) -> String {
 }
 
 #[test]
+fn document_and_html_elements_expose_event_handler_idl_attributes() {
+    assert_eq!(
+        eval(
+            "['oninput' in document, 'onclick' in document, 'oninput' in document.createElement('div'), document.oninput === null, document.createElement('div').oninput === null].join()"
+        ),
+        "true,true,true,true,true"
+    );
+}
+
+#[test]
 fn closest_walks_up_and_includes_the_element_itself() {
     assert_eq!(
         eval(

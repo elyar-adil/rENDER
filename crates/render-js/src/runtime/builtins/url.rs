@@ -86,12 +86,12 @@ impl JsRuntime {
 
     pub(in crate::runtime) fn url_constructor(
         &mut self,
-        _dom: &mut Dom,
+        dom: &mut Dom,
         constructor: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let parsed = self
-            .resolve_url(arguments, true)?
+            .resolve_url(dom, arguments, true)?
             .ok_or_else(|| JsError::type_error("Invalid URL"))?;
         let prototype = self
             .realm
@@ -106,8 +106,8 @@ impl JsRuntime {
     /// `URL.parse(input, base)` (the URL parser static method): `null` where
     /// the constructor would throw. It never installs a base URL of its own,
     /// so a relative input without a base is not parseable.
-    fn url_parse(&mut self, _dom: &mut Dom, arguments: &[JsValue]) -> Result<JsValue, JsError> {
-        match self.resolve_url(arguments, false)? {
+    fn url_parse(&mut self, dom: &mut Dom, arguments: &[JsValue]) -> Result<JsValue, JsError> {
+        match self.resolve_url(dom, arguments, false)? {
             Some(url) => {
                 let prototype = self.url_prototype();
                 self.create_url_instance(&url, prototype)
@@ -117,9 +117,9 @@ impl JsRuntime {
     }
 
     /// `URL.canParse(input, base)`: whether `URL.parse` would return a URL.
-    fn url_can_parse(&mut self, _dom: &mut Dom, arguments: &[JsValue]) -> Result<JsValue, JsError> {
+    fn url_can_parse(&mut self, dom: &mut Dom, arguments: &[JsValue]) -> Result<JsValue, JsError> {
         Ok(JsValue::Boolean(
-            self.resolve_url(arguments, false)?.is_some(),
+            self.resolve_url(dom, arguments, false)?.is_some(),
         ))
     }
 
@@ -141,28 +141,34 @@ impl JsRuntime {
     /// input is relative and no base argument was given; `URL.parse` does not.
     fn resolve_url(
         &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
         require_result: bool,
     ) -> Result<Option<Url>, JsError> {
-        let input = required_argument(arguments, 0, "URL")?.to_js_string();
-        let input = input.to_lossy();
+        // WHATWG URL: both arguments are converted with ToString, so a `URL`
+        // object (or any object with `toString`) supplies its string form.
+        let input = self
+            .to_string_value(dom, required_argument(arguments, 0, "URL")?)?
+            .to_lossy();
         let explicit_base = match arguments.get(1) {
             None | Some(JsValue::Undefined) => None,
-            Some(value) => Some(value.to_js_string().to_lossy()),
+            Some(value) => Some(self.to_string_value(dom, value)?.to_lossy()),
         };
-        let base = explicit_base.or_else(|| {
-            if require_result {
+        if let Some(base) = explicit_base {
+            // An explicit base is parsed before the input; an invalid one makes
+            // the result unparseable even when the input is absolute.
+            return Ok(Url::parse(&base)
+                .ok()
+                .and_then(|base| Url::parse(&input).ok().or_else(|| base.join(&input).ok())));
+        }
+        if require_result {
+            return Ok(Url::parse(&input).ok().or_else(|| {
                 self.document_url()
-            } else {
-                None
-            }
-        });
-        Ok(match base {
-            Some(base) => Url::parse(&input)
-                .or_else(|_| Url::parse(&base).and_then(|base| base.join(&input)))
-                .ok(),
-            None => Url::parse(&input).ok(),
-        })
+                    .and_then(|base| Url::parse(&base).ok())
+                    .and_then(|base| base.join(&input).ok())
+            }));
+        }
+        Ok(Url::parse(&input).ok())
     }
 
     fn document_url(&self) -> Option<String> {

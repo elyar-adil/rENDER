@@ -12,7 +12,7 @@ use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
-use crate::value::{NativeFunction, ObjectHost, TypedArrayKind};
+use crate::value::{NativeFunction, ObjectHost};
 use render_dom::Dom;
 
 const MAX_BLOB_BYTES: usize = 16 * 1024 * 1024;
@@ -141,29 +141,9 @@ impl JsRuntime {
 
     fn blob_array_buffer(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
         let (bytes, _) = self.blob_bytes(receiver)?;
-        let constructor = self
-            .realm
-            .global("Uint8Array")
-            .and_then(|value| match value {
-                JsValue::Object(object) => Some(object),
-                _ => None,
-            })
-            .ok_or_else(|| JsError::type_error("Uint8Array is unavailable"))?;
-        let prototype = self
-            .realm
-            .get_property(constructor, "prototype")
-            .and_then(|value| match value {
-                JsValue::Object(object) => Some(object),
-                _ => None,
-            });
-        let values = bytes
-            .iter()
-            .map(|byte| f64::from(*byte))
-            .collect::<Vec<_>>();
-        let array =
-            self.create_typed_array_from_values(TypedArrayKind::Uint8, &values, prototype)?;
+        let buffer = self.array_buffer_from_bytes(bytes)?;
         let (promise, value) = self.create_promise()?;
-        self.resolve_promise(promise, &array);
+        self.resolve_promise(promise, &JsValue::Object(buffer));
         Ok(value)
     }
 

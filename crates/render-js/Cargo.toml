@@ -16,6 +16,8 @@ render-html = { path = "../render-html" }
 getrandom = "0.4"
 icu_properties = "2.1.2"
 mp4parse = "0.17.0"
+sha1 = "0.10.6"
+sha2 = "0.10.9"
 unicode-ident = "1.0.24"
 unicode-segmentation = "1.13.3"
 url = "2.5.4"
