@@ -4,6 +4,7 @@ pub mod cascade;
 pub mod color;
 pub mod computed;
 pub mod container;
+pub mod cssom;
 pub mod length;
 pub mod properties;
 pub mod pseudo;

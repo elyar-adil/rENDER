@@ -1528,6 +1528,12 @@ impl JsRuntime {
                 receiver,
                 arguments,
             ),
+            NativeFunction::StyleSheetInsertRule
+            | NativeFunction::StyleSheetDeleteRule
+            | NativeFunction::CssRuleListItem
+            | NativeFunction::StyleSheetListItem => {
+                self.dispatch_style_native(dom, function, receiver, arguments)
+            }
             NativeFunction::SymbolToString => self.dispatch_object_native(
                 dom,
                 NativeFunction::SymbolToString,

@@ -59,6 +59,8 @@ mod coroutine_run;
 #[cfg(test)]
 mod coroutine_tests;
 #[cfg(test)]
+mod cssom_tests;
+#[cfg(test)]
 mod dialog_tests;
 mod disposal;
 mod document_write;

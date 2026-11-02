@@ -116,6 +116,21 @@ fn element_matches(dom: &Dom, node: NodeId, filter: &CollectionFilter) -> bool {
         }
         CollectionFilter::NamedItem(key) => dom.names_element(node, key),
         CollectionFilter::Forms => dom.is_form_element(node),
+        // CSSOM §6.1: a style sheet's owner is a `style` element or a `link`
+        // element whose `rel` includes `stylesheet`. HTML's `rel` is a
+        // space-separated, ASCII-case-insensitive token set.
+        CollectionFilter::StyleSheets => match element.local_name.as_str() {
+            "style" => true,
+            "link" => dom
+                .attribute(node, "rel")
+                .ok()
+                .flatten()
+                .is_some_and(|rel| {
+                    rel.split_ascii_whitespace()
+                        .any(|token| token.eq_ignore_ascii_case("stylesheet"))
+                }),
+            _ => false,
+        },
         CollectionFilter::ChildNodes
         | CollectionFilter::ChildElements
         | CollectionFilter::FormControls
@@ -221,7 +236,7 @@ impl JsRuntime {
             .collection_members_of(dom, object)
             .and_then(|members| members.get(index).copied());
         match member {
-            Some(node) => Ok(Some(self.wrap_node(dom, node)?)),
+            Some(node) => Ok(Some(self.wrap_collection_member(dom, object, node)?)),
             None => Ok(None),
         }
     }
@@ -279,11 +294,34 @@ impl JsRuntime {
             }
         };
         match member {
-            Some(node) => Ok(Some(self.wrap_node(dom, node)?)),
+            Some(node) => Ok(Some(self.wrap_collection_member(dom, object, node)?)),
             // An out-of-range index is not a property at all, so it reads as
             // `undefined` without consulting the prototype chain.
             None => Ok(Some(JsValue::Undefined)),
         }
+    }
+
+    /// The value a collection yields for one of its members. Every collection
+    /// yields the member node itself except `document.styleSheets`, whose
+    /// members are `CSSStyleSheet` objects owned by those nodes (CSSOM §6.1).
+    fn wrap_collection_member(
+        &mut self,
+        dom: &mut Dom,
+        collection: ObjectId,
+        node: NodeId,
+    ) -> Result<JsValue, JsError> {
+        let style_sheets = matches!(
+            self.realm.host_ref(collection),
+            Some(ObjectHost::LiveCollection {
+                filter: CollectionFilter::StyleSheets,
+                ..
+            })
+        );
+        if style_sheets {
+            self.ensure_heap_capacity(1)?;
+            return Ok(JsValue::Object(self.realm.style_sheet_wrapper(node)));
+        }
+        self.wrap_node(dom, node)
     }
 
     /// `NodeList.prototype.item` and `HTMLCollection.prototype.item`: the member
@@ -300,7 +338,7 @@ impl JsRuntime {
             .collection_members_of(dom, receiver)
             .and_then(|members| members.get(index).copied());
         match member {
-            Some(node) => self.wrap_node(dom, node),
+            Some(node) => self.wrap_collection_member(dom, receiver, node),
             None => Ok(JsValue::Null),
         }
     }
@@ -337,7 +375,9 @@ impl JsRuntime {
             return None;
         };
         match filter {
-            CollectionFilter::ChildNodes | CollectionFilter::FormControlName(_) => None,
+            CollectionFilter::ChildNodes
+            | CollectionFilter::FormControlName(_)
+            | CollectionFilter::StyleSheets => None,
             CollectionFilter::FormControls if dom.is_form_element(*root) => {
                 Some(NamedRule::FormControls)
             }

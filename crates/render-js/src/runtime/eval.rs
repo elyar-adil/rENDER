@@ -5317,6 +5317,13 @@ impl JsRuntime {
                         None => Ok(JsValue::Null),
                     };
                 }
+                // CSSOM §6.1: one live `StyleSheetList` per document.
+                "styleSheets" => {
+                    self.ensure_heap_capacity(1)?;
+                    return Ok(JsValue::Object(
+                        self.realm.document_style_sheets_wrapper(document),
+                    ));
+                }
                 "parentNode" | "parentElement" | "nextSibling" | "previousSibling"
                 | "ownerDocument" => return Ok(JsValue::Null),
                 "firstChild" | "lastChild" => {
@@ -5396,6 +5403,17 @@ impl JsRuntime {
                     return self
                         .text_content(dom, node)
                         .map(|text| JsValue::String(JsString::from(text)));
+                }
+                // CSSOM §6.4.1: the sheet a `<style>` or `<link
+                // rel=stylesheet>` element owns, and `undefined` elsewhere.
+                // Returning the object here is what makes
+                // `document.styleSheets[i] === style.sheet` observable.
+                "sheet" => {
+                    if Self::is_style_sheet_owner(dom, node) {
+                        self.ensure_heap_capacity(1)?;
+                        return Ok(JsValue::Object(self.realm.style_sheet_wrapper(node)));
+                    }
+                    return Ok(JsValue::Undefined);
                 }
                 "textContent" => {
                     return self
@@ -5757,6 +5775,105 @@ impl JsRuntime {
                     }
                 }
             }
+            // CSSOM §6.4: the members of a style sheet. `cssRules` is the
+            // live rule list; `ownerNode`, `href`, `type` and `title` come
+            // from the element that owns the sheet.
+            Some(ObjectHost::CssStyleSheet(node)) => match property {
+                "ownerNode" => return self.wrap_node(dom, node),
+                "ownerRule" => return Ok(JsValue::Null),
+                "cssRules" | "rules" => {
+                    self.ensure_heap_capacity(1)?;
+                    return Ok(JsValue::Object(self.realm.css_rule_list_wrapper(node)));
+                }
+                "href" => {
+                    // A `<style>` sheet has no URL; a stylesheet `<link>` does,
+                    // resolved against the document base URL (CSSOM §6.4).
+                    let is_link = matches!(
+                        dom.node(node).map(render_dom::Node::kind),
+                        Some(render_dom::NodeKind::Element(element))
+                            if element.local_name == "link"
+                    );
+                    let href = if is_link {
+                        dom.attribute(node, "href").ok().flatten()
+                    } else {
+                        None
+                    };
+                    return Ok(match href {
+                        Some(href) => {
+                            let base = self.document_url_string();
+                            let resolved = url::Url::parse(&base)
+                                .ok()
+                                .and_then(|base| base.join(href).ok())
+                                .map_or_else(|| href.to_owned(), |url| url.to_string());
+                            JsValue::String(JsString::from(resolved))
+                        }
+                        None => JsValue::Null,
+                    });
+                }
+                "type" => {
+                    let value = dom
+                        .attribute(node, "type")
+                        .ok()
+                        .flatten()
+                        .unwrap_or("text/css");
+                    return Ok(JsValue::String(JsString::from(value)));
+                }
+                "title" => {
+                    let value = dom.attribute(node, "title").ok().flatten().unwrap_or("");
+                    return Ok(JsValue::String(JsString::from(value)));
+                }
+                _ => {}
+            },
+            // CSSOM §6.7: the `length` and indexed members of a rule list.
+            Some(ObjectHost::CssRuleList(node)) => {
+                let rules = self.style_sheet_rules(dom, node)?;
+                if property == "length" {
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "rule counts stay far below any precision boundary"
+                    )]
+                    let length = rules.len() as f64;
+                    return Ok(JsValue::Number(length));
+                }
+                if let Ok(index) = property.parse::<usize>() {
+                    if index >= rules.len() {
+                        return Ok(JsValue::Undefined);
+                    }
+                    self.ensure_heap_capacity(1)?;
+                    return Ok(JsValue::Object(self.realm.css_rule_wrapper(node, index)));
+                }
+            }
+            // CSSOM §6.3: a top-level rule's text and type.
+            Some(ObjectHost::CssRule { owner, index }) => {
+                let rules = self.style_sheet_rules(dom, owner)?;
+                match property {
+                    "cssText" => {
+                        return Ok(rules.get(index).map_or(JsValue::Null, |rule| {
+                            JsValue::String(JsString::from(rule.clone()))
+                        }));
+                    }
+                    "type" => {
+                        let code = rules.get(index).map_or(0.0, |rule| {
+                            crate::runtime::builtins::style::css_rule_type_code(rule)
+                        });
+                        return Ok(JsValue::Number(code));
+                    }
+                    "parentStyleSheet" => {
+                        self.ensure_heap_capacity(1)?;
+                        return Ok(JsValue::Object(self.realm.style_sheet_wrapper(owner)));
+                    }
+                    "parentRule" => return Ok(JsValue::Null),
+                    "selectorText" => {
+                        let selector = rules.get(index).and_then(|rule| {
+                            rule.split_once('{').map(|(selector, _)| selector.trim())
+                        });
+                        return Ok(selector.map_or(JsValue::Null, |selector| {
+                            JsValue::String(JsString::from(selector.to_owned()))
+                        }));
+                    }
+                    _ => {}
+                }
+            }
             Some(ObjectHost::TypedArray { kind, .. }) if property == "BYTES_PER_ELEMENT" => {
                 #[allow(
                     clippy::cast_precision_loss,
@@ -5932,6 +6049,13 @@ impl JsRuntime {
                 Some(NativeFunction::StyleRemoveProperty)
             }
             (Some(ObjectHost::CssStyleDeclaration(_)), "item") => Some(NativeFunction::StyleItem),
+            (Some(ObjectHost::CssStyleSheet(_)), "insertRule") => {
+                Some(NativeFunction::StyleSheetInsertRule)
+            }
+            (Some(ObjectHost::CssStyleSheet(_)), "deleteRule") => {
+                Some(NativeFunction::StyleSheetDeleteRule)
+            }
+            (Some(ObjectHost::CssRuleList(_)), "item") => Some(NativeFunction::CssRuleListItem),
             (Some(ObjectHost::RegExp(_)), "exec") => Some(NativeFunction::RegExpExec),
             (Some(ObjectHost::RegExp(_)), "test") => Some(NativeFunction::RegExpTest),
             (Some(ObjectHost::RegExp(_)), "toString") => Some(NativeFunction::RegExpToString),
@@ -7907,6 +8031,31 @@ impl JsRuntime {
                 if element.local_name == "script"
                     && element.namespace == render_dom::Namespace::Html
         )
+    }
+
+    /// Whether a node owns a style sheet: an HTML `style` element, or a `link`
+    /// whose `rel` includes the `stylesheet` token (CSSOM §6.1, HTML §4.2.4).
+    fn is_style_sheet_owner(dom: &Dom, node: render_dom::NodeId) -> bool {
+        let Some(render_dom::NodeKind::Element(element)) =
+            dom.node(node).map(render_dom::Node::kind)
+        else {
+            return false;
+        };
+        if element.namespace != render_dom::Namespace::Html {
+            return false;
+        }
+        match element.local_name.as_str() {
+            "style" => true,
+            "link" => dom
+                .attribute(node, "rel")
+                .ok()
+                .flatten()
+                .is_some_and(|rel| {
+                    rel.split_ascii_whitespace()
+                        .any(|token| token.eq_ignore_ascii_case("stylesheet"))
+                }),
+            _ => false,
+        }
     }
 
     /// Accept an object receiver for member access, wrapping primitives that

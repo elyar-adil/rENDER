@@ -1103,6 +1103,12 @@ pub(crate) enum NativeFunction {
     StyleSetProperty,
     StyleRemoveProperty,
     StyleItem,
+    /// `CSSStyleSheet.prototype.insertRule` / `deleteRule` and
+    /// `CSSRuleList.prototype.item` (CSSOM §6.4, §6.7).
+    StyleSheetInsertRule,
+    StyleSheetDeleteRule,
+    CssRuleListItem,
+    StyleSheetListItem,
     QueueMicrotask,
     /// `Window.prototype.postMessage`, bound to the window it is installed on.
     WindowPostMessage,
@@ -2402,6 +2408,11 @@ pub(crate) enum CollectionFilter {
     /// The `form` elements of a document, in tree order, as `document.forms`
     /// gives them (HTML §3.1.5). The root is the document.
     Forms,
+    /// The document's style sheets: every `style` element and every `link`
+    /// whose `rel` contains the `stylesheet` token, in tree order, as
+    /// `document.styleSheets` lists them (CSSOM §6.1, HTML §4.2.4). The root
+    /// is the document.
+    StyleSheets,
     /// The controls of a form, as `form.elements` gives them, or the listed
     /// descendants of a fieldset, as `fieldset.elements` does (HTML §4.10.3,
     /// §4.10.4). The root is the form or the fieldset; the members come from
@@ -2432,6 +2443,17 @@ pub(crate) enum ObjectHost {
     /// members to `data-*` attributes on the owning element.
     DataSet(NodeId),
     CssStyleDeclaration(NodeId),
+    /// A `CSSStyleSheet` whose rules are the text of the `<style>` element
+    /// `NodeId` (CSSOM §6.4). A `<link rel=stylesheet>` sheet has the element
+    /// as its owner but no text child, so its CSSOM rule list starts empty.
+    CssStyleSheet(NodeId),
+    /// The live `CSSRuleList` of the style element `NodeId`, read from its text.
+    CssRuleList(NodeId),
+    /// The `index`th top-level rule of the style element `owner`.
+    CssRule {
+        owner: NodeId,
+        index: usize,
+    },
     NativeFunction(NativeFunction),
     BoundFunction {
         function: NativeFunction,
@@ -3203,6 +3225,20 @@ pub struct RealmRecord {
     range_wrappers: BTreeMap<RangeId, ObjectId>,
     class_list_wrappers: BTreeMap<NodeId, ObjectId>,
     style_declaration_wrappers: BTreeMap<NodeId, ObjectId>,
+    /// One `CSSStyleSheet` per `<style>`/`<link>` owner (CSSOM §6.4).
+    style_sheet_wrappers: BTreeMap<NodeId, ObjectId>,
+    /// One `CSSRuleList` per style element, so repeated reads return the same
+    /// live list (CSSOM §6.7).
+    css_rule_list_wrappers: BTreeMap<NodeId, ObjectId>,
+    /// One `CSSRule` per `(owner, index)`, stable while read repeatedly.
+    css_rule_wrappers: BTreeMap<(NodeId, usize), ObjectId>,
+    /// `document.styleSheets`, one `StyleSheetList` per document.
+    document_style_sheet_wrappers: BTreeMap<NodeId, ObjectId>,
+    /// CSSOM rules inserted into a sheet whose owner text is not in the DOM
+    /// (a `<link rel=stylesheet>` loaded from the network). Rules of a
+    /// `<style>` element live in the element's text instead, so the cascade
+    /// and the CSSOM cannot disagree.
+    pub(crate) css_rule_overrides: BTreeMap<NodeId, Vec<String>>,
     dataset_wrappers: BTreeMap<NodeId, ObjectId>,
     /// The `childNodes` `NodeList` of each node: one object per node (DOM §4.4).
     child_node_list_wrappers: BTreeMap<NodeId, ObjectId>,
@@ -3698,6 +3734,11 @@ impl Realm {
             range_wrappers: BTreeMap::new(),
             class_list_wrappers: BTreeMap::new(),
             style_declaration_wrappers: BTreeMap::new(),
+            style_sheet_wrappers: BTreeMap::new(),
+            css_rule_list_wrappers: BTreeMap::new(),
+            css_rule_wrappers: BTreeMap::new(),
+            document_style_sheet_wrappers: BTreeMap::new(),
+            css_rule_overrides: BTreeMap::new(),
             dataset_wrappers: BTreeMap::new(),
             child_node_list_wrappers: BTreeMap::new(),
             child_collection_wrappers: BTreeMap::new(),
@@ -5006,6 +5047,17 @@ impl Realm {
                     ("hasFeature", NativeFunction::ImplementationHasFeature),
                 ][..],
             ),
+            // CSSOM §6: the CSSOM interfaces that hold no DOM nodes.
+            (
+                "StyleSheetList",
+                &[("item", NativeFunction::StyleSheetListItem)][..],
+            ),
+            ("StyleSheet", &[][..]),
+            (
+                "CSSRuleList",
+                &[("item", NativeFunction::CssRuleListItem)][..],
+            ),
+            ("CSSRule", &[][..]),
         ] {
             let proto = ObjectId(objects.len());
             objects.push(JsObject {
@@ -5024,9 +5076,53 @@ impl Realm {
             );
             prototypes.insert(name, proto);
         }
+        // `CSSStyleSheet` is a `StyleSheet` (CSSOM §6.4). Building it here,
+        // after the table created its parent, keeps the interface chain and
+        // the constructors' own `[[Prototype]]` aligned.
+        {
+            let parent = prototypes["StyleSheet"];
+            let parent_constructor =
+                objects[parent.0]
+                    .properties
+                    .get("constructor")
+                    .and_then(|descriptor| match descriptor.value {
+                        JsValue::Object(object) => Some(object),
+                        _ => None,
+                    });
+            let proto = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(parent),
+                ..JsObject::default()
+            });
+            Self::install_builtin_methods(
+                objects,
+                function_prototype,
+                proto,
+                &[
+                    ("insertRule", NativeFunction::StyleSheetInsertRule),
+                    ("deleteRule", NativeFunction::StyleSheetDeleteRule),
+                ],
+            );
+            Self::dom_interface(
+                objects,
+                global,
+                function_prototype,
+                "CSSStyleSheet",
+                proto,
+                parent_constructor,
+                ObjectHost::DomConstructor,
+            );
+            prototypes.insert("CSSStyleSheet", proto);
+        }
         // `length` is an accessor on each list prototype (WebIDL §3.10.4), so
         // `"length" in list` holds through the prototype chain.
-        for name in ["NodeList", "HTMLCollection", "DOMTokenList"] {
+        for name in [
+            "NodeList",
+            "HTMLCollection",
+            "DOMTokenList",
+            "StyleSheetList",
+            "CSSRuleList",
+        ] {
             let proto = prototypes[name];
             let getter = ObjectId(objects.len());
             objects.push(JsObject {
@@ -11337,6 +11433,10 @@ impl RealmRecord {
                 + self.range_wrappers.len()
                 + self.class_list_wrappers.len()
                 + self.style_declaration_wrappers.len()
+                + self.style_sheet_wrappers.len()
+                + self.css_rule_list_wrappers.len()
+                + self.css_rule_wrappers.len()
+                + self.document_style_sheet_wrappers.len()
                 + self.dataset_wrappers.len()
                 + self.child_node_list_wrappers.len()
                 + self.child_collection_wrappers.len()
@@ -11377,6 +11477,10 @@ impl RealmRecord {
         roots.extend(self.implementation_wrappers.values().copied());
         roots.extend(self.class_list_wrappers.values().copied());
         roots.extend(self.style_declaration_wrappers.values().copied());
+        roots.extend(self.style_sheet_wrappers.values().copied());
+        roots.extend(self.css_rule_list_wrappers.values().copied());
+        roots.extend(self.css_rule_wrappers.values().copied());
+        roots.extend(self.document_style_sheet_wrappers.values().copied());
         roots.extend(self.dataset_wrappers.values().copied());
         roots.extend(self.child_node_list_wrappers.values().copied());
         roots.extend(self.child_collection_wrappers.values().copied());
@@ -12399,6 +12503,66 @@ impl Realm {
             ..JsObject::default()
         });
         self.style_declaration_wrappers.insert(node, wrapper);
+        wrapper
+    }
+
+    /// The `CSSStyleSheet` of the `<style>` or `<link>` element `node`, one
+    /// object for the element's whole life (CSSOM §6.4: `style.sheet` and
+    /// `document.styleSheets[i]` return the same object).
+    pub(crate) fn style_sheet_wrapper(&mut self, node: NodeId) -> ObjectId {
+        if let Some(wrapper) = self.style_sheet_wrappers.get(&node) {
+            return *wrapper;
+        }
+        let prototype = self.dom_prototype("CSSStyleSheet");
+        let wrapper = self.allocate(JsObject {
+            prototype: Some(prototype),
+            host: ObjectHost::CssStyleSheet(node),
+            ..JsObject::default()
+        });
+        self.style_sheet_wrappers.insert(node, wrapper);
+        wrapper
+    }
+
+    /// `document.styleSheets`: a live `StyleSheetList` over `document`.
+    pub(crate) fn document_style_sheets_wrapper(&mut self, document: NodeId) -> ObjectId {
+        if let Some(wrapper) = self.document_style_sheet_wrappers.get(&document) {
+            return *wrapper;
+        }
+        let wrapper =
+            self.live_collection_wrapper(document, CollectionFilter::StyleSheets, "StyleSheetList");
+        self.document_style_sheet_wrappers.insert(document, wrapper);
+        wrapper
+    }
+
+    /// The `CSSRuleList` of the style element `node`. Its rules are read from
+    /// the element's current text, so an edit made through the DOM and an edit
+    /// made through `insertRule` observe each other.
+    pub(crate) fn css_rule_list_wrapper(&mut self, node: NodeId) -> ObjectId {
+        if let Some(wrapper) = self.css_rule_list_wrappers.get(&node) {
+            return *wrapper;
+        }
+        let prototype = self.dom_prototype("CSSRuleList");
+        let wrapper = self.allocate(JsObject {
+            prototype: Some(prototype),
+            host: ObjectHost::CssRuleList(node),
+            ..JsObject::default()
+        });
+        self.css_rule_list_wrappers.insert(node, wrapper);
+        wrapper
+    }
+
+    /// The `index`th `CSSRule` of the style element `owner`.
+    pub(crate) fn css_rule_wrapper(&mut self, owner: NodeId, index: usize) -> ObjectId {
+        if let Some(wrapper) = self.css_rule_wrappers.get(&(owner, index)) {
+            return *wrapper;
+        }
+        let prototype = self.dom_prototype("CSSRule");
+        let wrapper = self.allocate(JsObject {
+            prototype: Some(prototype),
+            host: ObjectHost::CssRule { owner, index },
+            ..JsObject::default()
+        });
+        self.css_rule_wrappers.insert((owner, index), wrapper);
         wrapper
     }
 
