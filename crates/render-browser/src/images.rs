@@ -726,7 +726,12 @@ mod tests {
             &mut images,
             ImageLimits::default(),
         );
-        assert_eq!(application.loaded.len(), 1, "diagnostics: {:?}", application.diagnostics);
+        assert_eq!(
+            application.loaded.len(),
+            1,
+            "diagnostics: {:?}",
+            application.diagnostics
+        );
         assert_eq!(images.len(), 1);
         assert!(application.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == ImageResourceDiagnosticCode::ContentTypeMismatch
