@@ -371,7 +371,7 @@ pub struct ComputedStyle {
     // that is not shared is still updated in place.
     properties: Arc<BTreeMap<String, ComputedValue>>,
     typed_properties: Arc<BTreeMap<String, TypedPropertyValue>>,
-    custom_properties: Arc<BTreeMap<String, ComputedValue>>,
+    custom_properties: Arc<CustomProperties>,
     invalid_custom_properties: Arc<BTreeSet<String>>,
     /// Properties whose value came from a declaration in the document itself,
     /// as opposed to the initial value, an inherited value, or the user-agent
@@ -383,6 +383,51 @@ pub struct ComputedStyle {
     /// inserts and value clones per element on large pages.
     initial: Option<Arc<InitialValues>>,
     diagnostics: Arc<Vec<ComputationDiagnostic>>,
+}
+
+/// Custom properties as a persistent overlay over the parent's map.
+///
+/// A design-system stylesheet can declare a thousand custom properties on
+/// `:root`, and a page can have thousands of elements. Materializing the full
+/// inherited map on every element made each computed style copy the whole
+/// table (and its token vectors), which on GitHub's 2,600-element page cost
+/// seconds and hundreds of megabytes per style pass. An element that declares
+/// nothing shares the parent layer; one that declares a few names stores only
+/// those overrides.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CustomProperties {
+    /// The parent element's resolved custom properties.
+    inherited: Option<Arc<CustomProperties>>,
+    /// Names this element declares with a valid computed value.
+    overrides: Option<Arc<BTreeMap<String, ComputedValue>>>,
+    /// Names whose declaration on this element produced the guaranteed-invalid
+    /// value, so the parent's value must not show through.
+    removed: Option<Arc<BTreeSet<String>>>,
+    /// Registered `inherits: false` properties and their initial (or
+    /// guaranteed-invalid) value. They are document-wide and therefore shared
+    /// by every element instead of being copied into each override map.
+    non_inheriting: Option<Arc<BTreeMap<String, Option<ComputedValue>>>>,
+}
+
+impl CustomProperties {
+    fn get(&self, name: &str) -> Option<&ComputedValue> {
+        if let Some(values) = &self.overrides
+            && let Some(value) = values.get(name)
+        {
+            return Some(value);
+        }
+        if let Some(values) = &self.non_inheriting
+            && let Some(value) = values.get(name)
+        {
+            return value.as_ref();
+        }
+        if let Some(removed) = &self.removed
+            && removed.contains(name)
+        {
+            return None;
+        }
+        self.inherited.as_ref().and_then(|parent| parent.get(name))
+    }
 }
 
 impl ComputedStyle {
@@ -523,11 +568,6 @@ impl ComputedStyle {
                 .and_then(|initial| initial.values.get(property))
                 .and_then(|value| value.typed.as_ref())
         })
-    }
-
-    #[must_use]
-    pub fn custom_properties(&self) -> &BTreeMap<String, ComputedValue> {
-        &self.custom_properties
     }
 
     #[must_use]
@@ -1004,7 +1044,7 @@ struct CustomResolver<'a> {
     /// Resolved custom properties inherited from the parent. When the element
     /// declares no custom properties of its own, these are consulted directly
     /// instead of cloning the whole inherited map into `sources`.
-    inherited: Option<&'a BTreeMap<String, ComputedValue>>,
+    inherited: Option<&'a CustomProperties>,
     inherited_invalid: Option<&'a BTreeSet<String>>,
     /// The document's registrations, so a substituted value is checked against
     /// its syntax before another property can use it.
@@ -1041,6 +1081,18 @@ impl CustomResolver<'_> {
             return None;
         }
         if !self.sources.contains_key(name) {
+            // A registered non-inheriting property never reads the parent's
+            // value when this element did not declare it. Its initial value
+            // (or guaranteed-invalid value) is the computed value instead.
+            let non_inheriting = self
+                .registered
+                .and_then(|registered| registered.definition(name))
+                .is_some_and(|registration| !registration.inherits);
+            if non_inheriting {
+                let resolved = self.registered_fallbacks.get(name).cloned().flatten();
+                self.memo.insert(name.to_owned(), resolved.clone());
+                return resolved;
+            }
             let resolved = if self
                 .inherited_invalid
                 .is_some_and(|invalid| invalid.contains(name))
@@ -1258,6 +1310,10 @@ impl InitialValues {
 struct RegisteredProperties {
     definitions: BTreeMap<String, PropertyRegistration>,
     initials: BTreeMap<String, ComputedValue>,
+    /// `inherits: false` registrations and their initial value (`None` for the
+    /// guaranteed-invalid value). Shared by every computed style in a document
+    /// so these names never have to be copied into per-element maps.
+    non_inheriting: Option<Arc<BTreeMap<String, Option<ComputedValue>>>>,
 }
 
 impl RegisteredProperties {
@@ -1265,7 +1321,7 @@ impl RegisteredProperties {
         definitions: BTreeMap<String, PropertyRegistration>,
         limits: &ComputationLimits,
     ) -> Self {
-        let initials = definitions
+        let initials: BTreeMap<String, ComputedValue> = definitions
             .iter()
             .filter_map(|(name, registration)| {
                 let source = registration.initial_value.as_deref()?;
@@ -1273,9 +1329,15 @@ impl RegisteredProperties {
                 Some((name.clone(), ComputedValue::within_limits(tokens, limits)?))
             })
             .collect();
+        let non_inheriting: BTreeMap<String, Option<ComputedValue>> = definitions
+            .iter()
+            .filter(|(_, registration)| !registration.inherits)
+            .map(|(name, _)| (name.clone(), initials.get(name).cloned()))
+            .collect();
         Self {
             definitions,
             initials,
+            non_inheriting: (!non_inheriting.is_empty()).then(|| Arc::new(non_inheriting)),
         }
     }
 
@@ -1622,50 +1684,48 @@ fn compute_style_with_initials(
         .iter()
         .filter(|(name, _)| name.starts_with("--"))
         .collect::<Vec<_>>();
-    // An element that declares no custom properties inherits the parent's
-    // resolved map unchanged. Sharing it avoids copying and re-resolving every
-    // inherited variable for every element; the resolver falls back to the
-    // parent map for `var()` references in this element's declarations.
-    //
-    // A document with `@property` registrations cannot take that shortcut,
-    // because a registered `inherits: false` property must stop inheriting even
-    // when the element declares nothing at all.
+    // An element that declares no custom properties shares the parent's layer
+    // unchanged. A document that registers an `inherits: false` property still
+    // needs a thin child layer, because that property is answered by the shared
+    // `non_inheriting` table before the inherited chain is consulted; the layer
+    // holds no per-element map.
     let inherits_custom =
-        cascaded_custom.is_empty() && parent.is_some() && registered.definitions.is_empty();
+        cascaded_custom.is_empty() && parent.is_some() && registered.non_inheriting.is_none();
     let mut invalid = if inherits_custom {
         BTreeSet::new()
     } else {
-        parent
+        let mut invalid = parent
             .map(|style| (*style.invalid_custom_properties).clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // A registered non-inheriting property never carries the parent's
+        // value (or invalidity) into this element.
+        for (name, registration) in &registered.definitions {
+            if !registration.inherits {
+                invalid.remove(name);
+            }
+        }
+        invalid
     };
-    let mut sources: BTreeMap<String, CustomSource> = if inherits_custom {
-        BTreeMap::new()
-    } else {
-        parent
-            .map(|style| {
-                style
-                    .custom_properties
-                    .iter()
-                    .filter(|(name, _)| {
-                        registered
-                            .definition(name)
-                            .is_none_or(|registration| registration.inherits)
-                    })
-                    .map(|(name, value)| {
-                        (name.clone(), CustomSource::Resolved(value.tokens.clone()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    // Registered properties exist on every element, so an element that says
-    // nothing about one starts from its registered initial value. For an
-    // inherited registration the parent's value, already in `sources`, wins.
-    for (name, value) in &registered.initials {
-        sources
-            .entry(name.clone())
-            .or_insert_with(|| CustomSource::Resolved(value.tokens.clone()));
+    // Only the element's own declarations are sources. Inherited values live in
+    // the parent layer, which the resolver consults without copying. At the
+    // root there is no parent, so inheriting registrations take their initial
+    // value as a source; non-inheriting registrations are answered by the
+    // document-wide `non_inheriting` table.
+    let mut sources: BTreeMap<String, CustomSource> = BTreeMap::new();
+    if parent.is_none() {
+        for (name, value) in &registered.initials {
+            if registered
+                .definition(name)
+                .is_none_or(|registration| registration.inherits)
+            {
+                sources.insert(name.clone(), CustomSource::Resolved(value.tokens.clone()));
+            }
+        }
+    }
+    for (name, registration) in &registered.definitions {
+        if !registration.inherits && !registered.initials.contains_key(name) {
+            invalid.insert(name.clone());
+        }
     }
     if cascaded_custom.len() > limits.max_custom_properties {
         diagnostics.push(ComputationDiagnostic {
@@ -1751,7 +1811,7 @@ fn compute_style_with_initials(
         }
     }
 
-    let mut custom_properties = BTreeMap::new();
+    let mut custom_overrides = BTreeMap::new();
     let mut resolution_invalid = BTreeSet::new();
     if !inherits_custom {
         let mut graph = BTreeMap::new();
@@ -1821,11 +1881,7 @@ fn compute_style_with_initials(
     let mut resolver = CustomResolver {
         sources: &sources,
         invalid: &invalid,
-        inherited: inherits_custom.then(|| {
-            parent
-                .map(|style| &*style.custom_properties)
-                .expect("inherits_custom implies a parent")
-        }),
+        inherited: parent.map(|style| &*style.custom_properties),
         inherited_invalid: parent.map(|style| &*style.invalid_custom_properties),
         registered: Some(registered),
         registered_fallbacks: &registered_fallbacks,
@@ -1835,13 +1891,15 @@ fn compute_style_with_initials(
         diagnosed: BTreeSet::new(),
     };
     if !inherits_custom {
+        // Resolve only the names this element declares. Everything else keeps
+        // the parent layer, so no inherited value is copied or re-substituted.
         let source_names = sources.keys().cloned().collect::<Vec<_>>();
         for name in source_names {
             let resolved = resolver
                 .resolve(&name, 0)
                 .and_then(|tokens| ComputedValue::within_limits(tokens, limits));
             if let Some(value) = resolved {
-                custom_properties.insert(name, value);
+                custom_overrides.insert(name, value);
             } else {
                 resolution_invalid.insert(name);
             }
@@ -1849,8 +1907,8 @@ fn compute_style_with_initials(
     }
     // A registered universal property with no initial value has no source at
     // all until it is declared; it is the guaranteed-invalid value.
-    for name in registered.definitions.keys() {
-        if !sources.contains_key(name) {
+    for (name, registration) in &registered.definitions {
+        if !registration.inherits && !sources.contains_key(name) {
             resolution_invalid.insert(name.clone());
         }
     }
@@ -1975,18 +2033,35 @@ fn compute_style_with_initials(
         parent,
     );
     invalid.extend(resolution_invalid);
+    // Names whose value on this element is the guaranteed-invalid value must
+    // hide the parent layer. A name that was already invalid on the parent is
+    // hidden by the parent layer itself unless this element redeclared it.
+    let mut removed = BTreeSet::new();
+    for name in &invalid {
+        let inherited = parent.is_some_and(|style| style.invalid_custom_properties.contains(name));
+        if !inherited || sources.contains_key(name) {
+            removed.insert(name.clone());
+        }
+    }
+
+    let custom_properties = if inherits_custom {
+        parent.map_or_else(
+            || Arc::new(CustomProperties::default()),
+            |style| Arc::clone(&style.custom_properties),
+        )
+    } else {
+        Arc::new(CustomProperties {
+            inherited: parent.map(|style| Arc::clone(&style.custom_properties)),
+            overrides: (!custom_overrides.is_empty()).then(|| Arc::new(custom_overrides)),
+            removed: (!removed.is_empty()).then(|| Arc::new(removed)),
+            non_inheriting: registered.non_inheriting.clone(),
+        })
+    };
 
     ComputedStyle {
         properties: Arc::new(properties),
         typed_properties: Arc::new(typed_properties),
-        custom_properties: if inherits_custom {
-            parent.map_or_else(
-                || Arc::new(BTreeMap::new()),
-                |style| Arc::clone(&style.custom_properties),
-            )
-        } else {
-            Arc::new(custom_properties)
-        },
+        custom_properties,
         invalid_custom_properties: if inherits_custom {
             parent.map_or_else(
                 || Arc::new(BTreeSet::new()),
@@ -2143,6 +2218,22 @@ fn collect_registered_properties(
         }
     }
     registrations
+}
+
+/// Whether a `::before`/`::after` cascade generates a box.
+///
+/// CSS Pseudo-Elements 4 §4.1: the initial `content` is `normal`, which
+/// computes to `none` for these pseudo-elements, and an element with
+/// `content: none` generates no pseudo-element. A universal rule that sets an
+/// unrelated property on every `::before` must therefore not force a full
+/// computed style for every element.
+fn pseudo_generates_content(cascaded: &CascadedStyle) -> bool {
+    let Some(content) = cascaded.get("content") else {
+        return false;
+    };
+    let value = content.value.trim();
+    // A `var()` or other substitution cannot be decided here; compute it.
+    !(value.eq_ignore_ascii_case("normal") || value.eq_ignore_ascii_case("none"))
 }
 
 /// Cascade and compute every element in parent-before-child order.
@@ -2306,11 +2397,15 @@ pub fn compute_document_styles_with_hints_from_root(
                 if let Some(started) = pseudo_started {
                     pseudo_cascade_time += started.elapsed();
                 }
-                // No matched pseudo rule means no `content`, so there is
-                // nothing to generate. Computing an initial style for every
-                // element's ::before and ::after was the largest remaining
-                // cost on GitHub's 2,600-element page.
-                if pseudo_cascaded.properties().is_empty() {
+                // No matched declaration of `content` means the pseudo-element
+                // is not generated (CSS Pseudo-Elements 4 §4.1: `content:
+                // normal` computes to `none` for ::before/::after). Universal
+                // declarations such as `*, ::before, ::after { box-sizing:
+                // border-box }` match every element but generate nothing, so a
+                // non-empty cascaded style is not enough: computing a full
+                // pseudo style for every element was the largest remaining
+                // style cost on GitHub's 2,600-element page.
+                if !pseudo_generates_content(&pseudo_cascaded) {
                     continue;
                 }
                 let pseudo_compute_started = debug_index.then(std::time::Instant::now);
@@ -2792,6 +2887,71 @@ mod tests {
             target.get("--accent").map(super::ComputedValue::css_text),
             Some("lime")
         );
+    }
+
+    #[test]
+    fn a_child_without_custom_declarations_shares_the_parent_layer() {
+        let output =
+            parse_document("<!doctype html><div id='parent'><span id='child'></span></div>");
+        let sheet = parse_stylesheet("#parent { --brand: red; --derived: var(--brand) }");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::new(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let parent = &styles[&target_id(&output.dom, "#parent")];
+        let child = &styles[&target_id(&output.dom, "#child")];
+
+        assert!(
+            std::sync::Arc::ptr_eq(&parent.custom_properties, &child.custom_properties),
+            "a child that declares no custom property must not copy the inherited map"
+        );
+        assert_eq!(
+            child.get("--derived").map(super::ComputedValue::css_text),
+            Some("red")
+        );
+    }
+
+    #[test]
+    fn a_declaring_child_stores_only_its_own_overrides() {
+        let output =
+            parse_document("<!doctype html><div id='parent'><span id='child'></span></div>");
+        let sheet = parse_stylesheet(
+            "#parent { --brand: red; --other: 2px } \
+             #child { --brand: blue; color: var(--other) }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::new(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let child = &styles[&target_id(&output.dom, "#child")];
+
+        assert_eq!(
+            child.get("--brand").map(super::ComputedValue::css_text),
+            Some("blue")
+        );
+        assert_eq!(
+            child.get("--other").map(super::ComputedValue::css_text),
+            Some("2px")
+        );
+        let overrides = child
+            .custom_properties
+            .overrides
+            .as_ref()
+            .expect("the child declares one custom property");
+        assert_eq!(overrides.len(), 1, "inherited names are not copied");
+        assert!(overrides.contains_key("--brand"));
     }
 
     #[test]
