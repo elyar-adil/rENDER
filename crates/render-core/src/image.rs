@@ -882,6 +882,28 @@ impl ImageResources {
         self.insert_entry(key, Arc::new(image), None, limits)
     }
 
+    /// Copy every entry of `other` into this store, allocating fresh resource
+    /// IDs. The embedder uses this to combine the network image store with
+    /// the live canvas and video-frame store before handing a document
+    /// snapshot to another thread: the display list resolves images by node,
+    /// so both stores must be visible to that render.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store-limit error of the first entry that does not fit.
+    /// Entries copied before it stay, exactly as a sequence of inserts would.
+    pub fn overlay(&mut self, other: &Self, limits: ImageLimits) -> Result<(), ImageStoreError> {
+        for loaded in other.by_node_url.values() {
+            self.insert_entry(
+                loaded.key.clone(),
+                Arc::clone(&loaded.image),
+                loaded.animation.clone(),
+                limits,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Store a decoded animation while keeping its first frame as the ordinary
     /// still bitmap in [`LoadedImage::image`].
     ///

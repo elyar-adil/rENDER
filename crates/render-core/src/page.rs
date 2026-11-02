@@ -1830,12 +1830,13 @@ impl Page {
 
     /// Publish the bitmap of every canvas script drew into since the last
     /// render, so that the paint path reads the pixels as they are now.
-    fn publish_canvas_bitmaps(&mut self) {
+    fn publish_canvas_bitmaps(&mut self) -> bool {
         let changed = self
             .canvas
             .engine()
             .borrow_mut()
             .take_changed_elements(self.document.dom());
+        let mut published = false;
         for (node, width, height, rgba) in changed {
             let Ok(image) = DecodedImage::from_rgba8(width, height, &rgba) else {
                 continue;
@@ -1846,8 +1847,31 @@ impl Page {
                 .is_ok()
             {
                 self.video_frames_dirty = true;
+                published = true;
             }
         }
+        published
+    }
+
+    /// Publish pixels script drew into canvas bitmaps, and return whether any
+    /// bitmap changed along with a snapshot of the live canvas and video-frame
+    /// image store.
+    ///
+    /// An embedder whose rendering happens outside this page (the native
+    /// browser renders a `Document` clone on a worker) drains changes with
+    /// this before building its render input. Without it the canvas engine
+    /// retains the pixels and the normal image store never sees them, which
+    /// is how a page's `<canvas>` draws into nothing on screen.
+    pub fn publish_render_resources(&mut self) -> (bool, ImageResources) {
+        let changed = self.publish_canvas_changes();
+        (changed, self.video_frames.clone())
+    }
+
+    /// Publish canvas pixels into the image store and report whether that
+    /// changed a bitmap, without copying the store. An embedder that renders
+    /// elsewhere uses this on every turn to know a repaint is due.
+    pub fn publish_canvas_changes(&mut self) -> bool {
+        self.publish_canvas_bitmaps()
     }
 
     /// Capture border-box geometry from the latest layout and publish it to

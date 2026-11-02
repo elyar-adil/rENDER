@@ -1041,6 +1041,58 @@ fn a_dom_change_in_a_turn_is_kept_for_the_event_loop_even_when_the_caller_ignore
 }
 
 #[test]
+fn a_canvas_draw_in_a_turn_is_kept_as_a_repaint_reason() {
+    let mut page = PageState::new(PageSource {
+        html: "<!doctype html><canvas id=qr width=4 height=4 style='display:block'></canvas>"
+            .into(),
+        title: "canvas".into(),
+        target: NavigationTarget::Url(Url::parse("https://example.test/").expect("page URL")),
+    });
+    let draw = "var ctx = document.getElementById('qr').getContext('2d');\
+                ctx.fillStyle = '#0f8'; ctx.fillRect(0, 0, 4, 4);";
+    page.page.queue_script(draw).expect("script queues");
+    let _ = page.run_page_turns();
+    // The first script also creates the canvas context. Start a fresh turn
+    // with no outstanding mutation so only the pixels can be the reason.
+    page.dom_changed_in_turn = false;
+    page.page.queue_script(draw).expect("second script queues");
+
+    // The browser renders through a worker, so the page never runs its own
+    // `render_update`. The turn must still publish the bitmap and report the
+    // repaint reason, or the canvas the script just drew never reaches a
+    // submitted frame.
+    let before = page.page.document().dom().revision();
+    let (changed, _) = page.run_page_turns();
+    let after = page.page.document().dom().revision();
+    assert_eq!(
+        after, before,
+        "drawing again does not change the DOM revision"
+    );
+    assert!(changed, "the canvas draw is reported as a repaint reason");
+    assert!(
+        page.dom_changed_in_turn,
+        "the canvas draw is a repaint reason for the coordinator"
+    );
+
+    let dom = page.page.document().dom();
+    let mut pending = vec![dom.document()];
+    let mut canvas = None;
+    while let Some(node) = pending.pop() {
+        if dom.attribute(node, "id").ok().flatten() == Some("qr") {
+            canvas = Some(node);
+            break;
+        }
+        pending.extend(dom.children(node).unwrap_or_default().iter().copied());
+    }
+    let canvas = canvas.expect("canvas node");
+    let (_, images) = page.page.publish_render_resources();
+    assert!(
+        images.get_for_node(canvas).is_some(),
+        "the drawn canvas bitmap is in the page's render image store"
+    );
+}
+
+#[test]
 fn timer_deferred_document_title_propagates_on_a_later_turn() {
     let mut page = PageState::new(PageSource {
         html: "<!doctype html><html><body></body></html>".into(),

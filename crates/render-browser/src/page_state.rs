@@ -993,7 +993,10 @@ impl PageState {
         self.drain_console();
         let revision_after = self.page.document().dom().revision().as_u64();
         self.dom_revision = revision_after;
-        let changed = revision_after != revision_before;
+        // Canvas pixels change outside the DOM revision; they are a repaint
+        // reason of their own, exactly as they are in `Page::run_turn`.
+        let canvas_changed = self.page.publish_canvas_changes();
+        let changed = revision_after != revision_before || canvas_changed;
         if changed {
             // Timers, event handlers and fetch callbacks may append scripts
             // long after the initial document scan completed.

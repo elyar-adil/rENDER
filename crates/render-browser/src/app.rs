@@ -660,6 +660,14 @@ impl BrowserApp {
             // The fragment target follows the document as scripts mutate it,
             // so recompute it for every full frame rather than only on load.
             let _target_changed = page.set_target_url(&base_url);
+            // Canvas and video pixels live in the page's own image store while
+            // network images live in the tab's. The render worker has the
+            // document clone but not the page, so hand it both stores merged.
+            let (_, canvas_images) = page.page.publish_render_resources();
+            let mut render_images = page.images.clone();
+            if let Err(error) = render_images.overlay(&canvas_images, ImageLimits::default()) {
+                eprintln!("render-browser could not publish canvas pixels: {error}");
+            }
             PageRenderPayload::Full(Box::new(FullPageRenderPayload {
                 document: page.page.document().clone(),
                 base_url,
@@ -671,7 +679,7 @@ impl BrowserApp {
                 // Script-inserted links are common on real sites, and the
                 // completed batch may itself have raced with a new link.
                 discover_external_styles: page.pending_style_sheets.is_none(),
-                images: page.images.clone(),
+                images: render_images,
                 interaction: page.interaction.clone(),
                 transition_state: page.transition_state.clone(),
                 frame_documents: page.page.runtime().frame_documents(),
@@ -5653,7 +5661,13 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
                     let changed_in_turn = std::mem::take(&mut page.dom_changed_in_turn);
                     // `focus()` changes document state but not the DOM revision.
                     let focus_changed = page.sync_focused_from_dom();
-                    if revision_after != revision_before || changed_in_turn || focus_changed {
+                    // A canvas draw changes pixels without a DOM mutation.
+                    let canvas_changed = page.page.publish_canvas_changes();
+                    if revision_after != revision_before
+                        || changed_in_turn
+                        || focus_changed
+                        || canvas_changed
+                    {
                         rendered_active |= *id == active;
                         title_candidates.push(*id);
                         page.scripts_resolved = false;
