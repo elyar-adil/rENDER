@@ -3,7 +3,7 @@ use std::fmt;
 use std::io::Read;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{
-    Arc, Mutex, RwLock,
+    Arc, Condvar, Mutex, RwLock,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -1712,6 +1712,80 @@ pub struct HttpTransport {
     config: Arc<FetchConfig>,
     agent: Arc<RwLock<TransportAgent>>,
     h2: Arc<H2Pool>,
+    /// Identical concurrent GETs share one transfer. Browsers coalesce
+    /// duplicate subresources the same way: a page that links the same
+    /// stylesheet from several partials must not download it once per link.
+    coalescer: Arc<RequestCoalescer>,
+}
+
+/// One in-flight request that later identical requests can wait on.
+#[derive(Default)]
+struct InFlight {
+    result: Mutex<Option<FetchResult>>,
+    ready: Condvar,
+}
+
+/// Identical concurrent GETs, keyed by every input that can change the
+/// response. A completed entry is removed as soon as its waiters are woken, so
+/// this map only ever holds transfers that are actually running.
+#[derive(Default)]
+struct RequestCoalescer {
+    in_flight: Mutex<HashMap<String, Arc<InFlight>>>,
+}
+
+impl RequestCoalescer {
+    fn enter(&self, key: &str) -> (Arc<InFlight>, bool) {
+        let mut map = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = map.get(key) {
+            return (Arc::clone(entry), false);
+        }
+        let entry = Arc::new(InFlight::default());
+        map.insert(key.to_owned(), Arc::clone(&entry));
+        (entry, true)
+    }
+
+    fn finish(&self, key: &str, entry: &Arc<InFlight>, result: &FetchResult) {
+        *entry
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.clone());
+        entry.ready.notify_all();
+        let mut map = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            map.remove(key);
+        }
+    }
+}
+
+/// The cache/coalescing identity of a request, or `None` when sharing a
+/// response would be unsafe (a body, range or conditional validator makes each
+/// transfer its own).
+fn coalesce_key(request: &FetchRequest) -> Option<String> {
+    if request.method != HttpMethod::Get
+        || request.body.is_some()
+        || request.byte_range.is_some()
+        || request
+            .cache_validators
+            .as_ref()
+            .is_some_and(|v| !v.is_empty())
+    {
+        return None;
+    }
+    let mut headers = request.headers.clone();
+    headers.sort();
+    Some(format!(
+        "{}\u{1f}{:?}\u{1f}{:?}\u{1f}{headers:?}",
+        request.url, request.accept, request.cookie
+    ))
 }
 
 impl fmt::Debug for HttpTransport {
@@ -1865,6 +1939,7 @@ impl HttpTransport {
                 has_proxy,
             })),
             h2,
+            coalescer: Arc::default(),
         }
     }
 
@@ -1885,6 +1960,7 @@ impl HttpTransport {
                 has_proxy,
             })),
             h2,
+            coalescer: Arc::default(),
         }
     }
 
@@ -1927,6 +2003,7 @@ impl HttpTransport {
                 has_proxy,
             })),
             h2,
+            coalescer: Arc::default(),
         }
     }
 
@@ -1948,6 +2025,7 @@ impl HttpTransport {
                 has_proxy: false,
             })),
             h2,
+            coalescer: Arc::default(),
         }
     }
 
@@ -1981,9 +2059,48 @@ impl HttpTransport {
     /// verification, and transport failures.
     pub fn fetch(&self, request: &FetchRequest, cancel: &CancelToken) -> FetchResult {
         let started = Instant::now();
-        let outcome = self.fetch_transfer(request, cancel);
+        let outcome = self.fetch_coalesced(request, cancel);
         self.report(request, started, &outcome);
         outcome
+    }
+
+    /// Shares one transfer between identical concurrent GETs.
+    ///
+    /// Two `<link rel=stylesheet>` elements naming the same URL are two
+    /// requests in the document, but one response on the wire. Without this,
+    /// every duplicate link starts its own transfer before any of them can
+    /// populate the HTTP cache, so a page can download the same large sheet
+    /// several times over. The entry is removed once the transfer settles, so
+    /// only genuinely concurrent work is shared.
+    fn fetch_coalesced(&self, request: &FetchRequest, cancel: &CancelToken) -> FetchResult {
+        let Some(key) = coalesce_key(request) else {
+            return self.fetch_transfer(request, cancel);
+        };
+        let (entry, owner) = self.coalescer.enter(&key);
+        if owner {
+            let result = self.fetch_transfer(request, cancel);
+            self.coalescer.finish(&key, &entry, &result);
+            return result;
+        }
+        loop {
+            if cancel.is_cancelled() {
+                return Err(FetchError::Cancelled);
+            }
+            let slot = entry
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(result) = slot.as_ref() {
+                return result.clone();
+            }
+            let (slot, _) = entry
+                .ready
+                .wait_timeout(slot, Duration::from_millis(10))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(result) = slot.as_ref() {
+                return result.clone();
+            }
+        }
     }
 
     /// Reports one request's terminal outcome to the configured observer.

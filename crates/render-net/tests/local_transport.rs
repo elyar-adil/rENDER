@@ -1196,3 +1196,65 @@ fn redirect_302_rewrites_a_post_to_get_like_browsers_do() {
         "302 must rewrite POST to GET"
     );
 }
+
+#[test]
+fn identical_concurrent_gets_share_one_transfer() {
+    let (base, server) = spawn_server(1, move |_request| WireResponse {
+        status: "200 OK",
+        headers: Vec::new(),
+        body: b"shared-body".to_vec(),
+        delay: Duration::from_millis(120),
+        body_chunk_delay: Duration::ZERO,
+    });
+    let url = base.join("sheet.css").expect("resource URL");
+    let client = transport(|_| {});
+    let start = Arc::new(std::sync::Barrier::new(2));
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let client = client.clone();
+            let url = url.clone();
+            let start = Arc::clone(&start);
+            handles.push(scope.spawn(move || {
+                start.wait();
+                client
+                    .fetch(&FetchRequest::get(url), &CancelToken::default())
+                    .expect("coalesced fetch succeeds")
+                    .body
+            }));
+        }
+        for result in handles {
+            assert_eq!(result.join().expect("fetch thread"), b"shared-body");
+        }
+    });
+    server.join().expect("server exits");
+}
+
+#[test]
+fn concurrent_gets_with_different_cookies_are_not_shared() {
+    let (base, server) = spawn_server(2, move |_request| WireResponse::ok("cookie-specific"));
+    let url = base.join("account").expect("resource URL");
+    let client = transport(|_| {});
+    let start = Arc::new(std::sync::Barrier::new(2));
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for cookie in ["session=a", "session=b"] {
+            let client = client.clone();
+            let url = url.clone();
+            let start = Arc::clone(&start);
+            handles.push(scope.spawn(move || {
+                let mut request = FetchRequest::get(url);
+                request.cookie = Some(cookie.to_owned());
+                start.wait();
+                client
+                    .fetch(&request, &CancelToken::default())
+                    .expect("fetch succeeds")
+                    .body
+            }));
+        }
+        for result in handles {
+            assert_eq!(result.join().expect("fetch thread"), b"cookie-specific");
+        }
+    });
+    server.join().expect("server exits");
+}
