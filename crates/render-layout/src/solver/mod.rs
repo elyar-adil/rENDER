@@ -672,6 +672,9 @@ struct FlexItem {
     base_outer: f32,
     target_outer: f32,
     min_outer: f32,
+    /// Whether `min_outer` is the content-based automatic minimum rather than
+    /// the item's computed `min-width`/`min-height`.
+    min_is_auto: bool,
     fragment: Option<FragmentId>,
     natural_outer_cross: f32,
     auto_main_before: bool,

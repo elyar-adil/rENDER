@@ -2394,6 +2394,39 @@ fn flex_column_centering_centers_the_login_card() {
     // main size, which `min-height:688px` lifts above the 600px viewport.
     assert_eq!(card.origin.y, (688.0 - card.size.height) / 2.0);
 }
+// A definite main-axis minimum is not just a shrink floor: it clamps the
+// item's hypothetical main size before free space is distributed. A sign-in
+// column declared `height: calc(100% - 42px); min-height: 688px` and was
+// already exactly 684px tall, so the free space was zero and the old
+// shrink-only floor allowed it to collapse to 372px; the footer then painted
+// over the social icons.
+#[test]
+fn a_definite_flex_item_minimum_is_applied_without_a_shrink_need() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body>\
+         <div id=home><div id=content></div><div id=footer></div></div>\
+         </body>",
+        "html, body, div { display:block; margin:0 } \
+         #home { display:flex; flex-direction:column; height:600px; overflow:auto } \
+         #content { height:calc(100% - 42px); min-height:688px } \
+         #footer { height:100px }",
+        1180.0,
+    );
+    let fragment_for = |selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .expect("fragment")
+            .rect
+    };
+    let content = fragment_for("#content");
+    let footer = fragment_for("#footer");
+    assert_eq!(content.size.height, 688.0);
+    assert_eq!(footer.origin.y, 688.0);
+    assert_eq!(footer.size.height, 100.0);
+}
+
 #[test]
 fn a_block_inside_an_inline_is_laid_out_as_a_block_between_the_two_halves() {
     // §9.2.1.1: the enclosing inline box is broken around the block-level box,

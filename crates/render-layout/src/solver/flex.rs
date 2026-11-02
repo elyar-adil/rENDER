@@ -489,6 +489,7 @@ impl Solver<'_> {
                     base_outer,
                     target_outer: base_outer,
                     min_outer: 0.0,
+                    min_is_auto: false,
                     fragment: None,
                     natural_outer_cross: 0.0,
                     auto_main_before: Self::margin_is_auto(style, before_property),
@@ -517,6 +518,7 @@ impl Solver<'_> {
                 .as_ref()
                 .and_then(|style| style.typed(property))
                 .is_none_or(|value| matches!(value, TypedPropertyValue::Size(Size::Auto)));
+            item.min_is_auto = automatic_minimum;
             if automatic_minimum {
                 // Flexbox §4.5: the used value of an `auto` main-axis minimum
                 // size on a non-scrollable flex item is its content-based
@@ -535,6 +537,23 @@ impl Solver<'_> {
                     self.intrinsic_flex_size(node, horizontal, main_size, 0)
                 };
                 item.min_outer = (intrinsic
+                    + self.flex_outer_extras(
+                        style.as_ref(),
+                        horizontal,
+                        containing.size.width,
+                        source,
+                    ))
+                .max(0.0);
+            } else {
+                // Flexbox §9.7: a definite main-axis minimum size is a floor
+                // the shrink step must respect. It was only computed for the
+                // `auto` case, so an item with `min-height: 688px` could still
+                // shrink to whatever freed space the container needed and let
+                // later siblings overlap it.
+                let minimum = self
+                    .resolve_size_against(style.as_ref(), property, Some(main_size), source)
+                    .unwrap_or(0.0);
+                item.min_outer = (minimum
                     + self.flex_outer_extras(
                         style.as_ref(),
                         horizontal,
@@ -649,6 +668,16 @@ impl Solver<'_> {
                 if !horizontal && Self::flex_basis_is_auto(item_style) {
                     item.base_outer = result.outer_height;
                     item.target_outer = result.outer_height;
+                    // The content-based minimum is the item's content size.
+                    // Measuring it before the item has a used width could
+                    // return a larger, width-dependent number (a footer whose
+                    // block axis is its main axis read 1174px before it was
+                    // laid out at 312px). Lay the item out first, then keep the
+                    // automatic floor equal to what its content actually used;
+                    // a definite computed minimum is never relaxed this way.
+                    if item.min_is_auto {
+                        item.min_outer = result.outer_height.max(0.0);
+                    }
                 }
             }
         }
@@ -803,10 +832,17 @@ impl Solver<'_> {
     }
 
     pub(super) fn distribute_flex_space(items: &mut [FlexItem], available_without_gaps: f32) {
+        // Flexbox §9.7's "hypothetical main size" clamps the flex base size by
+        // the item's used min and max main sizes before any free space is
+        // distributed. Without the clamp, a `min-height` only acted as a floor
+        // when the line had to shrink; a line whose items exactly filled the
+        // container left a definite minimum ignored and the item collapsed to
+        // its measured content height (a 688px sign-in column became 372 and
+        // the footer painted over the social icons).
         for item in items.iter_mut() {
-            item.target_outer = item.base_outer;
+            item.target_outer = item.base_outer.max(item.min_outer);
         }
-        let base = items.iter().map(|item| item.base_outer).sum::<f32>();
+        let base = items.iter().map(|item| item.target_outer).sum::<f32>();
         let free = available_without_gaps - base;
         if free > 0.0 {
             let grow = items.iter().map(|item| item.grow).sum::<f32>();
