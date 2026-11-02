@@ -9,6 +9,7 @@ mod diagnostics;
 mod fetch_handles;
 mod frame;
 mod interaction_state;
+mod page_selection;
 mod page_source;
 mod page_state;
 mod platform_presenter;

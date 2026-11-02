@@ -621,6 +621,17 @@ impl<'a> InteractionScene<'a> {
     }
 }
 
+/// The selection semantics of a primary-button press.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerDownMode {
+    /// Collapse at the caret under the pointer.
+    Replace,
+    /// Keep the existing anchor and move the focus to the caret.
+    Extend,
+    /// Select the word under the pointer.
+    SelectWord,
+}
+
 /// Stateful pointer gesture adapter that constructs the existing DOM
 /// [`Selection`] model. The state itself has no platform event dependency.
 #[derive(Clone, Debug, Default)]
@@ -649,6 +660,18 @@ impl PointerSelection {
         &mut self.selection
     }
 
+    /// Whether a gesture is in progress.
+    #[must_use]
+    pub const fn is_pointer_down(&self) -> bool {
+        self.pointer_down
+    }
+
+    /// Whether the in-progress gesture has moved far enough to be a drag.
+    #[must_use]
+    pub const fn is_dragged(&self) -> bool {
+        self.dragged
+    }
+
     /// Start a pointer selection gesture and collapse at the nearest caret.
     ///
     /// # Errors
@@ -660,11 +683,42 @@ impl PointerSelection {
         scene: &InteractionScene<'_>,
         point: PhysicalPoint,
     ) -> Result<PointerOutcome, HitTestError> {
+        self.pointer_down_with_mode(scene, point, PointerDownMode::Replace)
+    }
+
+    /// Start a pointer gesture with explicit selection semantics. A word
+    /// selection keeps the anchor at the word start so a later drag extends
+    /// from the word rather than from the original press point.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input, interaction resource exhaustion, or
+    /// a rejected DOM selection boundary.
+    pub fn pointer_down_with_mode(
+        &mut self,
+        scene: &InteractionScene<'_>,
+        point: PhysicalPoint,
+        mode: PointerDownMode,
+    ) -> Result<PointerOutcome, HitTestError> {
         let hit = scene.hit_test(point)?;
         let caret = scene.caret_at(point)?;
         let selection_changed = if let Some(caret) = caret {
-            self.selection.collapse(scene.dom, caret)?;
-            true
+            match mode {
+                PointerDownMode::Extend if !self.selection.is_empty() => {
+                    self.selection.extend(scene.dom, caret)?;
+                    true
+                }
+                PointerDownMode::Replace | PointerDownMode::Extend => {
+                    self.selection.collapse(scene.dom, caret)?;
+                    true
+                }
+                PointerDownMode::SelectWord => {
+                    let range = scene.word_range_at(caret)?;
+                    self.selection.collapse(scene.dom, range.start())?;
+                    self.selection.extend(scene.dom, range.end())?;
+                    true
+                }
+            }
         } else {
             false
         };
@@ -729,7 +783,11 @@ impl PointerSelection {
         document_base_url: &Url,
     ) -> Result<PointerOutcome, HitTestError> {
         let hit = scene.hit_test(point)?;
-        let selection_changed = if self.pointer_down {
+        // A press has already placed the caret (or selected a word/extended
+        // to a shift-click). Only a real drag needs to move the focus again;
+        // extending on an un-dragged release would collapse a double-click
+        // word selection back to the release offset.
+        let selection_changed = if self.pointer_down && self.dragged {
             if let Some(caret) = scene.caret_at(point)? {
                 self.selection.extend(scene.dom, caret)?;
                 true
@@ -1142,7 +1200,7 @@ mod tests {
 
     use super::{
         ActivationIntent, BoundaryBias, HitTestError, InteractionLimits, InteractionResource,
-        InteractionScene, PointerSelection,
+        InteractionScene, PointerDownMode, PointerSelection,
     };
 
     fn find_by_id(dom: &Dom, id: &str) -> NodeId {
@@ -1551,6 +1609,137 @@ mod tests {
             backward.selection().direction(),
             SelectionDirection::Backward
         );
+    }
+
+    #[test]
+    fn an_un_dragged_pointer_click_on_a_link_activates_it() {
+        let (document, output) = render(
+            "<!doctype html><body><a id='link' href='/next'>go now</a></body>",
+            PhysicalSize {
+                width: 320.0,
+                height: 100.0,
+            },
+        );
+        let link = find_by_id(document.dom(), "link");
+        let text = first_text(document.dom(), link);
+        let rect = text_fragment_rect(&output, text);
+        let scene = InteractionScene::new(
+            document.dom(),
+            &output.layout.fragments,
+            &SimpleTextMeasurer,
+            PhysicalPoint::default(),
+            InteractionLimits::default(),
+        )
+        .unwrap();
+        let point = point_in(rect, 0.25);
+        let mut pointer = PointerSelection::default();
+        pointer.pointer_down(&scene, point).unwrap();
+        let outcome = pointer
+            .pointer_up(
+                &scene,
+                point,
+                &Url::parse("https://example.test/dir/page.html").unwrap(),
+            )
+            .unwrap();
+        let Some(ActivationIntent::Navigate(navigation)) = outcome.activation else {
+            panic!("an un-dragged click on link text must activate the link");
+        };
+        assert_eq!(navigation.link, link);
+        assert_eq!(
+            navigation.destination,
+            Url::parse("https://example.test/next").unwrap()
+        );
+    }
+
+    #[test]
+    fn double_click_word_mode_survives_an_un_dragged_release() {
+        let (document, output) = render(
+            "<!doctype html><body><p id='p'>hello brave world</p></body>",
+            PhysicalSize {
+                width: 320.0,
+                height: 100.0,
+            },
+        );
+        let text = first_text(document.dom(), find_by_id(document.dom(), "p"));
+        let rect = text_fragment_rect(&output, text);
+        let scene = InteractionScene::new(
+            document.dom(),
+            &output.layout.fragments,
+            &SimpleTextMeasurer,
+            PhysicalPoint::default(),
+            InteractionLimits::default(),
+        )
+        .unwrap();
+        let point = (0..=100_u16)
+            .map(|step| point_in(rect, f32::from(step) / 100.0))
+            .find(|point| {
+                scene
+                    .caret_at(*point)
+                    .unwrap()
+                    .is_some_and(|caret| (6..11).contains(&caret.offset))
+            })
+            .expect("some x coordinate lands inside the word 'brave'");
+        let mut pointer = PointerSelection::default();
+        pointer
+            .pointer_down_with_mode(&scene, point, PointerDownMode::SelectWord)
+            .unwrap();
+        pointer
+            .pointer_up(&scene, point, &Url::parse("https://example.test/").unwrap())
+            .unwrap();
+        assert_eq!(
+            pointer.selection().anchor(),
+            Some(BoundaryPoint::new(text, 6)),
+            "the word starts at the selected word's first character"
+        );
+        assert_eq!(
+            pointer.selection().focus(),
+            Some(BoundaryPoint::new(text, 11)),
+            "the word ends at its last character plus one"
+        );
+    }
+
+    #[test]
+    fn shift_click_mode_extends_from_the_existing_anchor() {
+        let (document, output) = render(
+            "<!doctype html><body><p id='p'>first second</p></body>",
+            PhysicalSize {
+                width: 320.0,
+                height: 100.0,
+            },
+        );
+        let paragraph = find_by_id(document.dom(), "p");
+        let text = first_text(document.dom(), paragraph);
+        let rect = text_fragment_rect(&output, text);
+        let scene = InteractionScene::new(
+            document.dom(),
+            &output.layout.fragments,
+            &SimpleTextMeasurer,
+            PhysicalPoint::default(),
+            InteractionLimits::default(),
+        )
+        .unwrap();
+        let start = PhysicalPoint {
+            x: rect.origin.x - 1.0,
+            y: rect.origin.y + rect.size.height / 2.0,
+        };
+        let end = PhysicalPoint {
+            x: rect.right() + 1.0,
+            y: rect.origin.y + rect.size.height / 2.0,
+        };
+        let mut pointer = PointerSelection::default();
+        pointer.pointer_down(&scene, start).unwrap();
+        pointer
+            .pointer_down_with_mode(&scene, end, PointerDownMode::Extend)
+            .unwrap();
+        assert_eq!(
+            pointer.selection().anchor(),
+            Some(BoundaryPoint::new(text, 0))
+        );
+        assert_eq!(
+            pointer.selection().focus(),
+            Some(BoundaryPoint::new(text, 12))
+        );
+        assert_eq!(pointer.selection().direction(), SelectionDirection::Forward);
     }
 
     #[test]

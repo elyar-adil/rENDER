@@ -6,13 +6,13 @@ use std::time::Duration;
 use std::time::Instant;
 
 use render_browser::compositor::PlatformPresenter;
-use render_core::document::{Document, ExternalStyleSheets};
+use render_core::document::{Document, DocumentRenderOptions, ExternalStyleSheets};
 use render_core::dom::Dom;
 use render_core::dom::NodeId;
 use render_core::dom::NodeKind;
 use render_core::html::parse_document;
 use render_core::js::RuntimeLimits;
-use render_core::layout::{FragmentId, PhysicalPoint, PhysicalRect};
+use render_core::layout::{FragmentId, FragmentKind, PhysicalPoint, PhysicalRect};
 use render_core::navigation::HistoryEntry;
 use render_core::paint::CompositorCache;
 use render_core::paint::DisplayItem;
@@ -29,6 +29,7 @@ use winit::event::ElementState;
 use winit::event::MouseScrollDelta;
 use winit::event_loop::ControlFlow;
 use winit::keyboard::Key;
+use winit::keyboard::ModifiersState;
 use winit::keyboard::NamedKey;
 
 use crate::app::BrowserApp;
@@ -86,10 +87,26 @@ use render_browser::worker::RenderViewport;
 use render_browser::worker::RenderWorkerOptions;
 use render_core::js::ElementRect;
 
+/// Clipboard the app can write without a desktop session.
+#[derive(Default)]
+struct TestClipboard(Option<String>);
+
+impl render_browser::editor::Clipboard for TestClipboard {
+    fn read_text(&mut self) -> Option<String> {
+        self.0.clone()
+    }
+
+    fn write_text(&mut self, value: &str) -> bool {
+        self.0 = Some(value.to_owned());
+        true
+    }
+}
+
 fn empty_render_frame(viewport: WindowSize<u32>, pixel: u32, revision: u64) -> PageRenderFrame {
     PageRenderFrame {
         frame: vec![pixel],
         viewport,
+        fragments: None,
         display_list: None,
         paint_scene: None,
         compositor: None,
@@ -1247,6 +1264,7 @@ fn script_inserted_stylesheet_is_discovered_after_initial_styles_resolve() {
         result: Ok(PageRenderFrame {
             frame: Vec::new(),
             viewport: WindowSize::new(800, 600),
+            fragments: None,
             display_list: None,
             paint_scene: None,
             compositor: None,
@@ -1306,6 +1324,7 @@ fn first_paint_waits_for_blocking_stylesheets() {
         result: Ok(PageRenderFrame {
             frame: Vec::new(),
             viewport: WindowSize::new(800, 600),
+            fragments: None,
             display_list: None,
             paint_scene: None,
             compositor: None,
@@ -1748,6 +1767,7 @@ fn gated_render_worker() -> (
                 Ok(PageRenderFrame {
                     frame: vec![0x00ff_ffff; (width * height) as usize],
                     viewport: WindowSize::new(width, height),
+                    fragments: None,
                     display_list: None,
                     paint_scene: None,
                     compositor: None,
@@ -2723,7 +2743,7 @@ fn headless_app_with_render_worker(
         proxy_ui: render_browser::settings::ProxyUiState::new(None),
         editor: AddressEditor::new("file:///rENDER-test-fixtures/page.html"),
         content_editor: None,
-        clipboard: render_browser::editor::NativeClipboard::default(),
+        clipboard: Box::new(TestClipboard::default()),
         window: None,
         context: None,
         presenter: render_browser::compositor::shared_presenter(),
@@ -2744,6 +2764,8 @@ fn headless_app_with_render_worker(
         scrollbar_hot: false,
         address_selecting: false,
         content_selecting: false,
+        page_gesture: None,
+        content_clicks: render_browser::chrome::AddressClickTracker::default(),
         address_menu: None,
         modifiers: winit::keyboard::ModifiersState::default(),
         title_bar_clicks: render_browser::chrome::TitleBarClickTracker::default(),
@@ -2852,6 +2874,100 @@ fn click_content_at(app: &mut BrowserApp, x: f32, document_y: f32) {
 fn click_search_box(app: &mut BrowserApp) {
     click_content_at(app, 400.0, 167.0);
 }
+
+/// Render the tab's current DOM through the reference layout path and install
+/// its fragment tree, so page selection has a layout snapshot without a
+/// window or a completed worker frame.
+fn install_page_fragments(app: &mut BrowserApp, tab: TabId) {
+    install_page_fragments_at_scale(app, tab, 1.0);
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn install_page_fragments_at_scale(app: &mut BrowserApp, tab: TabId, scale: f32) {
+    let size = WindowSize::new(800, 600);
+    let layout = ChromeLayout::new(size.width, size.height, scale, app.tabs.tabs());
+    let chrome_height = layout.chrome_height;
+    app.layout = Some(layout);
+    let viewport = css_content_viewport(size, chrome_height, scale);
+    let css_viewport = render_core::layout::PhysicalSize {
+        width: viewport.width as f32,
+        height: viewport.height as f32,
+    };
+    let output = {
+        let page = app.pages.get(&tab).expect("page");
+        page.page
+            .document()
+            .clone()
+            .render_reference(DocumentRenderOptions {
+                layout: render_core::layout::LayoutOptions {
+                    viewport: css_viewport,
+                    ..render_core::layout::LayoutOptions::default()
+                },
+                ..DocumentRenderOptions::default()
+            })
+    };
+    let content_height = output.layout.fragments.scrollable_content_size.height;
+    let viewport_height = output.layout.fragments.viewport.height;
+    let revision = output.revision.as_u64();
+    let geometry = crate::frame::geometry_from_layout(&output.layout.fragments);
+    let page = app.pages.get_mut(&tab).expect("page");
+    page.fragments = Some(Arc::new(output.layout.fragments));
+    page.geometry = geometry;
+    page.dom_revision = revision;
+    page.scroll.update_metrics(content_height, viewport_height);
+}
+
+fn text_fragment_rect(app: &BrowserApp, tab: TabId, id: &str) -> PhysicalRect {
+    let page = app.pages.get(&tab).expect("page");
+    let dom = page.page.document().dom();
+    let root = find_id(dom, id);
+    let mut pending = vec![root];
+    let mut text = None;
+    while let Some(node) = pending.pop() {
+        if matches!(
+            dom.node(node).map(render_core::dom::Node::kind),
+            Some(NodeKind::Text(_))
+        ) {
+            text = Some(node);
+            break;
+        }
+        pending.extend(dom.children(node).unwrap_or_default().iter().copied());
+    }
+    let text = text.unwrap_or_else(|| panic!("#{id} should contain a text node"));
+    page.fragments
+        .as_ref()
+        .expect("fragments installed")
+        .iter()
+        .find_map(|fragment| {
+            (fragment.source == Some(text) && matches!(fragment.kind, FragmentKind::Text(_)))
+                .then_some(fragment.rect)
+        })
+        .unwrap_or_else(|| panic!("text fragment for #{id} should exist"))
+}
+
+fn press_page_at(app: &mut BrowserApp, x: f32, document_y: f32) {
+    click_content_at(app, x, document_y);
+    app.left_pointer_down = true;
+}
+
+fn move_page_to(app: &mut BrowserApp, x: f32, document_y: f32) {
+    let chrome_height = app.layout.as_ref().expect("chrome layout").chrome_height;
+    app.handle_cursor_move(PhysicalPosition::new(
+        f64::from(x),
+        f64::from(chrome_height) + f64::from(document_y),
+    ));
+}
+
+fn drag_page_between(app: &mut BrowserApp, from: (f32, f32), to: (f32, f32)) {
+    press_page_at(app, from.0, from.1);
+    move_page_to(app, to.0, to.1);
+    app.handle_pointer_release();
+}
+
+const SELECTION_PAGE_HTML: &str = "<!doctype html><style>html,body{margin:0;padding:0}\
+    p{margin:0;padding:0}</style><body><div style='height:120px'></div>\
+    <p id=one>alpha beta</p><p id=two>gamma delta</p><div style='height:800px'></div>\
+    </body></html>";
 
 #[test]
 fn clicking_the_search_box_focuses_it_and_typing_renders_the_value() {
@@ -3234,6 +3350,288 @@ fn clicking_inside_existing_page_input_text_places_the_caret_near_the_click() {
     assert!(
         content.editor.cursor() < content.editor.text().len(),
         "clicking within existing text must not always move the caret to the end"
+    );
+}
+
+#[test]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn dragging_across_two_text_fragments_paints_two_selection_rects() {
+    let (mut app, tab) = headless_app_with(SELECTION_PAGE_HTML);
+    install_page_fragments(&mut app, tab);
+    let first = text_fragment_rect(&app, tab, "one");
+    let second = text_fragment_rect(&app, tab, "two");
+    drag_page_between(
+        &mut app,
+        (
+            first.origin.x + first.size.width * 0.2,
+            first.origin.y + first.size.height / 2.0,
+        ),
+        (
+            second.origin.x + second.size.width * 0.8,
+            second.origin.y + second.size.height / 2.0,
+        ),
+    );
+
+    let chrome_height = app.layout.as_ref().expect("chrome layout").chrome_height;
+    let rects = app.page_selection_geometry(chrome_height);
+    assert_eq!(rects.len(), 2, "each selected text fragment paints a rect");
+    assert!(
+        rects[0].rect.y < rects[1].rect.y,
+        "the highlight follows document order"
+    );
+    assert!(app.pages.get(&tab).expect("page").has_page_selection());
+
+    // The highlight is a native overlay: an empty page raster plus selection
+    // must produce non-background pixels at both rects.
+    app.compose_frame(WindowSize::new(800, 600));
+    for selection in &rects {
+        let x = (selection.rect.x + selection.rect.width / 2.0) as usize;
+        let y = (selection.rect.y + selection.rect.height / 2.0) as usize;
+        let pixel = app.frame[y * 800 + x];
+        assert_ne!(pixel, 0x00ff_ffff, "the selection rect must be painted");
+    }
+
+    // A press on blank page content clears the selection instead of moving
+    // the caret to the nearest text.
+    click_content_at(&mut app, 10.0, 500.0);
+    assert!(
+        !app.pages.get(&tab).expect("page").has_page_selection(),
+        "clicking blank content clears the highlight"
+    );
+}
+
+#[test]
+fn double_click_selects_a_word() {
+    let (mut app, tab) = headless_app_with(SELECTION_PAGE_HTML);
+    install_page_fragments(&mut app, tab);
+    let rect = text_fragment_rect(&app, tab, "one");
+    let y = rect.origin.y + rect.size.height / 2.0;
+
+    let mut selected = None;
+    for step in 0..=20_u16 {
+        let x = rect.origin.x + rect.size.width * f32::from(step) / 20.0;
+        app.content_clicks.reset();
+        click_content_at(&mut app, x, y);
+        app.handle_pointer_release();
+        click_content_at(&mut app, x, y);
+        app.handle_pointer_release();
+        let text = app.pages.get(&tab).expect("page").page_selection_text();
+        if text == "beta" {
+            selected = Some(x);
+            break;
+        }
+    }
+    assert!(
+        selected.is_some(),
+        "double-clicking inside a word must select exactly that word"
+    );
+}
+
+#[test]
+fn command_c_copies_the_page_selection() {
+    let (mut app, tab) = headless_app_with(SELECTION_PAGE_HTML);
+    install_page_fragments(&mut app, tab);
+    let first = text_fragment_rect(&app, tab, "one");
+    let second = text_fragment_rect(&app, tab, "two");
+    drag_page_between(
+        &mut app,
+        (
+            first.origin.x + first.size.width * 0.2,
+            first.origin.y + first.size.height / 2.0,
+        ),
+        (
+            second.origin.x + second.size.width * 0.8,
+            second.origin.y + second.size.height / 2.0,
+        ),
+    );
+
+    app.modifiers = if cfg!(target_os = "macos") {
+        ModifiersState::SUPER
+    } else {
+        ModifiersState::CONTROL
+    };
+    app.handle_keyboard(&pressed_character("c"));
+    let copied = app
+        .clipboard
+        .read_text()
+        .expect("copy writes the clipboard");
+    assert!(copied.contains("beta"), "copied text: {copied:?}");
+    assert!(copied.contains("gamma"), "copied text: {copied:?}");
+}
+
+#[test]
+fn clicking_a_link_without_dragging_still_navigates() {
+    let (mut app, tab) = headless_app_with(
+        "<!doctype html><style>html,body{margin:0;padding:0}</style>\
+         <body><p id=before>intro</p><a id=link href='/next'>next page</a></body>",
+    );
+    install_page_fragments(&mut app, tab);
+    let rect = text_fragment_rect(&app, tab, "link");
+    let x = rect.origin.x + rect.size.width / 2.0;
+    let y = rect.origin.y + rect.size.height / 2.0;
+    press_page_at(&mut app, x, y);
+    app.handle_pointer_release();
+
+    let page = app.pages.get(&tab).expect("page");
+    assert_eq!(
+        page.history.len(),
+        2,
+        "an un-dragged click on link text must still push its navigation"
+    );
+    assert_eq!(
+        page.history.current().url.as_str(),
+        "file:///next",
+        "the link's href is followed on release"
+    );
+}
+
+#[test]
+fn navigation_clears_the_page_selection() {
+    let (mut app, tab) = headless_app_with(SELECTION_PAGE_HTML);
+    install_page_fragments(&mut app, tab);
+    let first = text_fragment_rect(&app, tab, "one");
+    drag_page_between(
+        &mut app,
+        (
+            first.origin.x + 1.0,
+            first.origin.y + first.size.height / 2.0,
+        ),
+        (
+            first.right() - 1.0,
+            first.origin.y + first.size.height / 2.0,
+        ),
+    );
+    assert!(app.pages.get(&tab).expect("page").has_page_selection());
+
+    app.navigate_target(tab, NavigationTarget::Home, HistoryMode::Push);
+    let page = app.pages.get(&tab).expect("page");
+    assert!(
+        !page.has_page_selection(),
+        "a new document cannot keep ranges into the old DOM"
+    );
+    assert!(page.fragments.is_none());
+}
+
+#[test]
+fn scrolling_moves_the_page_selection_highlight() {
+    let (mut app, tab) = headless_app_with(SELECTION_PAGE_HTML);
+    install_page_fragments(&mut app, tab);
+    let first = text_fragment_rect(&app, tab, "one");
+    drag_page_between(
+        &mut app,
+        (
+            first.origin.x + 1.0,
+            first.origin.y + first.size.height / 2.0,
+        ),
+        (
+            first.right() - 1.0,
+            first.origin.y + first.size.height / 2.0,
+        ),
+    );
+    let chrome_height = app.layout.as_ref().expect("chrome layout").chrome_height;
+    let before = app.page_selection_geometry(chrome_height)[0].rect.y;
+
+    {
+        let page = app.pages.get_mut(&tab).expect("page");
+        page.scroll.update_metrics(2_000.0, 600.0);
+        assert!(page.scroll.scroll_by(50.0));
+    }
+    let after = app.page_selection_geometry(chrome_height)[0].rect.y;
+    assert!(
+        (after - (before - 50.0)).abs() < f32::EPSILON,
+        "the overlay follows the same scroll offset as the retained raster"
+    );
+}
+
+#[test]
+#[allow(clippy::cast_precision_loss)]
+fn a_high_dpi_selection_overlay_uses_physical_coordinates() {
+    let (mut app, tab) = headless_app_with(SELECTION_PAGE_HTML);
+    install_page_fragments_at_scale(&mut app, tab, 2.0);
+    let first = text_fragment_rect(&app, tab, "one");
+    let y = first.origin.y + first.size.height / 2.0;
+    let chrome_height = app.layout.as_ref().expect("chrome layout").chrome_height;
+    app.cursor = Point {
+        x: (first.origin.x + 1.0) * 2.0,
+        y: chrome_height as f32 + y * 2.0,
+    };
+    app.handle_content_press();
+    app.left_pointer_down = true;
+    app.handle_cursor_move(PhysicalPosition::new(
+        f64::from(first.right() - 1.0) * 2.0,
+        f64::from(chrome_height) + f64::from(y) * 2.0,
+    ));
+    app.handle_pointer_release();
+
+    let rects = app.page_selection_geometry(chrome_height);
+    assert_eq!(rects.len(), 1);
+    let expected_top = chrome_height as f32 + first.origin.y * 2.0;
+    assert!(
+        (rects[0].rect.y - expected_top).abs() < 0.01,
+        "chrome offset and DPR are applied to the selection y"
+    );
+    assert!(
+        (rects[0].rect.height - first.size.height * 2.0).abs() < 0.01,
+        "the highlight height is a physical size"
+    );
+    assert!(
+        rects[0].rect.x >= first.origin.x * 2.0 && rects[0].rect.x <= first.right() * 2.0 + 0.01,
+        "the highlight x is in physical pixels"
+    );
+}
+
+#[test]
+fn a_dom_edit_clamps_the_page_selection_offsets() {
+    let (mut app, tab) = headless_app_with(SELECTION_PAGE_HTML);
+    install_page_fragments(&mut app, tab);
+    let first = text_fragment_rect(&app, tab, "one");
+    drag_page_between(
+        &mut app,
+        (
+            first.origin.x + 1.0,
+            first.origin.y + first.size.height / 2.0,
+        ),
+        (
+            first.right() - 1.0,
+            first.origin.y + first.size.height / 2.0,
+        ),
+    );
+
+    let page = app.pages.get_mut(&tab).expect("page");
+    let paragraph = find_id(page.page.document().dom(), "one");
+    let text = page
+        .page
+        .document()
+        .dom()
+        .children(paragraph)
+        .expect("paragraph children")
+        .iter()
+        .copied()
+        .find(|node| {
+            matches!(
+                page.page
+                    .document()
+                    .dom()
+                    .node(*node)
+                    .map(render_core::dom::Node::kind),
+                Some(NodeKind::Text(_))
+            )
+        })
+        .expect("paragraph text");
+    page.page
+        .document_mut()
+        .dom_mut()
+        .set_character_data(text, "al")
+        .expect("shorten text");
+    assert!(page.repair_page_selection());
+    let anchor = page
+        .page_selection
+        .selection()
+        .anchor()
+        .expect("selection survives a shortening edit");
+    assert!(
+        anchor.offset <= 2,
+        "a character-data edit clamps the offset to the new length"
     );
 }
 

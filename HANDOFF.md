@@ -1,3 +1,50 @@
+# 交接文档 (2026-11-02, 续七十) — 原生页面文字选择与复制
+
+本轮补上了页面正文的鼠标选择/复制，没有站点特判。
+
+## 状态与坐标
+
+- `PageState` 新增 `fragments: Option<Arc<FragmentTree>>`，由 full render 的 `PageRenderFrame` 携带（retained-raster 帧为 `None`，保留上一棵树）。页面选择只绑定已提交的布局快照。
+- 每 tab 的 `PageSelection` 包装 core `PointerSelection` 并记录 DOM revision。选择、方向、边界 clamp、mutation repair 全部复用 `render-core` 既有实现。
+- 高亮由 `InteractionScene::selection_geometry` 产生 CSS 文档矩形，`compose_frame` 转成物理坐标：`x = rect.x * DPR`、`y = chrome_height + (rect.y - scroll_y) * DPR`，再与 `layout.content` 求交。页面 raster 保持 retained，选择只是 alpha overlay（现有浅蓝 selection 色，112 alpha），不需要重渲染。
+- scroll 直接改变 `viewport_rect` 的来源偏移，高亮随内容移动；resize 用新 DPR/chrome 重算。选择可见时 `can_composite_scroll` 返回 false，避免 compositor 直接 present 页面 surface 时把 overlay 擦掉，并对在途 compositor job 调用 `cancel_tab`。
+
+## 手势
+
+- `PointerDownMode::{Replace, Extend, SelectWord}`：普通按下 collapse 到最近 caret；shift-click 保留 anchor 并 extend；双击用 `word_range_at` 选中单词。`pointer_up` 只在真正拖动后再次 extend，双击单词不会被 release 点 collapse 回去。
+- 按下命中文字后，`click`（含链接导航）延迟到 release；未拖动仍走原 `perform_content_click`，因此链接、按钮和表单提交语义不变。移动超过 2 CSS px 才视为拖动，轻微抖动不会吞掉链接点击。
+- 点击空白正文、chrome、地址栏或切走页面会清空选择；导航在 `PageState::set_source` 中清空选择与 fragment 树。
+- 拖动中不进 form control：聚焦 input/textarea 的 press 仍交给 `ContentTextEditor`；Cmd+C 在 content editor 有焦点时仍走编辑器自己的 selection，不经过页面 Range。
+
+## 复制
+
+- 手势 press/finish 时把 core Selection 同步到 DOM live Selection（`selection_set_base_and_extent`）。Cmd/Ctrl+C 通过 `Dom::selection_to_string` 取文本并写入 clipboard。
+- `BrowserApp.clipboard` 从具体 `NativeClipboard` 改为 `Box<dyn Clipboard>`，headless 测试可注入内存 clipboard。
+- DOM mutation 后 `PageState::repair_page_selection` 调 `Selection::apply_mutations`：character-data 编辑 clamp offset，child-list/断开边界按 core 规则清除；journal 已丢弃时直接清除。compose 前执行。
+
+## 测试与验证
+
+新增 app tests：两段文字拖动产生两个高亮矩形并实际画出非背景像素、双击选词、Cmd/Ctrl+C 复制、未拖动的链接点击仍导航、导航清空选择、滚动使高亮同步位移、文本缩短后 offset clamp、点击空白清空选择、DPR 2 下高亮矩形为物理坐标。render-core hit-test 新增未拖动链接激活、双击单词、shift-click extend 三个测试。
+
+```text
+cargo fmt --all --check                                    clean
+cargo clippy -p render-browser -p render-core --all-targets -- -D warnings
+                                                            clean
+cargo test -p render-browser --bin render-browser          140 passed
+cargo test -p render-browser --lib                         241 passed
+cargo test -p render-core --lib interaction                 20 passed
+python tools/check_site_neutrality.py                       0 blocking, 31 advisory
+```
+
+## 剩余缺口
+
+- 未派发 `selectstart`/`selectionchange`；拖动过程中只在 press/finish 同步 DOM Selection，脚本在拖动中读到的仍是上一次边界。
+- 脚本通过 `Selection` API 设置的选择不会反向驱动原生高亮（高亮以 shell 的 `PageSelection` 为准）。
+- 选择不跨 iframe 内容（iframe 目前以 image 形式绘制在父 fragment 树中）；无拖动自动滚屏、无三击整段/行选择、无键盘 caret 扩展、无右键复制菜单。
+- 每次点击会为 DOM Selection 创建新的 live Range；render-dom 的 range 表本身尚无回收机制。
+
+---
+
 # 交接文档 (2026-11-02, 续六十九) — 常用站点体验收敛：滚动/渲染性能、百度布局、字体继承、X/知乎诊断
 
 本轮把目标从“广撒网补能力”收敛到少数常用页面：百度搜索、Google、知乎、X。所有修复仍然走通用 HTML/CSS/DOM/JS/layout/paint 路径，没有站点特判。

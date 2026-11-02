@@ -125,6 +125,7 @@ use render_core::image::ImageLimits;
 use render_core::image::ImageSelectionContext;
 use render_core::image::ImageSource;
 use render_core::interaction::FocusNavigationDirection;
+use render_core::interaction::hit_test::PointerDownMode;
 use render_core::navigation::HistoryEntry;
 
 use render_core::import_map::ImportMapMiss;
@@ -186,6 +187,27 @@ pub(super) enum HistoryMode {
     Push,
     Current,
 }
+
+/// One primary-button gesture that began on selectable page text.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PageGesture {
+    tab: TabId,
+    /// The click target captured at press time, so release activates the same
+    /// node even when script moved the page's hover chain in between.
+    target: Option<render_core::dom::NodeId>,
+    press: Point,
+    /// The pointer crossed the drag threshold. Selection extension is owned by
+    /// the core gesture; this only decides whether release may click.
+    dragged: bool,
+    /// A double-click (word selection) and a shift-click (extension) do not
+    /// run the ordinary click default action.
+    activate_on_release: bool,
+}
+
+/// CSS-pixel movement before a press becomes a text-selection drag rather than
+/// a click. Keeping a small threshold means a shaky mouse still activates a
+/// link.
+const PAGE_DRAG_THRESHOLD_CSS_PX: f32 = 2.0;
 
 /// Rejection message produced by the render-net worker when its bounded
 /// command queue is full. The two crates share the wording by contract.
@@ -256,7 +278,7 @@ pub(super) struct BrowserApp {
     pub(super) proxy_ui: ProxyUiState,
     pub(super) editor: AddressEditor,
     pub(super) content_editor: Option<ContentTextEditor>,
-    pub(super) clipboard: NativeClipboard,
+    pub(super) clipboard: Box<dyn Clipboard>,
     pub(super) window: Option<Arc<Window>>,
     pub(super) context: Option<Context<Arc<Window>>>,
     /// Platform sink shared with the compositor worker. The worker presents
@@ -306,6 +328,10 @@ pub(super) struct BrowserApp {
     /// text control.  The page editor owns the anchor/caret; this flag only
     /// keeps pointer motion from being mistaken for tab dragging.
     pub(super) content_selecting: bool,
+    /// The active page text-selection gesture, if the press began on text.
+    pub(super) page_gesture: Option<PageGesture>,
+    /// Double-click detection for page text (the address field has its own).
+    pub(super) content_clicks: AddressClickTracker,
     pub(super) address_menu: Option<AddressContextMenu>,
     pub(super) modifiers: ModifiersState,
     pub(super) title_bar_clicks: TitleBarClickTracker,
@@ -382,7 +408,7 @@ impl BrowserApp {
             proxy_ui,
             editor,
             content_editor: None,
-            clipboard: NativeClipboard::default(),
+            clipboard: Box::new(NativeClipboard::default()),
             window: None,
             context: None,
             presenter,
@@ -406,6 +432,8 @@ impl BrowserApp {
             scrollbar_hot: false,
             address_selecting: false,
             content_selecting: false,
+            page_gesture: None,
+            content_clicks: AddressClickTracker::default(),
             address_menu: None,
             modifiers: ModifiersState::default(),
             title_bar_clicks: TitleBarClickTracker::default(),
@@ -609,7 +637,12 @@ impl BrowserApp {
             && prefer_retained_raster
             && page.viewport == viewport
             && page.style_batch.is_none()
-            && page.compositor.is_some();
+            && page.compositor.is_some()
+            // The selection overlay is painted by `compose_frame`, after the
+            // page surface. A compositor frame presents the page surface
+            // alone, so selecting text while scrolling must fall back to the
+            // retained-raster path until the selection is cleared.
+            && !page.has_page_selection();
         // A render for this tab is still running and its result stays
         // committable. Superseding it on every DOM mutation would starve
         // commits whenever mutations arrive faster than renders finish
@@ -963,6 +996,9 @@ impl BrowserApp {
                 completed.identity.viewport.width,
                 completed.identity.viewport.height,
             );
+            if let Some(fragments) = frame.fragments {
+                page.fragments = Some(fragments);
+            }
             if let Some(display_list) = frame.display_list {
                 page.display_list = Some(display_list);
             }
@@ -1133,6 +1169,10 @@ impl BrowserApp {
     }
 
     pub(super) fn compose_frame(&mut self, size: WindowSize<u32>) {
+        // Reconcile page selection offsets with any DOM mutation that landed
+        // since the gesture. This runs before the page raster is blitted so a
+        // cleared or clamped selection never paints a stale range.
+        self.repair_active_page_selection();
         if self.frame_size != size {
             self.frame_damage.mark_full();
         }
@@ -1168,12 +1208,21 @@ impl BrowserApp {
         }
         let content_caret = self.content_caret_geometry(layout.chrome_height);
         let content_selection = self.content_selection_geometry(layout.chrome_height);
+        let page_selection = self.page_selection_geometry(layout.chrome_height);
         let theme = self.theme;
         // Scrollbar state is read before the canvas borrows the frame.
         let scrollbar = self.active_scrollbar_geometry();
         let scrollbar_dragging = self.scrollbar_drag.is_some();
         let scrollbar_hot = self.scrollbar_hot || scrollbar_dragging;
         let mut canvas = Canvas::new(&mut self.frame, size.width, size.height);
+        for selection in page_selection {
+            // Page selection is a native overlay on the retained page raster,
+            // exactly like the focused-control caret: the glyphs underneath
+            // stay visible and no re-render is needed to select text.
+            canvas.with_clip(selection.clip, |canvas| {
+                canvas.blend_rect(selection.rect, content_selection_color(theme), 112);
+            });
+        }
         if let Some(selection) = content_selection {
             // Blend the highlight so the page's existing glyphs stay legible.
             // The retained page raster is painted before this native editing
@@ -1402,6 +1451,94 @@ impl BrowserApp {
                 height: rect.height * scale,
             },
         })
+    }
+
+    /// Page text selection rectangles in physical window coordinates.
+    ///
+    /// Layout and the selection geometry are CSS pixels; the native frame and
+    /// the chrome offset are physical. The scroll offset is already applied by
+    /// `SelectionRect::viewport_rect`, so scrolling moves the highlight with
+    /// the retained page raster without touching the selection boundaries.
+    pub(super) fn page_selection_geometry(&self, chrome_height: u32) -> Vec<ContentSelection> {
+        let Some(layout) = &self.layout else {
+            return Vec::new();
+        };
+        let Some(page) = self.pages.get(&self.tabs.active_id()) else {
+            return Vec::new();
+        };
+        let scale = layout.scale.max(f32::EPSILON);
+        page.page_selection_rects(self.fonts.as_ref())
+            .into_iter()
+            .filter_map(|rect| {
+                let viewport = rect.viewport_rect;
+                let raw = Rect {
+                    x: viewport.origin.x * scale,
+                    y: chrome_height as f32 + viewport.origin.y * scale,
+                    width: viewport.size.width * scale,
+                    height: viewport.size.height * scale,
+                };
+                intersect_rect(raw, layout.content).map(|clip| ContentSelection { clip, rect: raw })
+            })
+            .collect()
+    }
+
+    fn repair_active_page_selection(&mut self) {
+        if let Some(page) = self.pages.get_mut(&self.tabs.active_id()) {
+            page.repair_page_selection();
+        }
+    }
+
+    /// Recompose after native selection changed. The page region must be
+    /// marked damaged because the selection overlay is drawn after the
+    /// retained raster and is not part of the page's own damage tracking.
+    fn repaint_page_selection(&mut self) {
+        let id = self.tabs.active_id();
+        if let Some(page) = self.pages.get_mut(&id)
+            && page.has_page_selection()
+        {
+            // A scroll compositor job would present the page surface without
+            // this overlay, so supersede it and repaint through `compose_frame`.
+            page.expected_compositor = None;
+            if let Some(worker) = &self.compositor_worker {
+                worker.cancel_tab(id.as_u64());
+            }
+        }
+        if let Some(window) = &self.window {
+            let size = window.inner_size();
+            self.mark_page_damage(size);
+        }
+        self.repaint_chrome();
+    }
+
+    fn clear_page_selection_for(&mut self, id: TabId) {
+        let changed = self.pages.get_mut(&id).is_some_and(|page| {
+            let had_selection = page.has_page_selection();
+            page.clear_page_selection();
+            had_selection
+        });
+        if changed && let Some(window) = &self.window {
+            let size = window.inner_size();
+            self.mark_page_damage(size);
+        }
+    }
+
+    fn clear_active_page_selection(&mut self) {
+        let id = self.tabs.active_id();
+        self.clear_page_selection_for(id);
+    }
+
+    /// Copy the current page selection through the DOM Range's `toString`, so
+    /// the text matches exactly what the mirrored Selection API reports.
+    /// Focused form controls never reach this path; their editor owns copy.
+    pub(super) fn copy_page_selection(&mut self) -> bool {
+        let Some(page) = self.pages.get(&self.tabs.active_id()) else {
+            return false;
+        };
+        let text = page.page_selection_text();
+        if text.is_empty() {
+            return false;
+        }
+        self.clipboard.write_text(&text)
     }
 
     /// Schedules a PNG of the composed frame once `delay` has elapsed.
@@ -3938,7 +4075,7 @@ impl BrowserApp {
             if let Some(item) = menu.item_at(self.cursor)
                 && item.enabled
             {
-                self.editor.execute(item.command, &mut self.clipboard);
+                self.editor.execute(item.command, self.clipboard.as_mut());
             }
             self.repaint_chrome();
             return;
@@ -3956,6 +4093,12 @@ impl BrowserApp {
         if target != HitTarget::AddressBar {
             self.address_clicks.reset();
             self.address_selecting = false;
+        }
+        if target != HitTarget::Content {
+            self.content_clicks.reset();
+            // Clicking chrome or the title bar clears a page selection, the
+            // same way clicking outside a document does.
+            self.clear_active_page_selection();
         }
         // The scrollbar overlay sits inside the content rect; it takes
         // pointer priority so page links underneath stay unpressed.
@@ -4083,6 +4226,9 @@ impl BrowserApp {
         if let Some(node) = editable
             && let Some(value) = self.content_text_input_value(id, node)
         {
+            // A text control's selection belongs to its native editor, never
+            // to page selection. Pressing it also ends any page selection.
+            self.clear_page_selection_for(id);
             let mut editor = AddressEditor::new(value);
             let click_index = self.content_index_at_x(id, node, self.cursor.x);
             editor.place_cursor(click_index, false);
@@ -4108,8 +4254,122 @@ impl BrowserApp {
         if let Some(window) = &self.window {
             window.set_ime_allowed(false);
         }
+        // A press on rendered text starts a native selection gesture. The
+        // click (including link activation) is deferred to release so a drag
+        // can select text instead of navigating.
+        if let Some(gesture) = self.begin_page_selection_press(id) {
+            // The scene hit is a text node, which is deeper than the geometry
+            // hit used for controls; an inline link often has no box geometry
+            // of its own, so focus and the deferred click must use it.
+            if let Some(target) = gesture.target {
+                self.set_content_active(Some(target));
+                self.set_content_focus(
+                    self.content_focus_target(id, Some(target)),
+                    FocusSource::Pointer,
+                );
+            }
+            self.page_gesture = Some(gesture);
+            self.repaint_page_selection();
+            return;
+        }
+        self.clear_page_selection_for(id);
         self.perform_content_click(id, hit_node);
         self.repaint_chrome();
+    }
+
+    /// Starts a per-tab page selection gesture when the press is on text.
+    /// Returns `None` for blank areas and non-text content so the ordinary
+    /// click path keeps its existing press-time behavior.
+    fn begin_page_selection_press(&mut self, id: TabId) -> Option<PageGesture> {
+        let point = self.content_cursor()?;
+        let scale = self.layout.as_ref().map_or(1.0, |layout| layout.scale);
+        let shift = self.modifiers.shift_key();
+        let double_click = !shift
+            && self.content_clicks.register(
+                Instant::now().duration_since(self.started_at),
+                self.cursor,
+                scale,
+            );
+        let mode = if double_click {
+            PointerDownMode::SelectWord
+        } else if shift {
+            PointerDownMode::Extend
+        } else {
+            PointerDownMode::Replace
+        };
+        let fonts = self.fonts.as_ref();
+        let target = self.pages.get_mut(&id).and_then(|page| {
+            page.begin_page_selection(
+                fonts,
+                PhysicalPoint {
+                    x: point.x,
+                    y: point.y,
+                },
+                mode,
+            )
+            .ok()
+            .flatten()
+        })?;
+        Some(PageGesture {
+            tab: id,
+            target: Some(target),
+            press: self.cursor,
+            dragged: false,
+            activate_on_release: !double_click && !shift,
+        })
+    }
+
+    /// Moves the active page selection focus to the pointer. Returns whether
+    /// the selection range actually changed.
+    fn extend_page_selection(&mut self, tab: TabId) -> bool {
+        let Some(point) = self.content_cursor() else {
+            return false;
+        };
+        let fonts = self.fonts.as_ref();
+        self.pages.get_mut(&tab).is_some_and(|page| {
+            page.drag_page_selection(
+                fonts,
+                PhysicalPoint {
+                    x: point.x,
+                    y: point.y,
+                },
+            )
+            .unwrap_or(false)
+        })
+    }
+
+    /// Completes a page selection gesture and, for an un-dragged click, runs
+    /// the click that was deferred at press time.
+    fn finish_page_gesture(&mut self, gesture: PageGesture) {
+        let Some(point) = self.content_cursor() else {
+            self.page_gesture = None;
+            return;
+        };
+        let dragged = self
+            .pages
+            .get(&gesture.tab)
+            .is_some_and(|page| page.page_selection.is_dragged());
+        let base_url = self
+            .pages
+            .get(&gesture.tab)
+            .map(|page| page.navigation.committed().target.history_url());
+        let fonts = self.fonts.as_ref();
+        if let Some(base_url) = base_url
+            && let Some(page) = self.pages.get_mut(&gesture.tab)
+        {
+            let _ = page.finish_page_selection(
+                fonts,
+                PhysicalPoint {
+                    x: point.x,
+                    y: point.y,
+                },
+                &base_url,
+            );
+        }
+        if !dragged && gesture.activate_on_release {
+            self.perform_content_click(gesture.tab, gesture.target);
+        }
+        self.repaint_page_selection();
     }
 
     /// Dispatches the trusted `click` for `hit_node` and then runs the submit
@@ -4900,6 +5160,27 @@ impl BrowserApp {
             }
             self.cursor_icon = cursor_icon;
         }
+        if let Some(mut gesture) = self.page_gesture
+            && self.left_pointer_down
+        {
+            let scale = layout.scale.max(f32::EPSILON);
+            let limit = PAGE_DRAG_THRESHOLD_CSS_PX * scale;
+            let dx = self.cursor.x - gesture.press.x;
+            let dy = self.cursor.y - gesture.press.y;
+            if !gesture.dragged && dx.mul_add(dx, dy * dy) <= limit * limit {
+                // Mouse jitter inside the threshold is still a click.
+                self.schedule_content_hover();
+                return;
+            }
+            if !gesture.dragged {
+                gesture.dragged = true;
+                self.page_gesture = Some(gesture);
+            }
+            self.extend_page_selection(gesture.tab);
+            self.repaint_page_selection();
+            self.schedule_content_hover();
+            return;
+        }
         if self.address_selecting {
             let index =
                 address_index_at_x(layout, &self.editor, self.cursor.x, self.fonts.as_ref());
@@ -4992,6 +5273,9 @@ impl BrowserApp {
                 content.editor.finish_pointer_selection();
             }
             self.repaint_chrome();
+        }
+        if let Some(gesture) = self.page_gesture.take() {
+            self.finish_page_gesture(gesture);
         }
         // A scrollbar drag suppresses the page's hover chain. Releasing the
         // button can leave the pointer over the page, so refresh it now rather
@@ -5128,7 +5412,10 @@ impl BrowserApp {
     fn can_composite_scroll(&self, id: TabId, viewport: WindowSize<u32>) -> bool {
         self.compositor_worker.is_some()
             && self.pages.get(&id).is_some_and(|page| {
-                page.viewport == viewport && page.style_batch.is_none() && page.compositor.is_some()
+                page.viewport == viewport
+                    && page.style_batch.is_none()
+                    && page.compositor.is_some()
+                    && !page.has_page_selection()
             })
     }
 
@@ -5187,10 +5474,21 @@ impl BrowserApp {
                 .then(|| address_shortcut(&key.logical_key, shift))
                 .flatten()
             {
-                self.editor.execute(command, &mut self.clipboard);
+                self.editor.execute(command, self.clipboard.as_mut());
                 self.repaint_chrome();
                 return;
             }
+        }
+        // Page text copy. A focused page control has its own editor selection
+        // and is handled below, so form-control text never travels through
+        // the document Range path.
+        if primary
+            && key_character_is(&key.logical_key, "c")
+            && !self.editor.is_focused()
+            && self.content_editor.is_none()
+            && self.copy_page_selection()
+        {
+            return;
         }
         // Tab belongs to sequential focus navigation, including while a page
         // control's native editor is open: the move commits and closes it.
@@ -5310,7 +5608,7 @@ impl BrowserApp {
             let changed = self
                 .content_editor
                 .as_mut()
-                .is_some_and(|content| content.editor.execute(command, &mut self.clipboard));
+                .is_some_and(|content| content.editor.execute(command, self.clipboard.as_mut()));
             if changed && !matches!(command, AddressCommand::Copy | AddressCommand::SelectAll) {
                 self.sync_content_editor();
             }
@@ -5593,6 +5891,19 @@ pub(super) struct ContentCaret {
 pub(super) struct ContentSelection {
     pub(super) clip: Rect,
     pub(super) rect: Rect,
+}
+
+fn intersect_rect(rect: Rect, clip: Rect) -> Option<Rect> {
+    let left = rect.x.max(clip.x);
+    let top = rect.y.max(clip.y);
+    let right = (rect.x + rect.width).min(clip.x + clip.width);
+    let bottom = (rect.y + rect.height).min(clip.y + clip.height);
+    (right > left && bottom > top).then_some(Rect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
 }
 
 fn paint_content_caret(canvas: &mut Canvas<'_>, caret: ContentCaret, theme: ChromeTheme) {

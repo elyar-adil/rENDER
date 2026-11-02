@@ -5,6 +5,7 @@ use crate::fetch_handles::CachedBatchHandle;
 use crate::fetch_handles::CachedRequestHandle;
 use crate::interaction_state;
 use crate::interaction_state::FocusSource;
+use crate::page_selection::PageSelection;
 use crate::page_source::PageSource;
 use crate::profile::ProfileCookies;
 use crate::profile::ProfileStorage;
@@ -25,10 +26,16 @@ use render_core::image::ImageResourceKey;
 use render_core::image::ImageResources;
 use render_core::import_map::ImportMap;
 use render_core::interaction::FocusNavigationDirection;
+use render_core::interaction::hit_test::{
+    HitTestError, InteractionLimits, InteractionScene, PointerDownMode, SelectionRect,
+};
 use render_core::js::DocumentReadyState;
 use render_core::js::ElementRect;
 use render_core::js::JsError;
 use render_core::js::JsValue;
+use render_core::layout::FragmentTree;
+use render_core::layout::PhysicalPoint;
+use render_core::layout::TextMeasurer;
 use render_core::module_graph::ModuleGraph;
 use render_core::navigation::HistoryEntry;
 use render_core::navigation::NavigationLimits;
@@ -175,6 +182,11 @@ pub(super) struct PageState {
     /// replace a newer presented frame.
     pub(super) committed_render: Option<RenderIdentity>,
     pub(super) display_list: Option<Arc<DisplayList>>,
+    /// The fragment tree of the last committed full render. Page hit testing
+    /// and selection geometry are bound to exactly this snapshot.
+    pub(super) fragments: Option<Arc<FragmentTree>>,
+    /// Native page text selection for this tab.
+    pub(super) page_selection: PageSelection,
     pub(super) paint_scene: Option<Arc<PaintScene>>,
     /// Retained compositor for scroll frames, when the scene is compositable.
     pub(super) compositor: Option<Arc<CompositorCache>>,
@@ -358,6 +370,25 @@ fn page_html_with_probe(html: &str) -> String {
     output
 }
 
+fn page_scene<'a>(
+    dom: &'a render_core::dom::Dom,
+    fragments: &'a FragmentTree,
+    fonts: &'a dyn TextMeasurer,
+    scroll_y: f32,
+) -> Option<InteractionScene<'a>> {
+    InteractionScene::new(
+        dom,
+        fragments,
+        fonts,
+        PhysicalPoint {
+            x: 0.0,
+            y: scroll_y,
+        },
+        InteractionLimits::default(),
+    )
+    .ok()
+}
+
 impl PageState {
     pub(super) fn new(source: PageSource) -> Self {
         let mut first_entry = HistoryEntry::new(source.target.history_url());
@@ -412,6 +443,8 @@ impl PageState {
             requested_viewport: WindowSize::new(0, 0),
             committed_render: None,
             display_list: None,
+            fragments: None,
+            page_selection: PageSelection::default(),
             paint_scene: None,
             compositor: None,
             geometry: BTreeMap::new(),
@@ -546,6 +579,9 @@ impl PageState {
         self.requested_viewport = WindowSize::new(0, 0);
         self.committed_render = None;
         self.display_list = None;
+        self.fragments = None;
+        // The replaced document cannot keep offsets into the old DOM.
+        self.page_selection.clear();
         self.paint_scene = None;
         self.compositor = None;
         self.geometry.clear();
@@ -555,6 +591,176 @@ impl PageState {
         self.expected_render = None;
         self.expected_compositor = None;
         self.created_at = Instant::now();
+    }
+
+    /// Start a page selection at `point` when it lands on rendered text.
+    /// Returns the hit node for the deferred click, or `None` for blank or
+    /// non-text content, in which case the shell keeps its ordinary
+    /// click/focus behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns an interaction error for invalid coordinates or exhausted
+    /// traversal budgets.
+    pub(super) fn begin_page_selection(
+        &mut self,
+        fonts: &dyn TextMeasurer,
+        point: PhysicalPoint,
+        mode: PointerDownMode,
+    ) -> Result<Option<render_core::dom::NodeId>, HitTestError> {
+        let Some(fragments) = self.fragments.as_deref() else {
+            return Ok(None);
+        };
+        let Some(scene) = page_scene(
+            self.page.document().dom(),
+            fragments,
+            fonts,
+            self.scroll.offset_y(),
+        ) else {
+            return Ok(None);
+        };
+        let hit = scene.hit_test(point)?;
+        let Some(hit) = hit.filter(|hit| hit.text_position.is_some()) else {
+            return Ok(None);
+        };
+        let outcome = self.page_selection.begin(&scene, point, mode)?;
+        if outcome.selection_changed {
+            self.publish_page_selection();
+        }
+        Ok(outcome.selection_changed.then_some(hit.node))
+    }
+
+    /// Extend a page selection gesture to `point`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an interaction error for invalid coordinates or exhausted
+    /// traversal budgets.
+    pub(super) fn drag_page_selection(
+        &mut self,
+        fonts: &dyn TextMeasurer,
+        point: PhysicalPoint,
+    ) -> Result<bool, HitTestError> {
+        let Some(fragments) = self.fragments.as_deref() else {
+            return Ok(false);
+        };
+        let Some(scene) = page_scene(
+            self.page.document().dom(),
+            fragments,
+            fonts,
+            self.scroll.offset_y(),
+        ) else {
+            return Ok(false);
+        };
+        let outcome = self.page_selection.drag(&scene, point)?;
+        Ok(outcome.selection_changed)
+    }
+
+    /// Finish a page selection gesture and report whether it was a drag.
+    /// The final range is published to the DOM Selection so `window`
+    /// `getSelection()` and copy both observe the same boundaries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an interaction error for invalid coordinates or exhausted
+    /// traversal budgets.
+    pub(super) fn finish_page_selection(
+        &mut self,
+        fonts: &dyn TextMeasurer,
+        point: PhysicalPoint,
+        document_base_url: &Url,
+    ) -> Result<bool, HitTestError> {
+        let Some(fragments) = self.fragments.as_deref() else {
+            return Ok(false);
+        };
+        let Some(scene) = page_scene(
+            self.page.document().dom(),
+            fragments,
+            fonts,
+            self.scroll.offset_y(),
+        ) else {
+            return Ok(false);
+        };
+        let dragged = self.page_selection.is_dragged();
+        self.page_selection
+            .finish(&scene, point, document_base_url)?;
+        self.publish_page_selection();
+        Ok(dragged)
+    }
+
+    /// Mirror the native selection into the DOM's live Selection API.
+    fn publish_page_selection(&mut self) {
+        let anchor = self.page_selection.selection().anchor();
+        let focus = self.page_selection.selection().focus();
+        let document = self.page.document().dom().document();
+        let dom = self.page.document_mut().dom_mut();
+        match (anchor, focus) {
+            (Some(anchor), Some(focus)) => {
+                let _ = dom.selection_set_base_and_extent(
+                    document,
+                    render_core::dom::BoundaryPoint {
+                        node: anchor.container,
+                        offset: anchor.offset,
+                    },
+                    render_core::dom::BoundaryPoint {
+                        node: focus.container,
+                        offset: focus.offset,
+                    },
+                );
+            }
+            _ => {
+                let _ = dom.selection_remove_all_ranges(document);
+            }
+        }
+    }
+
+    pub(super) fn clear_page_selection(&mut self) {
+        if self.page_selection.is_empty() {
+            return;
+        }
+        self.page_selection.clear();
+        self.publish_page_selection();
+    }
+
+    /// Reconcile the selection with DOM mutations applied since it was made.
+    pub(super) fn repair_page_selection(&mut self) -> bool {
+        let repair = self.page_selection.repair(self.page.document().dom());
+        if repair == render_core::interaction::SelectionRepair::Unchanged {
+            return false;
+        }
+        self.publish_page_selection();
+        true
+    }
+
+    #[must_use]
+    pub(super) fn has_page_selection(&self) -> bool {
+        self.page_selection.has_visible_range()
+    }
+
+    #[must_use]
+    pub(super) fn page_selection_rects(&self, fonts: &dyn TextMeasurer) -> Vec<SelectionRect> {
+        let Some(fragments) = self.fragments.as_deref() else {
+            return Vec::new();
+        };
+        let Some(scene) = page_scene(
+            self.page.document().dom(),
+            fragments,
+            fonts,
+            self.scroll.offset_y(),
+        ) else {
+            return Vec::new();
+        };
+        self.page_selection
+            .geometry(&scene)
+            .map_or_else(|_| Vec::new(), |geometry| geometry.rects)
+    }
+
+    /// The text of the current DOM selection, which is the native page
+    /// selection mirrored by [`Self::publish_page_selection`].
+    #[must_use]
+    pub(super) fn page_selection_text(&self) -> String {
+        let dom = self.page.document().dom();
+        dom.selection_to_string(dom.document()).unwrap_or_default()
     }
 
     /// Replaces the hover chain and reports whether selector matching changed.

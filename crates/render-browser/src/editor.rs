@@ -351,7 +351,7 @@ impl AddressEditor {
     }
 
     /// Executes one shared edit command. Returns whether it changed editor or clipboard state.
-    pub fn execute(&mut self, command: AddressCommand, clipboard: &mut impl Clipboard) -> bool {
+    pub fn execute(&mut self, command: AddressCommand, clipboard: &mut dyn Clipboard) -> bool {
         match command {
             AddressCommand::Undo => self.undo(),
             AddressCommand::Redo => self.redo(),

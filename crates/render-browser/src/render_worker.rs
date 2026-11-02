@@ -36,6 +36,7 @@ use render_core::dom::NodeId;
 use render_core::image::ImageResources;
 use render_core::js::ElementRect;
 use render_core::layout::FragmentKind;
+use render_core::layout::FragmentTree;
 use render_core::layout::PhysicalPoint;
 use render_core::layout::PhysicalSize;
 use render_core::paint::Color;
@@ -103,6 +104,9 @@ pub(super) struct PageRenderFrame {
     pub(super) frame: Vec<u32>,
     /// Physical dimensions of `frame`, as presented.
     pub(super) viewport: WindowSize<u32>,
+    /// The CSS-pixel layout snapshot this frame was painted from. Retained
+    /// raster frames carry `None`, so the tab keeps the previous tree.
+    pub(super) fragments: Option<Arc<FragmentTree>>,
     pub(super) display_list: Option<Arc<DisplayList>>,
     pub(super) paint_scene: Option<Arc<PaintScene>>,
     /// A fresh retained compositor for a full render.
@@ -443,9 +447,11 @@ pub(super) fn process_page_render(
                 }
             }
             let frame = surface_to_softbuffer(&output.raster.surface);
+            let fragments = Arc::new(output.layout.fragments);
             Ok(PageRenderFrame {
                 frame,
                 viewport,
+                fragments: Some(fragments),
                 display_list: Some(display_list),
                 paint_scene: Some(paint_scene),
                 compositor,
@@ -491,6 +497,7 @@ pub(super) fn process_page_render(
             Ok(PageRenderFrame {
                 viewport: WindowSize::new(raster.surface.width(), raster.surface.height()),
                 frame: surface_to_softbuffer(&raster.surface),
+                fragments: None,
                 display_list: None,
                 paint_scene: None,
                 compositor: None,
