@@ -82,7 +82,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use fontdue::{Font, FontSettings};
+use fontdue::Font;
 use render_core::document::FontFaceInstaller;
 use render_core::dom::{Dom, NodeKind};
 use render_core::font_face::{
@@ -984,18 +984,9 @@ impl FontFaceInstaller for SystemFontFaceInstaller<'_> {
 /// bytes it can consume.
 fn load_font_bytes(bytes: &[u8]) -> Result<Arc<Font>, FontLoadFailure> {
     let decoded = decode_font_container(bytes).ok_or(FontLoadFailure::Undecodable)?;
-    let settings = FontSettings {
-        collection_index: 0,
-        // The engine rasterizes one scalar at a time and never asks fontdue
-        // for GSUB-indexed glyphs, so eagerly loading every substitution
-        // outline only costs startup time and resident memory. A large CJK
-        // collection makes that cost hundreds of megabytes.
-        load_substitutions: false,
-        ..FontSettings::default()
-    };
-    Font::from_bytes(decoded, settings)
-        .map(Arc::new)
-        .map_err(|_| FontLoadFailure::Undecodable)
+    // A document face is always a single-face container: `decode_font_container`
+    // accepts sfnt, WOFF and WOFF2, not a TrueType collection.
+    crate::font_backend::font_from_bytes(&decoded, 0).ok_or(FontLoadFailure::Undecodable)
 }
 
 /// Turns a raw sfnt, WOFF or WOFF2 body into the sfnt the rasteriser reads.

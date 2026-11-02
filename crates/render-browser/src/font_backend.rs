@@ -48,6 +48,26 @@
 //! mismatch is not prevented by convention here, it is prevented by there being
 //! one function.
 //!
+//! # A face is a character map until a glyph needs it
+//!
+//! `fontdue::Font` is not lazy: `from_bytes` reads every character-map entry and
+//! builds an outline for every mapped glyph. That is the right trade for the
+//! face a page actually sets text in and the wrong one for an installed
+//! fallback that exists for a handful of characters. `PingFang` and Arial Unicode
+//! together hold hundreds of megabytes of outlines on macOS, and an English
+//! page uses neither. So an installed face is represented by its path, its face
+//! index inside a collection, and a bit-per-codepoint [`Coverage`] read from the
+//! same character map `fontdue` reads, with the decoded `Font` behind a
+//! `OnceLock`.
+//!
+//! §5.2 asks whether a face's character map contains the character, and that is
+//! the only question matching asks before a face is selected. It is answered
+//! from the coverage bitset. Measurement, shaping and rasterisation then decode
+//! the face, which happens on the first glyph that actually needs it. The face
+//! that is decoded is produced by the same `fontdue::Font::from_bytes` call with
+//! the same settings the eager path used, so advances, line metrics and masks
+//! are byte-identical; only the moment of decoding moved.
+//!
 //! # The face that has not arrived
 //!
 //! What §5.2 settles is what a face that has not arrived *is*: "If the font
@@ -112,7 +132,7 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 
 use fontdue::{Font, FontSettings};
 use render_core::layout::{
@@ -778,11 +798,151 @@ impl RequestSnapshot {
     }
 }
 
+/// The number of Unicode scalar values a coverage set has a bit for.
+const UNICODE_SCALARS: usize = 0x11_0000;
+
+/// One installed face's character map, read without building any outline.
+///
+/// The set is one bit per Unicode scalar value: 136 KiB for the whole range,
+/// against hundreds of megabytes for the outlines `fontdue` builds alongside
+/// the map. `has_glyph` is the only thing font matching asks before a face is
+/// chosen, and this answers it exactly: every cmap subtable is visited, and a
+/// mapping to glyph zero is not a glyph - which is the same filter
+/// `Font::lookup_glyph_index` applies.
+struct Coverage {
+    bits: Vec<u64>,
+}
+
+impl Coverage {
+    /// Reads a face's cmap into a coverage set.
+    ///
+    /// Every subtable is visited, in the order `fontdue` visits them, because
+    /// the rasteriser's answer to `lookup_glyph_index` is the union of their
+    /// mappings. A face with no cmap has an empty set, which is the same face
+    /// `fontdue` would build with an empty character map.
+    fn of_face(face: &ttf_parser::Face<'_>) -> Self {
+        let mut coverage = Self {
+            bits: vec![0; UNICODE_SCALARS.div_ceil(64)],
+        };
+        if let Some(cmap) = face.tables().cmap {
+            for subtable in cmap.subtables {
+                subtable.codepoints(|codepoint| {
+                    if subtable
+                        .glyph_index(codepoint)
+                        .is_some_and(|glyph| glyph.0 != 0)
+                    {
+                        coverage.insert(codepoint);
+                    }
+                });
+            }
+        }
+        coverage
+    }
+
+    fn insert(&mut self, codepoint: u32) {
+        let Ok(codepoint) = usize::try_from(codepoint) else {
+            return;
+        };
+        if codepoint < UNICODE_SCALARS {
+            self.bits[codepoint / 64] |= 1_u64 << (codepoint % 64);
+        }
+    }
+
+    fn contains(&self, character: char) -> bool {
+        let codepoint = character as usize;
+        self.bits
+            .get(codepoint / 64)
+            .is_some_and(|word| word & (1_u64 << (codepoint % 64)) != 0)
+    }
+}
+
+/// An installed face whose outlines are decoded on first use.
+///
+/// The file and its collection index are resolved at start-up, so a load later
+/// in the session reads the same bytes the eager loader would have read and
+/// cannot be redirected by a working-directory change. The `OnceLock` holds the
+/// one decoded `Font` for the process; a file that has since disappeared or
+/// stopped decoding is cached as `None` rather than retried for every glyph.
+struct LazyFace {
+    path: PathBuf,
+    collection_index: u32,
+    coverage: Coverage,
+    font: OnceLock<Option<Arc<Font>>>,
+}
+
+impl LazyFace {
+    /// The decoded face, reading and parsing the file on the first call.
+    fn font(&self) -> Option<Arc<Font>> {
+        self.font
+            .get_or_init(|| {
+                let started = std::time::Instant::now();
+                let font = fs::read(&self.path)
+                    .ok()
+                    .and_then(|bytes| font_from_bytes(&bytes, self.collection_index));
+                if env::var_os("RENDER_DEBUG_FONTS").is_some() {
+                    eprintln!(
+                        "font-backend decoded {} index={} ok={} decode_us={}",
+                        self.path.display(),
+                        self.collection_index,
+                        font.is_some(),
+                        started.elapsed().as_micros(),
+                    );
+                }
+                font
+            })
+            .clone()
+    }
+}
+
+/// One entry of the unified face table: a decoded face, or one waiting to be
+/// decoded.
+///
+/// `Ready` is what every document face is - its bytes arrived over the network
+/// or from a `data:` URL and have already been decoded - and what an installed
+/// face becomes once a character needs it. `Lazy` is the installed face at rest.
+#[derive(Clone)]
+enum FaceSlot {
+    Ready(Arc<Font>),
+    Lazy(Arc<LazyFace>),
+}
+
+impl FaceSlot {
+    fn ready(font: Arc<Font>) -> Self {
+        Self::Ready(font)
+    }
+
+    /// Whether the face's character map contains `character`, without decoding
+    /// the face.
+    fn covers(&self, character: char) -> bool {
+        match self {
+            Self::Ready(font) => font.lookup_glyph_index(character) != 0,
+            Self::Lazy(face) => face.coverage.contains(character),
+        }
+    }
+
+    /// The decoded face, decoding a lazy one now.
+    fn font(&self) -> Option<Arc<Font>> {
+        match self {
+            Self::Ready(font) => Some(Arc::clone(font)),
+            Self::Lazy(face) => face.font(),
+        }
+    }
+
+    /// Whether the decoded face is already resident, for measurements and
+    /// tests. Asking this never decodes a face.
+    fn is_ready(&self) -> bool {
+        match self {
+            Self::Ready(_) => true,
+            Self::Lazy(face) => face.font.get().is_some_and(Option::is_some),
+        }
+    }
+}
+
 /// The installed faces, which are a property of the machine and never change
 /// while the process runs.
 struct InstalledFaces {
-    /// The loaded fonts, indexed by `loaded[family][face]`.
-    loaded: Vec<Vec<Arc<Font>>>,
+    /// The table's faces, indexed by `loaded[family][face]`.
+    loaded: Vec<Vec<FaceSlot>>,
     /// The declared table, which is the same order.
     families: Vec<Family>,
     /// §4.3.3.1's `local()` names, indexed the same way: `names[family][face]`
@@ -825,8 +985,8 @@ impl InstalledFaces {
 struct FontState {
     /// The unified table: document families first, then installed.
     table: FaceTable,
-    /// The fonts the table indexes, in the same order.
-    loaded: Vec<Vec<Arc<Font>>>,
+    /// The faces the table indexes, in the same order.
+    loaded: Vec<Vec<FaceSlot>>,
     /// Bumped whenever `table` or `loaded` are replaced, and mixed into every
     /// [`FontInstanceId`], so a memo or a mask from an earlier table cannot be
     /// reached under a later one.
@@ -856,7 +1016,8 @@ pub struct SystemFontBackend {
 }
 
 impl SystemFontBackend {
-    /// Load every face of every family in the platform table.
+    /// Reads every installed face's character map, leaving its outlines to be
+    /// decoded when a glyph first needs them.
     ///
     /// A family whose files are absent is simply not in the table, which is what
     /// §5.2 calls a family that does not exist; the search walks on. A platform
@@ -868,6 +1029,7 @@ impl SystemFontBackend {
     ///
     /// Returns an I/O-style error when no supported system font can be found.
     pub fn load() -> Result<Self, Box<dyn Error>> {
+        let started = std::time::Instant::now();
         let installed = load_installed_faces();
         if installed.loaded.iter().all(Vec::is_empty) {
             return Err(io::Error::new(
@@ -875,6 +1037,25 @@ impl SystemFontBackend {
                 "no supported system font was found",
             )
             .into());
+        }
+        if env::var_os("RENDER_DEBUG_FONTS").is_some() {
+            eprintln!(
+                "font-backend installed_faces={} eager={} lazy={} load_us={}",
+                installed.loaded.iter().map(Vec::len).sum::<usize>(),
+                installed
+                    .loaded
+                    .iter()
+                    .flatten()
+                    .filter(|face| face.is_ready())
+                    .count(),
+                installed
+                    .loaded
+                    .iter()
+                    .flatten()
+                    .filter(|face| !face.is_ready())
+                    .count(),
+                started.elapsed().as_micros(),
+            );
         }
         let table = FaceTable::empty()
             .with_installed_families(installed.families.clone())
@@ -917,9 +1098,27 @@ impl SystemFontBackend {
     }
 
     /// How many faces of the platform table were actually found on disk.
+    ///
+    /// A face is counted whether or not its outlines have been decoded; use
+    /// [`Self::eager_face_count`] for the resident subset.
     #[must_use]
     pub fn loaded_face_count(&self) -> usize {
         self.installed.loaded.iter().map(Vec::len).sum()
+    }
+
+    /// How many installed faces have been decoded and are resident.
+    ///
+    /// Start-up reads each installed face's character map but no outlines, so
+    /// this is zero until a glyph needs a face. It never counts a document face,
+    /// which is decoded before it enters the table.
+    #[must_use]
+    pub fn eager_face_count(&self) -> usize {
+        self.installed
+            .loaded
+            .iter()
+            .flatten()
+            .filter(|face| face.is_ready())
+            .count()
     }
 
     /// How many of the table's families came from `@font-face` rules.
@@ -959,18 +1158,21 @@ impl SystemFontBackend {
     /// activate." The two kinds of item are answered in the order the author wrote
     /// them, and a `local()` item is answered first when it comes first - which is
     /// the ordering that stops a network request for a font already installed.
-    fn resolve_source(&self, rule: &DocumentRule, document: &DocumentFonts) -> Option<Arc<Font>> {
+    fn resolve_source(&self, rule: &DocumentRule, document: &DocumentFonts) -> Option<FaceSlot> {
         for source in &rule.sources {
             match source {
                 ResolvedSource::Local(name) => {
                     if let Some((family, face)) = self.installed.local_face(name)
-                        && let Some(font) = self
+                        && let Some(face) = self
                             .installed
                             .loaded
                             .get(family)
                             .and_then(|faces| faces.get(face))
                     {
-                        return Some(Arc::clone(font));
+                        // The installed face keeps its lazy representation, so a
+                        // `local()` reference to a fallback costs nothing until a
+                        // glyph needs it.
+                        return Some(face.clone());
                     }
                 }
                 ResolvedSource::Url { url, expired } => {
@@ -981,7 +1183,7 @@ impl SystemFontBackend {
                         continue;
                     }
                     if let Some(font) = document.resource(url) {
-                        return Some(font);
+                        return Some(FaceSlot::ready(font));
                     }
                 }
             }
@@ -1012,16 +1214,16 @@ impl SystemFontBackend {
             .with_fallback(&self.installed.fallback)
     }
 
-    /// The fonts the table indexes: the document's resolved faces first, then the
+    /// The faces the table indexes: the document's resolved faces first, then the
     /// installed ones.
     ///
     /// The document half is rebuilt rather than borrowed because the table's
     /// indices are the ones the matcher uses, and a face the matcher can name has
     /// to be at the index the table gives it. The installed half is cloned as
-    /// `Arc`s, so this is a refcount bump per face and not a second copy of a
+    /// handles, so this is a refcount bump per face and not a second copy of a
     /// font file.
-    fn build_loaded(&self, document: &DocumentFonts) -> Vec<Vec<Arc<Font>>> {
-        let mut loaded: Vec<Vec<Arc<Font>>> = document
+    fn build_loaded(&self, document: &DocumentFonts) -> Vec<Vec<FaceSlot>> {
+        let mut loaded: Vec<Vec<FaceSlot>> = document
             .families()
             .iter()
             .map(|family| {
@@ -1132,10 +1334,17 @@ impl SystemFontBackend {
     /// font document face resolved through a `local()` name and the same font as an
     /// installed face are one allocation.
     /// The face a character no installed face covers is drawn from: the first
-    /// loaded face, whose `.notdef` glyph is the box every font carries for a
+    /// table face, whose `.notdef` glyph is the box every font carries for a
     /// missing character.
+    ///
+    /// This is the same face the eager table used, and it is the first *table*
+    /// face rather than the first decoded one on purpose: two installed faces
+    /// need not agree on a `.notdef` outline, and choosing by what happened to
+    /// be decoded would make a missing character's box depend on which other
+    /// text the page contained.
     fn missing_glyph_face(&self) -> Option<Arc<Font>> {
-        self.with_state(|state| state.loaded.iter().flatten().next().map(Arc::clone))
+        let face = self.with_state(|state| state.loaded.iter().flatten().next().cloned())?;
+        face.font()
     }
 
     fn face_for(
@@ -1152,40 +1361,89 @@ impl SystemFontBackend {
         // the field worth carrying: mixing the generation into `request_key`
         // already keeps a stale memo *entry* unreachable, and this keeps a stale
         // *walk* from being used by a caller that is holding one.
-        if self.with_state(|state| state.generation) != instance.generation {
-            let request = instance.request.as_request();
-            return self.face_for(&self.resolve(&request), character);
+        let mut skipped: Vec<(usize, usize)> = Vec::new();
+        loop {
+            // One lock answers both questions the table and the faces have to
+            // agree on: which face the walk selects, and the handle to exactly
+            // that face. Decoding then happens after the lock is released, so a
+            // 75 MB collection does not hold up a document's faces arriving.
+            let chosen: Result<Option<(crate::font_matching::MatchedFace, FaceSlot)>, ()> = self
+                .with_state(|state| {
+                    if state.generation != instance.generation {
+                        return Err(());
+                    }
+                    let Some(matched) =
+                        state
+                            .table
+                            .face_for(&instance.walk, character, |family, face| {
+                                !skipped.contains(&(family, face))
+                                    && has_glyph(state.loaded, family, face, character)
+                            })
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(face) = state
+                        .loaded
+                        .get(matched.family)
+                        .and_then(|faces| faces.get(matched.face))
+                        .cloned()
+                    else {
+                        return Ok(None);
+                    };
+                    Ok(Some((matched, face)))
+                });
+            match chosen {
+                Err(()) => {
+                    // The table changed while this walk was in hand: re-resolve
+                    // against the current generation, which mints a new id.
+                    let request = instance.request.as_request();
+                    return self.face_for(&self.resolve(&request), character);
+                }
+                Ok(None) => return None,
+                Ok(Some((matched, face))) => {
+                    let Some(font) = face.font() else {
+                        // A face whose file has gone or no longer decodes is not
+                        // a face the walk can use; §5.2 walks on to the next
+                        // family instead of painting the wrong letterform.
+                        skipped.push((matched.family, matched.face));
+                        continue;
+                    };
+                    // The coverage bitset is read from the same cmap fontdue
+                    // builds, so this cannot disagree in practice; it is checked
+                    // so a parser disagreement fails as a missing glyph rather
+                    // than as a face measured at one advance and painted at
+                    // another.
+                    if font.lookup_glyph_index(character) == 0 {
+                        skipped.push((matched.family, matched.face));
+                        continue;
+                    }
+                    return Some((font, matched.embolden, matched.shear_degrees));
+                }
+            }
         }
-        self.with_state(|state| {
-            let matched = state
-                .table
-                .face_for(&instance.walk, character, |family, face| {
-                    has_glyph(state.loaded, family, face, character)
-                })?;
-            let font = state.loaded.get(matched.family)?.get(matched.face)?;
-            Some((Arc::clone(font), matched.embolden, matched.shear_degrees))
-        })
     }
 }
 
 /// The installed half of the backend's state, as one borrow.
 struct FontStateSnapshot<'a> {
     table: &'a FaceTable,
-    loaded: &'a [Vec<Arc<Font>>],
+    loaded: &'a [Vec<FaceSlot>],
     generation: u64,
 }
 
-/// Whether the font at `(family, face)` has a glyph for `character`.
+/// Whether the face at `(family, face)` has a glyph for `character`.
 ///
 /// §5.2: "A font is considered to support a given character if (1) the character
 /// is contained in the font's character map". The other half of that test -
 /// §4.5's `unicode-range` - is applied inside [`FaceTable::face_for`], because it
 /// is a property of the table and not of any one font file.
-fn has_glyph(loaded: &[Vec<Arc<Font>>], family: usize, face: usize, character: char) -> bool {
+///
+/// For a lazy installed face this reads the coverage bitset and decodes nothing.
+fn has_glyph(loaded: &[Vec<FaceSlot>], family: usize, face: usize, character: char) -> bool {
     loaded
         .get(family)
         .and_then(|faces| faces.get(face))
-        .is_some_and(|font| font.lookup_glyph_index(character) != 0)
+        .is_some_and(|face| face.covers(character))
 }
 
 /// The advance of one character in one face.
@@ -1560,31 +1818,30 @@ fn shear_coverage(coverage: &[u8], width: u32, height: u32, degrees: f32) -> Opt
     Some(sheared)
 }
 
-/// Loads the installed faces: the declared table, the fonts behind it, and the
-/// `local()` names §4.3.3.1 matches against.
+/// Loads the installed faces: the declared table, the character map behind each
+/// face, and the `local()` names §4.3.3.1 matches against.
+///
+/// No outline is built here. Each face's cmap is read with `ttf-parser` - the
+/// same parser and version `fontdue` uses - and the rest of the file is dropped.
+/// A face is decoded by [`LazyFace::font`] the first time a glyph needs it.
 fn load_installed_faces() -> InstalledFaces {
     let mut families: Vec<Family> = Vec::new();
-    let mut loaded: Vec<Vec<Arc<Font>>> = Vec::new();
+    let mut loaded: Vec<Vec<FaceSlot>> = Vec::new();
     let mut local_names: Vec<Vec<&'static [&'static str]>> = Vec::new();
     let mut family_index: HashMap<&'static str, usize> = HashMap::new();
     for source in PLATFORM_FACES {
-        let Ok(bytes) = read_face_file(source) else {
+        let Ok(path) = find_face_file(source) else {
             continue;
         };
-        let settings = FontSettings {
-            collection_index: source.collection_index,
-            // `fontdue` eagerly builds outlines for every glyph reachable
-            // through GSUB when this is true. The engine shapes and rasterizes
-            // one scalar at a time through `rasterize_indexed`-free paths, so
-            // those substitution glyphs are never used; on a CJK collection
-            // they multiply startup time and resident memory by a large
-            // factor.
-            load_substitutions: false,
-            ..FontSettings::default()
-        };
-        let Ok(font) = Font::from_bytes(bytes, settings) else {
+        let Ok(bytes) = fs::read(&path) else {
             continue;
         };
+        // The same parse `Font::from_bytes` performs first, so a file that
+        // cannot be a face here is a file that could not have been one eagerly.
+        let Ok(face) = ttf_parser::Face::parse(&bytes, source.collection_index) else {
+            continue;
+        };
+        let coverage = Coverage::of_face(&face);
         let family = if let Some(index) = family_index.get(source.family) {
             *index
         } else {
@@ -1607,7 +1864,12 @@ fn load_installed_faces() -> InstalledFaces {
         families[family]
             .faces
             .push(Face::new(source.weight, source.style));
-        loaded[family].push(Arc::new(font));
+        loaded[family].push(FaceSlot::Lazy(Arc::new(LazyFace {
+            path,
+            collection_index: source.collection_index,
+            coverage,
+            font: OnceLock::new(),
+        })));
         local_names[family].push(source.local_names);
     }
     let fallback = FALLBACK_FAMILIES
@@ -1622,16 +1884,39 @@ fn load_installed_faces() -> InstalledFaces {
     }
 }
 
-fn read_face_file(source: &FaceSource) -> io::Result<Vec<u8>> {
+/// Builds the rasteriser's face from already-decoded sfnt bytes.
+///
+/// One function for installed and document faces, so both use the same
+/// `FontSettings`: the engine shapes and rasterises one scalar at a time and
+/// never asks for GSUB-indexed glyphs, so loading substitution outlines only
+/// costs start-up time and resident memory. An installed face reaches this when
+/// a glyph needs it; a document face reaches it when its bytes arrive.
+pub(crate) fn font_from_bytes(bytes: &[u8], collection_index: u32) -> Option<Arc<Font>> {
+    let settings = FontSettings {
+        collection_index,
+        load_substitutions: false,
+        ..FontSettings::default()
+    };
+    Font::from_bytes(bytes, settings).ok().map(Arc::new)
+}
+
+/// Resolves the file that holds one declared face.
+fn find_face_file(source: &FaceSource) -> io::Result<PathBuf> {
     let mut last = io::Error::new(io::ErrorKind::NotFound, "no candidate file");
     for file in source.files {
         let path = Path::new(file);
         let found = if path.is_absolute() {
-            fs::read(path)
+            path.is_file().then(|| path.to_path_buf()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{} is not a file", path.display()),
+                )
+            })
         } else {
             font_directories()
                 .into_iter()
-                .find_map(|directory| fs::read(directory.join(file)).ok())
+                .map(|directory| directory.join(file))
+                .find(|candidate| candidate.is_file())
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::NotFound,
@@ -1640,11 +1925,19 @@ fn read_face_file(source: &FaceSource) -> io::Result<Vec<u8>> {
                 })
         };
         match found {
-            Ok(bytes) => return Ok(bytes),
+            Ok(path) => return Ok(path),
             Err(error) => last = error,
         }
     }
     Err(last)
+}
+
+/// Reads one declared face's file. Only callers that need the bytes - the
+/// coverage test below and the `local()` acceptance test - use this; start-up
+/// itself keeps the resolved path and drops the bytes.
+#[cfg(test)]
+fn read_face_file(source: &FaceSource) -> io::Result<Vec<u8>> {
+    fs::read(find_face_file(source)?)
 }
 
 fn font_directories() -> Vec<PathBuf> {
@@ -2095,6 +2388,438 @@ mod tests {
         );
     }
 
+    // ---- lazy installed faces ----------------------------------------------
+
+    /// The one property the lazy representation must have for matching to be
+    /// unchanged: the coverage bitset is exactly the set of codepoints
+    /// `fontdue`'s character map answers for.
+    ///
+    /// The small fixture is compared in full, including the popcount, so a
+    /// missing insert and a phantom insert both fail. Every installed face this
+    /// platform actually has is then checked against its own decoded map for
+    /// the same total and a sample of scripts. Reading the decoded maps here is
+    /// deliberate: this is the test that is allowed to spend the memory the
+    /// production path is avoiding.
+    #[test]
+    fn a_lazy_faces_coverage_is_its_decoded_character_map() {
+        use fontdue::FontSettings;
+
+        let fixture = include_bytes!("../../render-core/tests/fixtures/render-test-webfont.ttf");
+        let parsed = ttf_parser::Face::parse(fixture, 0).expect("the fixture is a face");
+        let coverage = super::Coverage::of_face(&parsed);
+        let face = fontdue::Font::from_bytes(
+            &fixture[..],
+            FontSettings {
+                load_substitutions: false,
+                ..FontSettings::default()
+            },
+        )
+        .expect("the fixture decodes");
+        let mapped: usize = coverage
+            .bits
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum();
+        assert_eq!(
+            mapped,
+            face.chars().len(),
+            "the coverage set has {mapped} codepoints but the decoded face maps {}",
+            face.chars().len()
+        );
+        for character in face.chars().keys() {
+            assert!(
+                coverage.contains(*character),
+                "{character:?} is in the decoded map but not the coverage set"
+            );
+        }
+
+        for source in PLATFORM_FACES {
+            let Ok(bytes) = read_face_file(source) else {
+                continue;
+            };
+            let parsed = ttf_parser::Face::parse(&bytes, source.collection_index)
+                .expect("a file the eager loader accepted parses");
+            let coverage = super::Coverage::of_face(&parsed);
+            let face = fontdue::Font::from_bytes(
+                &bytes[..],
+                FontSettings {
+                    collection_index: source.collection_index,
+                    load_substitutions: false,
+                    ..FontSettings::default()
+                },
+            )
+            .expect("a file the coverage reader accepted decodes");
+            let mapped: usize = coverage
+                .bits
+                .iter()
+                .map(|word| word.count_ones() as usize)
+                .sum();
+            assert_eq!(
+                mapped,
+                face.chars().len(),
+                "{} index {} has {mapped} coverage codepoints but {} mapped glyphs",
+                source.family,
+                source.collection_index,
+                face.chars().len()
+            );
+            for character in ['A', '0', ' ', 'é', '你', '網', 'α', '♥', 'Ա', 'ก'] {
+                assert_eq!(
+                    coverage.contains(character),
+                    face.lookup_glyph_index(character) != 0,
+                    "{} disagrees about {character:?}",
+                    source.family
+                );
+            }
+        }
+    }
+
+    /// The §5 walk must answer the same family and face whether it asks a lazy
+    /// coverage set or the decoded character map. This is the matching half of
+    /// the equality above, run across families, weights and scripts.
+    #[test]
+    fn coverage_selects_exactly_what_the_decoded_faces_select() {
+        let backend = super::SystemFontBackend::load().expect("the platform table loads");
+        let requests = [
+            FontRequest::initial(),
+            FontRequest::of_family("sans-serif"),
+            FontRequest::of_family("serif"),
+            FontRequest::of_family("monospace"),
+            FontRequest {
+                family: "system-ui",
+                weight: 700,
+                style: FontStyle::Normal,
+                synthesis: render_core::layout::FontSynthesis::default(),
+            },
+            FontRequest::of_family("\"No Such Font\", monospace"),
+            FontRequest::of_family("Arial Unicode MS"),
+        ];
+        let characters = [
+            ' ',
+            'A',
+            'z',
+            '0',
+            'é',
+            '你',
+            '網',
+            'α',
+            '♥',
+            'Ա',
+            'ก',
+            '\u{10FFFF}',
+        ];
+        let mut coverage = Vec::new();
+        for request in &requests {
+            for character in characters {
+                coverage.push((
+                    *request,
+                    character,
+                    selected_pair(&backend, request, character, false),
+                ));
+            }
+        }
+        // Decode every installed face, which turns every Coverage answer into a
+        // lookup_glyph_index answer, and run the same walk again.
+        for faces in &backend.installed.loaded {
+            for face in faces {
+                face.font();
+            }
+        }
+        for (request, character, expected) in coverage {
+            assert_eq!(
+                selected_pair(&backend, &request, character, true),
+                expected,
+                "the decoded walk and the coverage walk disagree for {character:?} under {:?}",
+                request.family
+            );
+        }
+    }
+
+    /// A Latin run parses its own face and nothing else.
+    ///
+    /// This is the whole saving: before this round the backend decoded every
+    /// installed face at start-up, including the CJK and last-resort faces a
+    /// Latin page never asks for.
+    #[test]
+    fn a_latin_run_decodes_only_the_face_it_paints() {
+        use render_core::paint::GlyphMaskProvider;
+
+        let backend = super::SystemFontBackend::load().expect("the platform table loads");
+        assert_eq!(
+            backend.eager_face_count(),
+            0,
+            "start-up reads character maps and no outlines"
+        );
+        assert!(
+            backend.loaded_face_count() > 0,
+            "the table still reports the faces it found"
+        );
+
+        let request = FontRequest::initial();
+        let run = backend.shape_font(
+            "Handgloves 019",
+            &request,
+            16.0,
+            PhysicalPoint { x: 0.0, y: 0.0 },
+            Color::BLACK,
+        );
+        assert_eq!(run.glyphs.len(), "Handgloves 019".chars().count());
+        let selected = selected_pair(&backend, &request, 'H', false)
+            .expect("the initial family covers Latin text");
+        // The face must actually paint, not merely report an advance. A font
+        // whose outlines did not load would still pass every advance check.
+        let font = backend.installed.loaded[selected.0][selected.1]
+            .font()
+            .expect("the selected face decodes");
+        let (metrics, coverage) = font.rasterize('H', 16.0);
+        let mask = backend
+            .shared_mask(run.font, GlyphId('H' as u32), 16.0)
+            .expect("the selected face has a mask for a glyph in the run");
+        assert!(
+            mask.coverage.iter().any(|coverage| *coverage > 0),
+            "the Latin face paints ink"
+        );
+        assert_eq!(
+            mask.coverage, coverage,
+            "the painted mask is the selected face's own rasterisation"
+        );
+        assert_eq!(mask.left, metrics.xmin);
+        for (family, faces) in backend.installed.loaded.iter().enumerate() {
+            for (face, slot) in faces.iter().enumerate() {
+                if (family, face) != selected {
+                    assert!(
+                        !slot.is_ready(),
+                        "{} face {face} decoded for a run that never selected it",
+                        backend.installed.families[family].name
+                    );
+                }
+            }
+        }
+    }
+
+    /// The first CJK character decodes the CJK fallback face, and the mask it
+    /// paints is that face's own rasterisation.
+    #[test]
+    fn a_cjk_glyph_decodes_its_fallback_face_on_first_use() {
+        use render_core::paint::GlyphMaskProvider;
+
+        let backend = super::SystemFontBackend::load().expect("the platform table loads");
+        let request = FontRequest::initial();
+        let character = '你';
+        let Some((family, face)) = selected_pair(&backend, &request, character, false) else {
+            // A platform with no installed CJK face legitimately has no answer.
+            return;
+        };
+        let name = backend.installed.families[family].name.clone();
+        assert!(
+            !backend.installed.loaded[family][face].is_ready(),
+            "{name} decoded before a glyph needed it"
+        );
+
+        let run = backend.shape_font(
+            &character.to_string(),
+            &request,
+            24.0,
+            PhysicalPoint { x: 0.0, y: 0.0 },
+            Color::BLACK,
+        );
+        assert_eq!(run.glyphs.len(), 1);
+        assert_eq!(
+            run.glyphs[0].glyph.0, character as u32,
+            "the run names the character, so the mask path re-resolves the same face"
+        );
+        assert!(
+            backend.installed.loaded[family][face].is_ready(),
+            "the first glyph decoded {name}"
+        );
+
+        let font = backend.installed.loaded[family][face]
+            .font()
+            .expect("the face that painted the glyph is resident");
+        let (metrics, coverage) = font.rasterize(character, 24.0);
+        let mask = backend
+            .shared_mask(run.font, GlyphId(character as u32), 24.0)
+            .expect("the selected face has a mask");
+        assert_eq!(
+            mask.coverage, coverage,
+            "the painted mask is not the selected face's rasterisation"
+        );
+        assert_eq!(mask.left, metrics.xmin);
+        assert_eq!(
+            mask.top,
+            metrics.ymin + i32::try_from(metrics.height).expect("a glyph fits an i32")
+        );
+        assert!(
+            (advance(&backend, &request, &character.to_string())
+                - font.metrics(character, 24.0).advance_width)
+                .abs()
+                < 1e-3,
+            "measurement read the same face the mask came from"
+        );
+    }
+
+    /// A character only Arial Unicode covers is still rendered, and asking
+    /// whether it is covered does not decode the 310 MB face.
+    #[test]
+    fn a_glyph_that_needs_arial_unicode_decodes_it_and_renders() {
+        use render_core::paint::GlyphMaskProvider;
+
+        let backend = super::SystemFontBackend::load().expect("the platform table loads");
+        let Some((family, _)) = backend
+            .installed
+            .families
+            .iter()
+            .enumerate()
+            .find(|(_, family)| family.name == "Arial Unicode MS")
+        else {
+            return;
+        };
+        let request = FontRequest::of_family("Arial Unicode MS");
+        let character = 'α';
+        let (selected_family, face) = selected_pair(&backend, &request, character, false)
+            .expect("Arial Unicode's character map covers Greek");
+        assert_eq!(selected_family, family);
+        assert!(
+            !backend.installed.loaded[family][face].is_ready(),
+            "coverage alone answered the matching question without decoding the face"
+        );
+        assert_eq!(backend.eager_face_count(), 0);
+
+        let run = backend.shape_font(
+            &character.to_string(),
+            &request,
+            24.0,
+            PhysicalPoint { x: 0.0, y: 0.0 },
+            Color::BLACK,
+        );
+        assert_eq!(run.glyphs.len(), 1);
+        assert_eq!(run.glyphs[0].glyph.0, character as u32);
+        assert!(
+            backend.installed.loaded[family][face].is_ready(),
+            "the glyph decoded Arial Unicode"
+        );
+        let mask = backend
+            .shared_mask(run.font, GlyphId(character as u32), 24.0)
+            .expect("the lazy face has a mask");
+        assert!(
+            mask.coverage.iter().any(|coverage| *coverage > 0),
+            "the glyph paints ink"
+        );
+        let font = backend.installed.loaded[family][face]
+            .font()
+            .expect("the face is resident");
+        let (_, direct) = font.rasterize(character, 24.0);
+        assert_eq!(
+            mask.coverage, direct,
+            "the on-demand face is the same rasterisation as an eager decode"
+        );
+    }
+
+    /// The whole document pipeline at 1x and 2x is unchanged by whether the
+    /// installed faces were decoded before the render or during it.
+    #[test]
+    fn a_document_rasterizes_identically_at_one_and_two_x() {
+        use render_core::document::{Document, DocumentBackends, DocumentRenderOptions};
+        use render_core::layout::LayoutOptions;
+
+        let backend = super::SystemFontBackend::load().expect("the platform table loads");
+        let html = "<!doctype html><style>\
+                    body { margin: 8px; font-family: serif; }\
+                    .sans { font-family: sans-serif; }\
+                    .mono { font-family: monospace; }\
+                    </style>\
+                    <p>Latin text 0123456789</p>\
+                    <p class=sans>中文简体，繁體網頁。αβγ ♥ Ա</p>\
+                    <p class=mono>monospace println!(\"hi\")</p>";
+        let render = |scale: f32| {
+            let document = Document::parse(html);
+            document
+                .render(
+                    DocumentRenderOptions {
+                        layout: LayoutOptions {
+                            viewport: render_core::layout::PhysicalSize {
+                                width: 640.0,
+                                height: 480.0,
+                            },
+                            ..LayoutOptions::default()
+                        },
+                        device_scale: scale,
+                        ..DocumentRenderOptions::default()
+                    },
+                    DocumentBackends {
+                        text_measurer: &backend,
+                        text_shaper: &backend,
+                        glyph_masks: &backend,
+                        font_face_installer: None,
+                    },
+                )
+                .raster
+                .surface
+        };
+
+        let lazy_1x = render(1.0);
+        let lazy_2x = render(2.0);
+        assert_eq!(
+            (lazy_2x.width(), lazy_2x.height()),
+            (lazy_1x.width() * 2, lazy_1x.height() * 2),
+            "device_scale doubles the raster without changing the CSS viewport"
+        );
+        assert!(
+            lazy_1x.pixels().iter().any(|pixel| pixel.alpha != 0),
+            "the document paints something at 1x"
+        );
+
+        // Decode the rest of the table, exactly as the eager backend had done
+        // before the first render, and rasterise again. Any difference would be
+        // a face whose lazy path measured or painted differently.
+        for faces in &backend.installed.loaded {
+            for face in faces {
+                face.font();
+            }
+        }
+        assert_eq!(
+            lazy_1x.pixels(),
+            render(1.0).pixels(),
+            "1x pixels do not depend on when the faces were decoded"
+        );
+        assert_eq!(
+            lazy_2x.pixels(),
+            render(2.0).pixels(),
+            "2x pixels do not depend on when the faces were decoded"
+        );
+    }
+
+    /// `loaded_face_count` still means the table's found faces, not the decoded
+    /// subset. The decoded subset is the separate number start-up now reports.
+    #[test]
+    fn loaded_face_count_counts_the_table_and_eager_face_count_the_resident_faces() {
+        let backend = super::SystemFontBackend::load().expect("the platform table loads");
+        let found = backend.loaded_face_count();
+        assert!(found > 0);
+        assert_eq!(
+            found,
+            backend.installed.loaded.iter().map(Vec::len).sum::<usize>(),
+            "every found face is one table row"
+        );
+        assert_eq!(backend.eager_face_count(), 0);
+        let _ = backend.shape_font(
+            "A",
+            &FontRequest::initial(),
+            16.0,
+            PhysicalPoint { x: 0.0, y: 0.0 },
+            Color::BLACK,
+        );
+        assert_eq!(
+            backend.eager_face_count(),
+            1,
+            "one Latin glyph decodes exactly one face"
+        );
+        assert_eq!(
+            backend.loaded_face_count(),
+            found,
+            "the table did not change"
+        );
+    }
+
     // ---- the webfont path, end to end ---------------------------------------
 
     /// A declared face's file, read off disk, for a document face to be built
@@ -2154,6 +2879,33 @@ mod tests {
                 })
                 .expect("the walk finds a face for a character the platform covers")
                 .family
+        })
+    }
+
+    /// The family and face the walk selects, answered either from the lazy
+    /// coverage sets (`decoded = false`) or from the decoded character maps
+    /// (`decoded = true`). The two answers must agree; the test below decodes
+    /// the table between the two halves.
+    fn selected_pair(
+        backend: &SystemFontBackend,
+        request: &FontRequest<'_>,
+        character: char,
+        decoded: bool,
+    ) -> Option<(usize, usize)> {
+        backend.with_state(|state| {
+            let instance = backend.resolve(request);
+            state
+                .table
+                .face_for(&instance.walk, character, |family, face| {
+                    let slot = &state.loaded[family][face];
+                    if decoded {
+                        slot.font()
+                            .is_some_and(|font| font.lookup_glyph_index(character) != 0)
+                    } else {
+                        slot.covers(character)
+                    }
+                })
+                .map(|matched| (matched.family, matched.face))
         })
     }
 
@@ -2350,7 +3102,9 @@ mod tests {
                     has_glyph(state.loaded, family, face, 'H')
                 })
                 .expect("a request for a document family with a loaded face resolves");
-            Arc::clone(&state.loaded[matched.family][matched.face])
+            state.loaded[matched.family][matched.face]
+                .font()
+                .expect("the selected face decodes")
         })
     }
 

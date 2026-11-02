@@ -2104,6 +2104,7 @@ dependencies = [
  "render-core",
  "render-net",
  "softbuffer",
+ "ttf-parser",
  "wgpu",
  "winit",
  "woff2-patched",

@@ -17,6 +17,14 @@ bytes = "=1.10.0"
 encoding_rs = "0.8.35"
 flate2 = "1.1"
 fontdue = "0.9.3"
+# Installed faces need their character map before they need their outlines.
+# `ttf-parser` is already the parser inside `fontdue` (same 0.21 version), so
+# reading a face's cmap here does not add a second font parser to the build.
+# The feature set must match `fontdue`'s exactly: ttf-parser's default features
+# (notably `variable-fonts`) make the system SF font rasterize with empty
+# outlines, so enabling them would change rendered output rather than only add
+# an API.
+ttf-parser = { version = "0.21.1", default-features = false, features = ["opentype-layout"] }
 image-codec = { package = "image", version = "0.25.8", default-features = false, features = ["png"] }
 render-core = { path = "../render-core" }
 render-net = { path = "../render-net" }
