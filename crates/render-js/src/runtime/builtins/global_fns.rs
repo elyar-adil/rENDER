@@ -263,6 +263,9 @@ impl JsRuntime {
             NativeFunction::Temporal(kind, method) => {
                 self.dispatch_temporal_native(dom, kind, method, receiver, arguments)
             }
+            NativeFunction::Intl(operation) => {
+                self.dispatch_intl_native(dom, operation, receiver, arguments)
+            }
             NativeFunction::UrlCreateObjectUrl | NativeFunction::UrlRevokeObjectUrl => {
                 self.dispatch_url_native(dom, function, receiver, arguments)
             }

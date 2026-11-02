@@ -2162,6 +2162,7 @@ dependencies = [
  "render-dom",
  "render-html",
  "unicode-ident",
+ "unicode-segmentation",
  "url",
 ]
 

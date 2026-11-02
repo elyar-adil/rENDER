@@ -37,6 +37,7 @@ pub(super) mod focus;
 pub(super) mod function;
 pub(super) mod global_fns;
 pub(super) mod hyperlink;
+pub(crate) mod intl;
 pub(super) mod iterator;
 pub(super) mod json;
 pub(super) mod math;

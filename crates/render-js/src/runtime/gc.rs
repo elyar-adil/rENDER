@@ -263,6 +263,8 @@ pub(super) fn mark_host(
         | ObjectHost::DisposableStackConstructor(_)
         | ObjectHost::TemporalConstructor(_)
         | ObjectHost::Temporal(_)
+        | ObjectHost::IntlConstructor(_)
+        | ObjectHost::Intl(_)
         | ObjectHost::CollectionConstructor(_)
         | ObjectHost::TypedArrayConstructor(_)
         | ObjectHost::DataViewConstructor

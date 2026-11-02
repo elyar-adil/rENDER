@@ -10,6 +10,7 @@ use url::Url;
 
 use crate::bigint::JsBigInt;
 use crate::parser::FunctionKind;
+use crate::runtime::builtins::intl::{IntlKind, IntlOp, IntlValue};
 use crate::runtime::builtins::temporal::{TemporalKind, TemporalMethod, TemporalValue};
 use crate::runtime::types::ArgumentsMap;
 use crate::runtime::types::ElementRect;
@@ -820,6 +821,8 @@ pub(crate) enum NativeFunction {
     Atomics(AtomicsOp),
     /// A method, accessor or static function of one Temporal class.
     Temporal(TemporalKind, TemporalMethod),
+    /// A method, accessor or static function of the `Intl` namespace.
+    Intl(IntlOp),
     GetElementById,
     DocumentElementFromPoint,
     QuerySelector,
@@ -2529,6 +2532,10 @@ pub(crate) enum ObjectHost {
     TemporalConstructor(TemporalKind),
     /// An instance of one Temporal class, with the slots that class keeps.
     Temporal(TemporalValue),
+    /// The constructor object of one `Intl` class.
+    IntlConstructor(IntlKind),
+    /// One `Intl` formatter, plural-rules or segmenter instance.
+    Intl(IntlValue),
     /// The `onFulfilled` (`rejected == false`) or `onRejected` callback of an
     /// `await` inside `disposeAsync` on `stack`: it resumes the disposal.
     DisposeAwaitResume {
@@ -2871,6 +2878,7 @@ impl ObjectHost {
                 | Self::SuppressedErrorConstructor
                 | Self::DisposableStackConstructor(_)
                 | Self::TemporalConstructor(_)
+                | Self::IntlConstructor(_)
         )
     }
 }
@@ -3173,6 +3181,8 @@ pub struct RealmRecord {
     /// `%Temporal.<class>.prototype%` for each class that has instances. The
     /// intrinsics are rooted in `gc_identity_roots`, like the stack prototypes.
     pub(crate) temporal_prototypes: BTreeMap<TemporalKind, ObjectId>,
+    /// `%Intl.<class>.prototype%` and the two internal Segments prototypes.
+    pub(crate) intl_prototypes: BTreeMap<IntlKind, ObjectId>,
     /// `%MediaQueryList.prototype%`. Root it explicitly: a script that drops
     /// every reference to a list still gets a live list that must keep
     /// evaluating, so the prototype outlives the lists too.
@@ -3326,6 +3336,7 @@ impl Realm {
             swept_objects: 0,
         };
         realm.install_temporal();
+        realm.install_intl();
         realm
     }
 
@@ -3344,6 +3355,7 @@ impl Realm {
         self.realms.push(record);
         let previous = self.enter_realm(id);
         self.install_temporal();
+        self.install_intl();
         self.enter_realm(previous);
         id
     }
@@ -3367,6 +3379,7 @@ impl Realm {
         self.realms.push(record);
         let previous = self.enter_realm(id);
         self.install_temporal();
+        self.install_intl();
         self.enter_realm(previous);
         id
     }
@@ -3691,6 +3704,7 @@ impl Realm {
             form_controls_wrappers: BTreeMap::new(),
             document_forms_wrappers: BTreeMap::new(),
             temporal_prototypes: BTreeMap::new(),
+            intl_prototypes: BTreeMap::new(),
         }
     }
 
@@ -11358,6 +11372,7 @@ impl RealmRecord {
         roots.push(self.shadow_realm_prototype);
         roots.push(self.media_query_list_prototype);
         roots.extend(self.temporal_prototypes.values().copied());
+        roots.extend(self.intl_prototypes.values().copied());
         roots.extend(self.node_wrappers.values().copied());
         roots.extend(self.implementation_wrappers.values().copied());
         roots.extend(self.class_list_wrappers.values().copied());

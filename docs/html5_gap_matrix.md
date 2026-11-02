@@ -125,7 +125,7 @@ host 能力仍被分类为 unsupported 时，不得宣称 test262 100%。
 | 5 iterator/**generator**/Promise/async | 🟡 **分裂** | `Iterator` 全局 + `%IteratorHelperPrototype%` + 惰性助手 ✅（`built-ins/Iterator` pass 12 → 356）；`Promise` 有真实原型 then/catch/finally ✅。🔴 **generator/async 方法体仍按普通函数执行** —— `crates/render-js/src/parser.rs:581-583` 源码注释直陈"The runtime does not suspend generator frames"，`methods-gen-*` 一族约 1k 用例失败。🔴 core-js 品牌检查在 Promise 微任务续体上失败（Promise 互操作） |
 | 6 module graph | 🔴 | `crates/render-js/src/parser.rs:583` 自述 module 声明被"lowered into the shared page"，`runtime/builtins/global_fns.rs:349` 自述"Module graph fetching belongs to the browser coordinator" |
 | 7 typed arrays | ✅ | `runtime/builtins/typed_array.rs` |
-| 8 Intl / Temporal | 🔴 | 大量 Syntax/Reference 失败，各自独立大簇 |
+| 8 Intl / Temporal | 🟡 Intl 部分 / Temporal 🔴 | `Intl.Collator`/`DateTimeFormat`/`NumberFormat`/`PluralRules`/`Segmenter`/`getCanonicalLocales` 已实现（en-US 数据、UTC/local 时区；缺口见 `visual_fidelity_gaps.md` S12）；`Temporal` 仍是独立大簇 |
 
 🔴 另有两处明确缺口：BigInt 字面量 38 例失败；`[object Object]` 断言簇 638（多与 generator 迭代器相关）。
 🟡 超大稀疏 array-like 已由 `MAX_MATERIALIZED_ELEMENTS` 上界 + 显式 `ResourceLimit` 处理

@@ -6351,6 +6351,7 @@ impl JsRuntime {
                 | ObjectHost::ShadowRealmConstructor
                 | ObjectHost::DisposableStackConstructor(_)
                 | ObjectHost::TemporalConstructor(_)
+                | ObjectHost::IntlConstructor(_)
                 | ObjectHost::PromiseConstructor
                 | ObjectHost::EventConstructor
                 | ObjectHost::DomConstructor
@@ -6579,6 +6580,9 @@ impl JsRuntime {
             }
             Some(ObjectHost::TemporalConstructor(kind)) => {
                 self.temporal_construct(dom, kind, &new_target, arguments)
+            }
+            Some(ObjectHost::IntlConstructor(kind)) => {
+                self.intl_construct(dom, kind, constructor, arguments)
             }
             Some(ObjectHost::PromiseConstructor) => self.construct_promise(dom, arguments),
             Some(ObjectHost::Canvas(
@@ -7041,6 +7045,14 @@ impl JsRuntime {
             }
             Some(ObjectHost::TemporalConstructor(_)) => {
                 Err(JsError::type_error("Temporal constructors require 'new'"))
+            }
+            Some(ObjectHost::IntlConstructor(
+                crate::runtime::builtins::intl::IntlKind::Segmenter,
+            )) => Err(JsError::type_error(
+                "Intl.Segmenter constructor requires 'new'",
+            )),
+            Some(ObjectHost::IntlConstructor(kind)) => {
+                self.intl_construct(dom, kind, callee, arguments)
             }
             Some(ObjectHost::DisposeAwaitResume { stack, rejected }) => {
                 let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);

@@ -465,7 +465,7 @@ HTTP Range 与资源状态 → HTMLMediaElement 状态机 → MP4 解复用 → 
 | 模块（`import` / `export`） | ✅ 语法、依赖图获取、链接与执行顺序已接入（`crates/render-core/src/module_graph.rs`、`page.rs`）；剩余失败簇见 test262 |
 | 动态 `import()` | 🟡 全局 `import` 存在（`crates/render-js/src/value.rs:1455-1462`），语义为页面内解析 |
 | 顶层 await | 🔴 |
-| `Intl.*` / `Temporal` | 🔴 各自是独立大簇，test262 大量 Syntax/Reference 失败（`HANDOFF.md`） |
+| `Intl.*` / `Temporal` | 🟡 `Intl.Collator`/`DateTimeFormat`/`NumberFormat`/`PluralRules`/`Segmenter`/`getCanonicalLocales` 已实现，固定 en-US 数据与 UTC/local 时区（`visual_fidelity_gaps.md` S12）；`Intl.Locale`/`DisplayNames`/`RelativeTimeFormat`/`ListFormat` 仍缺；`Temporal` 仍是独立大簇 |
 
 ### 6.2 内置对象
 
@@ -610,7 +610,7 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 | `crypto.getRandomValues` / `randomUUID` | ✅ prelude 通过宿主熵源实现，`getRandomValues` 单次上限 65,536 字节 |
 | `alert` / `confirm` / `prompt` | 🔴。⚠️ 上一版写"实现为 PyQt 对话框"，该说法随 Qt 架构退役，本次删除。通用做法是走宿主抽象（`render-core/src/interaction.rs` 的 `DefaultActionKind` 家族已有同类扩展点） |
 | `devicePixelRatio` | 🔴 硬编码 1.0（`crates/render-browser/src/app.rs:1464` 与 `crates/render-core/src/image.rs:109` 都是 `device_pixel_ratio_milli: 1_000`）。它目前只用于 `srcset` 密度选择（`image.rs:1085`），所以高分屏资源选择是错的 |
-| `crypto.subtle` / WebAuthn / Notification / Geolocation / Battery / DeviceOrientation / Gamepad / Speech / WebMIDI / WebUSB / WebBluetooth / WebHID / WebSerial / WebNFC / `Intl.*` | ⛔ |
+| `crypto.subtle` / WebAuthn / Notification / Geolocation / Battery / DeviceOrientation / Gamepad / Speech / WebMIDI / WebUSB / WebBluetooth / WebHID / WebSerial / WebNFC | ⛔ |
 
 ---
 
@@ -667,7 +667,7 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 | ARIA 属性反射到 DOM | 🔴（`aria-*` 只是普通属性，无消费者） |
 | 可访问性树 / 屏幕阅读器对接 | ⛔ |
 | 键盘导航：Tab 焦点环、Enter/Space 触发按钮 | 🟡 顺序焦点排序与前进/后退 ✅（`crates/render-core/src/interaction.rs`，`sequential_focus_order` / `sequential_focus_target`）；`focus()` / `blur()` ✅；**Tab/Shift-Tab 已接到页面输入路径 ✅**（先派发可取消 `keydown`，落到文本控件时打开原生编辑器）；`:focus` / `:focus-visible` 样式 ✅（键盘恒显示、指针仅文本控件、脚本继承上次输入）；Enter/Space 触发按钮仍 🟡 |
-| `Intl.*` | ⛔ |
+| `Intl.*` | 🟡 核心格式化与分段已实现（en-US/UTC；见 `visual_fidelity_gaps.md` S12），`Locale`/`DisplayNames`/`RelativeTimeFormat`/`ListFormat` 仍缺 |
 | 高 DPI（device pixel ratio）一致绘制 | 🔴 恒 1.0（见 7.7） |
 | 用户缩放 / 页面缩放 | ⛔ |
 | 打印（`window.print`、@page） | ⛔ |

@@ -1373,7 +1373,7 @@ Absent:
 | `ResizeObserver` | Component frameworks gate layout on it. |
 | Customized built-ins, declarative shadow roots (`shadowrootmode`), `slotchange`, and shadow-scoped stylesheets | The autonomous `customElements` and `attachShadow` paths exist; these are the remaining Shadow DOM pieces. `attributeChangedCallback` also does not fire for `classList`/`style`/`dataset`/`Attr.value` writes. |
 | `WebSocket`, `Worker`, `SharedWorker`, `EventSource` | No live-update or off-main-thread execution path. |
-| `indexedDB`, `Notification`, `PerformanceObserver`, `WebAssembly`, `ReadableStream`, `TransformStream` | Lower frequency on ordinary pages. |
+| `indexedDB`, `Notification`, `PerformanceObserver`, `WebAssembly`, `TransformStream` | Lower frequency on ordinary pages. `ReadableStream` default streams are implemented; see S12 for the remaining stream gaps. |
 
 A missing global is worse than a wrong one, because it throws a `ReferenceError` at
 the point of use and takes the surrounding script with it. Every remaining entry above is a
@@ -2777,3 +2777,68 @@ Evidence: `crates/render-css/src/stylesheet.rs` (`parse_scope_prelude`,
 `element_match_context`), and `crates/render-core/src/document.rs`
 (`scope_owner`). Tests pin both boundaries, nesting, implicit ownership, zero-specificity
 declarations, proximity ordering, and generated content.
+
+## S12 - WHATWG Streams and Intl: core implemented, limits named
+
+**Status: partly closed.** The real-site blocker behind the blank X login page was
+that the TSR bootstrap script called `new ReadableStream(...)` and the startup
+chunk evaluated `new Intl.Segmenter` at top level. Both globals now exist and
+have tested behaviour.
+
+### ReadableStream (`crates/render-js/src/prelude.js`)
+
+Implemented for default (non-byte) streams:
+
+- `new ReadableStream(underlyingSource, strategy)` with a default controller,
+  `start`, `pull`, `cancel`, `highWaterMark` and `size`;
+- `controller.enqueue/close/error/desiredSize`, including the rule that closing
+  a stream with queued chunks delivers those chunks before `done`;
+- `getReader()`, `read()` promises of `{value, done}`, `cancel()`, `closed`,
+  `desiredSize`, `releaseLock()`, `locked`;
+- pull-driven backpressure: a pull runs only while `desiredSize > 0` or a read
+  is waiting, a re-entrant pull sets `pullAgain`, and queued chunks are FIFO;
+- `tee()` with two independently cancellable branches;
+- `values()` and `[Symbol.asyncIterator]`, so `for await` works.
+
+Deliberately absent (a call throws rather than doing something else):
+byte streams/BYOB readers, `pipeTo`, `pipeThrough`, `TransformStream`,
+`WritableStream` and `ReadableStream.from`. The reduced tests are
+`crates/render-js/src/runtime/streams_tests.rs` (10 tests); they cover ordered
+start enqueues, pull backpressure, `desiredSize`, error rejection, pending-read
+delivery, lock release, `for await`, `tee`, cancellation and the exact X
+listener shape.
+
+### Intl (`crates/render-js/src/runtime/builtins/intl.rs`)
+
+Implemented with real formatting/segmentation, not stubs:
+
+- `Intl.Segmenter` for `grapheme` (extended grapheme clusters), `word`
+  (UAX #29 boundaries with `isWordLike`) and `sentence`; `segment()` returns an
+  iterable `Segments` object with UTF-16 `index`, `input`, `containing()` and
+  `toArray()`;
+- `Intl.NumberFormat` decimal/percent/currency styles, `useGrouping`,
+  min/max fraction and integer digits, `signDisplay`, compact notation and
+  `formatToParts()`; common ISO currency symbols and zero-digit currencies;
+- `Intl.DateTimeFormat` with en-US field order/names, date and time styles,
+  `hour12`/`hourCycle`, `timeZoneName`, and `formatToParts()`;
+- `Intl.PluralRules` cardinal/ordinal English categories;
+- `Intl.Collator` with real `compare()` (code-point order);
+- `Intl.getCanonicalLocales()` and `supportedLocalesOf()`.
+
+**Locale/time-zone limits.** There is no non-English CLDR data and no time-zone
+database. Formatting is en-US, `resolvedOptions().locale` is `"en-US"`, and
+`timeZone` accepts only UTC/the engine's local (UTC) time. Unsupported
+collation options, non-UTC zones, non-standard notation, significant digits,
+and non-gregory/latn date options throw a `RangeError` rather than silently
+producing a wrong answer. `Intl.Locale`, `Intl.DisplayNames`,
+`Intl.RelativeTimeFormat`, `Intl.ListFormat`, `Intl.supportedValuesOf` and
+`Intl.DurationFormat` remain absent entirely. `Date.prototype.toLocale*String`
+and `String.prototype.localeCompare` still use the engine's pre-existing fixed
+formatter/comparator instead of routing through these Intl objects; that wiring
+is a separate gap.
+
+Evidence: 11 tests in `builtins/intl.rs`; `cargo test -p render-js` 1256 passed.
+A live X replay loads the page, entry bundle and all initial chunks with
+`scripts_failed=0 scripts_threw=0`; it still shows the shell because the
+guest-activation request (`https://api.x.com/1.1/guest/activate.json`) returns
+404 through the diagnostic proxy, so no hydration payload can be fetched.

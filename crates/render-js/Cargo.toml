@@ -17,6 +17,7 @@ getrandom = "0.4"
 icu_properties = "2.1.2"
 mp4parse = "0.17.0"
 unicode-ident = "1.0.24"
+unicode-segmentation = "1.13.3"
 url = "2.5.4"
 
 [lints]
