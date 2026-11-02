@@ -1010,7 +1010,13 @@ impl<'a> RasterState<'a> {
     /// Adds one painted rectangle to the innermost offscreen layer's tracking
     /// box. The root surface needs no tracking: it is never cropped.
     fn note_layer_bounds(&mut self, rect: PhysicalRect) {
-        let Some(StackingFrame::Layer { painted, .. }) = self
+        let surface = self
+            .layers
+            .last()
+            .map(|layer| (layer.width(), layer.height()));
+        let Some(StackingFrame::Layer {
+            transform, painted, ..
+        }) = self
             .frames
             .iter_mut()
             .rev()
@@ -1018,6 +1024,22 @@ impl<'a> RasterState<'a> {
         else {
             return;
         };
+        // Item bounds are in the layer's untransformed coordinates. A
+        // non-identity transform (flip, scale, skew, rotation) can move them
+        // anywhere in the offscreen surface, so the tight crop is only valid
+        // for identity contexts. Scanning the full surface here is
+        // conservative and keeps transformed content from being clipped.
+        if *transform != Transform2D::default() {
+            if let Some((width, height)) = surface {
+                *painted = Some(PhysicalRect::new(
+                    0.0,
+                    0.0,
+                    u32_to_f32(width),
+                    u32_to_f32(height),
+                ));
+            }
+            return;
+        }
         *painted = Some(painted.map_or(rect, |current| union_rect(current, rect)));
     }
 
