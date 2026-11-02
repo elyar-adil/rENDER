@@ -46,6 +46,154 @@ fn location_exposes_normalized_committed_url_components() {
 }
 
 #[test]
+fn url_search_params_parse_serialize_and_iterate() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var params = new URLSearchParams("?a=1&a=2&b=hello+world&c=%E4%BD%A0");
+                params.get("a") === "1" &&
+                params.getAll("a").join(",") === "1,2" &&
+                params.get("b") === "hello world" &&
+                params.get("c") === "你" &&
+                params.size === 4 &&
+                params.toString() === "a=1&a=2&b=hello+world&c=%E4%BD%A0" &&
+                Array.from(params.keys()).join(",") === "a,a,b,c" &&
+                Array.from(params.values()).join(",") === "1,2,hello world,你" &&
+                JSON.stringify(Array.from(params.entries())) ===
+                    JSON.stringify([["a","1"],["a","2"],["b","hello world"],["c","你"]]) &&
+                JSON.stringify(Array.from(params)) === JSON.stringify(Array.from(params.entries()));
+            "#,
+        )
+        .expect("URLSearchParams parsing and iteration should execute");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
+}
+
+#[test]
+fn url_search_params_mutate_and_replace_entries() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var params = new URLSearchParams("a=1&a=2&b=3");
+                params.set("a", "9");
+                params.append("c", "4");
+                params.delete("b");
+                params.sort();
+                var first = params.toString() === "a=9&c=4";
+                params.delete("a", "9");
+                var second = params.toString() === "c=4" && params.has("c", "4") && !params.has("c", "5");
+                params.append("a", "1");
+                params.append("a", "2");
+                params.delete("a", "1");
+                second && first && params.getAll("a").join(",") === "2";
+            "#,
+        )
+        .expect("URLSearchParams mutation should execute");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
+}
+
+#[test]
+fn url_search_params_constructor_accepts_records_and_pair_sequences() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var record = new URLSearchParams({ x: "1", y: "two words" });
+                var pairs = new URLSearchParams([["k", "v"], ["k", "w"]]);
+                var copy = new URLSearchParams(record);
+                record.set("x", "changed");
+                record.toString() === "x=changed&y=two+words" &&
+                copy.toString() === "x=1&y=two+words" &&
+                pairs.getAll("k").join(",") === "v,w" &&
+                new URLSearchParams().size === 0;
+            "#,
+        )
+        .expect("URLSearchParams constructor forms should execute");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
+}
+
+#[test]
+fn url_search_params_for_each_and_live_size() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var params = new URLSearchParams("a=1&b=2");
+                var seen = [];
+                var receiver = { tag: "this" };
+                params.forEach(function (value, key, list) {
+                    seen.push(key + "=" + value + ":" + (this === receiver) + ":" + (list === params));
+                }, receiver);
+                var before = params.size;
+                params.append("c", "3");
+                var after = params.size;
+                params.delete("a");
+                seen.join("|") === "a=1:true:true|b=2:true:true" &&
+                before === 2 && after === 3 && params.size === 2;
+            "#,
+        )
+        .expect("URLSearchParams forEach and size should execute");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
+}
+
+#[test]
+fn url_search_params_updates_its_owning_url() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var url = new URL("https://example.test/path?x=1");
+                var shares_prototype = Object.getPrototypeOf(url.searchParams) === URLSearchParams.prototype;
+                url.searchParams.set("y", "two words");
+                var set = url.href === "https://example.test/path?x=1&y=two+words" &&
+                          url.search === "?x=1&y=two+words";
+                url.searchParams.delete("x");
+                var deleted = url.href === "https://example.test/path?y=two+words" &&
+                              url.search === "?y=two+words";
+                url.searchParams.set("z", "3");
+                url.searchParams.sort();
+                var sorted = url.search === "?y=two+words&z=3";
+                shares_prototype && set && deleted && sorted;
+            "#,
+        )
+        .expect("URL.searchParams should mutate its URL");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
+}
+
+#[test]
+fn url_parse_returns_null_instead_of_throwing() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                URL.parse("/a?b=1", "https://example.test").href === "https://example.test/a?b=1" &&
+                URL.parse("https://example.test/x").pathname === "/x" &&
+                URL.parse("/a") === null &&
+                URL.parse("not a url") === null &&
+                URL.parse("http://[::1") === null &&
+                URL.canParse("/a", "https://example.test") === true &&
+                URL.canParse("/a") === false &&
+                URL.canParse("https://example.test/x") === true;
+            "#,
+        )
+        .expect("URL.parse should execute");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
+}
+
+#[test]
 fn array_some_short_circuits_on_the_first_matching_callback() {
     let mut parsed = parse_document("<!doctype html><p></p>");
     let mut runtime = JsRuntime::new(&parsed.dom);

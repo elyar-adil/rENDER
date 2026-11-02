@@ -6778,9 +6778,9 @@ impl JsRuntime {
             Some(ObjectHost::RegExpConstructor) => {
                 self.regexp_constructor_value(dom, constructor, arguments, false)
             }
-            Some(ObjectHost::UrlConstructor) => self.url_constructor(constructor, arguments),
+            Some(ObjectHost::UrlConstructor) => self.url_constructor(dom, constructor, arguments),
             Some(ObjectHost::UrlSearchParamsConstructor) => {
-                self.url_search_params_constructor(constructor, arguments)
+                self.url_search_params_constructor(dom, constructor, arguments)
             }
             Some(ObjectHost::ArrowFunction(_)) => {
                 Err(JsError::type_error("arrow function is not a constructor"))
@@ -7149,9 +7149,9 @@ impl JsRuntime {
                 // except that a same-realm pattern is returned unchanged.
                 self.regexp_constructor_value(dom, callee, arguments, true)
             }
-            Some(ObjectHost::UrlConstructor) => self.url_constructor(callee, arguments),
+            Some(ObjectHost::UrlConstructor) => self.url_constructor(dom, callee, arguments),
             Some(ObjectHost::UrlSearchParamsConstructor) => {
-                self.url_search_params_constructor(callee, arguments)
+                self.url_search_params_constructor(dom, callee, arguments)
             }
             Some(ObjectHost::ErrorConstructor(kind)) => {
                 self.error_constructor(dom, callee, &JsValue::Undefined, kind, arguments)
@@ -7326,12 +7326,19 @@ impl JsRuntime {
             }
             Some(ObjectHost::NativeFunction(
                 function @ (NativeFunction::UrlSearchParamsGet
+                | NativeFunction::UrlSearchParamsGetAll
                 | NativeFunction::UrlSearchParamsHas
                 | NativeFunction::UrlSearchParamsSet
                 | NativeFunction::UrlSearchParamsAppend
+                | NativeFunction::UrlSearchParamsDelete
+                | NativeFunction::UrlSearchParamsSort
                 | NativeFunction::UrlSearchParamsToString
-                | NativeFunction::UrlSearchParamsForEach),
-            )) => Ok(self.url_search_params_method(&receiver, function, arguments, dom)),
+                | NativeFunction::UrlSearchParamsForEach
+                | NativeFunction::UrlSearchParamsKeys
+                | NativeFunction::UrlSearchParamsValues
+                | NativeFunction::UrlSearchParamsEntries
+                | NativeFunction::UrlSearchParamsSize),
+            )) => self.url_search_params_method(&receiver, function, arguments, dom),
             // §20.1.3.3 `isPrototypeOf` returns false for a primitive V before
             // ToObject(this), so only an object V reaches a nullish receiver's TypeError.
             Some(ObjectHost::NativeFunction(NativeFunction::ObjectPrototypeIsPrototypeOf))

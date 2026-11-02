@@ -1674,42 +1674,23 @@ impl JsRuntime {
             | NativeFunction::TypedArrayToStringTagGetter => {
                 self.dispatch_typed_array_native(dom, function, receiver, arguments)
             }
-            NativeFunction::UrlSearchParamsAppend => self.dispatch_url_native(
-                dom,
-                NativeFunction::UrlSearchParamsAppend,
-                receiver,
-                arguments,
-            ),
-            NativeFunction::UrlSearchParamsForEach => self.dispatch_url_native(
-                dom,
-                NativeFunction::UrlSearchParamsForEach,
-                receiver,
-                arguments,
-            ),
-            NativeFunction::UrlSearchParamsGet => self.dispatch_url_native(
-                dom,
-                NativeFunction::UrlSearchParamsGet,
-                receiver,
-                arguments,
-            ),
-            NativeFunction::UrlSearchParamsHas => self.dispatch_url_native(
-                dom,
-                NativeFunction::UrlSearchParamsHas,
-                receiver,
-                arguments,
-            ),
-            NativeFunction::UrlSearchParamsSet => self.dispatch_url_native(
-                dom,
-                NativeFunction::UrlSearchParamsSet,
-                receiver,
-                arguments,
-            ),
-            NativeFunction::UrlSearchParamsToString => self.dispatch_url_native(
-                dom,
-                NativeFunction::UrlSearchParamsToString,
-                receiver,
-                arguments,
-            ),
+            NativeFunction::UrlSearchParamsAppend
+            | NativeFunction::UrlSearchParamsDelete
+            | NativeFunction::UrlSearchParamsEntries
+            | NativeFunction::UrlSearchParamsForEach
+            | NativeFunction::UrlSearchParamsGet
+            | NativeFunction::UrlSearchParamsGetAll
+            | NativeFunction::UrlSearchParamsHas
+            | NativeFunction::UrlSearchParamsKeys
+            | NativeFunction::UrlSearchParamsSet
+            | NativeFunction::UrlSearchParamsSize
+            | NativeFunction::UrlSearchParamsSort
+            | NativeFunction::UrlSearchParamsToString
+            | NativeFunction::UrlSearchParamsValues
+            | NativeFunction::UrlParse
+            | NativeFunction::UrlCanParse => {
+                self.dispatch_url_native(dom, function, receiver, arguments)
+            }
             NativeFunction::UrlToString => {
                 self.dispatch_url_native(dom, NativeFunction::UrlToString, receiver, arguments)
             }

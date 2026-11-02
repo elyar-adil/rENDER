@@ -866,11 +866,20 @@ pub(crate) enum NativeFunction {
     HistoryGo,
     CssSupports,
     UrlSearchParamsGet,
+    UrlSearchParamsGetAll,
     UrlSearchParamsHas,
     UrlSearchParamsSet,
     UrlSearchParamsAppend,
+    UrlSearchParamsDelete,
+    UrlSearchParamsSort,
     UrlSearchParamsToString,
     UrlSearchParamsForEach,
+    UrlSearchParamsKeys,
+    UrlSearchParamsValues,
+    UrlSearchParamsEntries,
+    UrlSearchParamsSize,
+    UrlParse,
+    UrlCanParse,
     UrlToString,
     SymbolToString,
     SymbolValueOf,
@@ -4266,13 +4275,20 @@ impl Realm {
             prototype: Some(object_prototype),
             ..JsObject::default()
         });
+        let mut url_search_entries = None;
         for (name, function) in [
             ("get", NativeFunction::UrlSearchParamsGet),
+            ("getAll", NativeFunction::UrlSearchParamsGetAll),
             ("has", NativeFunction::UrlSearchParamsHas),
             ("set", NativeFunction::UrlSearchParamsSet),
             ("append", NativeFunction::UrlSearchParamsAppend),
+            ("delete", NativeFunction::UrlSearchParamsDelete),
+            ("sort", NativeFunction::UrlSearchParamsSort),
             ("toString", NativeFunction::UrlSearchParamsToString),
             ("forEach", NativeFunction::UrlSearchParamsForEach),
+            ("keys", NativeFunction::UrlSearchParamsKeys),
+            ("values", NativeFunction::UrlSearchParamsValues),
+            ("entries", NativeFunction::UrlSearchParamsEntries),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
@@ -4280,11 +4296,39 @@ impl Realm {
                 host: ObjectHost::NativeFunction(function),
                 ..JsObject::default()
             });
+            if name == "entries" {
+                url_search_entries = Some(method);
+            }
             objects[url_search_prototype.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor::builtin(JsValue::Object(method)),
             );
         }
+        if let Some(entries) = url_search_entries {
+            define_symbol_property_on(
+                objects,
+                url_search_prototype,
+                &JsSymbol::well_known("@@iterator"),
+                PropertyDescriptor::builtin(JsValue::Object(entries)),
+            );
+        }
+        let size_getter = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::UrlSearchParamsSize),
+            ..JsObject::default()
+        });
+        objects[url_search_prototype.0].properties.insert(
+            "size".to_owned(),
+            PropertyDescriptor {
+                getter: Some(size_getter),
+                setter: None,
+                value: JsValue::Undefined,
+                writable: false,
+                enumerable: true,
+                configurable: true,
+            },
+        );
         let url_search_constructor = ObjectId(objects.len());
         objects.push(JsObject {
             prototype: Some(function_prototype),
@@ -4326,6 +4370,8 @@ impl Realm {
             PropertyDescriptor::builtin(JsValue::Object(url_prototype)),
         );
         for (name, function) in [
+            ("parse", NativeFunction::UrlParse),
+            ("canParse", NativeFunction::UrlCanParse),
             ("createObjectURL", NativeFunction::UrlCreateObjectUrl),
             ("revokeObjectURL", NativeFunction::UrlRevokeObjectUrl),
         ] {
