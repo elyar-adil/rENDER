@@ -548,7 +548,10 @@ const PLATFORM_FACES: &[FaceSource] = &[
         aliases: &["pingfang sc", "苹方-简", "heiti sc", "pingfang"],
         generics: &[],
         files: &["/System/Library/Fonts/PingFang.ttc"],
-        collection_index: 0,
+        // Index 0 in this collection is PingFang HK, not SC. Simplified
+        // Chinese pages must get the SC face; loading HK draws Traditional
+        // Hong Kong glyph forms for the same codepoints.
+        collection_index: 2,
         weight: 400,
         style: FontStyle::Normal,
         local_names: &[],
@@ -1558,6 +1561,13 @@ fn load_installed_faces() -> InstalledFaces {
         };
         let settings = FontSettings {
             collection_index: source.collection_index,
+            // `fontdue` eagerly builds outlines for every glyph reachable
+            // through GSUB when this is true. The engine shapes and rasterizes
+            // one scalar at a time through `rasterize_indexed`-free paths, so
+            // those substitution glyphs are never used; on a CJK collection
+            // they multiply startup time and resident memory by a large
+            // factor.
+            load_substitutions: false,
             ..FontSettings::default()
         };
         let Ok(font) = Font::from_bytes(bytes, settings) else {
@@ -2095,6 +2105,15 @@ mod tests {
                     continue;
                 }
                 if let Ok(bytes) = read_face_file(source) {
+                    // A document `@font-face` body is an sfnt, WOFF or WOFF2
+                    // container. A collection (`.ttc`) is not one of those, so
+                    // it cannot stand in for a decodable document face even
+                    // though it is a valid installed face. macOS Menlo is such
+                    // a collection and is the first regular face this table
+                    // finds there.
+                    if bytes.starts_with(b"ttcf") {
+                        continue;
+                    }
                     return (bytes, source.family);
                 }
             }
