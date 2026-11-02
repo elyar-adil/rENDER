@@ -498,11 +498,23 @@ fn resolve_image_format(
         return Some(sniffed_format);
     };
     if let Some(declared_format) = ImageFormat::from_media_type(&content_type.media_type) {
-        if declared_format == ImageFormat::Svg
-            && let Some(sniffed_format) = sniffed_format
+        // Bytes beat a supported-but-wrong label. Browsers decode the actual
+        // container; rejecting a valid PNG because a CDN labelled it JPEG
+        // leaves a hole in the page (hao123's feed backgrounds are one real
+        // case). The mismatch is still reported, but as a warning.
+        if let Some(sniffed_format) = sniffed_format
+            && sniffed_format != declared_format
         {
-            // Bytes beat a text/svg label that contradicts a binary image
-            // signature (CDNs mislabel PNG payloads as svg+xml).
+            application.diagnostics.push(resource_diagnostic(
+                resource,
+                ImageDiagnosticSeverity::Warning,
+                ImageResourceDiagnosticCode::ContentTypeMismatch,
+                format!(
+                    "image response declared '{}' but the bytes are '{}'; using the sniffed format",
+                    content_type.media_type,
+                    sniffed_format.media_type()
+                ),
+            ));
             return Some(sniffed_format);
         }
         return Some(declared_format);
@@ -606,7 +618,10 @@ mod tests {
     use render_core::image::{ImageLimits, ImageResources};
     use render_net::{BatchOptions, CancelToken, FetchConfig, HttpTransport, Url};
 
-    use super::{IMAGE_ACCEPT, ImageResourceDiagnosticCode, apply_image_batch, plan_images};
+    use super::{
+        IMAGE_ACCEPT, ImageDiagnosticSeverity, ImageResourceDiagnosticCode, apply_image_batch,
+        plan_images,
+    };
 
     // Valid 1 x 1 RGBA PNG generated once for the local transport fixtures.
     const AVIF_PROBE: &str = "AAAAIGZ0eXBhdmlmAAAAAGF2aWZtaWYxbWlhZk1BMUIAAADybWV0YQAAAAAAAAAoaGRscgAAAAAAAAAAcGljdAAAAAAAAAAAAAAAAGxpYmF2aWYAAAAADnBpdG0AAAAAAAEAAAAeaWxvYwAAAABEAAABAAEAAAABAAABGgAAAB0AAAAoaWluZgAAAAAAAQAAABppbmZlAgAAAAABAABhdjAxQ29sb3IAAAAAamlwcnAAAABLaXBjbwAAABRpc3BlAAAAAAAAAAIAAAACAAAAEHBpeGkAAAAAAwgICAAAAAxhdjFDgQ0MAAAAABNjb2xybmNseAACAAIAAYAAAAAXaXBtYQAAAAAAAAABAAEEAQKDBAAAACVtZGF0EgAKCBgANogQEAwgMg8f8D///8WfhwB8+ErK";
@@ -691,7 +706,9 @@ mod tests {
     }
 
     #[test]
-    fn content_type_mismatch_fails_closed() {
+    fn content_type_mismatch_decodes_by_the_sniffed_signature() {
+        // A valid PNG labelled image/jpeg is a routine CDN mistake. Browsers
+        // decode the bytes; failing closed leaves a hole in the page.
         let (base, server) = serve(1, Some("image/jpeg"), PNG);
         let document = Document::parse("<img src='not-a-jpeg.jpg'>");
         let plan = plan_images(&document, &base, ImageLimits::default());
@@ -709,9 +726,11 @@ mod tests {
             &mut images,
             ImageLimits::default(),
         );
-        assert!(images.is_empty());
+        assert_eq!(application.loaded.len(), 1, "diagnostics: {:?}", application.diagnostics);
+        assert_eq!(images.len(), 1);
         assert!(application.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == ImageResourceDiagnosticCode::ContentTypeMismatch
+                && diagnostic.severity == ImageDiagnosticSeverity::Warning
         }));
     }
 
