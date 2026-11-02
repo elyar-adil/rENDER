@@ -1248,6 +1248,77 @@ fn a_planned_image_is_pending_until_its_batch_settles_and_broken_when_it_fails()
 }
 
 #[test]
+fn a_settled_image_applies_before_the_rest_of_its_batch() {
+    let (mut app, tab) = headless_app_with(
+        "<img id=first src=https://example.test/first.png>\
+         <img id=second src=https://example.test/second.png>",
+    );
+    let (first, second) = {
+        let page = app.pages.get(&tab).expect("page");
+        let dom = page.page.document().dom();
+        (find_id(dom, "first"), find_id(dom, "second"))
+    };
+    app.start_images(tab);
+    {
+        let page = app.pages.get(&tab).expect("page");
+        assert_eq!(
+            page.page.document().dom().image_state(first),
+            render_core::dom::ImageLoadState::Pending
+        );
+        assert_eq!(
+            page.page.document().dom().image_state(second),
+            render_core::dom::ImageLoadState::Pending
+        );
+        assert_eq!(
+            page.pending_images
+                .as_ref()
+                .expect("image batch")
+                .plan
+                .resources
+                .len(),
+            2
+        );
+    }
+
+    // The first request fails while the second is still in flight. The
+    // failure must apply now, without inventing a missing result for the
+    // image that has not answered yet.
+    app.finish_image_results(tab, vec![(0, Err(render_net::FetchError::Timeout))], false);
+    {
+        let page = app.pages.get(&tab).expect("page");
+        assert_eq!(
+            page.page.document().dom().image_state(first),
+            render_core::dom::ImageLoadState::Broken,
+            "a settled result applies immediately"
+        );
+        assert_eq!(
+            page.page.document().dom().image_state(second),
+            render_core::dom::ImageLoadState::Pending,
+            "an in-flight image is not reported missing"
+        );
+        assert!(
+            page.pending_images.is_some(),
+            "the batch stays open for its remaining member"
+        );
+        assert!(
+            page.expected_render.is_some(),
+            "the applied result requests a repaint"
+        );
+    }
+
+    app.finish_image_results(tab, vec![(1, Err(render_net::FetchError::Timeout))], true);
+    let page = app.pages.get(&tab).expect("page");
+    assert_eq!(
+        page.page.document().dom().image_state(second),
+        render_core::dom::ImageLoadState::Broken
+    );
+    assert!(
+        page.pending_images.is_none(),
+        "the completed batch is released"
+    );
+}
+
+#[test]
 fn an_image_whose_load_fails_fires_error_at_its_element() {
     let (mut app, tab) = headless_app_with("<img id=photo src=https://example.test/a.png>");
     {

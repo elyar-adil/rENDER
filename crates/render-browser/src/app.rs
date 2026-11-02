@@ -89,7 +89,9 @@ use render_browser::font_backend::SystemFontBackend;
 use render_browser::font_faces::FontFetchPlan;
 use render_browser::font_faces::apply_font_batch;
 use render_browser::gpu_presenter::GpuPresenter;
+use render_browser::images::ImageBatchApplication;
 use render_browser::images::ImageDiagnosticSeverity;
+use render_browser::images::ImageFetchPlan;
 use render_browser::images::apply_image_batch;
 use render_browser::images::plan_images_with_styles_and_context;
 use render_browser::model::TabId;
@@ -2767,12 +2769,13 @@ impl BrowserApp {
             }
             if let Some(pending) = page.pending_images.as_mut() {
                 pending.handle.retry_deferred(resubmit);
-                match pending.handle.try_recv() {
-                    Ok(results) => completed_images.push((*id, results)),
-                    Err(TryRecvError::Empty) => {}
-                    Err(TryRecvError::Disconnected) => {
-                        unreachable!("cache batch handle maps disconnects")
-                    }
+                // Images are independent: apply every response that has
+                // arrived instead of holding pixels behind the slowest
+                // request in the batch. The batch stays installed until its
+                // last member settles, so later polling passes keep draining.
+                let ready = pending.handle.drain_ready();
+                if !ready.is_empty() {
+                    completed_images.push((*id, ready, pending.handle.is_complete()));
                 }
             }
             for request in page.page.take_pending_fetch_requests() {
@@ -2812,9 +2815,12 @@ impl BrowserApp {
             let results = self.finish_cached_batch(completions);
             self.finish_classic_scripts(id, results);
         }
-        for (id, completions) in completed_images {
-            let results = self.finish_cached_batch(completions);
-            self.finish_images(id, results);
+        for (id, completions, complete) in completed_images {
+            let results = completions
+                .into_iter()
+                .map(|(index, completion)| (index, self.finish_cached_fetch(completion)))
+                .collect();
+            self.finish_image_results(id, results, complete);
         }
     }
 
@@ -2993,6 +2999,12 @@ impl BrowserApp {
         self.request_redraw();
     }
 
+    /// Applies an image batch whose members have all settled.
+    ///
+    /// This is the test-facing ordered-batch entry point; network polling
+    /// uses [`Self::finish_image_results`] so decoded images are not held
+    /// behind the slowest request.
+    #[cfg(test)]
     pub(super) fn finish_images(&mut self, id: TabId, results: Vec<FetchResult>) {
         let Some(page) = self.pages.get_mut(&id) else {
             return;
@@ -3007,6 +3019,86 @@ impl BrowserApp {
             &mut page.images,
             ImageLimits::default(),
         );
+        self.finish_image_application(id, &pending.plan, &application, true);
+    }
+
+    /// Applies the subset of an in-flight image batch that has already
+    /// settled. Each result keeps its index in the original plan.
+    ///
+    /// Only the settled subset is handed to `apply_image_batch`, so members
+    /// still in flight are not reported as missing results. `complete` closes
+    /// the pending batch and starts a fresh scan for changed `src` values.
+    pub(super) fn finish_image_results(
+        &mut self,
+        id: TabId,
+        results: Vec<(usize, FetchResult)>,
+        complete: bool,
+    ) {
+        let applied = {
+            let Some(page) = self.pages.get_mut(&id) else {
+                return;
+            };
+            let Some(pending) = page.pending_images.as_ref() else {
+                return;
+            };
+            let (resources, results): (Vec<_>, Vec<_>) = results
+                .into_iter()
+                .filter_map(|(index, result)| {
+                    pending
+                        .plan
+                        .resources
+                        .get(index)
+                        .cloned()
+                        .map(|resource| (resource, result))
+                })
+                .unzip();
+            if resources.is_empty() {
+                if complete {
+                    page.pending_images = None;
+                }
+                None
+            } else {
+                let subset = ImageFetchPlan {
+                    revision: pending.plan.revision,
+                    document_url: pending.plan.document_url.clone(),
+                    resources,
+                    // Discovery diagnostics were reported once when the batch
+                    // started. Re-reporting them for every straggler would
+                    // multiply one warning by the number of in-flight images.
+                    diagnostics: Vec::new(),
+                };
+                let application = apply_image_batch(
+                    page.page.document(),
+                    &subset,
+                    results,
+                    &mut page.images,
+                    ImageLimits::default(),
+                );
+                if complete {
+                    page.pending_images = None;
+                }
+                Some((subset, application))
+            }
+        };
+        let Some((subset, application)) = applied else {
+            if complete {
+                self.start_images(id);
+            }
+            return;
+        };
+        self.finish_image_application(id, &subset, &application, complete);
+    }
+
+    fn finish_image_application(
+        &mut self,
+        id: TabId,
+        plan: &ImageFetchPlan,
+        application: &ImageBatchApplication,
+        complete: bool,
+    ) {
+        let Some(page) = self.pages.get_mut(&id) else {
+            return;
+        };
         report_image_diagnostics(&application.diagnostics);
         page.image_errors = page.image_errors.saturating_add(
             application
@@ -3053,8 +3145,7 @@ impl BrowserApp {
         // element is broken, which reads as `complete` with a zero natural
         // size. Stale-source outcomes are warnings for a superseded URL and
         // must not mark the current element.
-        let element_owners: Vec<render_core::dom::NodeId> = pending
-            .plan
+        let element_owners: Vec<render_core::dom::NodeId> = plan
             .resources
             .iter()
             .filter(|resource| resource.key.source == ImageSource::Element)
@@ -3079,9 +3170,7 @@ impl BrowserApp {
             // element, which is what fallback chains (`onerror`, `<picture>`
             // source switching, AVIF/WebP probes) react to.
             if matches!(
-                pending
-                    .plan
-                    .resources
+                plan.resources
                     .iter()
                     .find(|resource| resource.key.owner == owner)
                     .map(|resource| resource.key.source),
@@ -3090,17 +3179,19 @@ impl BrowserApp {
                 let _ = page.page.queue_dom_event(PageDomEvent::new(owner, "error"));
             }
         }
-        // Every completed image batch marks the page dirty, not only a batch
-        // that decoded something. A batch whose results were all stale, failed,
-        // or already applied still ended, and the page must repaint so the
-        // remaining plan converges; skipping it left a page whose images never
-        // decode permanently frozen on its last commit.
+        // Every applied image result marks the page dirty, not only one that
+        // decoded something. A result whose pixels were stale or failed still
+        // changes the element's state, and the page must repaint so the
+        // remaining plan converges.
         page.external_styles_generation = page.external_styles_generation.saturating_add(1);
         self.schedule_page_render_for_tab(id);
-        // An img can change src while the previous batch is in flight. That
-        // response is correctly discarded as stale, but without a follow-up
-        // scan the new URL would wait for an unrelated future render.
-        self.start_images(id);
+        if complete {
+            // An img can change src while the previous batch is in flight.
+            // That response is correctly discarded as stale, but without a
+            // follow-up scan the new URL would wait for an unrelated future
+            // render.
+            self.start_images(id);
+        }
     }
 
     pub(super) fn schedule_page_render_for_tab(&mut self, id: TabId) {

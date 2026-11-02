@@ -175,6 +175,37 @@ impl CachedBatchHandle {
         resubmitted
     }
 
+    /// Drains every member that has settled, leaving slow members pending.
+    ///
+    /// Returns each result with its position in the original batch so a caller
+    /// with an ordered plan can apply the finished prefix (or any subset) while
+    /// the rest is still in flight. The normal [`Self::try_recv`] waits for the
+    /// whole batch and is still used where order or completeness is semantic,
+    /// such as stylesheets and scripts.
+    pub(super) fn drain_ready(&mut self) -> Vec<(usize, CachedFetchResult)> {
+        let mut ready = Vec::new();
+        for index in 0..self.handles.len() {
+            let Some(handle) = self.handles[index].as_mut() else {
+                continue;
+            };
+            match handle.try_recv() {
+                Ok(result) => {
+                    ready.push((index, result));
+                    self.handles[index] = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => unreachable!("cache handle maps disconnects"),
+            }
+        }
+        ready
+    }
+
+    /// Whether every member has been drained or settled.
+    #[must_use]
+    pub(super) fn is_complete(&self) -> bool {
+        self.handles.iter().all(Option::is_none)
+    }
+
     pub(super) fn try_recv(&mut self) -> Result<Vec<CachedFetchResult>, TryRecvError> {
         let mut pending = false;
         for index in 0..self.handles.len() {
@@ -218,6 +249,7 @@ mod tests {
     use render_net::NetworkWorker;
     use render_net::Url;
 
+    use super::CachedBatchHandle;
     use super::CachedRequestHandle;
     use super::CachedRequestState;
     use render_browser::cache::CacheEpoch;
@@ -262,6 +294,39 @@ mod tests {
         assert!(
             result.result.is_ok(),
             "deferred request completed: {result:?}"
+        );
+    }
+
+    #[test]
+    fn drain_ready_applies_finished_members_without_waiting_for_stragglers() {
+        let epoch = CacheEpoch::default();
+        let first_request = render_net::FetchRequest::get(test_url("/first.png"));
+        let second_request = render_net::FetchRequest::get(test_url("/second.png"));
+        let first_url = test_url("/first.png");
+        let first = CachedRequestHandle::ready(
+            first_request,
+            epoch,
+            render_net::FetchResponse {
+                requested_url: first_url.clone(),
+                final_url: first_url.clone(),
+                redirect_chain: vec![first_url],
+                redirects: Vec::new(),
+                status: render_net::HttpStatus::from_u16(200),
+                headers: Vec::new(),
+                content_type: None,
+                body: b"first".to_vec(),
+            },
+        );
+        let second = CachedRequestHandle::deferred(second_request, epoch);
+        let mut batch = CachedBatchHandle::new(vec![first, second]);
+
+        let ready = batch.drain_ready();
+        assert_eq!(ready.len(), 1, "only the settled member is ready");
+        assert_eq!(ready[0].0, 0, "the result keeps its plan position");
+        assert!(!batch.is_complete(), "the deferred member is still pending");
+        assert!(
+            batch.drain_ready().is_empty(),
+            "a drained member is not returned twice"
         );
     }
 
