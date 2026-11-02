@@ -539,6 +539,39 @@ impl DisplayList {
         &self.items
     }
 
+    /// Returns a copy of this list in device pixels.
+    ///
+    /// Layout and the display list stay in CSS pixels because script geometry,
+    /// hit testing and media queries all use that space. Rasterization needs
+    /// physical pixels, so this conversion is applied once, immediately before
+    /// the rasterizer: every geometric field is multiplied by `scale`, and
+    /// glyph runs carry the scaled font size so the mask provider rasterizes
+    /// outlines at the device resolution instead of upsampling a CSS-pixel
+    /// bitmap. [`ImagePaint::source`] stays in resource pixels; only the
+    /// destination is geometric.
+    #[must_use]
+    pub fn scaled(&self, scale: f32) -> Self {
+        if !scale.is_finite() || scale <= 0.0 {
+            return self.clone();
+        }
+        Self {
+            dom_revision: self.dom_revision,
+            viewport: scaled_size(self.viewport, scale),
+            items: self
+                .items
+                .iter()
+                .map(|item| DisplayItem {
+                    id: item.id,
+                    fragment: item.fragment,
+                    source: item.source,
+                    bounds: scaled_rect(item.bounds, scale),
+                    coordinate_space: item.coordinate_space,
+                    command: scaled_command(&item.command, scale),
+                })
+                .collect(),
+        }
+    }
+
     #[must_use]
     pub fn diff(&self, previous: &Self) -> DisplayListDiff {
         if self.viewport != previous.viewport {
@@ -613,6 +646,300 @@ impl DisplayList {
             dirty_rects,
             full_repaint: false,
         }
+    }
+}
+
+const fn scaled_size(size: PhysicalSize, scale: f32) -> PhysicalSize {
+    PhysicalSize {
+        width: size.width * scale,
+        height: size.height * scale,
+    }
+}
+
+const fn scaled_point(point: PhysicalPoint, scale: f32) -> PhysicalPoint {
+    PhysicalPoint {
+        x: point.x * scale,
+        y: point.y * scale,
+    }
+}
+
+const fn scaled_rect(rect: PhysicalRect, scale: f32) -> PhysicalRect {
+    PhysicalRect {
+        origin: scaled_point(rect.origin, scale),
+        size: scaled_size(rect.size, scale),
+    }
+}
+
+const fn scaled_edges(edges: EdgeSizes, scale: f32) -> EdgeSizes {
+    EdgeSizes {
+        top: edges.top * scale,
+        right: edges.right * scale,
+        bottom: edges.bottom * scale,
+        left: edges.left * scale,
+    }
+}
+
+const fn scaled_radii(radii: CornerRadii, scale: f32) -> CornerRadii {
+    CornerRadii {
+        top_left: radii.top_left * scale,
+        top_right: radii.top_right * scale,
+        bottom_right: radii.bottom_right * scale,
+        bottom_left: radii.bottom_left * scale,
+    }
+}
+
+fn scaled_clip(shape: ClipShape, scale: f32) -> ClipShape {
+    match shape {
+        ClipShape::Rect(rect) => ClipShape::Rect(scaled_rect(rect, scale)),
+        ClipShape::RoundedRect { rect, radii } => ClipShape::RoundedRect {
+            rect: scaled_rect(rect, scale),
+            radii: scaled_radii(radii, scale),
+        },
+        ClipShape::Circle { center, radius } => ClipShape::Circle {
+            center: scaled_point(center, scale),
+            radius: radius * scale,
+        },
+        ClipShape::Ellipse { center, radii } => ClipShape::Ellipse {
+            center: scaled_point(center, scale),
+            radii: scaled_size(radii, scale),
+        },
+        ClipShape::Polygon {
+            points,
+            count,
+            fill_rule,
+        } => {
+            let mut scaled_points = [PhysicalPoint { x: 0.0, y: 0.0 }; MAX_CLIP_POLYGON_POINTS];
+            for (scaled, point) in scaled_points.iter_mut().zip(points) {
+                *scaled = scaled_point(point, scale);
+            }
+            ClipShape::Polygon {
+                points: scaled_points,
+                count,
+                fill_rule,
+            }
+        }
+    }
+}
+
+fn scaled_transform(transform: Transform2D, scale: f32) -> Transform2D {
+    // Scale, skew and rotation are unitless directions; only the translation
+    // is a device length.
+    Transform2D {
+        translate_x: transform.translate_x * scale,
+        translate_y: transform.translate_y * scale,
+        ..transform
+    }
+}
+
+fn scaled_filter(filter: &FilterEffect, scale: f32) -> FilterEffect {
+    FilterEffect {
+        operations: filter
+            .operations
+            .iter()
+            .map(|operation| match *operation {
+                FilterOperation::Blur(radius) => FilterOperation::Blur(radius * scale),
+                FilterOperation::DropShadow {
+                    offset_x,
+                    offset_y,
+                    blur,
+                    color,
+                } => FilterOperation::DropShadow {
+                    offset_x: offset_x * scale,
+                    offset_y: offset_y * scale,
+                    blur: blur * scale,
+                    color,
+                },
+                FilterOperation::Brightness(value) => FilterOperation::Brightness(value),
+                FilterOperation::Grayscale(value) => FilterOperation::Grayscale(value),
+                FilterOperation::Saturate(value) => FilterOperation::Saturate(value),
+            })
+            .collect(),
+    }
+}
+
+fn scaled_gradient(gradient: &LinearGradient, scale: f32) -> LinearGradient {
+    LinearGradient {
+        rect: scaled_rect(gradient.rect, scale),
+        start: scaled_point(gradient.start, scale),
+        end: scaled_point(gradient.end, scale),
+        // Stop offsets are fractions of the gradient line, not lengths.
+        stops: gradient.stops.clone(),
+        repeating: gradient.repeating,
+    }
+}
+
+fn scaled_radial_gradient(gradient: &RadialGradient, scale: f32) -> RadialGradient {
+    RadialGradient {
+        rect: scaled_rect(gradient.rect, scale),
+        center: scaled_point(gradient.center, scale),
+        radius_x: gradient.radius_x * scale,
+        radius_y: gradient.radius_y * scale,
+        // Stop offsets are fractions of the gradient line, not lengths.
+        stops: gradient.stops.clone(),
+        repeating: gradient.repeating,
+    }
+}
+
+fn scaled_conic_gradient(gradient: &ConicGradient, scale: f32) -> ConicGradient {
+    ConicGradient {
+        rect: scaled_rect(gradient.rect, scale),
+        center: scaled_point(gradient.center, scale),
+        from_angle: gradient.from_angle,
+        // Stop offsets are fractions of the gradient line, not lengths.
+        stops: gradient.stops.clone(),
+        repeating: gradient.repeating,
+    }
+}
+
+fn scaled_mask_image(image: &MaskImage, scale: f32) -> MaskImage {
+    match image {
+        MaskImage::Linear(gradient) => MaskImage::Linear(scaled_gradient(gradient, scale)),
+        MaskImage::Radial(gradient) => MaskImage::Radial(scaled_radial_gradient(gradient, scale)),
+        MaskImage::Conic(gradient) => MaskImage::Conic(scaled_conic_gradient(gradient, scale)),
+        MaskImage::Raster {
+            resource,
+            destination,
+        } => MaskImage::Raster {
+            resource: *resource,
+            destination: scaled_rect(*destination, scale),
+        },
+    }
+}
+
+fn scaled_mask_layer(layer: &MaskLayer, scale: f32) -> MaskLayer {
+    MaskLayer {
+        image: scaled_mask_image(&layer.image, scale),
+        tile: scaled_rect(layer.tile, scale),
+        clip: scaled_rect(layer.clip, scale),
+        repeat_x: layer.repeat_x,
+        repeat_y: layer.repeat_y,
+    }
+}
+
+fn scaled_stacking_context(context: &StackingContext, scale: f32) -> StackingContext {
+    StackingContext {
+        opacity: context.opacity,
+        transform: scaled_transform(context.transform, scale),
+        blend_mode: context.blend_mode,
+        isolated: context.isolated,
+        reason: context.reason,
+        filter: context
+            .filter
+            .as_ref()
+            .map(|filter| scaled_filter(filter, scale)),
+        mask: context
+            .mask
+            .as_ref()
+            .map(|mask| scaled_mask_layer(mask, scale)),
+    }
+}
+
+fn scaled_sticky(constraint: &StickyConstraint, scale: f32) -> StickyConstraint {
+    let inset = |value: Option<f32>| value.map(|value| value * scale);
+    StickyConstraint {
+        margin_rect: scaled_rect(constraint.margin_rect, scale),
+        containing_block: scaled_rect(constraint.containing_block, scale),
+        insets: crate::layout::StickyInsets {
+            top: inset(constraint.insets.top),
+            right: inset(constraint.insets.right),
+            bottom: inset(constraint.insets.bottom),
+            left: inset(constraint.insets.left),
+        },
+        scrollport: scaled_size(constraint.scrollport, scale),
+        scrollport_origin: scaled_point(constraint.scrollport_origin, scale),
+        scroll_container: constraint.scroll_container,
+    }
+}
+
+fn scaled_command(command: &DisplayCommand, scale: f32) -> DisplayCommand {
+    match command {
+        DisplayCommand::SolidRect { rect, color } => DisplayCommand::SolidRect {
+            rect: scaled_rect(*rect, scale),
+            color: *color,
+        },
+        DisplayCommand::Border(border) => DisplayCommand::Border(BorderPaint {
+            rect: scaled_rect(border.rect, scale),
+            widths: scaled_edges(border.widths, scale),
+            colors: border.colors,
+            styles: border.styles,
+            radii: scaled_radii(border.radii, scale),
+        }),
+        DisplayCommand::BoxShadow(shadow) => DisplayCommand::BoxShadow(BoxShadowPaint {
+            rect: scaled_rect(shadow.rect, scale),
+            offset: scaled_point(shadow.offset, scale),
+            blur_radius: shadow.blur_radius * scale,
+            spread_radius: shadow.spread_radius * scale,
+            color: shadow.color,
+            inset: shadow.inset,
+            radii: scaled_radii(shadow.radii, scale),
+        }),
+        DisplayCommand::PushClip(shape) => DisplayCommand::PushClip(scaled_clip(*shape, scale)),
+        DisplayCommand::PopClip => DisplayCommand::PopClip,
+        DisplayCommand::PushTransform(transform) => {
+            DisplayCommand::PushTransform(scaled_transform(*transform, scale))
+        }
+        DisplayCommand::PopTransform => DisplayCommand::PopTransform,
+        DisplayCommand::GlyphRun(run) => DisplayCommand::GlyphRun(GlyphRun {
+            font: run.font,
+            font_size: run.font_size * scale,
+            color: run.color,
+            glyphs: run
+                .glyphs
+                .iter()
+                .map(|glyph| GlyphInstance {
+                    glyph: glyph.glyph,
+                    position: scaled_point(glyph.position, scale),
+                    advance: glyph.advance * scale,
+                })
+                .collect(),
+        }),
+        DisplayCommand::TextDecoration(decoration) => {
+            DisplayCommand::TextDecoration(TextDecoration {
+                rect: scaled_rect(decoration.rect, scale),
+                color: decoration.color,
+                line: decoration.line,
+                style: decoration.style,
+                thickness: decoration.thickness * scale,
+            })
+        }
+        DisplayCommand::TextShadow(shadow) => DisplayCommand::TextShadow(TextShadowPaint {
+            run: shadow.run,
+            font: shadow.font,
+            font_size: shadow.font_size * scale,
+            offset: scaled_point(shadow.offset, scale),
+            blur_radius: shadow.blur_radius * scale,
+            color: shadow.color,
+        }),
+        DisplayCommand::ListMarker(marker) => DisplayCommand::ListMarker(ListMarkerPaint {
+            rect: scaled_rect(marker.rect, scale),
+            color: marker.color,
+            shape: marker.shape,
+        }),
+        DisplayCommand::Image(image) => DisplayCommand::Image(ImagePaint {
+            resource: image.resource,
+            destination: scaled_rect(image.destination, scale),
+            // `source` is in decoded-image pixels, not layout units.
+            source: image.source,
+            interpolate: image.interpolate,
+            content_revision: image.content_revision,
+        }),
+        DisplayCommand::LinearGradient(gradient) => {
+            DisplayCommand::LinearGradient(scaled_gradient(gradient, scale))
+        }
+        DisplayCommand::RadialGradient(gradient) => {
+            DisplayCommand::RadialGradient(scaled_radial_gradient(gradient, scale))
+        }
+        DisplayCommand::ConicGradient(gradient) => {
+            DisplayCommand::ConicGradient(scaled_conic_gradient(gradient, scale))
+        }
+        DisplayCommand::PushStackingContext(context) => {
+            DisplayCommand::PushStackingContext(scaled_stacking_context(context, scale))
+        }
+        DisplayCommand::PopStackingContext => DisplayCommand::PopStackingContext,
+        DisplayCommand::PushSticky(constraint) => {
+            DisplayCommand::PushSticky(Box::new(scaled_sticky(constraint, scale)))
+        }
+        DisplayCommand::PopSticky => DisplayCommand::PopSticky,
     }
 }
 
@@ -4787,23 +5114,500 @@ mod tests {
     use crate::css::properties::ObjectFit;
     use crate::css::selector::{MatchContext, parse_selector_list, select_all};
     use crate::css::stylesheet::parse_stylesheet;
-    use crate::dom::NodeId;
+    use crate::dom::{DomRevision, NodeId};
     use crate::html::{ParseOutput, parse_document};
     use crate::layout::{
         FormattingLimits, FragmentKind, LayoutOptions, PhysicalPoint, PhysicalRect, PhysicalSize,
         SimpleTextMeasurer, build_formatting_tree, layout_formatting_tree,
     };
-    use crate::paint::Color;
+    use crate::paint::{Color, CpuRasterizer, GlyphMask, GlyphMaskProvider};
 
     use super::{
-        Builder, ClipFillRule, ClipShape, CompositingReason, DisplayCommand,
-        DisplayListBuildOutput, DisplayListBuilderOptions, GlyphRun, ImagePaint, ListMarkerPaint,
-        ListMarkerShape, PaintCoordinateSpace, ReferenceTextShaper, StackingContext, SystemPalette,
-        TextDecoration, TextDecorationLine, TextDecorationStyle, TextShadowPaint, TextShaper,
-        Transform2D, build_display_list, build_display_list_with_images,
+        BorderPaint, BoxShadowPaint, Builder, ClipFillRule, ClipShape, CompositingReason,
+        ConicGradient, CornerRadii, DisplayCommand, DisplayItem, DisplayItemId,
+        DisplayList as PaintDisplayList, DisplayListBuildOutput, DisplayListBuilderOptions,
+        FilterEffect, FilterOperation, GlyphId, GlyphInstance, GlyphRun, GradientStop, ImagePaint,
+        ImageResourceId, LinearGradient, ListMarkerPaint, ListMarkerShape, MaskImage, MaskLayer,
+        PaintCoordinateSpace, PaintPhase, RadialGradient, ReferenceTextShaper, StackingContext,
+        SystemPalette, TextDecoration, TextDecorationLine, TextDecorationStyle, TextShadowPaint,
+        TextShaper, Transform2D, build_display_list, build_display_list_with_images,
         build_display_list_with_images_clip_paths_and_containers, parse_conic_gradient,
         parse_linear_gradient, parse_radial_gradient,
     };
+    use crate::layout::{EdgeSizes, FragmentId, StickyConstraint, StickyInsets};
+
+    fn geometry() -> PhysicalRect {
+        PhysicalRect::new(10.0, 20.0, 30.0, 40.0)
+    }
+
+    fn item(ordinal: u32, command: DisplayCommand) -> DisplayItem {
+        DisplayItem {
+            id: DisplayItemId {
+                source: None,
+                fragment_hint: ordinal,
+                phase: PaintPhase::Background,
+                ordinal,
+            },
+            fragment: FragmentId::from_index(0),
+            source: None,
+            bounds: geometry(),
+            coordinate_space: PaintCoordinateSpace::Document,
+            command,
+        }
+    }
+
+    /// Device conversion is one complete multiplication over the display list:
+    /// a field missed here stays in CSS pixels and paints half-size, so this
+    /// test names every geometric field rather than sampling one.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one assertion block per DisplayCommand variant documents the conversion contract"
+    )]
+    fn scaled_display_list_converts_every_geometric_command_field() {
+        let stops = vec![GradientStop {
+            offset: 0.25,
+            color: Color::BLACK,
+        }];
+        let command = |command| item(0, command);
+        let list = PaintDisplayList::from_items(
+            DomRevision::default(),
+            PhysicalSize {
+                width: 100.0,
+                height: 80.0,
+            },
+            vec![
+                command(DisplayCommand::SolidRect {
+                    rect: geometry(),
+                    color: Color::BLACK,
+                }),
+                command(DisplayCommand::Border(BorderPaint {
+                    rect: geometry(),
+                    widths: EdgeSizes {
+                        top: 1.0,
+                        right: 2.0,
+                        bottom: 3.0,
+                        left: 4.0,
+                    },
+                    colors: [Color::BLACK; 4],
+                    styles: [crate::css::properties::BorderStyle::Solid; 4],
+                    radii: CornerRadii {
+                        top_left: 1.0,
+                        top_right: 2.0,
+                        bottom_right: 3.0,
+                        bottom_left: 4.0,
+                    },
+                })),
+                command(DisplayCommand::BoxShadow(BoxShadowPaint {
+                    rect: geometry(),
+                    offset: PhysicalPoint { x: 2.0, y: 3.0 },
+                    blur_radius: 4.0,
+                    spread_radius: 5.0,
+                    color: Color::BLACK,
+                    inset: false,
+                    radii: CornerRadii::default(),
+                })),
+                command(DisplayCommand::PushClip(ClipShape::RoundedRect {
+                    rect: geometry(),
+                    radii: CornerRadii {
+                        top_left: 2.0,
+                        top_right: 2.0,
+                        bottom_right: 2.0,
+                        bottom_left: 2.0,
+                    },
+                })),
+                command(DisplayCommand::PushTransform(Transform2D {
+                    scale_x: 2.0,
+                    skew_x: 0.5,
+                    skew_y: 0.25,
+                    scale_y: 3.0,
+                    translate_x: 10.0,
+                    translate_y: 20.0,
+                })),
+                command(DisplayCommand::GlyphRun(GlyphRun {
+                    font: super::FontInstanceId(7),
+                    font_size: 14.0,
+                    color: Color::BLACK,
+                    glyphs: vec![GlyphInstance {
+                        glyph: GlyphId(1),
+                        position: PhysicalPoint { x: 10.0, y: 20.0 },
+                        advance: 7.0,
+                    }],
+                })),
+                command(DisplayCommand::TextDecoration(TextDecoration {
+                    rect: geometry(),
+                    color: Color::BLACK,
+                    line: TextDecorationLine::Underline,
+                    style: TextDecorationStyle::Solid,
+                    thickness: 1.0,
+                })),
+                command(DisplayCommand::TextShadow(TextShadowPaint {
+                    run: 1,
+                    font: super::FontInstanceId(7),
+                    font_size: 14.0,
+                    offset: PhysicalPoint { x: 2.0, y: 3.0 },
+                    blur_radius: 4.0,
+                    color: Color::BLACK,
+                })),
+                command(DisplayCommand::ListMarker(ListMarkerPaint {
+                    rect: geometry(),
+                    color: Color::BLACK,
+                    shape: ListMarkerShape::Disc,
+                })),
+                command(DisplayCommand::Image(ImagePaint {
+                    resource: ImageResourceId(9),
+                    destination: geometry(),
+                    source: PhysicalRect::new(1.0, 2.0, 3.0, 4.0),
+                    interpolate: true,
+                    content_revision: None,
+                })),
+                command(DisplayCommand::LinearGradient(LinearGradient {
+                    rect: geometry(),
+                    start: PhysicalPoint { x: 1.0, y: 2.0 },
+                    end: PhysicalPoint { x: 3.0, y: 4.0 },
+                    stops: stops.clone(),
+                    repeating: false,
+                })),
+                command(DisplayCommand::RadialGradient(RadialGradient {
+                    rect: geometry(),
+                    center: PhysicalPoint { x: 1.0, y: 2.0 },
+                    radius_x: 3.0,
+                    radius_y: 4.0,
+                    stops: stops.clone(),
+                    repeating: false,
+                })),
+                command(DisplayCommand::ConicGradient(ConicGradient {
+                    rect: geometry(),
+                    center: PhysicalPoint { x: 1.0, y: 2.0 },
+                    from_angle: 0.5,
+                    stops: stops.clone(),
+                    repeating: false,
+                })),
+                command(DisplayCommand::PushStackingContext(StackingContext {
+                    opacity: 0.5,
+                    transform: Transform2D {
+                        translate_x: 7.0,
+                        translate_y: 9.0,
+                        ..Transform2D::default()
+                    },
+                    blend_mode: super::BlendMode::Normal,
+                    isolated: false,
+                    reason: CompositingReason::Opacity,
+                    filter: Some(FilterEffect {
+                        operations: vec![
+                            FilterOperation::Blur(3.0),
+                            FilterOperation::DropShadow {
+                                offset_x: 2.0,
+                                offset_y: 1.0,
+                                blur: 5.0,
+                                color: Color::BLACK,
+                            },
+                        ],
+                    }),
+                    mask: Some(MaskLayer {
+                        image: MaskImage::Raster {
+                            resource: ImageResourceId(4),
+                            destination: geometry(),
+                        },
+                        tile: geometry(),
+                        clip: geometry(),
+                        repeat_x: true,
+                        repeat_y: false,
+                    }),
+                })),
+                command(DisplayCommand::PushSticky(Box::new(StickyConstraint {
+                    margin_rect: geometry(),
+                    containing_block: PhysicalRect::new(0.0, 0.0, 100.0, 200.0),
+                    insets: StickyInsets {
+                        top: Some(10.0),
+                        right: None,
+                        bottom: Some(20.0),
+                        left: Some(30.0),
+                    },
+                    scrollport: PhysicalSize {
+                        width: 100.0,
+                        height: 200.0,
+                    },
+                    scrollport_origin: PhysicalPoint { x: 5.0, y: 6.0 },
+                    scroll_container: None,
+                }))),
+            ],
+        );
+        let scaled = list.scaled(2.0);
+        assert_eq!(
+            scaled.viewport,
+            PhysicalSize {
+                width: 200.0,
+                height: 160.0
+            }
+        );
+        assert_eq!(
+            scaled.items()[0].bounds,
+            PhysicalRect::new(20.0, 40.0, 60.0, 80.0)
+        );
+        let rect = PhysicalRect::new(20.0, 40.0, 60.0, 80.0);
+        match &scaled.items()[0].command {
+            DisplayCommand::SolidRect { rect, .. } => assert_eq!(*rect, rect_value(20.0, 40.0)),
+            other => panic!("expected a solid rect, got {other:?}"),
+        }
+        match &scaled.items()[1].command {
+            DisplayCommand::Border(border) => {
+                assert_eq!(border.rect, rect);
+                assert_eq!(
+                    border.widths,
+                    EdgeSizes {
+                        top: 2.0,
+                        right: 4.0,
+                        bottom: 6.0,
+                        left: 8.0
+                    }
+                );
+                assert_eq!(border.radii.top_left, 2.0);
+                assert_eq!(border.radii.bottom_left, 8.0);
+            }
+            other => panic!("expected a border, got {other:?}"),
+        }
+        match &scaled.items()[2].command {
+            DisplayCommand::BoxShadow(shadow) => {
+                assert_eq!(shadow.rect, rect);
+                assert_eq!(shadow.offset, PhysicalPoint { x: 4.0, y: 6.0 });
+                assert_eq!(shadow.blur_radius, 8.0);
+                assert_eq!(shadow.spread_radius, 10.0);
+            }
+            other => panic!("expected a box shadow, got {other:?}"),
+        }
+        match &scaled.items()[3].command {
+            DisplayCommand::PushClip(ClipShape::RoundedRect {
+                rect: clip_rect,
+                radii,
+            }) => {
+                assert_eq!(*clip_rect, rect);
+                assert_eq!(radii.top_left, 4.0);
+            }
+            other => panic!("expected a rounded clip, got {other:?}"),
+        }
+        match &scaled.items()[4].command {
+            DisplayCommand::PushTransform(transform) => {
+                assert_eq!(transform.scale_x, 2.0);
+                assert_eq!(transform.skew_x, 0.5);
+                assert_eq!(transform.translate_x, 20.0);
+                assert_eq!(transform.translate_y, 40.0);
+            }
+            other => panic!("expected a transform, got {other:?}"),
+        }
+        match &scaled.items()[5].command {
+            DisplayCommand::GlyphRun(run) => {
+                assert_eq!(run.font_size, 28.0);
+                assert_eq!(run.glyphs[0].position, PhysicalPoint { x: 20.0, y: 40.0 });
+                assert_eq!(run.glyphs[0].advance, 14.0);
+            }
+            other => panic!("expected glyphs, got {other:?}"),
+        }
+        match &scaled.items()[6].command {
+            DisplayCommand::TextDecoration(decoration) => {
+                assert_eq!(decoration.rect, rect);
+                assert_eq!(decoration.thickness, 2.0);
+            }
+            other => panic!("expected a decoration, got {other:?}"),
+        }
+        match &scaled.items()[7].command {
+            DisplayCommand::TextShadow(shadow) => {
+                assert_eq!(shadow.font_size, 28.0);
+                assert_eq!(shadow.offset, PhysicalPoint { x: 4.0, y: 6.0 });
+                assert_eq!(shadow.blur_radius, 8.0);
+            }
+            other => panic!("expected a text shadow, got {other:?}"),
+        }
+        match &scaled.items()[8].command {
+            DisplayCommand::ListMarker(marker) => assert_eq!(marker.rect, rect),
+            other => panic!("expected a marker, got {other:?}"),
+        }
+        match &scaled.items()[9].command {
+            DisplayCommand::Image(image) => {
+                assert_eq!(image.destination, rect);
+                assert_eq!(
+                    image.source,
+                    PhysicalRect::new(1.0, 2.0, 3.0, 4.0),
+                    "source coordinates are decoded-image pixels"
+                );
+            }
+            other => panic!("expected an image, got {other:?}"),
+        }
+        for index in 10..=12 {
+            match &scaled.items()[index].command {
+                DisplayCommand::LinearGradient(gradient) => {
+                    assert_eq!(gradient.rect, rect);
+                    assert_eq!(gradient.start, PhysicalPoint { x: 2.0, y: 4.0 });
+                    assert_eq!(gradient.end, PhysicalPoint { x: 6.0, y: 8.0 });
+                }
+                DisplayCommand::RadialGradient(gradient) => {
+                    assert_eq!(gradient.rect, rect);
+                    assert_eq!(gradient.center, PhysicalPoint { x: 2.0, y: 4.0 });
+                    assert_eq!(gradient.radius_x, 6.0);
+                    assert_eq!(gradient.radius_y, 8.0);
+                }
+                DisplayCommand::ConicGradient(gradient) => {
+                    assert_eq!(gradient.rect, rect);
+                    assert_eq!(gradient.center, PhysicalPoint { x: 2.0, y: 4.0 });
+                    assert_eq!(gradient.from_angle, 0.5);
+                }
+                other => panic!("expected a gradient, got {other:?}"),
+            }
+        }
+        match &scaled.items()[13].command {
+            DisplayCommand::PushStackingContext(context) => {
+                assert_eq!(context.transform.translate_x, 14.0);
+                assert_eq!(context.transform.translate_y, 18.0);
+                let filter = context.filter.as_ref().expect("filter survives scaling");
+                assert_eq!(filter.operations[0], FilterOperation::Blur(6.0));
+                assert_eq!(
+                    filter.operations[1],
+                    FilterOperation::DropShadow {
+                        offset_x: 4.0,
+                        offset_y: 2.0,
+                        blur: 10.0,
+                        color: Color::BLACK,
+                    }
+                );
+                let mask = context.mask.as_ref().expect("mask survives scaling");
+                assert_eq!(mask.tile, rect);
+                match &mask.image {
+                    MaskImage::Raster { destination, .. } => assert_eq!(*destination, rect),
+                    other => panic!("expected a raster mask, got {other:?}"),
+                }
+            }
+            other => panic!("expected a stacking context, got {other:?}"),
+        }
+        match &scaled.items()[14].command {
+            DisplayCommand::PushSticky(sticky) => {
+                assert_eq!(sticky.margin_rect, rect);
+                assert_eq!(
+                    sticky.containing_block,
+                    PhysicalRect::new(0.0, 0.0, 200.0, 400.0)
+                );
+                assert_eq!(sticky.insets.top, Some(20.0));
+                assert_eq!(sticky.insets.bottom, Some(40.0));
+                assert_eq!(sticky.insets.left, Some(60.0));
+                assert_eq!(
+                    sticky.scrollport,
+                    PhysicalSize {
+                        width: 200.0,
+                        height: 400.0
+                    }
+                );
+                assert_eq!(sticky.scrollport_origin, PhysicalPoint { x: 10.0, y: 12.0 });
+            }
+            other => panic!("expected a sticky scope, got {other:?}"),
+        }
+        assert_eq!(list.scaled(f32::NAN).viewport, list.viewport);
+    }
+
+    fn rect_value(x: f32, y: f32) -> PhysicalRect {
+        PhysicalRect::new(x, y, 60.0, 80.0)
+    }
+
+    struct SizedGlyphMasks {
+        requested: std::sync::Mutex<Vec<f32>>,
+    }
+
+    impl GlyphMaskProvider for SizedGlyphMasks {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the fixture font sizes are positive integers"
+        )]
+        fn mask(
+            &self,
+            _font: super::FontInstanceId,
+            _glyph: GlyphId,
+            font_size: f32,
+        ) -> Option<GlyphMask> {
+            self.requested.lock().expect("request log").push(font_size);
+            let size = font_size.round().max(1.0) as u32;
+            Some(GlyphMask {
+                width: size,
+                height: size,
+                left: 0,
+                top: i32::try_from(size).expect("glyph mask is small"),
+                coverage: vec![255; size as usize * size as usize],
+            })
+        }
+    }
+
+    fn glyph_list(font_size: f32, viewport: PhysicalSize) -> PaintDisplayList {
+        PaintDisplayList::from_items(
+            DomRevision::default(),
+            viewport,
+            vec![item(
+                0,
+                DisplayCommand::GlyphRun(GlyphRun {
+                    font: super::FontInstanceId(0),
+                    font_size,
+                    color: Color::BLACK,
+                    glyphs: vec![GlyphInstance {
+                        glyph: GlyphId(65),
+                        position: PhysicalPoint {
+                            x: 0.0,
+                            y: font_size,
+                        },
+                        advance: font_size * 0.5,
+                    }],
+                }),
+            )]
+            .into_iter()
+            .map(|mut item| {
+                item.bounds = PhysicalRect::new(0.0, 0.0, viewport.width, viewport.height);
+                item
+            })
+            .collect(),
+        )
+    }
+
+    fn ink_bbox(surface: &crate::paint::Surface) -> (u32, u32) {
+        let mut width = 0;
+        let mut height = 0;
+        for y in 0..surface.height() {
+            for x in 0..surface.width() {
+                if surface.pixel(x, y) == Some(Color::BLACK) {
+                    width = width.max(x + 1);
+                    height = height.max(y + 1);
+                }
+            }
+        }
+        (width, height)
+    }
+
+    /// A high-DPI raster must request glyph masks at the scaled font size. If
+    /// only the destination rectangle were doubled, the mask would stay 14px
+    /// and the rasterizer would upscale a CSS-resolution bitmap.
+    #[test]
+    fn device_scale_rasterizes_text_at_the_scaled_font_size() {
+        let masks = SizedGlyphMasks {
+            requested: std::sync::Mutex::new(Vec::new()),
+        };
+        let logical = glyph_list(
+            14.0,
+            PhysicalSize {
+                width: 40.0,
+                height: 40.0,
+            },
+        );
+        let one = CpuRasterizer.rasterize(&logical, Color::WHITE, &masks);
+        let two = CpuRasterizer.rasterize(&logical.scaled(2.0), Color::WHITE, &masks);
+        assert_eq!((one.surface.width(), one.surface.height()), (40, 40));
+        assert_eq!((two.surface.width(), two.surface.height()), (80, 80));
+        assert_eq!(ink_bbox(&one.surface), (14, 14));
+        assert_eq!(
+            ink_bbox(&two.surface),
+            (28, 28),
+            "the 2x raster must contain a 28px glyph mask, not a doubled 14px bitmap"
+        );
+        assert_eq!(
+            *masks.requested.lock().expect("request log"),
+            vec![14.0, 28.0],
+            "the mask provider sees the device font size"
+        );
+    }
 
     /// The one thing that must never be true of the reference path: the width
     /// layout measured a run at and the width the shaper gives its glyphs are

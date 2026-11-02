@@ -1578,6 +1578,61 @@ mod tests {
         }
     }
 
+    /// A retained scene is built from the device-scaled display list, so a
+    /// CSS scroll offset has to reach the compositor as `offset * scale`.
+    /// Passing CSS directly leaves the frame 2x behind (and the cached bands
+    /// would stay correct but the wrong rows would be presented).
+    #[test]
+    fn a_two_x_scene_scrolls_by_the_scaled_origin() {
+        let logical = list(
+            PhysicalSize {
+                width: 40.0,
+                height: 60.0,
+            },
+            vec![
+                item(
+                    0,
+                    PhysicalRect::new(0.0, 0.0, 40.0, 400.0),
+                    rect(0.0, 0.0, 40.0, 400.0, Color::WHITE),
+                ),
+                item(
+                    1,
+                    PhysicalRect::new(0.0, 130.0, 40.0, 20.0),
+                    rect(0.0, 130.0, 40.0, 20.0, Color::rgb(0, 0, 255)),
+                ),
+            ],
+        );
+        let physical = logical.scaled(2.0);
+        let cache = CompositorCache::from_display_list(Arc::new(physical.clone()), Color::WHITE)
+            .expect("the scaled scene is compositable");
+        // 120 CSS px of scroll is 240 physical px.
+        let composited = cache.render(
+            PhysicalPoint { x: 0.0, y: 240.0 },
+            &NoGlyphMasks,
+            None,
+            None,
+        );
+        let reference = CpuRasterizer.rasterize_viewport(
+            &physical,
+            Color::WHITE,
+            &NoGlyphMasks,
+            PhysicalPoint { x: 0.0, y: 240.0 },
+        );
+        assert_eq!(composited.surface, reference.surface);
+        assert_eq!(composited.surface.pixel(5, 25), Some(Color::rgb(0, 0, 255)));
+        let unstaled = cache.render(
+            PhysicalPoint { x: 0.0, y: 120.0 },
+            &NoGlyphMasks,
+            None,
+            None,
+        );
+        assert_ne!(
+            unstaled.surface.pixel(5, 25),
+            Some(Color::rgb(0, 0, 255)),
+            "using the CSS offset directly would drift the presented frame"
+        );
+    }
+
     #[test]
     fn fixed_content_is_retained_in_viewport_space() {
         let viewport = PhysicalSize {

@@ -802,6 +802,11 @@ pub struct DocumentRenderOptions {
     /// Document-space origin painted into the layout viewport. Layout itself
     /// always uses `layout.viewport`; this offset only affects compositing.
     pub scroll_offset: PhysicalPoint,
+    /// Device pixel ratio used for rasterization. Layout, the display list,
+    /// script geometry and hit testing stay in CSS pixels; the rasterizer
+    /// receives a scaled copy of the list and a scaled paint origin. `1.0`
+    /// keeps the historical CSS-pixel raster.
+    pub device_scale: f32,
     /// How far into the CSS Animations timeline this frame samples, in seconds.
     /// `0.0` is the first frame; a caller with a clock passes the elapsed time.
     pub animation_time: f32,
@@ -839,6 +844,7 @@ impl Default for DocumentRenderOptions {
             formatting_limits: FormattingLimits::default(),
             layout: LayoutOptions::default(),
             scroll_offset: PhysicalPoint::default(),
+            device_scale: 1.0,
             animation_time: 0.0,
             color_scheme: ColorScheme::Light,
             raster_background: display_list.palette.canvas,
@@ -2118,11 +2124,27 @@ fn render_dom(
     );
     stages.display = stage_micros(stage_elapsed("display", &mut stage_mark));
     let paint_viewport_origin = layout.fragments.clamp_scroll_offset(options.scroll_offset);
+    // Layout and the retained display list are CSS-pixel data. Rasterization
+    // happens in device pixels, so the list is converted once here: every
+    // geometric field is scaled, including glyph font sizes, and the rasterizer
+    // therefore asks the mask provider for outlines at device resolution.
+    let device_scale = if options.device_scale.is_finite() && options.device_scale > 0.0 {
+        options.device_scale
+    } else {
+        1.0
+    };
+    let scaled_display =
+        ((device_scale - 1.0).abs() > f32::EPSILON).then(|| display.list.scaled(device_scale));
+    let raster_list = scaled_display.as_ref().unwrap_or(&display.list);
+    let raster_viewport_origin = PhysicalPoint {
+        x: paint_viewport_origin.x * device_scale,
+        y: paint_viewport_origin.y * device_scale,
+    };
     let raster = CpuRasterizer.rasterize_viewport_with_images(
-        &display.list,
+        raster_list,
         options.raster_background,
         backends.glyph_masks,
-        paint_viewport_origin,
+        raster_viewport_origin,
         images,
     );
     stages.raster = stage_micros(stage_elapsed("raster", &mut stage_mark));
@@ -3771,6 +3793,61 @@ mod tests {
                 diagnostic.code == DocumentDiagnosticCode::MediaQueryUnsupported
             }),
             "a media feature the cascade evaluates must not be reported unsupported"
+        );
+    }
+
+    /// A 2x device keeps the layout viewport at CSS pixels and only doubles the
+    /// raster surface. A width media query must therefore answer 1180, not the
+    /// 2360 physical pixels the shell happens to present.
+    #[test]
+    fn device_scale_doubles_the_raster_without_changing_the_css_viewport() {
+        let document = Document::parse(
+            "<!doctype html><style>\
+             body { margin:0 }\
+             #target { color: rgb(0, 128, 0) }\
+             @media (min-width: 2000px) { #target { color: rgb(255, 0, 0) } }\
+             </style><p id=target>14px text</p>",
+        );
+        let options = DocumentRenderOptions {
+            layout: crate::layout::LayoutOptions {
+                viewport: PhysicalSize {
+                    width: 1_180.0,
+                    height: 684.0,
+                },
+                ..crate::layout::LayoutOptions::default()
+            },
+            device_scale: 2.0,
+            ..DocumentRenderOptions::default()
+        };
+        let render = document.render_reference(options);
+        assert_eq!(
+            render.layout.fragments.viewport,
+            PhysicalSize {
+                width: 1_180.0,
+                height: 684.0
+            },
+            "layout stays in CSS pixels"
+        );
+        assert_eq!(
+            (
+                render.raster.surface.width(),
+                render.raster.surface.height()
+            ),
+            (2_360, 1_368),
+            "the raster covers the physical surface"
+        );
+        assert_eq!(
+            typed_css(&document, &render, "#target", "color"),
+            "rgb(0, 128, 0)",
+            "min-width:2000px must not match an 1180 CSS-px viewport"
+        );
+        assert_eq!(
+            render.display.list.viewport,
+            PhysicalSize {
+                width: 1_180.0,
+                height: 684.0
+            },
+            "the retained list stays in CSS pixels for hit testing and script geometry"
         );
     }
 

@@ -14,12 +14,14 @@
 
 use std::time::Duration;
 
-use render_core::document::NestedFrameRender;
+use render_core::document::{DocumentRenderOptions, NestedFrameRender};
 use render_core::dom::{NodeId, NodeKind};
 use render_core::interaction::hit_test::{InteractionLimits, InteractionScene};
 use render_core::js::JsValue;
-use render_core::layout::{FragmentKind, PhysicalPoint, SimpleTextMeasurer};
-use render_core::page::Page;
+use render_core::layout::{
+    FragmentKind, LayoutOptions, PhysicalPoint, PhysicalSize, SimpleTextMeasurer,
+};
+use render_core::page::{Page, PageOptions};
 use render_core::paint::{Color, DisplayCommand};
 use url::Url;
 
@@ -138,6 +140,68 @@ fn an_iframe_load_event_reaches_the_page_after_the_child_script() {
     );
     settle(&mut page);
     assert_eq!(evaluate(&mut page, "seen"), JsValue::String("true".into()));
+}
+
+/// The child document is rasterized into the iframe's content box at the same
+/// device scale as the embedding document. Keeping the child at CSS resolution
+/// would make the iframe's text half the size and blurry on a Retina window.
+#[test]
+fn nested_frames_rasterize_at_the_same_device_scale() {
+    let url = Url::parse("https://example.test/app").expect("page URL");
+    let options = PageOptions {
+        render: DocumentRenderOptions {
+            layout: LayoutOptions {
+                viewport: PhysicalSize {
+                    width: 800.0,
+                    height: 600.0,
+                },
+                ..LayoutOptions::default()
+            },
+            device_scale: 2.0,
+            ..DocumentRenderOptions::default()
+        },
+        ..PageOptions::default()
+    };
+    let mut page = Page::with_options_and_url(
+        "<!doctype html><style>html,body{margin:0}iframe{display:block;width:160px;height:100px;border:0}</style>\
+         <body><iframe srcdoc=\"<p style='font:14px monospace'>child</p>\"></iframe></body>",
+        options,
+        &url,
+    );
+    settle(&mut page);
+    let frame = only_frame(&page);
+    assert_eq!(
+        frame.output.display.list.viewport,
+        PhysicalSize {
+            width: 160.0,
+            height: 100.0
+        },
+        "the child retains a CSS-pixel display list"
+    );
+    assert_eq!(
+        (
+            frame.output.raster.surface.width(),
+            frame.output.raster.surface.height()
+        ),
+        (320, 200),
+        "the child surface covers the iframe content box in device pixels"
+    );
+    let image = page
+        .snapshot()
+        .display
+        .list
+        .items()
+        .iter()
+        .find_map(|item| match &item.command {
+            DisplayCommand::Image(image) if item.source == Some(iframe_node(&page)) => Some(*image),
+            _ => None,
+        })
+        .expect("the iframe paints its child surface");
+    assert_eq!(
+        image.destination,
+        render_core::layout::PhysicalRect::new(0.0, 0.0, 160.0, 100.0),
+        "the parent places the child in CSS pixels; only rasterization scales"
+    );
 }
 
 #[test]
