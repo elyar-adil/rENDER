@@ -2437,6 +2437,7 @@ fn headless_app_with_render_worker(
         presenter: render_browser::compositor::shared_presenter(),
         layout: None,
         frame: Vec::new(),
+        pending_scroll_delta: 0.0,
         frame_size: WindowSize::new(800, 600),
         frame_damage: FrameDamage::default(),
         theme: render_browser::chrome::ChromeTheme::Light,
@@ -3883,4 +3884,121 @@ fn primary_button_release_is_recognised_for_the_left_button_only() {
             state: ElementState::Released,
         }
     ));
+}
+
+#[test]
+fn wheel_events_coalesce_until_the_next_redraw() {
+    let (mut app, tab) = headless_app_with("<main style='height:4000px'>scroll</main>");
+    let chrome_height = app.layout.as_ref().expect("chrome layout").chrome_height;
+    app.cursor = Point {
+        x: 200.0,
+        y: f32::from(u16::try_from(chrome_height).expect("chrome height is small")) + 20.0,
+    };
+    {
+        let page = app.pages.get_mut(&tab).expect("page");
+        page.scroll.update_metrics(4_000.0, 560.0);
+    }
+    for _ in 0..8 {
+        app.handle_mouse_wheel(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+            0.0, -16.0,
+        )));
+    }
+    assert!(
+        app.pages[&tab].scroll.offset_y().abs() < f32::EPSILON,
+        "a wheel event must only accumulate; the redraw applies the frame"
+    );
+    assert!(app.flush_pending_scroll());
+    assert!(
+        (app.pages[&tab].scroll.offset_y() - 128.0).abs() < f32::EPSILON,
+        "one redraw applies the sum of every event since the previous frame"
+    );
+    assert!(
+        !app.flush_pending_scroll(),
+        "a second flush with no new wheel input must not scroll again"
+    );
+}
+
+/// A hover change under a stationary pointer needs a new style pass, but it
+/// must not replace the retained scroll frame. The user keeps scrolling while
+/// the styled frame builds in the background.
+#[test]
+fn a_hover_change_during_scroll_keeps_the_composited_frame() {
+    let fonts = Arc::new(SystemFontBackend::load().expect("system fonts load"));
+    let submissions = Arc::new(AtomicUsize::new(0));
+    let worker = crate::render_worker::PageRenderWorker::start(
+        RenderWorkerOptions {
+            queue_capacity: 4,
+            worker_count: 1,
+        },
+        {
+            let submissions = Arc::clone(&submissions);
+            move |_job: RenderJob<PageRenderPayload>,
+                  _cancellation: &RenderCancellation|
+                  -> Result<PageRenderFrame, RenderFailure> {
+                submissions.fetch_add(1, Ordering::SeqCst);
+                Err(RenderFailure::Cancelled)
+            }
+        },
+        || {},
+    )
+    .expect("render worker starts");
+    let (mut app, tab) =
+        headless_app_with_render_worker("<main>scroll</main>", worker, Arc::clone(&fonts));
+    app.compositor_worker = Some(
+        render_browser::compositor::start_compositor_worker(
+            fonts,
+            render_browser::compositor::shared_presenter(),
+            || {},
+        )
+        .expect("compositor worker starts"),
+    );
+    let chrome_height = app.layout.as_ref().expect("chrome layout").chrome_height;
+    app.cursor = Point {
+        x: 200.0,
+        y: f32::from(u16::try_from(chrome_height).expect("chrome height is small")) + 20.0,
+    };
+    // The headless fixture's compositor is authored for RENDER_TEST_VIEWPORT,
+    // so make the window's content area match it exactly.
+    app.frame_size = WindowSize::new(
+        RENDER_TEST_VIEWPORT.width,
+        RENDER_TEST_VIEWPORT.height + chrome_height,
+    );
+    let viewport = RENDER_TEST_VIEWPORT;
+    {
+        let page = app.pages.get_mut(&tab).expect("page");
+        page.viewport = viewport;
+        page.compositor = Some(simple_compositor());
+        page.scroll.update_metrics(4_000.0, viewport.height as f32);
+        // A non-empty chain that the pointer no longer hits: the first scroll
+        // reports a hover change, which used to force a full render instead of
+        // a composited scroll frame.
+        page.interaction.hovered = HashSet::from([page.page.document().dom().document()]);
+    }
+    app.handle_mouse_wheel(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+        0.0, -16.0,
+    )));
+    assert!(app.flush_pending_scroll());
+    assert!(
+        app.pages[&tab].expected_render.is_some(),
+        "the hover change still starts a styled frame"
+    );
+    assert!(
+        app.pages[&tab].expected_compositor.is_some(),
+        "the scroll frame is composed from retained layers, not displaced by the restyle"
+    );
+    wait_for_renders(&submissions, 1);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.pages[&tab].expected_compositor.is_some() {
+        app.poll_compositor_worker();
+        assert!(
+            Instant::now() < deadline,
+            "the composited scroll frame never committed"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        app.pages[&tab].frame.len(),
+        viewport.width as usize * viewport.height as usize
+    );
 }

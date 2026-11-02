@@ -262,6 +262,13 @@ pub(super) struct BrowserApp {
     pub(super) presenter: SharedPresenter,
     pub(super) layout: Option<ChromeLayout>,
     pub(super) frame: Vec<u32>,
+    /// Wheel movement accumulated since the last redraw, in document pixels.
+    ///
+    /// A high-resolution trackpad reports several wheel events per display
+    /// frame. Applying each one immediately would compose, submit and present
+    /// once per event; applying the sum at redraw time keeps scrolling at the
+    /// frame rate instead.
+    pub(super) pending_scroll_delta: f32,
     /// A pending `--screenshot` request: where to write the composed frame and
     /// when. The event loop exits once it is written.
     pub(super) screenshot: Option<ScreenshotRequest>,
@@ -369,6 +376,7 @@ impl BrowserApp {
             presenter,
             layout: None,
             frame: Vec::new(),
+            pending_scroll_delta: 0.0,
             frame_size: WindowSize::new(0, 0),
             frame_damage: FrameDamage {
                 full: true,
@@ -736,16 +744,17 @@ impl BrowserApp {
             );
         }
         if active {
-            if let Some(size) = self.window.as_ref().map(|window| window.inner_size()) {
-                self.mark_page_damage(size);
-                self.compose_frame(size);
-            }
-            // A direct platform present already put the new scroll frame on
-            // screen. The composed CPU frame is still refreshed for the next
-            // chrome repaint, but no redraw is requested for this frame.
             if present_time.is_none() {
+                if let Some(size) = self.window.as_ref().map(|window| window.inner_size()) {
+                    self.mark_page_damage(size);
+                    self.compose_frame(size);
+                }
                 self.request_redraw();
             }
+            // A direct platform present already put the new scroll frame on
+            // screen. The CPU frame is refreshed lazily by the next chrome
+            // repaint, so composing it here would add a second full-window
+            // pass per scroll frame for pixels the window already shows.
         } else {
             self.repaint_chrome();
         }
@@ -1284,6 +1293,12 @@ impl BrowserApp {
             return true;
         }
         let request = self.screenshot.take().expect("checked above");
+        // The CPU frame may be one composited scroll behind when the platform
+        // presented the page directly; recompose from the latest page surface
+        // so the file matches what the window shows.
+        if let Some(size) = self.window.as_ref().map(|window| window.inner_size()) {
+            self.compose_frame(size);
+        }
         if env::var_os("RENDER_DEBUG_LAYOUT").is_some() {
             self.debug_layout_dump();
         }
@@ -4818,14 +4833,34 @@ impl BrowserApp {
             return;
         }
         let delta_y = wheel_document_delta_y(delta);
-        self.apply_scroll_delta(delta_y);
+        if !delta_y.is_finite() || delta_y == 0.0 {
+            return;
+        }
+        // Trackpads emit many events between two display frames. Accumulating
+        // here means one scroll application, one composite submission and one
+        // native present per redraw instead of one per input event.
+        self.pending_scroll_delta += delta_y;
+        self.request_redraw();
+    }
+
+    /// Applies wheel movement accumulated since the last redraw.
+    ///
+    /// Returns whether the scroll position was updated. The caller is the
+    /// redraw path, so the frame it is about to present reflects the sum of
+    /// every wheel event that arrived since the previous frame.
+    pub(super) fn flush_pending_scroll(&mut self) -> bool {
+        let delta_y = std::mem::take(&mut self.pending_scroll_delta);
+        if !delta_y.is_finite() || delta_y == 0.0 {
+            return false;
+        }
+        self.apply_scroll_delta(delta_y)
     }
 
     /// Applies one document-space scroll delta to the active tab and, when
     /// the offset changed, refreshes the viewport bookkeeping, the scroll
     /// event, and the (retained-raster) repaint. Shared by the wheel and the
     /// scrollbar thumb/track interactions.
-    fn apply_scroll_delta(&mut self, delta_y: f32) {
+    fn apply_scroll_delta(&mut self, delta_y: f32) -> bool {
         let id = self.tabs.active_id();
         let changed = self
             .pages
@@ -4855,9 +4890,51 @@ impl BrowserApp {
             // hover chain changes even without a CursorMoved event.
             let hover_changed = self.refresh_content_hover();
             if let Some(viewport) = viewport {
-                self.schedule_page_render(id, viewport, !hover_changed);
+                if self.can_composite_scroll(id, viewport) {
+                    // A hover change needs a new style pass, but it must not
+                    // displace the scroll frame: the retained compositor keeps
+                    // the page moving while the styled frame builds in the
+                    // background and supersedes it when it is ready.
+                    if hover_changed {
+                        self.queue_hover_repaint(id, viewport);
+                    }
+                    self.schedule_page_render(id, viewport, true);
+                } else {
+                    self.schedule_page_render(id, viewport, !hover_changed);
+                }
             }
             self.repaint_chrome();
+        }
+        changed
+    }
+
+    /// Whether a scroll frame for `id` can be composed from retained layers.
+    ///
+    /// This mirrors the compositor branch of [`Self::schedule_page_render`]
+    /// so scroll handling can decide between composing and a full restyle
+    /// without submitting a job first.
+    fn can_composite_scroll(&self, id: TabId, viewport: WindowSize<u32>) -> bool {
+        self.compositor_worker.is_some()
+            && self.pages.get(&id).is_some_and(|page| {
+                page.viewport == viewport && page.style_batch.is_none() && page.compositor.is_some()
+            })
+    }
+
+    /// Requests a new styled frame for a hover-chain change without blocking
+    /// scrolling.
+    ///
+    /// A render already in flight stays committable; the hover repaint is
+    /// coalesced behind it exactly like any other mutation. When the worker is
+    /// idle the full render starts immediately in parallel with the composited
+    /// scroll frame.
+    fn queue_hover_repaint(&mut self, id: TabId, viewport: WindowSize<u32>) {
+        if self.render_worker.is_tab_busy(id.as_u64()) {
+            if let Some(page) = self.pages.get_mut(&id) {
+                page.render_dirty = true;
+                page.render_dirty_viewport = Some(viewport);
+            }
+        } else {
+            self.schedule_page_render(id, viewport, false);
         }
     }
 
@@ -5448,6 +5525,10 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
                 self.handle_address_ime_commit(&value);
             }
             WindowEvent::RedrawRequested => {
+                // Wheel events coalesce into one scroll application per frame,
+                // so the compose below paints the sum of every delta that
+                // arrived since the previous redraw.
+                let _ = self.flush_pending_scroll();
                 if let Err(error) = self.present() {
                     Self::report_and_exit(event_loop, "present the CPU surface", error.as_ref());
                 }
