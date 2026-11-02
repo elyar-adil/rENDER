@@ -1253,6 +1253,61 @@ fn script_inserted_stylesheet_is_discovered_after_initial_styles_resolve() {
 }
 
 #[test]
+fn first_paint_waits_for_blocking_stylesheets() {
+    let (mut app, tab) = headless_app_with(
+        "<!doctype html><html><head><link rel=stylesheet href=a.css></head><body>x</body></html>",
+    );
+    let (plan, revision) = {
+        let page = app.pages.get(&tab).expect("page");
+        (
+            plan_external_style_sheets(
+                page.page.document(),
+                &page.navigation.committed().target.history_url(),
+                render_core::document::DocumentLimits::default(),
+            ),
+            page.dom_revision,
+        )
+    };
+    app.schedule_page_render(tab, WindowSize::new(800, 600), false);
+    let identity = app.pages.get(&tab).unwrap().expected_render.unwrap();
+    app.commit_render(CompletedRender {
+        identity,
+        result: Ok(PageRenderFrame {
+            frame: Vec::new(),
+            viewport: WindowSize::new(800, 600),
+            display_list: None,
+            paint_scene: None,
+            compositor: None,
+            raster_background: Color::rgb(255, 255, 255),
+            content_height: 0.0,
+            viewport_height: 600.0,
+            applied_style_sheets: None,
+            style_plan: Some(plan),
+            style_diagnostics: Vec::new(),
+            style_events: Vec::new(),
+            font_plan: None,
+            installed_fonts: Vec::new(),
+            computed_styles: None,
+            geometry: None,
+            document_revision: revision,
+            transition_state: None,
+            transition_events: Vec::new(),
+        }),
+    });
+
+    let page = app.pages.get(&tab).expect("page");
+    assert!(
+        page.committed_render.is_none(),
+        "the pre-stylesheet frame must not be installed"
+    );
+    assert!(page.frame.is_empty());
+    assert!(
+        page.pending_style_sheets.is_some(),
+        "the blocking sheet is started while the page waits"
+    );
+}
+
+#[test]
 fn committed_stylesheet_batch_fires_load_and_error_at_its_link() {
     let (mut app, tab) = headless_app_with(
         "<!doctype html><html><head>\

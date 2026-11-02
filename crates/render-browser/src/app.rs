@@ -861,6 +861,47 @@ impl BrowserApp {
             return;
         }
         log_completed_frame_debug(&frame, completed.identity.tab_id);
+        // A document's first paint is render-blocking on its `<link
+        // rel=stylesheet>` sheets. This frame was built before those sheets
+        // were applied; installing it is how a page flashed as unstyled text
+        // and then reflowed. Start the fetch and wait for the styled frame.
+        // Only the first paint is gated: a sheet added later must keep the
+        // existing page visible while the new rules arrive.
+        let first_paint_style_plan = self.pages.get(&id).and_then(|page| {
+            (page.committed_render.is_none()
+                && page.style_sheets.is_empty()
+                && frame.applied_style_sheets.is_none())
+            .then(|| frame.style_plan.clone())
+            .flatten()
+            .filter(|plan| !plan.is_empty())
+        });
+        if let Some(mut plan) = first_paint_style_plan {
+            let Some(page) = self.pages.get_mut(&id) else {
+                return;
+            };
+            if page.expected_render == Some(completed.identity) {
+                page.expected_render = None;
+            }
+            plan.resources
+                .retain(|resource| !page.started_style_sheets.contains(&resource.key));
+            if plan.resources.is_empty() {
+                // The blocking sheet is already in flight; its completion
+                // triggers the next render.
+                return;
+            }
+            page.started_style_sheets
+                .extend(plan.resources.iter().map(|resource| resource.key.clone()));
+            if env::var_os("RENDER_DEBUG_FRAME").is_some() {
+                eprintln!(
+                    "render-browser deferring first paint until {} stylesheet(s) resolve page={} generation={}",
+                    plan.resources.len(),
+                    completed.identity.tab_id,
+                    completed.identity.generation
+                );
+            }
+            self.start_external_style_sheets(id, plan);
+            return;
+        }
         let (style_plan, font_plan) = {
             let Some(page) = self.pages.get_mut(&id) else {
                 return;
