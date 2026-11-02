@@ -54,6 +54,47 @@ fn visibility_hidden_skips_own_paint_but_allows_visible_descendants() {
     }));
 }
 
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the button fragment has a non-negative integral position inside the test surface"
+)]
+fn an_absolute_button_in_an_overflow_hidden_form_field_is_not_clipped_by_its_line_box() {
+    // The button is statically placed in an anonymous line box after the
+    // input. That wrapper inherits the parent's style source only for
+    // inheritable properties; `overflow:hidden` on the field must clip the
+    // field, not an anonymous line box at the button's static position.
+    let document = Document::parse(
+        "<!doctype html><style>\
+         html, body { display:block; margin:0 }\
+         #field { position:relative; display:block; width:352px; height:62px; overflow:hidden }\
+         #spacer { display:block; height:44px }\
+         #button { position:absolute; right:0; top:24px; transform:translateY(-50%);\
+                   display:inline-block; border:0; padding:0; width:98px; height:24px;\
+                   background:#ffff00 }\
+         </style><div id=field><div id=spacer></div><button id=button></button></div>",
+    );
+    let render = document.render_reference(DocumentRenderOptions::default());
+    let button = target_id(&document, "button");
+    let fragment = render
+        .layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(button))
+        .expect("the button must be laid out");
+    let rect = fragment.rect;
+    let pixel = render
+        .raster
+        .surface
+        .pixel(
+            u32::try_from(rect.origin.x as i32 + 2).expect("inside the surface"),
+            u32::try_from(rect.origin.y as i32 + 2).expect("inside the surface"),
+        )
+        .expect("the button is inside the surface");
+    assert_eq!((pixel.red, pixel.green, pixel.blue), (255, 255, 0));
+}
+
 // HTML5 rendering §15.3: presentational attributes cascade at the UA origin
 // so classic markup styles pages without a stylesheet, while any author rule
 // still wins.

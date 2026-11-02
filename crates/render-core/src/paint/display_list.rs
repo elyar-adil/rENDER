@@ -1420,8 +1420,15 @@ impl<'a> Builder<'a> {
                 }
             }
         }
+        // An anonymous block has no element and no box of its own; the layout
+        // tree gives it its style source so inheritable properties reach its
+        // inline content. Non-inherited properties such as `overflow` must
+        // not come from that source, and clipping to the wrapper's line box
+        // would crop absolutely positioned descendants that are only *statically*
+        // placed inside it (a transformed button beside a form field is the
+        // common case). The real ancestor with `overflow` still clips them.
         let overflow_clip = match (&fragment.kind, style) {
-            (FragmentKind::Box(geometry), Some(style)) => {
+            (FragmentKind::Box(geometry), Some(style)) if fragment.source.is_some() => {
                 let mut clip_geometry = (*geometry).clone();
                 clip_geometry.content_rect =
                     self.recovered_content_rect(fragment, geometry, Some(style));
@@ -6343,6 +6350,64 @@ mod tests {
                 .iter()
                 .any(|item| matches!(item.command, DisplayCommand::PopClip))
         );
+    }
+
+    #[test]
+    fn anonymous_line_boxes_do_not_clip_positioned_children() {
+        // The absolutely positioned button is statically placed in an
+        // anonymous line box that inherits the parent's style source. Its
+        // `overflow:hidden` is a non-inherited property; clipping the line box
+        // to it crops the button, which is positioned outside that line.
+        let output = parse_document(
+            "<!doctype html><body><div id=box><div style='height:44px'></div>\
+             <button id=button style='position:absolute;right:0;top:24px;transform:translateY(-50%);background:#ff0'>ABC</button>\
+             </div></body>",
+        );
+        let sheet = parse_stylesheet(
+            "html, body { display:block; margin:0 } #box { position:relative; display:block; width:352px; height:62px; overflow:hidden } #button { display:inline-block; border:0 }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let layout = layout_formatting_tree(
+            &output.dom,
+            &formatting,
+            &styles,
+            LayoutOptions::default(),
+            &SimpleTextMeasurer,
+        );
+        let display = build_display_list(
+            &layout.fragments,
+            &formatting,
+            &styles,
+            DisplayListBuilderOptions::default(),
+            &ReferenceTextShaper,
+        );
+        assert!(
+            !display
+                .list
+                .items()
+                .iter()
+                .any(|item| item.source.is_none()
+                    && matches!(item.command, DisplayCommand::PushClip(_))),
+            "an anonymous line box must not emit an overflow clip"
+        );
+        // The button's own background and text are still painted.
+        assert!(display.list.items().iter().any(|item| {
+            matches!(
+                &item.command,
+                DisplayCommand::SolidRect { color, .. }
+                    if *color == Color::rgb(255, 255, 0)
+            )
+        }));
     }
 
     #[test]
