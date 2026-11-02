@@ -1777,6 +1777,21 @@ fn element_from_point_uses_installed_geometry_and_scroll() {
 }
 
 #[test]
+fn device_pixel_ratio_tracks_the_embedder_while_viewport_stays_css_pixels() {
+    let mut parsed = parse_document("<!doctype html><p>x</p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime.install_viewport(1180.0, 684.0, 0.0, 0.0);
+    runtime.install_device_pixel_ratio(2.0);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            "[innerWidth, innerHeight, devicePixelRatio, window.devicePixelRatio].join()",
+        )
+        .expect("viewport globals execute");
+    assert_eq!(outcome.value, JsValue::String("1180,684,2,2".into()));
+}
+
+#[test]
 fn get_rect_bounds_reports_installed_geometry() {
     let mut parsed = parse_document("<!doctype html><p id='p'>x</p>");
     let mut runtime = JsRuntime::new(&parsed.dom);

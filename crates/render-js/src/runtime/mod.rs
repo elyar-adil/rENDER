@@ -326,6 +326,10 @@ pub struct JsRuntime {
     random_state: u64,
     element_geometry: BTreeMap<u64, ElementRect>,
     viewport: ElementRect,
+    /// Device pixel ratio exposed as `window.devicePixelRatio` (CSSOM View
+    /// §4.2). Viewport and element geometry stay in CSS pixels; only this ratio
+    /// ties them to the physical raster the embedder presents.
+    device_pixel_ratio: f64,
     intersection_observers: Vec<ObjectId>,
     resize_observers: Vec<ObjectId>,
     mutation_observers: Vec<ObjectId>,
@@ -528,6 +532,7 @@ impl JsRuntime {
                 width: 1_024.0,
                 height: 768.0,
             },
+            device_pixel_ratio: 1.0,
             intersection_observers: Vec::new(),
             resize_observers: Vec::new(),
             mutation_observers: Vec::new(),
@@ -1049,6 +1054,17 @@ impl JsRuntime {
         // failure this project treats as worst: a global that exists, looks
         // right, and is silently wrong for the case that matters.
         self.queue_media_query_list_changes();
+    }
+
+    /// Publish the native window's device pixel ratio.
+    ///
+    /// CSS pixels remain the unit of every other geometry value; scripts use
+    /// this ratio only when they choose a raster resource (for example a
+    /// `srcset` candidate) or report density to a server.
+    pub fn install_device_pixel_ratio(&mut self, ratio: f64) {
+        if ratio.is_finite() && ratio > 0.0 {
+            self.device_pixel_ratio = ratio;
+        }
     }
 
     /// Whether at least one timer is still registered from script. Intervals

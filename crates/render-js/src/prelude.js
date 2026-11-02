@@ -840,7 +840,9 @@
   define(global, 'DOMRect', DOMRect);
 
   // ------------------------------------------------------------------ window
-  define(global, 'devicePixelRatio', 1);
+  // `devicePixelRatio` is resolved by the runtime, not stored on the global
+  // object: the embedder installs the native window's ratio and a cached data
+  // property would shadow it.
   define(global, 'name', '');
   define(global, 'opener', null);
   define(global, 'closed', false);

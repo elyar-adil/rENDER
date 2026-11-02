@@ -4858,6 +4858,9 @@ impl JsRuntime {
                 "cannot access {name} before initialization"
             )));
         }
+        if name == "devicePixelRatio" {
+            return Ok(JsValue::Number(self.device_pixel_ratio));
+        }
         if let Some(value) = match name {
             "innerWidth" | "outerWidth" => Some(self.viewport.width),
             "innerHeight" | "outerHeight" => Some(self.viewport.height),
@@ -5140,14 +5143,15 @@ impl JsRuntime {
         let inherited_origin = self.realm.get_property_with_origin(object, property);
         if object == self.realm.global_object() {
             let value = match property {
-                "innerWidth" | "outerWidth" => Some(self.viewport.width),
-                "innerHeight" | "outerHeight" => Some(self.viewport.height),
-                "scrollX" | "pageXOffset" => Some(self.viewport.x),
-                "scrollY" | "pageYOffset" => Some(self.viewport.y),
+                "innerWidth" | "outerWidth" => Some(f64::from(self.viewport.width)),
+                "innerHeight" | "outerHeight" => Some(f64::from(self.viewport.height)),
+                "scrollX" | "pageXOffset" => Some(f64::from(self.viewport.x)),
+                "scrollY" | "pageYOffset" => Some(f64::from(self.viewport.y)),
+                "devicePixelRatio" => Some(self.device_pixel_ratio),
                 _ => None,
             };
             if let Some(value) = value {
-                return Ok(JsValue::Number(f64::from(value)));
+                return Ok(JsValue::Number(value));
             }
         }
         // A live collection or static NodeList answers `length` and its indexed
