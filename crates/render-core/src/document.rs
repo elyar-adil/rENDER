@@ -17,6 +17,7 @@ use crate::css::cascade::{
 use crate::css::computed::{
     ComputationDiagnostic, ComputationLimits, ComputedStyle, PropertyRegistry,
     compute_document_styles_with_hints_from_root, compute_starting_styles,
+    recompute_document_styles_with_hints_from_roots,
 };
 use crate::css::container::{ContainerContext, container_geometry_for_style};
 use crate::css::length::{LengthContext, resolve_length_expr};
@@ -1541,6 +1542,10 @@ pub struct RenderStageTimings {
     pub style: u64,
     pub style_match: u64,
     pub container_feedback: u64,
+    /// Layout passes the container feedback loop ran. One means the first
+    /// measured geometry already matched the context the cascade used; the
+    /// loop stops rather than re-cascading.
+    pub container_feedback_passes: u64,
     pub transitions: u64,
     pub animations: u64,
     pub inline_svg: u64,
@@ -1767,6 +1772,43 @@ fn text_mentions_container_unit(text: &str) -> bool {
 /// are not part of the size a query sees. Only the first fragment of a split
 /// box is recorded; a fragmented container is not a case this layout creates
 /// yet, and choosing one fragment is at least deterministic.
+/// The root font size before any stylesheet has been applied. `rem` in a
+/// container query resolves against the real root once the first layout runs;
+/// this seed only avoids an extra document-wide pass when the page keeps the
+/// initial size, which is the common case.
+const INITIAL_ROOT_FONT_SIZE: f32 = 16.0;
+
+/// Query containers whose measured geometry changed between two layout passes.
+///
+/// `None` means the change is document-wide (the viewport or the root font
+/// size moved), so every element may need a new cascade. Otherwise the
+/// returned roots are the containers whose size, names, type or font changed;
+/// only their subtrees can see a different `@container` result or `cq*` unit,
+/// and the caller re-cascades just those.
+fn changed_container_roots(
+    previous: &ContainerContext,
+    measured: &ContainerContext,
+) -> Option<BTreeSet<NodeId>> {
+    if previous.viewport_width.to_bits() != measured.viewport_width.to_bits()
+        || previous.viewport_height.to_bits() != measured.viewport_height.to_bits()
+        || previous.root_font_size.to_bits() != measured.root_font_size.to_bits()
+    {
+        return None;
+    }
+    let mut changed = BTreeSet::new();
+    for (node, geometry) in &measured.containers {
+        if previous.containers.get(node) != Some(geometry) {
+            changed.insert(*node);
+        }
+    }
+    for node in previous.containers.keys() {
+        if !measured.containers.contains_key(node) {
+            changed.insert(*node);
+        }
+    }
+    Some(changed)
+}
+
 fn build_container_context(
     dom: &Dom,
     root: NodeId,
@@ -1958,11 +2000,25 @@ fn render_dom(
     };
 
     let cascade_match_started = std::time::Instant::now();
+    let property_registry = PropertyRegistry::standard_baseline();
+    let uses_containers = sheets_use_container_features(&cascade_inputs, dom);
+    if uses_containers {
+        // Seed the first pass with the viewport and the initial root font size.
+        // Sizes measured later can replace the seed; without it the first pass
+        // treated every `cq*` unit as zero and the feedback loop had to
+        // re-cascade the whole document once just to learn the viewport.
+        match_context.containers = std::sync::Arc::new(ContainerContext {
+            viewport_width: options.layout.viewport.width,
+            viewport_height: options.layout.viewport.height,
+            root_font_size: INITIAL_ROOT_FONT_SIZE,
+            containers: BTreeMap::new(),
+        });
+    }
     let mut styles = compute_document_styles_with_hints_from_root(
         dom,
         root,
         &cascade_inputs,
-        &PropertyRegistry::standard_baseline(),
+        &property_registry,
         &options.computation_limits,
         &match_context,
         &|node| presentational_hint_declarations(dom, node, quirks_mode),
@@ -1976,9 +2032,11 @@ fn render_dom(
     // the containers. Feed the measured content boxes back until they stop
     // changing, bounded so a page whose containers chase each other cannot
     // spin. No container feature means no extra layout at all.
-    if sheets_use_container_features(&cascade_inputs, dom) {
+    if uses_containers {
         let container_started = std::time::Instant::now();
+        let mut feedback_passes = 0_u64;
         for pass in 0..3 {
+            feedback_passes = feedback_passes.saturating_add(1);
             let formatting =
                 build_formatting_tree_from_root(dom, root, &styles, &options.formatting_limits);
             let layout = layout_formatting_tree_with_images_and_containers(
@@ -2004,17 +2062,44 @@ fn render_dom(
             if measured == match_context.containers {
                 break;
             }
-            match_context.containers = measured;
-            styles = compute_document_styles_with_hints_from_root(
-                dom,
-                root,
-                &cascade_inputs,
-                &PropertyRegistry::standard_baseline(),
-                &options.computation_limits,
-                &match_context,
-                &|node| presentational_hint_declarations(dom, node, quirks_mode),
-            );
+            let previous = std::sync::Arc::clone(&match_context.containers);
+            match_context.containers = std::sync::Arc::clone(&measured);
+            // The last allowed measurement cannot be laid out again. Keep the
+            // styles that produced it instead of re-cascading into a style/layout
+            // mismatch that could never be committed as a pair.
+            if pass == 2 {
+                break;
+            }
+            match changed_container_roots(&previous, &measured) {
+                // The viewport or root font size changed, which every `cq*`
+                // unit and media-dependent length can observe: re-cascade all.
+                None => {
+                    styles = compute_document_styles_with_hints_from_root(
+                        dom,
+                        root,
+                        &cascade_inputs,
+                        &property_registry,
+                        &options.computation_limits,
+                        &match_context,
+                        &|node| presentational_hint_declarations(dom, node, quirks_mode),
+                    );
+                }
+                Some(changed) if !changed.is_empty() => {
+                    recompute_document_styles_with_hints_from_roots(
+                        dom,
+                        &cascade_inputs,
+                        &property_registry,
+                        &options.computation_limits,
+                        &match_context,
+                        &|node| presentational_hint_declarations(dom, node, quirks_mode),
+                        &mut styles,
+                        &changed,
+                    );
+                }
+                Some(_) => break,
+            }
         }
+        stages.container_feedback_passes = feedback_passes;
         stages.container_feedback = stage_micros(container_started.elapsed());
         if stage_timing {
             eprintln!(
@@ -5126,6 +5211,89 @@ mod tests {
                 height: viewport.height / 10.0
             },
             "no eligible ancestor falls back to the small viewport size"
+        );
+    }
+
+    /// A page whose container boxes do not depend on container-query styles
+    /// settles after one measured pass: the second layout sees the same
+    /// geometry and the loop stops without a third cascade.
+    #[test]
+    fn container_feedback_converges_after_one_recompute() {
+        let document = Document::parse(
+            r"<!doctype html><style>
+               html, body { margin: 0 }
+               #outer { container-type: size; width: 400px; height: 300px }
+               #child { width: 50cqw; height: 20px }
+               @container (width > 100px) { #child { background-color: red } }
+               </style><div id=outer><div id=child></div></div>",
+        );
+        let render = document.render_reference(DocumentRenderOptions::default());
+        assert_eq!(
+            render.stage_timings.container_feedback_passes, 2,
+            "the first measured context needs one recompute; the next layout is stable"
+        );
+        let child = target_id(document.dom(), "#child");
+        let width = render
+            .layout
+            .fragments
+            .iter()
+            .find_map(
+                |fragment| match (&fragment.kind, fragment.source == Some(child)) {
+                    (FragmentKind::Box(geometry), true) => Some(geometry.content_rect.size.width),
+                    _ => None,
+                },
+            )
+            .expect("child box");
+        assert!((width - 200.0).abs() < f32::EPSILON);
+        assert_eq!(
+            render.styles[&child]
+                .get("background-color")
+                .map(crate::css::computed::ComputedValue::css_text),
+            Some("red"),
+        );
+    }
+
+    /// Nested containers: the leaf reads the nearest inline-size container,
+    /// and a query on the outer container still reaches the inner box. Both
+    /// are resolved by the feedback loop even when only the outer subtree is
+    /// re-cascaded.
+    #[test]
+    fn nested_container_feedback_resolves_the_leaf_against_the_inner_container() {
+        let document = Document::parse(
+            r"<!doctype html><style>
+               html, body { margin: 0 }
+               #outer { container-type: size; width: 400px; height: 300px }
+               #inner { container-type: inline-size; width: 200px; height: 100px }
+               #leaf { width: 50cqw; height: 10px }
+               @container (width > 150px) { #leaf { background-color: red } }
+               </style><div id=outer><div id=inner><div id=leaf></div></div></div>",
+        );
+        let render = document.render_reference(DocumentRenderOptions::default());
+        let leaf = target_id(document.dom(), "#leaf");
+        let width = render
+            .layout
+            .fragments
+            .iter()
+            .find_map(
+                |fragment| match (&fragment.kind, fragment.source == Some(leaf)) {
+                    (FragmentKind::Box(geometry), true) => Some(geometry.content_rect.size.width),
+                    _ => None,
+                },
+            )
+            .expect("leaf box");
+        assert!(
+            (width - 100.0).abs() < f32::EPSILON,
+            "50cqw of the 200px inner container, got {width}"
+        );
+        assert_eq!(
+            render.styles[&leaf]
+                .get("background-color")
+                .map(crate::css::computed::ComputedValue::css_text),
+            Some("red"),
+        );
+        assert!(
+            render.stage_timings.container_feedback_passes <= 3,
+            "feedback must stay bounded"
         );
     }
 
