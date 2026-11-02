@@ -416,6 +416,11 @@ impl JsRuntime {
                 dom.set_attribute(node, name, uint32_of_number(number).to_string())?;
             }
         }
+        // HTML §4.12.5.1: assigning a canvas's `width` or `height` resets its
+        // bitmap and context state. The reset happens even when the stored
+        // number did not change, because `canvas.width = canvas.width` is the
+        // idiomatic way to clear a canvas.
+        self.canvas_dimension_attribute_set(dom, node, name);
         Ok(())
     }
 

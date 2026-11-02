@@ -1247,6 +1247,20 @@ impl CanvasHost for CanvasHandle {
         }
     }
 
+    fn element_resized(&mut self, dom: &Dom, node: NodeId) {
+        let mut engine = self.0.borrow_mut();
+        let Some(id) = engine.elements.get(&node).copied() else {
+            // No context has been created yet; the first `getContext` reads
+            // the new size and starts from a fresh state anyway.
+            return;
+        };
+        let (width, height) = element_size(dom, node);
+        if let Some(found) = engine.canvases.get_mut(&id) {
+            found.resize(width, height);
+            engine.dirty.insert(id);
+        }
+    }
+
     fn execute(
         &mut self,
         dom: &Dom,

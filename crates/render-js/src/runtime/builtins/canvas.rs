@@ -212,6 +212,39 @@ impl JsRuntime {
         self.canvas_host = Some(host);
     }
 
+    /// Tell the host that an element canvas's `width` or `height` attribute
+    /// was assigned. The assignment resets the bitmap and context state even
+    /// when the numeric value did not change (HTML §4.12.5.1).
+    pub(in crate::runtime) fn canvas_element_resized(&mut self, dom: &Dom, node: NodeId) {
+        if let Some(host) = self.canvas_host.as_mut() {
+            host.element_resized(dom, node);
+        }
+    }
+
+    /// Notify the canvas host when `name` is the `width` or `height` content
+    /// attribute of an HTML `<canvas>`. Both the IDL setter and
+    /// `setAttribute`/`setAttributeNS` take this path so they agree on the
+    /// reset the specification requires.
+    pub(in crate::runtime) fn canvas_dimension_attribute_set(
+        &mut self,
+        dom: &Dom,
+        node: NodeId,
+        name: &str,
+    ) {
+        if !matches!(name, "width" | "height") {
+            return;
+        }
+        let is_canvas = matches!(
+            dom.node(node).map(render_dom::Node::kind),
+            Some(render_dom::NodeKind::Element(element))
+                if element.namespace == render_dom::Namespace::Html
+                    && element.local_name == "canvas"
+        );
+        if is_canvas {
+            self.canvas_element_resized(dom, node);
+        }
+    }
+
     pub(in crate::runtime) fn dispatch_canvas_native(
         &mut self,
         dom: &mut Dom,

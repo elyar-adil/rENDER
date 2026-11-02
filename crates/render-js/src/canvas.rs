@@ -280,6 +280,15 @@ pub trait CanvasHost: std::fmt::Debug {
     /// Sets the size of an offscreen canvas, resetting its bitmap.
     fn set_offscreen_size(&mut self, canvas: CanvasId, width: u32, height: u32);
 
+    /// An element canvas's `width` or `height` IDL attribute was assigned.
+    /// HTML §4.12.5.1 requires that assignment to reset the bitmap and the
+    /// rendering context's state even when the value is unchanged, so a
+    /// repeated `canvas.width = canvas.width` is the idiomatic clear. The
+    /// default is a host with no element canvases.
+    fn element_resized(&mut self, dom: &Dom, node: NodeId) {
+        let _ = (dom, node);
+    }
+
     /// Runs one context operation.
     ///
     /// # Errors

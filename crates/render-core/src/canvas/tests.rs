@@ -415,6 +415,38 @@ fn round_rect_three_radii_repeat_the_second() {
 }
 
 #[test]
+fn assigning_the_same_canvas_size_clears_the_bitmap_and_transform() {
+    // HTML §4.12.5.1: assigning `width`/`height` resets the bitmap and the
+    // context state even when the number is unchanged. CSS-in-JS QR code
+    // painters rely on it: every effect run starts `scale()` from identity,
+    // and a no-op assignment would compound the transform on each run.
+    let script = format!(
+        "{SETUP} ctx.fillStyle = '#ff0000'; ctx.fillRect(0, 0, 10, 10);\
+         ctx.scale(2, 2); c.width = 10;\
+         ctx.fillStyle = '#0000ff'; ctx.fillRect(0, 0, 2, 2);\
+         [{}, {}, {}].join('|')",
+        pixel(1, 1),
+        pixel(3, 3),
+        pixel(9, 9)
+    );
+    // The blue rect is 2 by 2 CSS pixels (not 4 by 4), the old red bitmap is
+    // gone, and the identity transform applies again.
+    assert_eq!(run(&script), "0,0,255,255|0,0,0,0|0,0,0,0");
+}
+
+#[test]
+fn set_attribute_clears_the_canvas_like_the_idl_setter() {
+    let script = format!(
+        "{SETUP} ctx.fillStyle = '#ff0000'; ctx.fillRect(0, 0, 10, 10);\
+         c.setAttribute('width', '10');\
+         [{}, {}].join('|')",
+        pixel(1, 1),
+        pixel(9, 9)
+    );
+    assert_eq!(run(&script), "0,0,0,0|0,0,0,0");
+}
+
+#[test]
 fn canvas_state_attributes_round_trip_and_reset() {
     // WPT 2d.reset.state.*: every state attribute reads back what was set,
     // and ctx.reset() restores the default it reported before.

@@ -78,7 +78,8 @@ impl JsRuntime {
                     name.clear();
                     name.push_str("class");
                 }
-                dom.set_attribute(node, name, value.to_lossy())?;
+                dom.set_attribute(node, name.clone(), value.to_lossy())?;
+                self.canvas_dimension_attribute_set(dom, node, &name);
                 Ok(JsValue::Undefined)
             }
             NativeFunction::SetTimeout | NativeFunction::SetInterval => {

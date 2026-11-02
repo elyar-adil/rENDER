@@ -245,7 +245,14 @@ impl JsRuntime {
                     .to_lossy();
                 let (namespace, prefix, local) =
                     self.validate_and_extract(namespace.as_deref(), &qualified)?;
-                dom.set_attribute_ns(node, namespace.as_deref(), prefix.as_deref(), local, value)?;
+                dom.set_attribute_ns(
+                    node,
+                    namespace.as_deref(),
+                    prefix.as_deref(),
+                    local.clone(),
+                    value,
+                )?;
+                self.canvas_dimension_attribute_set(dom, node, &local);
                 Ok(JsValue::Undefined)
             }
             NativeFunction::GetAttributeNs => {
