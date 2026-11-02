@@ -9,6 +9,11 @@ use crate::model::{Tab, TabId, TabIntent};
 use crate::navigation::NavigationIntent;
 use std::time::Duration;
 
+/// Smallest logical window for which the chrome keeps every control visible.
+/// The native window's minimum size and the layout tests share these values.
+pub const MIN_WINDOW_WIDTH: f64 = 560.0;
+pub const MIN_WINDOW_HEIGHT: f64 = 360.0;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Point {
     pub x: f32,
@@ -87,6 +92,34 @@ pub enum WindowAction {
     Close,
 }
 
+/// How the native window's three window buttons are drawn.
+///
+/// The layout differs by platform in a way users read immediately: macOS puts
+/// coloured traffic lights at the leading edge of the title row, while
+/// Windows and Linux put monochrome caption buttons at the trailing edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowControlStyle {
+    /// macOS: close/minimise/zoom traffic lights, leading edge.
+    TrafficLights,
+    /// Windows and Linux: minimise/maximise/close glyph buttons, trailing edge.
+    CaptionButtons,
+}
+
+impl WindowControlStyle {
+    #[must_use]
+    pub const fn native() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::TrafficLights
+        } else {
+            Self::CaptionButtons
+        }
+    }
+
+    const fn is_traffic_lights(self) -> bool {
+        matches!(self, Self::TrafficLights)
+    }
+}
+
 impl WindowControl {
     #[must_use]
     pub const fn action(self) -> WindowAction {
@@ -153,9 +186,14 @@ pub struct ChromeLayout {
     pub content: Rect,
     pub chrome_height: u32,
     pub scale: f32,
-    /// Whether the active page has a forward entry. The forward button is not
-    /// drawn or hit-testable while this is false; the other buttons keep their
-    /// slots so the toolbar does not shift under the pointer.
+    pub tab_strip_height: f32,
+    pub toolbar_height: f32,
+    pub tab_radius: f32,
+    pub control_style: WindowControlStyle,
+    /// Whether the active page has a back or forward entry. A disabled Back
+    /// keeps its slot (dimmed, no hover, no hit target); Forward is also
+    /// removed from the row when unavailable so the address bar can grow.
+    pub back_available: bool,
     pub forward_available: bool,
 }
 
@@ -165,17 +203,22 @@ pub struct ChromeLayout {
 fn toolbar_geometry(
     width: f32,
     scale: f32,
-    button_y: f32,
+    toolbar_y: f32,
+    toolbar_height: f32,
     forward_available: bool,
+    style: WindowControlStyle,
 ) -> (Vec<ButtonGeometry>, Rect) {
+    let traffic_lights = style.is_traffic_lights();
     let left = 12.0 * scale;
-    let button_size = 36.0 * scale;
-    let button_gap = 3.0 * scale;
+    let button_size = if traffic_lights { 32.0 } else { 36.0 } * scale;
+    let button_gap = if traffic_lights { 2.0 } else { 3.0 } * scale;
+    let address_height = if traffic_lights { 30.0 } else { 36.0 } * scale;
     let mut kinds = vec![ToolbarButton::Back];
     if forward_available {
         kinds.push(ToolbarButton::Forward);
     }
     kinds.extend([ToolbarButton::Reload, ToolbarButton::Home]);
+    let button_y = toolbar_y + (toolbar_height - button_size) * 0.5;
     let buttons = kinds
         .iter()
         .enumerate()
@@ -189,46 +232,61 @@ fn toolbar_geometry(
             },
         })
         .collect::<Vec<_>>();
-    let address_x = left + kinds.len() as f32 * (button_size + button_gap) + 7.0 * scale;
+    let address_x = left
+        + kinds.len() as f32 * (button_size + button_gap)
+        + if traffic_lights { 8.0 } else { 7.0 } * scale;
+    let right_margin = if traffic_lights { 12.0 } else { 14.0 } * scale;
+    let address_y = toolbar_y + (toolbar_height - address_height) * 0.5;
     let address = Rect {
         x: address_x,
-        y: button_y,
-        width: (width - address_x - 14.0 * scale).max(40.0 * scale),
-        height: button_size,
+        y: address_y,
+        width: (width - address_x - right_margin).max(40.0 * scale),
+        height: address_height,
     };
     (buttons, address)
 }
 
 impl ChromeLayout {
+    /// Updates Back/Forward affordances from the active page's history.
+    pub fn set_history_available(&mut self, back: bool, forward: bool) {
+        self.back_available = back;
+        self.set_forward_available(forward);
+    }
+
     /// Shows or hides the forward button and re-flows the toolbar around it.
     pub fn set_forward_available(&mut self, available: bool) {
         if self.forward_available == available {
             return;
         }
         self.forward_available = available;
-        let (buttons, address) =
-            toolbar_geometry(self.content.width, self.scale, self.address.y, available);
+        let (buttons, address) = toolbar_geometry(
+            self.content.width,
+            self.scale,
+            self.tab_strip_height,
+            self.toolbar_height,
+            available,
+            self.control_style,
+        );
         self.buttons = buttons;
         self.address = address;
     }
 
     #[must_use]
-    pub fn new(width: u32, height: u32, scale: f32, tabs: &[Tab]) -> Self {
-        Self::new_with_decorations(width, height, scale, tabs, false)
+    pub const fn toolbar_button_enabled(&self, button: ToolbarButton) -> bool {
+        match button {
+            ToolbarButton::Back => self.back_available,
+            ToolbarButton::Forward => self.forward_available,
+            ToolbarButton::Reload | ToolbarButton::Home => true,
+        }
     }
 
-    /// Layout used by the live browser window when the OS owns the title bar
-    /// and its minimize/maximize/close controls. The client area still draws
-    /// browser tabs, navigation, and the address editor, but never reserves a
-    /// second synthetic title bar.
     #[must_use]
-    pub fn new_native(width: u32, height: u32, scale: f32, tabs: &[Tab]) -> Self {
-        // Kept as a source-compatible alias for callers that used the old
-        // native-frame layout. The browser now owns a modern, cross-platform
-        // title row so tabs and window actions stay together on every OS.
-        Self::new(width, height, scale, tabs)
+    pub fn new(width: u32, height: u32, scale: f32, tabs: &[Tab]) -> Self {
+        Self::new_with_control_style(width, height, scale, tabs, WindowControlStyle::native())
     }
 
+    /// Explicit control style for tests and for a future native-decorations
+    /// path. Production layouts call [`WindowControlStyle::native`].
     #[must_use]
     #[allow(
         clippy::cast_possible_truncation,
@@ -236,54 +294,89 @@ impl ChromeLayout {
         clippy::too_many_lines,
         reason = "native dimensions and DPI-scaled chrome metrics are finite positive pixels"
     )]
-    fn new_with_decorations(
+    pub fn new_with_control_style(
         width: u32,
         height: u32,
         scale: f32,
         tabs: &[Tab],
-        native_decorations: bool,
+        style: WindowControlStyle,
     ) -> Self {
         let scale = scale.max(0.5);
         let width_f = width as f32;
-        let tab_strip_height = 42.0 * scale;
-        let toolbar_height = 54.0 * scale;
+        let traffic_lights = style.is_traffic_lights();
+        // macOS keeps the title row tighter than Windows' caption row:
+        // 12pt UI text, 32pt tab, 30pt address field. Caption-button platforms
+        // keep the taller metrics the shell has always used.
+        let tab_strip_height = if traffic_lights { 40.0 } else { 42.0 } * scale;
+        let toolbar_height = if traffic_lights { 50.0 } else { 54.0 } * scale;
         let chrome_height = (tab_strip_height + toolbar_height).round() as u32;
-        let left = 12.0 * scale;
         let tab_gap = 4.0 * scale;
-        let control_width = 46.0 * scale;
-        let control_kinds = [
-            WindowControl::Minimize,
-            WindowControl::MaximizeRestore,
-            WindowControl::Close,
-        ];
-        let control_group_width = control_width * control_kinds.len() as f32;
-        // With native decorations the platform title bar is outside the
-        // client area. Keep all client pixels available to the tab strip and
-        // do not create a second set of synthetic window buttons.
-        let controls_x = if native_decorations {
-            width_f
+        let tab_height = if traffic_lights { 32.0 } else { 34.0 } * scale;
+        let tab_radius = if traffic_lights { 8.0 } else { 9.0 } * scale;
+        // Traffic lights occupy a 60pt group at the leading edge; tabs begin
+        // after it so no tab can ever sit under a window button.
+        let controls_x = if traffic_lights {
+            12.0 * scale
         } else {
-            (width_f - control_group_width).max(0.0)
+            (width_f - 46.0 * scale * 3.0).max(0.0)
         };
-        let window_controls = if native_decorations {
-            Vec::new()
+        let left = if traffic_lights {
+            82.0 * scale
         } else {
-            control_kinds
-                .into_iter()
-                .enumerate()
-                .map(|(index, control)| WindowControlGeometry {
+            12.0 * scale
+        };
+        let control_kinds = if traffic_lights {
+            [
+                WindowControl::Close,
+                WindowControl::Minimize,
+                WindowControl::MaximizeRestore,
+            ]
+        } else {
+            [
+                WindowControl::Minimize,
+                WindowControl::MaximizeRestore,
+                WindowControl::Close,
+            ]
+        };
+        let window_controls = control_kinds
+            .into_iter()
+            .enumerate()
+            .map(|(index, control)| {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "the three window controls have a fixed, tiny index"
+                )]
+                let index = index as f32;
+                WindowControlGeometry {
                     control,
-                    bounds: Rect {
-                        x: controls_x + index as f32 * control_width,
-                        y: 0.0,
-                        width: control_width,
-                        height: tab_strip_height,
+                    bounds: if traffic_lights {
+                        // Centre the lights on the tab row into which they are
+                        // visually inset, not on the full strip: a 32pt tab
+                        // starts 8pt below the top, so its optical centre is
+                        // 4pt lower than the strip centre.
+                        Rect {
+                            x: controls_x + index * 20.0 * scale,
+                            y: tab_strip_height - tab_height * 0.5 - 10.0 * scale,
+                            width: 20.0 * scale,
+                            height: 20.0 * scale,
+                        }
+                    } else {
+                        Rect {
+                            x: controls_x + index * 46.0 * scale,
+                            y: 0.0,
+                            width: 46.0 * scale,
+                            height: tab_strip_height,
+                        }
                     },
-                })
-                .collect::<Vec<_>>()
-        };
+                }
+            })
+            .collect::<Vec<_>>();
         let new_tab_width = 30.0 * scale;
-        let tab_area_right = (controls_x - new_tab_width - 8.0 * scale).max(left);
+        let tab_area_right = if traffic_lights {
+            (width_f - new_tab_width - 8.0 * scale).max(left)
+        } else {
+            (controls_x - new_tab_width - 8.0 * scale).max(left)
+        };
         let tab_area = (tab_area_right - left).max(0.0);
         #[allow(
             clippy::cast_precision_loss,
@@ -291,7 +384,6 @@ impl ChromeLayout {
         )]
         let count = tabs.len().max(1) as f32;
         let tab_width = ((tab_area - tab_gap * (count - 1.0)).max(0.0) / count).min(230.0 * scale);
-        let tab_height = 34.0 * scale;
         let tab_y = tab_strip_height - tab_height;
         let geometries = tabs
             .iter()
@@ -309,7 +401,15 @@ impl ChromeLayout {
                     width: tab_width,
                     height: tab_height,
                 };
-                let close_size = (24.0 * scale).min(tab_width);
+                // A tab too narrow to carry a close target hides it instead of
+                // shrinking it into an unclickable sliver. Switching tabs still
+                // works and the title keeps the space.
+                let show_close = tab_width >= 56.0 * scale;
+                let close_size = if show_close {
+                    (if traffic_lights { 20.0 } else { 24.0 } * scale).min(tab_width)
+                } else {
+                    0.0
+                };
                 let close_inset = (5.0 * scale).min((tab_width - close_size).max(0.0));
                 TabGeometry {
                     id: tab.id,
@@ -326,27 +426,33 @@ impl ChromeLayout {
         let tabs_end = geometries
             .last()
             .map_or(left, |tab| tab.bounds.x + tab.bounds.width + tab_gap);
+        let new_tab_height = if traffic_lights { 26.0 } else { 28.0 } * scale;
         let new_tab = Rect {
             x: tabs_end,
-            y: tab_y + 4.0 * scale,
+            y: tab_y + (tab_height - new_tab_height) * 0.5,
             width: new_tab_width,
-            height: 28.0 * scale,
+            height: new_tab_height,
         };
         let title_bar_x = new_tab.x + new_tab.width + 4.0 * scale;
         let title_bar = Rect {
             x: title_bar_x,
             y: 0.0,
-            width: if native_decorations {
-                0.0
+            width: if traffic_lights {
+                (width_f - title_bar_x - 8.0 * scale).max(0.0)
             } else {
                 (controls_x - title_bar_x).max(0.0)
             },
             height: tab_strip_height,
         };
 
-        let toolbar_y = tab_strip_height;
-        let button_y = toolbar_y + (toolbar_height - 36.0 * scale) * 0.5;
-        let (buttons, address) = toolbar_geometry(width_f, scale, button_y, true);
+        let (buttons, address) = toolbar_geometry(
+            width_f,
+            scale,
+            tab_strip_height,
+            toolbar_height,
+            true,
+            style,
+        );
         let content_y = chrome_height.min(height);
         Self {
             tabs: geometries,
@@ -363,6 +469,11 @@ impl ChromeLayout {
             },
             chrome_height,
             scale,
+            tab_strip_height,
+            toolbar_height,
+            tab_radius,
+            control_style: style,
+            back_available: true,
             forward_available: true,
         }
     }
@@ -373,7 +484,7 @@ impl ChromeLayout {
             if tab.close.contains(point) {
                 return HitTarget::CloseTab(tab.id);
             }
-            if tab.bounds.contains_top_rounded(point, 9.0 * self.scale) {
+            if tab.bounds.contains_top_rounded(point, self.tab_radius) {
                 return HitTarget::Tab(tab.id);
             }
         }
@@ -390,7 +501,11 @@ impl ChromeLayout {
         }
         for button in &self.buttons {
             if button.bounds.contains(point) {
-                return HitTarget::Toolbar(button.button);
+                return if self.toolbar_button_enabled(button.button) {
+                    HitTarget::Toolbar(button.button)
+                } else {
+                    HitTarget::Chrome
+                };
             }
         }
         if self.address.contains(point) {
@@ -666,7 +781,7 @@ impl AddressContextMenu {
         let row_height = 30.0 * scale;
         let padding = 6.0 * scale;
         let separator_gap = 5.0 * scale;
-        let height = padding * 2.0 + row_height * 6.0 + separator_gap * 2.0;
+        let height = padding * 2.0 + row_height * 7.0 + separator_gap * 2.0;
         let viewport_width = viewport_width as f32;
         let viewport_height = viewport_height as f32;
         let bounds = Rect {
@@ -677,6 +792,7 @@ impl AddressContextMenu {
         };
         let commands = [
             AddressCommand::Undo,
+            AddressCommand::Redo,
             AddressCommand::Cut,
             AddressCommand::Copy,
             AddressCommand::Paste,
@@ -699,7 +815,7 @@ impl AddressContextMenu {
                     enabled: editor.command_is_enabled(command, paste_available),
                 };
                 y += row_height;
-                if index == 0 || index == 4 {
+                if index == 1 || index == 5 {
                     y += separator_gap;
                 }
                 item
@@ -726,9 +842,42 @@ impl AddressContextMenu {
     }
 }
 
+/// Vertical metrics of the chrome's interface font at one size. Chrome text is
+/// positioned from the top of its line box so every label shares the same
+/// optical baseline instead of relying on a hand-tuned y offset per control.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextLineMetrics {
+    pub ascent: f32,
+    pub descent: f32,
+}
+
+impl TextLineMetrics {
+    #[must_use]
+    pub fn line_height(self) -> f32 {
+        self.ascent + self.descent
+    }
+}
+
 pub trait TextPainter {
     fn measure(&self, text: &str, size: f32) -> f32;
     fn paint(&self, canvas: &mut Canvas<'_>, text: &str, origin: Point, size: f32, color: u32);
+
+    /// Ascent and descent of the interface face. The default keeps test
+    /// painters and any future backend usable without implementing metrics.
+    fn line_metrics(&self, size: f32) -> TextLineMetrics {
+        TextLineMetrics {
+            ascent: size * 0.8,
+            descent: size * 0.2,
+        }
+    }
+}
+
+/// Top of a vertically centred line box inside `rect`, rounded to a whole
+/// physical pixel so glyph rasterisation stays on the same grid at every DPI.
+#[must_use]
+pub fn centred_line_top(rect: Rect, metrics: TextLineMetrics) -> f32 {
+    let line_height = metrics.line_height();
+    (rect.y + (rect.height - line_height) * 0.5).round()
 }
 
 pub struct Canvas<'a> {
@@ -834,6 +983,11 @@ impl<'a> Canvas<'a> {
         reason = "rounded rectangles are clipped to finite framebuffer bounds"
     )]
     pub fn rounded_rect(&mut self, rect: Rect, radius: f32, color: u32) {
+        let radius = radius.min(rect.width * 0.5).min(rect.height * 0.5);
+        if radius <= 0.0 {
+            self.rect(rect, color);
+            return;
+        }
         let left = rect.x.max(self.clip.x).floor().max(0.0) as u32;
         let top = rect.y.max(self.clip.y).floor().max(0.0) as u32;
         let right = (rect.x + rect.width)
@@ -846,24 +1000,40 @@ impl<'a> Canvas<'a> {
             .ceil()
             .clamp(0.0, self.height as f32) as u32;
         let bottom = bottom.max(top);
-        let radius = radius.min(rect.width * 0.5).min(rect.height * 0.5);
+        let center_x = rect.x + rect.width * 0.5;
+        let center_y = rect.y + rect.height * 0.5;
+        let half_width = (rect.width * 0.5 - radius).max(0.0);
+        let half_height = (rect.height * 0.5 - radius).max(0.0);
         for y in top..bottom {
             for x in left..right {
-                let px = x as f32 + 0.5;
-                let py = y as f32 + 0.5;
-                // At fractional DPI scales, two mathematically equal bounds
-                // can round in opposite directions (for example 54.0 and
-                // 53.999996). `f32::clamp` panics when min > max, so collapse
-                // that sub-pixel interval to its midpoint explicitly.
-                let nearest_x = clamp_interval(px, rect.x + radius, rect.x + rect.width - radius);
-                let nearest_y = clamp_interval(py, rect.y + radius, rect.y + rect.height - radius);
-                let dx = px - nearest_x;
-                let dy = py - nearest_y;
-                if dx.mul_add(dx, dy * dy) <= radius * radius {
-                    self.pixels[y as usize * self.width as usize + x as usize] = color;
-                }
+                let px = x as f32 + 0.5 - center_x;
+                let py = y as f32 + 0.5 - center_y;
+                // Signed distance to a rounded box: one-pixel coverage at the
+                // edge makes pills and rounded selection as smooth as native
+                // controls at 2x instead of showing the old stair-step corner.
+                let qx = px.abs() - half_width;
+                let qy = py.abs() - half_height;
+                let outside = qx.max(0.0).hypot(qy.max(0.0));
+                let inside = qx.max(qy).min(0.0);
+                let distance = outside + inside - radius;
+                self.blend_coverage(x, y, color, (0.5 - distance).clamp(0.0, 1.0));
             }
         }
+    }
+
+    /// Draw a one-physical-pixel horizontal separator on an integer pixel row.
+    /// Chrome coordinates are already physical, so this stays hairline-crisp at
+    /// 2x instead of becoming a two-pixel band from fractional rounding.
+    pub fn hairline(&mut self, y: f32, x: f32, width: f32, color: u32) {
+        self.rect(
+            Rect {
+                x,
+                y: y.floor(),
+                width,
+                height: 1.0,
+            },
+            color,
+        );
     }
 
     pub fn top_rounded_rect(&mut self, rect: Rect, radius: f32, color: u32) {
@@ -1003,16 +1173,6 @@ impl<'a> Canvas<'a> {
     }
 }
 
-fn clamp_interval(value: f32, first: f32, second: f32) -> f32 {
-    let (lower, upper) = if first <= second {
-        (first, second)
-    } else {
-        let midpoint = (first + second) * 0.5;
-        (midpoint, midpoint)
-    };
-    value.max(lower).min(upper)
-}
-
 #[allow(
     clippy::too_many_arguments,
     reason = "chrome painting consumes the complete immutable UI snapshot"
@@ -1025,6 +1185,7 @@ pub fn paint_chrome(
     editor: &AddressEditor,
     theme: ChromeTheme,
     hot: HitTarget,
+    pressed: Option<HitTarget>,
     maximized: bool,
     drag: Option<(TabId, &[f32])>,
     text: &impl TextPainter,
@@ -1039,10 +1200,7 @@ pub fn paint_chrome(
         },
         palette.tab_strip,
     );
-    let toolbar_top = layout
-        .buttons
-        .first()
-        .map_or(0.0, |button| button.bounds.y - 9.0 * layout.scale);
+    let toolbar_top = layout.tab_strip_height;
     canvas.rect(
         Rect {
             x: 0.0,
@@ -1052,10 +1210,27 @@ pub fn paint_chrome(
         },
         palette.toolbar,
     );
-    paint_tabs(canvas, layout, tabs, active, hot, drag, text, palette);
-    paint_window_controls(canvas, layout, hot, maximized, palette);
-    paint_toolbar(canvas, layout, hot, palette);
-    paint_address(canvas, layout, editor, text, palette);
+    // One device pixel, not one CSS pixel: on a 2x display this is the same
+    // hairline the rest of macOS uses. The strip line is painted before the
+    // tabs so the active tab can sit on it without a seam.
+    canvas.hairline(
+        toolbar_top - 1.0,
+        0.0,
+        layout.content.width,
+        palette.separator,
+    );
+    paint_tabs(
+        canvas, layout, tabs, active, hot, pressed, drag, text, palette,
+    );
+    paint_window_controls(canvas, layout, hot, pressed, maximized, palette);
+    paint_toolbar(canvas, layout, hot, pressed, palette);
+    paint_address(canvas, layout, editor, hot, text, palette);
+    canvas.hairline(
+        layout.chrome_height as f32 - 1.0,
+        0.0,
+        layout.content.width,
+        palette.separator,
+    );
 }
 
 /// Overlay page scrollbar: a translucent track strip with a rounded thumb.
@@ -1089,6 +1264,7 @@ fn paint_tabs(
     tabs: &[Tab],
     active: TabId,
     hot: HitTarget,
+    pressed: Option<HitTarget>,
     drag: Option<(TabId, &[f32])>,
     text: &impl TextPainter,
     palette: Palette,
@@ -1096,10 +1272,10 @@ fn paint_tabs(
     let Some((dragged, drag_offsets)) = drag else {
         for (tab, geometry) in tabs.iter().zip(&layout.tabs) {
             paint_one_tab(
-                canvas, layout, tab, *geometry, 0.0, active, hot, false, text, palette,
+                canvas, layout, tab, *geometry, 0.0, active, hot, pressed, false, text, palette,
             );
         }
-        paint_new_tab_button(canvas, layout, hot, palette);
+        paint_new_tab_button(canvas, layout, hot, pressed, palette);
         return;
     };
     let offsets = |index: usize| drag_offsets.get(index).copied().unwrap_or(0.0);
@@ -1115,6 +1291,7 @@ fn paint_tabs(
             offsets(index),
             active,
             hot,
+            pressed,
             true,
             text,
             palette,
@@ -1134,12 +1311,13 @@ fn paint_tabs(
             offsets(index),
             active,
             hot,
+            pressed,
             true,
             text,
             palette,
         );
     }
-    paint_new_tab_button(canvas, layout, hot, palette);
+    paint_new_tab_button(canvas, layout, hot, pressed, palette);
 }
 
 #[allow(
@@ -1154,6 +1332,7 @@ fn paint_one_tab(
     offset: f32,
     active: TabId,
     hot: HitTarget,
+    pressed: Option<HitTarget>,
     dragging: bool,
     text: &impl TextPainter,
     palette: Palette,
@@ -1162,42 +1341,92 @@ fn paint_one_tab(
     let is_active = tab.id == active;
     let is_hot =
         !dragging && matches!(hot, HitTarget::Tab(id) | HitTarget::CloseTab(id) if id == tab.id);
+    let is_pressed = !dragging
+        && matches!(pressed, Some(HitTarget::Tab(id) | HitTarget::CloseTab(id)) if id == tab.id)
+        && is_hot;
+    let tab_pressed = is_pressed && matches!(pressed, Some(HitTarget::Tab(id)) if id == tab.id);
     let background = if is_active {
         palette.toolbar
+    } else if tab_pressed {
+        palette.tab_pressed
     } else if is_hot {
         palette.tab_hover
     } else {
         palette.tab_strip
     };
-    canvas.top_rounded_rect(geometry.bounds, 9.0 * layout.scale, background);
+    canvas.top_rounded_rect(geometry.bounds, layout.tab_radius, background);
+    let size = 13.0 * layout.scale;
     let mut text_x = geometry.bounds.x + 14.0 * layout.scale;
     if tab.loading {
-        let indicator = 7.0 * layout.scale;
-        canvas.rounded_rect(
-            Rect {
-                x: text_x,
-                y: geometry.bounds.y + (geometry.bounds.height - indicator) * 0.5,
-                width: indicator,
-                height: indicator,
+        paint_loading_indicator(
+            canvas,
+            Point {
+                x: text_x + 3.5 * layout.scale,
+                y: geometry.bounds.y + geometry.bounds.height * 0.5,
             },
-            indicator * 0.5,
+            layout.scale,
             palette.accent,
         );
         text_x += 14.0 * layout.scale;
     }
     let max_width = (geometry.close.x - text_x - 5.0 * layout.scale).max(0.0);
-    let title = elide(&tab.title, max_width, 13.0 * layout.scale, text);
+    let title = elide(&tab.title, max_width, size, text);
+    let metrics = text.line_metrics(size);
     text.paint(
         canvas,
         &title,
         Point {
             x: text_x,
-            y: geometry.bounds.y + 9.0 * layout.scale,
+            y: centred_line_top(geometry.bounds, metrics),
         },
-        13.0 * layout.scale,
-        palette.text,
+        size,
+        if is_active {
+            palette.text
+        } else {
+            palette.text_inactive
+        },
     );
-    paint_close_icon(canvas, geometry.close, layout.scale, palette.icon);
+    if geometry.close.width > 0.0 {
+        let close_hot = !dragging && matches!(hot, HitTarget::CloseTab(id) if id == tab.id);
+        let close_pressed = close_hot && is_pressed;
+        if close_hot || close_pressed {
+            canvas.rounded_rect(
+                geometry.close,
+                geometry.close.width * 0.5,
+                if close_pressed {
+                    palette.tab_close_pressed
+                } else {
+                    palette.tab_close_hover
+                },
+            );
+        }
+        paint_close_icon(
+            canvas,
+            geometry.close,
+            layout.scale,
+            if close_pressed {
+                0x00ff_ffff
+            } else {
+                palette.icon
+            },
+        );
+    }
+}
+
+fn paint_loading_indicator(canvas: &mut Canvas<'_>, center: Point, scale: f32, color: u32) {
+    let radius = 3.4 * scale;
+    let start = 0.35_f32;
+    let end = std::f32::consts::TAU - 1.05_f32;
+    let segments = 18;
+    let on_arc = |angle: f32| Point {
+        x: angle.cos().mul_add(radius, center.x),
+        y: angle.sin().mul_add(radius, center.y),
+    };
+    for segment in 0..segments {
+        let first = start + (end - start) * segment as f32 / segments as f32;
+        let second = start + (end - start) * (segment + 1) as f32 / segments as f32;
+        canvas.line(on_arc(first), on_arc(second), 1.3 * scale, color);
+    }
 }
 
 fn translate_tab_geometry(geometry: TabGeometry, offset: f32) -> TabGeometry {
@@ -1221,11 +1450,21 @@ fn paint_new_tab_button(
     canvas: &mut Canvas<'_>,
     layout: &ChromeLayout,
     hot: HitTarget,
+    pressed: Option<HitTarget>,
     palette: Palette,
 ) {
     let plus = layout.new_tab;
     if hot == HitTarget::NewTab {
-        canvas.rounded_rect(plus, 7.0 * layout.scale, palette.tab_hover);
+        let is_pressed = pressed == Some(HitTarget::NewTab);
+        canvas.rounded_rect(
+            plus,
+            7.0 * layout.scale,
+            if is_pressed {
+                palette.tab_pressed
+            } else {
+                palette.tab_hover
+            },
+        );
     }
     let center = Point {
         x: plus.x + plus.width * 0.5,
@@ -1233,26 +1472,26 @@ fn paint_new_tab_button(
     };
     canvas.line(
         Point {
-            x: center.x - 5.0 * layout.scale,
+            x: center.x - 6.0 * layout.scale,
             y: center.y,
         },
         Point {
-            x: center.x + 5.0 * layout.scale,
+            x: center.x + 6.0 * layout.scale,
             y: center.y,
         },
-        1.5 * layout.scale,
+        1.4 * layout.scale,
         palette.icon,
     );
     canvas.line(
         Point {
             x: center.x,
-            y: center.y - 5.0 * layout.scale,
+            y: center.y - 6.0 * layout.scale,
         },
         Point {
             x: center.x,
-            y: center.y + 5.0 * layout.scale,
+            y: center.y + 6.0 * layout.scale,
         },
-        1.5 * layout.scale,
+        1.4 * layout.scale,
         palette.icon,
     );
 }
@@ -1261,15 +1500,49 @@ fn paint_window_controls(
     canvas: &mut Canvas<'_>,
     layout: &ChromeLayout,
     hot: HitTarget,
+    pressed: Option<HitTarget>,
     maximized: bool,
     palette: Palette,
 ) {
+    if layout.control_style.is_traffic_lights() {
+        let group_hot = matches!(hot, HitTarget::WindowControl(_));
+        for geometry in &layout.window_controls {
+            let is_hot = hot == HitTarget::WindowControl(geometry.control);
+            let is_pressed = is_hot && pressed == Some(HitTarget::WindowControl(geometry.control));
+            let base = traffic_light_color(geometry.control);
+            let color = if is_pressed {
+                blend(base, 0x0000_0000, 45)
+            } else {
+                base
+            };
+            let diameter = 12.0 * layout.scale;
+            let circle = Rect {
+                x: geometry.bounds.x + (geometry.bounds.width - diameter) * 0.5,
+                y: geometry.bounds.y + (geometry.bounds.height - diameter) * 0.5,
+                width: diameter,
+                height: diameter,
+            };
+            canvas.rounded_rect(circle, diameter * 0.5, color);
+            if group_hot {
+                paint_traffic_light_glyph(
+                    canvas,
+                    circle,
+                    geometry.control,
+                    blend(base, 0x0000_0000, 150),
+                );
+            }
+        }
+        return;
+    }
     for geometry in &layout.window_controls {
         let is_hot = hot == HitTarget::WindowControl(geometry.control);
+        let is_pressed = is_hot && pressed == Some(HitTarget::WindowControl(geometry.control));
         if is_hot {
             canvas.rect(
                 geometry.bounds,
-                if geometry.control == WindowControl::Close {
+                if is_pressed {
+                    palette.button_pressed
+                } else if geometry.control == WindowControl::Close {
                     palette.close_hover
                 } else {
                     palette.button_hover
@@ -1282,6 +1555,106 @@ fn paint_window_controls(
             palette.icon
         };
         paint_window_control_icon(canvas, *geometry, layout.scale, maximized, icon_color);
+    }
+}
+
+const fn traffic_light_color(control: WindowControl) -> u32 {
+    match control {
+        WindowControl::Close => 0x00ff_5f57,
+        WindowControl::Minimize => 0x00fe_bc2e,
+        WindowControl::MaximizeRestore => 0x0028_c840,
+    }
+}
+
+/// Symbols inside the traffic lights only appear while the pointer is over
+/// the group, matching macOS. They are darker shades of each light rather than
+/// a separate colour so the dots keep their native weight.
+fn paint_traffic_light_glyph(
+    canvas: &mut Canvas<'_>,
+    circle: Rect,
+    control: WindowControl,
+    color: u32,
+) {
+    let center = Point {
+        x: circle.x + circle.width * 0.5,
+        y: circle.y + circle.height * 0.5,
+    };
+    let scale = circle.width / 12.0;
+    let line = 1.1 * scale;
+    match control {
+        WindowControl::Close => {
+            let arm = 2.6 * scale;
+            canvas.line(
+                Point {
+                    x: center.x - arm,
+                    y: center.y - arm,
+                },
+                Point {
+                    x: center.x + arm,
+                    y: center.y + arm,
+                },
+                line,
+                color,
+            );
+            canvas.line(
+                Point {
+                    x: center.x + arm,
+                    y: center.y - arm,
+                },
+                Point {
+                    x: center.x - arm,
+                    y: center.y + arm,
+                },
+                line,
+                color,
+            );
+        }
+        WindowControl::Minimize => canvas.line(
+            Point {
+                x: center.x - 3.2 * scale,
+                y: center.y,
+            },
+            Point {
+                x: center.x + 3.2 * scale,
+                y: center.y,
+            },
+            line,
+            color,
+        ),
+        WindowControl::MaximizeRestore => {
+            let tip = 3.0 * scale;
+            let base = 0.5 * scale;
+            canvas.fill_triangle(
+                Point {
+                    x: center.x - tip,
+                    y: center.y - tip,
+                },
+                Point {
+                    x: center.x - base,
+                    y: center.y - tip,
+                },
+                Point {
+                    x: center.x - tip,
+                    y: center.y - base,
+                },
+                color,
+            );
+            canvas.fill_triangle(
+                Point {
+                    x: center.x + tip,
+                    y: center.y + tip,
+                },
+                Point {
+                    x: center.x + base,
+                    y: center.y + tip,
+                },
+                Point {
+                    x: center.x + tip,
+                    y: center.y + base,
+                },
+                color,
+            );
+        }
     }
 }
 
@@ -1407,12 +1780,37 @@ fn paint_outline_rect(canvas: &mut Canvas<'_>, rect: Rect, thickness: f32, color
     );
 }
 
-fn paint_toolbar(canvas: &mut Canvas<'_>, layout: &ChromeLayout, hot: HitTarget, palette: Palette) {
+fn paint_toolbar(
+    canvas: &mut Canvas<'_>,
+    layout: &ChromeLayout,
+    hot: HitTarget,
+    pressed: Option<HitTarget>,
+    palette: Palette,
+) {
     for button in &layout.buttons {
-        if hot == HitTarget::Toolbar(button.button) {
-            canvas.rounded_rect(button.bounds, 8.0 * layout.scale, palette.button_hover);
+        let enabled = layout.toolbar_button_enabled(button.button);
+        let is_hot = enabled && hot == HitTarget::Toolbar(button.button);
+        if is_hot {
+            canvas.rounded_rect(
+                button.bounds,
+                7.0 * layout.scale,
+                if pressed == Some(HitTarget::Toolbar(button.button)) {
+                    palette.button_pressed
+                } else {
+                    palette.button_hover
+                },
+            );
         }
-        paint_toolbar_icon(canvas, *button, layout.scale, palette.icon);
+        paint_toolbar_icon(
+            canvas,
+            *button,
+            layout.scale,
+            if enabled {
+                palette.icon
+            } else {
+                palette.icon_disabled
+            },
+        );
     }
 }
 
@@ -1420,28 +1818,39 @@ fn paint_address(
     canvas: &mut Canvas<'_>,
     layout: &ChromeLayout,
     editor: &AddressEditor,
+    hot: HitTarget,
     text: &impl TextPainter,
     palette: Palette,
 ) {
-    canvas.rounded_rect(
-        layout.address,
-        layout.address.height * 0.5,
-        if editor.is_focused() {
-            palette.address_focused
-        } else {
-            palette.address
-        },
-    );
+    let radius = (layout.address.height * 0.5).min(8.0 * layout.scale);
     if editor.is_focused() {
-        let border = 1.5 * layout.scale;
-        canvas.rounded_rect(layout.address, layout.address.height * 0.5, palette.accent);
+        let border = (1.5 * layout.scale).max(2.0);
+        canvas.rounded_rect(layout.address, radius, palette.accent);
         canvas.rounded_rect(
             layout.address.inset(border),
-            layout.address.height * 0.5 - border,
+            (radius - border).max(0.0),
             palette.address_focused,
         );
+    } else {
+        // A one-device-pixel border keeps the field distinct from the toolbar
+        // at both 1x and 2x without the heavy browser-style outline.
+        canvas.rounded_rect(layout.address, radius, palette.address_border);
+        canvas.rounded_rect(
+            layout.address.inset(1.0),
+            (radius - 1.0).max(0.0),
+            if hot == HitTarget::AddressBar {
+                palette.address_hover
+            } else {
+                palette.address
+            },
+        );
     }
-    let clip = layout.address.inset(4.0 * layout.scale);
+    let clip = Rect {
+        x: layout.address.x + 4.0 * layout.scale,
+        y: layout.address.y + 2.0 * layout.scale,
+        width: (layout.address.width - 8.0 * layout.scale).max(0.0),
+        height: (layout.address.height - 4.0 * layout.scale).max(0.0),
+    };
     canvas.with_clip(clip, |canvas| {
         paint_address_contents(canvas, layout, editor, text, palette);
     });
@@ -1457,7 +1866,8 @@ fn paint_address_contents(
     let geometry = address_text_geometry(layout, editor, text);
     let size = geometry.size;
     let text_x = geometry.base_x;
-    let text_y = layout.address.y + 10.0 * layout.scale;
+    let metrics = text.line_metrics(size);
+    let line_top = centred_line_top(layout.address, metrics);
     let cursor_prefix = &editor.text()[..editor.cursor()];
     let cursor_width = text.measure(cursor_prefix, size);
     let offset = geometry.offset;
@@ -1467,9 +1877,9 @@ fn paint_address_contents(
         canvas.rounded_rect(
             Rect {
                 x: text_x + offset + prefix,
-                y: layout.address.y + 6.0 * layout.scale,
+                y: line_top,
                 width: selection,
-                height: layout.address.height - 12.0 * layout.scale,
+                height: metrics.line_height(),
             },
             3.0 * layout.scale,
             palette.selection,
@@ -1480,7 +1890,7 @@ fn paint_address_contents(
         editor.text(),
         Point {
             x: text_x + offset,
-            y: text_y,
+            y: line_top,
         },
         size,
         palette.text,
@@ -1490,9 +1900,9 @@ fn paint_address_contents(
         canvas.rect(
             Rect {
                 x: cursor_x,
-                y: layout.address.y + 8.0 * layout.scale,
-                width: 1.5 * layout.scale,
-                height: layout.address.height - 16.0 * layout.scale,
+                y: line_top + layout.scale,
+                width: layout.scale.max(1.0),
+                height: (metrics.line_height() - 2.0 * layout.scale).max(1.0),
             },
             palette.accent,
         );
@@ -1502,7 +1912,7 @@ fn paint_address_contents(
                 editor.preedit(),
                 Point {
                     x: cursor_x,
-                    y: text_y,
+                    y: line_top,
                 },
                 size,
                 palette.text,
@@ -1523,9 +1933,9 @@ fn address_text_geometry(
     editor: &AddressEditor,
     text: &impl TextPainter,
 ) -> AddressTextGeometry {
-    let size = 14.0 * layout.scale;
-    let base_x = layout.address.x + 16.0 * layout.scale;
-    let available = (layout.address.width - 32.0 * layout.scale).max(0.0);
+    let size = 13.0 * layout.scale;
+    let base_x = layout.address.x + 12.0 * layout.scale;
+    let available = (layout.address.width - 24.0 * layout.scale).max(0.0);
     let cursor_width = text.measure(&editor.text()[..editor.cursor()], size);
     let full_width = text.measure(editor.text(), size);
     let offset = if cursor_width > available - 8.0 * layout.scale {
@@ -1596,22 +2006,26 @@ pub fn paint_address_context_menu(
         palette.menu_background,
     );
     let font_size = 13.0 * scale;
+    let metrics = text.line_metrics(font_size);
     for item in &menu.items {
         if item.enabled && item.bounds.contains(pointer) {
             canvas.rounded_rect(item.bounds, 4.0 * scale, palette.menu_hover);
         }
-        let color = if item.enabled {
-            palette.text
-        } else {
+        let color = if !item.enabled {
             palette.menu_disabled
+        } else if item.bounds.contains(pointer) {
+            0x00ff_ffff
+        } else {
+            palette.text
         };
+        let label_top = centred_line_top(item.bounds, metrics);
         let label = address_command_label(item.command);
         text.paint(
             canvas,
             label,
             Point {
                 x: item.bounds.x + 10.0 * scale,
-                y: item.bounds.y + 7.0 * scale,
+                y: label_top,
             },
             font_size,
             color,
@@ -1624,10 +2038,18 @@ pub fn paint_address_context_menu(
                 shortcut,
                 Point {
                     x: item.bounds.x + item.bounds.width - shortcut_width - 10.0 * scale,
-                    y: item.bounds.y + 7.0 * scale,
+                    y: label_top,
                 },
                 font_size,
                 color,
+            );
+        }
+        if matches!(item.command, AddressCommand::Redo | AddressCommand::Delete) {
+            canvas.hairline(
+                item.bounds.y + item.bounds.height + 2.5 * scale,
+                menu.bounds.x + 8.0 * scale,
+                menu.bounds.width - 16.0 * scale,
+                palette.menu_separator,
             );
         }
     }
@@ -1646,19 +2068,32 @@ const fn address_command_label(command: AddressCommand) -> &'static str {
 }
 
 const fn address_command_shortcut(command: AddressCommand) -> &'static str {
-    match command {
-        AddressCommand::Undo => "Ctrl+Z",
-        AddressCommand::Redo => "Ctrl+Y",
-        AddressCommand::Cut => "Ctrl+X",
-        AddressCommand::Copy => "Ctrl+C",
-        AddressCommand::Paste => "Ctrl+V",
-        AddressCommand::Delete => "",
-        AddressCommand::SelectAll => "Ctrl+A",
+    // Native menu glyphs on macOS; accelerator text elsewhere.
+    if cfg!(target_os = "macos") {
+        match command {
+            AddressCommand::Undo => "⌘Z",
+            AddressCommand::Redo => "⇧⌘Z",
+            AddressCommand::Cut => "⌘X",
+            AddressCommand::Copy => "⌘C",
+            AddressCommand::Paste => "⌘V",
+            AddressCommand::Delete => "",
+            AddressCommand::SelectAll => "⌘A",
+        }
+    } else {
+        match command {
+            AddressCommand::Undo => "Ctrl+Z",
+            AddressCommand::Redo => "Ctrl+Y",
+            AddressCommand::Cut => "Ctrl+X",
+            AddressCommand::Copy => "Ctrl+C",
+            AddressCommand::Paste => "Ctrl+V",
+            AddressCommand::Delete => "",
+            AddressCommand::SelectAll => "Ctrl+A",
+        }
     }
 }
 
 fn paint_close_icon(canvas: &mut Canvas<'_>, rect: Rect, scale: f32, color: u32) {
-    let inset = 8.0 * scale;
+    let inset = rect.width * 0.3;
     canvas.line(
         Point {
             x: rect.x + inset,
@@ -1695,7 +2130,7 @@ fn paint_toolbar_icon(canvas: &mut Canvas<'_>, geometry: ButtonGeometry, scale: 
         x: bounds.x + bounds.width * 0.5,
         y: bounds.y + bounds.height * 0.5,
     };
-    let line = 1.7 * scale;
+    let line = 1.5 * scale;
     match geometry.button {
         ToolbarButton::Back | ToolbarButton::Forward => {
             // `direction` is where the arrow points: -1 for Back, +1 for
@@ -1707,11 +2142,11 @@ fn paint_toolbar_icon(canvas: &mut Canvas<'_>, geometry: ButtonGeometry, scale: 
                 1.0
             };
             let tail = Point {
-                x: center.x - 6.0 * direction * scale,
+                x: center.x - 7.0 * direction * scale,
                 y: center.y,
             };
             let tip = Point {
-                x: center.x + 6.0 * direction * scale,
+                x: center.x + 7.0 * direction * scale,
                 y: center.y,
             };
             canvas.line(tail, tip, line, color);
@@ -1719,7 +2154,7 @@ fn paint_toolbar_icon(canvas: &mut Canvas<'_>, geometry: ButtonGeometry, scale: 
                 tip,
                 Point {
                     x: center.x + direction * scale,
-                    y: center.y - 5.0 * scale,
+                    y: center.y - 5.5 * scale,
                 },
                 line,
                 color,
@@ -1728,7 +2163,7 @@ fn paint_toolbar_icon(canvas: &mut Canvas<'_>, geometry: ButtonGeometry, scale: 
                 tip,
                 Point {
                     x: center.x + direction * scale,
-                    y: center.y + 5.0 * scale,
+                    y: center.y + 5.5 * scale,
                 },
                 line,
                 color,
@@ -1737,10 +2172,10 @@ fn paint_toolbar_icon(canvas: &mut Canvas<'_>, geometry: ButtonGeometry, scale: 
         ToolbarButton::Reload => {
             // A clockwise arc open on the right, with a solid head at its
             // upper-right end pointing along the direction of travel.
-            let radius = 6.0 * scale;
+            let radius = 6.8 * scale;
             let start = 0.5_f32;
             let end = std::f32::consts::TAU - 0.5_f32;
-            let segments = 32;
+            let segments = 40;
             let on_arc = |angle: f32| Point {
                 x: angle.cos().mul_add(radius, center.x),
                 y: angle.sin().mul_add(radius, center.y),
@@ -1780,12 +2215,12 @@ fn paint_toolbar_icon(canvas: &mut Canvas<'_>, geometry: ButtonGeometry, scale: 
         ToolbarButton::Home => {
             canvas.line(
                 Point {
-                    x: center.x - 7.0 * scale,
+                    x: center.x - 8.0 * scale,
                     y: center.y,
                 },
                 Point {
                     x: center.x,
-                    y: center.y - 6.0 * scale,
+                    y: center.y - 7.0 * scale,
                 },
                 line,
                 color,
@@ -1793,10 +2228,10 @@ fn paint_toolbar_icon(canvas: &mut Canvas<'_>, geometry: ButtonGeometry, scale: 
             canvas.line(
                 Point {
                     x: center.x,
-                    y: center.y - 6.0 * scale,
+                    y: center.y - 7.0 * scale,
                 },
                 Point {
-                    x: center.x + 7.0 * scale,
+                    x: center.x + 8.0 * scale,
                     y: center.y,
                 },
                 line,
@@ -1804,35 +2239,35 @@ fn paint_toolbar_icon(canvas: &mut Canvas<'_>, geometry: ButtonGeometry, scale: 
             );
             canvas.line(
                 Point {
-                    x: center.x - 5.0 * scale,
+                    x: center.x - 6.0 * scale,
                     y: center.y - 1.0 * scale,
                 },
                 Point {
-                    x: center.x - 5.0 * scale,
-                    y: center.y + 7.0 * scale,
+                    x: center.x - 6.0 * scale,
+                    y: center.y + 8.0 * scale,
                 },
                 line,
                 color,
             );
             canvas.line(
                 Point {
-                    x: center.x - 5.0 * scale,
-                    y: center.y + 7.0 * scale,
+                    x: center.x - 6.0 * scale,
+                    y: center.y + 8.0 * scale,
                 },
                 Point {
-                    x: center.x + 5.0 * scale,
-                    y: center.y + 7.0 * scale,
+                    x: center.x + 6.0 * scale,
+                    y: center.y + 8.0 * scale,
                 },
                 line,
                 color,
             );
             canvas.line(
                 Point {
-                    x: center.x + 5.0 * scale,
-                    y: center.y + 7.0 * scale,
+                    x: center.x + 6.0 * scale,
+                    y: center.y + 8.0 * scale,
                 },
                 Point {
-                    x: center.x + 5.0 * scale,
+                    x: center.x + 6.0 * scale,
                     y: center.y - 1.0 * scale,
                 },
                 line,
@@ -1938,59 +2373,91 @@ struct Palette {
     tab_strip: u32,
     toolbar: u32,
     tab_hover: u32,
+    tab_pressed: u32,
     button_hover: u32,
+    button_pressed: u32,
     address: u32,
+    address_hover: u32,
     address_focused: u32,
+    address_border: u32,
     text: u32,
+    text_inactive: u32,
     icon: u32,
+    icon_disabled: u32,
     accent: u32,
     selection: u32,
+    separator: u32,
     close_hover: u32,
+    tab_close_hover: u32,
+    tab_close_pressed: u32,
     menu_background: u32,
     menu_border: u32,
     menu_hover: u32,
     menu_disabled: u32,
     menu_shadow: u32,
+    menu_separator: u32,
 }
 
 impl Palette {
     const fn new(theme: ChromeTheme) -> Self {
         match theme {
             ChromeTheme::Light => Self {
-                tab_strip: 0x00e8_eaf0,
-                toolbar: 0x00f8_f9fb,
-                tab_hover: 0x00d9_dde5,
-                button_hover: 0x00e6_e9ef,
-                address: 0x00ea_ecf1,
+                // macOS light-mode window chrome: cool toolbar, slightly
+                // darker tab well, system blue accent.
+                tab_strip: 0x00e9_ebf0,
+                toolbar: 0x00f6_f7f9,
+                tab_hover: 0x00dd_e0e6,
+                tab_pressed: 0x00d2_d6dd,
+                button_hover: 0x00e4_e7ec,
+                button_pressed: 0x00d7_dbe2,
+                address: 0x00ec_eef2,
+                address_hover: 0x00f1_f3f6,
                 address_focused: 0x00ff_ffff,
-                text: 0x0020_2430,
-                icon: 0x004c_5361,
-                accent: 0x001a_73e8,
-                selection: 0x00c9_defa,
-                close_hover: 0x00e8_1148,
+                address_border: 0x00d5_d9df,
+                text: 0x001d_1d1f,
+                text_inactive: 0x005e_6167,
+                icon: 0x004b_5058,
+                icon_disabled: 0x00a8_adb6,
+                accent: 0x0000_7aff,
+                selection: 0x00b3_d7ff,
+                separator: 0x00d0_d4da,
+                close_hover: 0x00ff_5f57,
+                tab_close_hover: 0x00d5_d8de,
+                tab_close_pressed: 0x00ff_5f57,
                 menu_background: 0x00ff_ffff,
                 menu_border: 0x00c9_cdd5,
-                menu_hover: 0x00e8_eef8,
+                menu_hover: 0x0000_7aff,
                 menu_disabled: 0x0093_98a3,
                 menu_shadow: 0x006e_727a,
+                menu_separator: 0x00e2_e4e8,
             },
             ChromeTheme::Dark => Self {
-                tab_strip: 0x001e_2026,
-                toolbar: 0x002b_2e35,
-                tab_hover: 0x0037_3b44,
-                button_hover: 0x003c_4049,
-                address: 0x001f_2228,
-                address_focused: 0x0018_1a1f,
-                text: 0x00ed_eff4,
-                icon: 0x00c6_cad3,
-                accent: 0x006e_a8fe,
-                selection: 0x0033_5f95,
-                close_hover: 0x00c4_2b1c,
+                tab_strip: 0x001c_1c1e,
+                toolbar: 0x002c_2c2e,
+                tab_hover: 0x003a_3a3c,
+                tab_pressed: 0x0048_484a,
+                button_hover: 0x003a_3a3c,
+                button_pressed: 0x0048_484a,
+                address: 0x001f_1f21,
+                address_hover: 0x0024_2426,
+                address_focused: 0x001a_1a1c,
+                address_border: 0x003d_3d40,
+                text: 0x00f5_f5f7,
+                text_inactive: 0x00a9_adb5,
+                icon: 0x00c7_c7cc,
+                icon_disabled: 0x005b_5f68,
+                accent: 0x000a_84ff,
+                selection: 0x003b_5f8a,
+                separator: 0x003a_3a3c,
+                close_hover: 0x00ff_5f57,
+                tab_close_hover: 0x0048_484a,
+                tab_close_pressed: 0x00ff_5f57,
                 menu_background: 0x002b_2e35,
                 menu_border: 0x004b_505b,
-                menu_hover: 0x003c_4657,
+                menu_hover: 0x000a_84ff,
                 menu_disabled: 0x007d_828c,
                 menu_shadow: 0x000c_0d0f,
+                menu_separator: 0x003d_3d40,
             },
         }
     }
@@ -2002,8 +2469,8 @@ impl Palette {
 #[must_use]
 pub const fn focus_accent(theme: ChromeTheme) -> u32 {
     match theme {
-        ChromeTheme::Light => 0x001a_73e8,
-        ChromeTheme::Dark => 0x006e_a8fe,
+        ChromeTheme::Light => 0x0000_7aff,
+        ChromeTheme::Dark => 0x000a_84ff,
     }
 }
 
@@ -2020,12 +2487,21 @@ fn blend(background: u32, foreground: u32, alpha: u8) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::float_cmp,
+        reason = "test window and chrome coordinates are small finite physical pixels"
+    )]
+
     use std::time::Duration;
 
     use super::{
-        AddressClickTracker, AddressContextMenu, ButtonGeometry, Canvas, ChromeLayout, HitTarget,
-        Point, Rect, TabDrag, TextPainter, TitleBarClickTracker, TitleBarGesture, ToolbarButton,
-        WindowAction, WindowControl, address_index_at_x, clamp_interval, paint_toolbar_icon,
+        AddressClickTracker, AddressContextMenu, ButtonGeometry, Canvas, ChromeLayout, ChromeTheme,
+        HitTarget, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH, Point, Rect, TabDrag, TextLineMetrics,
+        TextPainter, TitleBarClickTracker, TitleBarGesture, ToolbarButton, WindowAction,
+        WindowControl, WindowControlStyle, address_command_shortcut, address_index_at_x,
+        centred_line_top, paint_chrome, paint_toolbar_icon,
     };
     use crate::editor::{AddressCommand, AddressEditor};
     use crate::model::{TabIntent, TabModel};
@@ -2384,8 +2860,8 @@ mod tests {
         let editor = AddressEditor::new("ab中");
         for (scale, width, height) in [(1.0, 800, 600), (1.5, 1_200, 900), (2.0, 1_600, 1_200)] {
             let layout = ChromeLayout::new(width, height, scale, tabs.tabs());
-            let origin = layout.address.x + 16.0 * scale;
-            let advance = 14.0 * scale;
+            let origin = layout.address.x + 12.0 * scale;
+            let advance = 13.0 * scale;
             assert_eq!(
                 address_index_at_x(&layout, &editor, origin - 20.0, &text),
                 0
@@ -2453,19 +2929,33 @@ mod tests {
         assert!(menu.bounds.y >= 0.0);
         assert!(menu.bounds.x + menu.bounds.width <= 800.0);
         assert!(menu.bounds.y + menu.bounds.height <= 600.0);
-        assert_eq!(menu.items.len(), 6);
+        assert_eq!(menu.items.len(), 7);
         let paste = menu
             .items
             .iter()
             .find(|item| item.command == AddressCommand::Paste)
             .expect("paste item");
         assert!(!paste.enabled);
+        assert!(
+            menu.items
+                .iter()
+                .any(|item| item.command == AddressCommand::Redo),
+            "native edit menus group Undo and Redo"
+        );
         assert_eq!(
             menu.item_at(Point {
                 x: paste.bounds.x + 1.0,
                 y: paste.bounds.y + 1.0,
             }),
             Some(*paste)
+        );
+        assert_eq!(
+            address_command_shortcut(AddressCommand::Undo),
+            if cfg!(target_os = "macos") {
+                "⌘Z"
+            } else {
+                "Ctrl+Z"
+            }
         );
     }
 
@@ -2477,8 +2967,17 @@ mod tests {
         }
         let layout = ChromeLayout::new(560, 360, 1.0, tabs.tabs());
         for tab in &layout.tabs {
+            assert_eq!(
+                tab.close.width, 0.0,
+                "a sliver-wide tab must not expose a close target"
+            );
             assert!(tab.close.x >= tab.bounds.x);
             assert!(tab.close.x + tab.close.width <= tab.bounds.x + tab.bounds.width);
+            let center = Point {
+                x: tab.bounds.x + tab.bounds.width * 0.5,
+                y: tab.bounds.y + tab.bounds.height - 1.0,
+            };
+            assert_eq!(layout.hit_test(center), HitTarget::Tab(tab.id));
         }
     }
 
@@ -2496,11 +2995,319 @@ mod tests {
         }
     }
 
+    fn paint_test_frame(
+        layout: &ChromeLayout,
+        tabs: &TabModel,
+        editor: &AddressEditor,
+        hot: HitTarget,
+        pressed: Option<HitTarget>,
+    ) -> Vec<u32> {
+        let width = layout.content.width as u32;
+        let height = layout.chrome_height;
+        let mut pixels = vec![0; width as usize * height as usize];
+        let mut canvas = Canvas::new(&mut pixels, width, height);
+        paint_chrome(
+            &mut canvas,
+            layout,
+            tabs.tabs(),
+            tabs.active_id(),
+            editor,
+            ChromeTheme::Light,
+            hot,
+            pressed,
+            false,
+            None,
+            &FixedText,
+        );
+        pixels
+    }
+
     #[test]
-    fn subpixel_rounding_can_collapse_an_inverted_interval() {
-        let result = clamp_interval(54.0, 54.0, 53.999_996);
-        assert!(result.is_finite());
-        assert!((53.999_996..=54.0).contains(&result));
+    fn macos_traffic_lights_lead_the_strip_and_never_overlap_tabs() {
+        let tabs = TabModel::new("One", "about:home");
+        let layout = ChromeLayout::new_with_control_style(
+            2_360,
+            1_560,
+            2.0,
+            tabs.tabs(),
+            WindowControlStyle::TrafficLights,
+        );
+        assert_eq!(layout.window_controls.len(), 3);
+        assert_eq!(
+            layout.window_controls[0].control,
+            WindowControl::Close,
+            "traffic lights run close/minimise/zoom from the leading edge"
+        );
+        assert_eq!(
+            layout.window_controls[2].control,
+            WindowControl::MaximizeRestore
+        );
+        let last = layout.window_controls[2].bounds;
+        assert!(
+            last.x + last.width <= layout.tabs[0].bounds.x,
+            "tabs must start after the traffic-light group"
+        );
+        assert_eq!(layout.tabs[0].bounds.x, 82.0 * 2.0);
+        let light_center =
+            layout.window_controls[0].bounds.y + layout.window_controls[0].bounds.height * 0.5;
+        let tab_center = layout.tabs[0].bounds.y + layout.tabs[0].bounds.height * 0.5;
+        assert!(
+            (light_center - tab_center).abs() < 0.01,
+            "traffic lights share the tab's optical centre"
+        );
+        // Every light has a full-size hit target centred on its painted dot.
+        for geometry in &layout.window_controls {
+            assert_eq!(
+                layout.hit_test(Point {
+                    x: geometry.bounds.x + geometry.bounds.width * 0.5,
+                    y: geometry.bounds.y + geometry.bounds.height * 0.5,
+                }),
+                HitTarget::WindowControl(geometry.control)
+            );
+        }
+        assert!(layout.title_bar.width > 0.0);
+        assert_eq!(layout.chrome_height, 180);
+        assert_eq!(layout.tab_strip_height, 80.0);
+    }
+
+    #[test]
+    fn caption_controls_stay_at_the_trailing_edge_on_windows_and_linux() {
+        let tabs = TabModel::new("One", "about:home");
+        let layout = ChromeLayout::new_with_control_style(
+            2_360,
+            1_560,
+            2.0,
+            tabs.tabs(),
+            WindowControlStyle::CaptionButtons,
+        );
+        assert_eq!(layout.window_controls[0].control, WindowControl::Minimize);
+        assert_eq!(layout.window_controls[2].control, WindowControl::Close);
+        let last = layout.window_controls[2].bounds;
+        assert!((last.x + last.width - 2_360.0).abs() < 0.01);
+        assert_eq!(layout.tabs[0].bounds.x, 12.0 * 2.0);
+    }
+
+    #[test]
+    fn disabled_back_keeps_its_slot_but_has_no_hit_target_or_hover() {
+        let tabs = TabModel::new("One", "about:home");
+        let mut layout = ChromeLayout::new(2_360, 1_560, 2.0, tabs.tabs());
+        layout.set_history_available(false, false);
+        let back = layout
+            .buttons
+            .iter()
+            .find(|button| button.button == ToolbarButton::Back)
+            .expect("back slot")
+            .bounds;
+        let center = Point {
+            x: back.x + back.width * 0.5,
+            y: back.y + back.height * 0.5,
+        };
+        assert_eq!(layout.hit_test(center), HitTarget::Chrome);
+        assert!(!layout.toolbar_button_enabled(ToolbarButton::Back));
+        layout.set_history_available(true, true);
+        assert_eq!(
+            layout.hit_test(center),
+            HitTarget::Toolbar(ToolbarButton::Back)
+        );
+        assert!(layout.toolbar_button_enabled(ToolbarButton::Back));
+    }
+
+    #[test]
+    fn separators_and_active_tab_meet_on_device_pixel_rows() {
+        let tabs = TabModel::new("One", "about:home");
+        let layout = ChromeLayout::new(2_360, 1_560, 2.0, tabs.tabs());
+        let editor = AddressEditor::new("render://home");
+        let pixels = paint_test_frame(&layout, &tabs, &editor, HitTarget::Chrome, None);
+        let width = layout.content.width as usize;
+        let separator = 0x00d0_d4da;
+        let bottom = layout.chrome_height as usize - 1;
+        assert_eq!(pixels[bottom * width], separator);
+        assert_eq!(pixels[bottom * width + width - 1], separator);
+        assert_eq!(pixels[(bottom - 1) * width + 1_000], 0x00f6_f7f9);
+        let strip = layout.tab_strip_height as usize - 1;
+        assert_eq!(pixels[strip * width + 2_000], separator);
+        let active_tab_center_x =
+            (layout.tabs[0].bounds.x + layout.tabs[0].bounds.width * 0.5) as usize;
+        assert_eq!(
+            pixels[strip * width + active_tab_center_x],
+            0x00f6_f7f9,
+            "the active tab covers the strip hairline"
+        );
+    }
+
+    #[test]
+    fn rounded_corners_have_antialiased_coverage() {
+        let mut pixels = vec![0x00ff_ffff; 20 * 20];
+        let mut canvas = Canvas::new(&mut pixels, 20, 20);
+        canvas.rounded_rect(
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            5.0,
+            0x0000_0000,
+        );
+        assert_eq!(pixels[5 * 20 + 5], 0x0000_0000);
+        let corner = pixels[20 + 1];
+        assert_ne!(corner, 0x00ff_ffff);
+        assert_ne!(corner, 0x0000_0000);
+    }
+
+    #[test]
+    fn address_focus_ring_uses_the_native_accent() {
+        let tabs = TabModel::new("One", "about:home");
+        let layout = ChromeLayout::new(2_360, 1_560, 2.0, tabs.tabs());
+        let mut editor = AddressEditor::new("render://home");
+        let unfocused = paint_test_frame(&layout, &tabs, &editor, HitTarget::Chrome, None);
+        editor.set_focused(true);
+        let focused = paint_test_frame(&layout, &tabs, &editor, HitTarget::Chrome, None);
+        let accent = 0x0000_7aff;
+        assert!(!unfocused.contains(&accent));
+        assert!(
+            focused.iter().filter(|pixel| **pixel == accent).count() > 100,
+            "focus ring must be visible around the whole field"
+        );
+    }
+
+    #[test]
+    fn close_and_toolbar_controls_react_to_hover_and_press() {
+        let mut tabs = TabModel::new("One", "about:home");
+        let active = tabs.active_id();
+        tabs.apply(TabIntent::New);
+        let layout = ChromeLayout::new(2_360, 1_560, 2.0, tabs.tabs());
+        let editor = AddressEditor::new("render://home");
+        let close = layout.tabs[0].close;
+        let sample = Point {
+            x: close.x + 3.0 * layout.scale,
+            y: close.y + 3.0 * layout.scale,
+        };
+        let index = sample.y as usize * layout.content.width as usize + sample.x as usize;
+        let tab_hot = paint_test_frame(&layout, &tabs, &editor, HitTarget::Tab(active), None);
+        let close_hot =
+            paint_test_frame(&layout, &tabs, &editor, HitTarget::CloseTab(active), None);
+        let close_pressed = paint_test_frame(
+            &layout,
+            &tabs,
+            &editor,
+            HitTarget::CloseTab(active),
+            Some(HitTarget::CloseTab(active)),
+        );
+        assert_ne!(tab_hot[index], close_hot[index]);
+        let red_sample = Point {
+            x: close.x + 4.0,
+            y: close.y + close.height * 0.5,
+        };
+        let red_index =
+            red_sample.y as usize * layout.content.width as usize + red_sample.x as usize;
+        assert_eq!(
+            close_pressed[red_index], 0x00ff_5f57,
+            "pressed close target turns system red"
+        );
+
+        let reload = layout
+            .buttons
+            .iter()
+            .find(|button| button.button == ToolbarButton::Reload)
+            .expect("reload");
+        let sample = Point {
+            x: reload.bounds.x + 4.0,
+            y: reload.bounds.y + 4.0,
+        };
+        let index = sample.y as usize * layout.content.width as usize + sample.x as usize;
+        let hovered = paint_test_frame(
+            &layout,
+            &tabs,
+            &editor,
+            HitTarget::Toolbar(ToolbarButton::Reload),
+            None,
+        );
+        let pressed = paint_test_frame(
+            &layout,
+            &tabs,
+            &editor,
+            HitTarget::Toolbar(ToolbarButton::Reload),
+            Some(HitTarget::Toolbar(ToolbarButton::Reload)),
+        );
+        assert_ne!(hovered[index], pressed[index]);
+    }
+
+    #[test]
+    fn hovering_one_traffic_light_reveals_the_whole_group_symbols() {
+        let tabs = TabModel::new("One", "about:home");
+        let layout = ChromeLayout::new_with_control_style(
+            2_360,
+            1_560,
+            2.0,
+            tabs.tabs(),
+            WindowControlStyle::TrafficLights,
+        );
+        let editor = AddressEditor::new("render://home");
+        let base = paint_test_frame(&layout, &tabs, &editor, HitTarget::Chrome, None);
+        let hot = paint_test_frame(
+            &layout,
+            &tabs,
+            &editor,
+            HitTarget::WindowControl(WindowControl::Minimize),
+            None,
+        );
+        let width = layout.content.width as usize;
+        for geometry in &layout.window_controls {
+            let left = geometry.bounds.x as usize;
+            let right = (geometry.bounds.x + geometry.bounds.width) as usize;
+            let top = geometry.bounds.y as usize;
+            let bottom = (geometry.bounds.y + geometry.bounds.height) as usize;
+            let changed = (top..bottom)
+                .flat_map(|y| (left..right).map(move |x| y * width + x))
+                .filter(|index| base[*index] != hot[*index])
+                .count();
+            assert!(
+                changed > 4,
+                "symbols for {:?} should appear on group hover",
+                geometry.control
+            );
+        }
+    }
+
+    #[test]
+    fn chrome_centreline_rounds_to_the_device_pixel_grid() {
+        let top = centred_line_top(
+            Rect {
+                x: 0.0,
+                y: 10.0,
+                width: 100.0,
+                height: 30.0,
+            },
+            TextLineMetrics {
+                ascent: 10.0,
+                descent: 3.0,
+            },
+        );
+        assert!((top - 19.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn minimum_window_geometry_keeps_every_control_inside_the_picture() {
+        let mut tabs = TabModel::new("One", "about:home");
+        for _ in 0..6 {
+            tabs.apply(TabIntent::New);
+        }
+        let min_width = (MIN_WINDOW_WIDTH * 2.0) as u32;
+        let min_height = (MIN_WINDOW_HEIGHT * 2.0) as u32;
+        for width in [2_360_u32, 1_600, min_width] {
+            let layout = ChromeLayout::new(width, min_height, 2.0, tabs.tabs());
+            assert!(layout.chrome_height <= min_height);
+            assert!(layout.address.x + layout.address.width <= width as f32 + 0.01);
+            for button in &layout.buttons {
+                assert!(button.bounds.x + button.bounds.width <= width as f32 + 0.01);
+            }
+            for tab in &layout.tabs {
+                assert!(tab.close.x + tab.close.width <= tab.bounds.x + tab.bounds.width + 0.01);
+            }
+            assert!(!layout.title_bar.width.is_nan());
+            assert!(layout.title_bar.width >= 0.0);
+        }
     }
 }
 

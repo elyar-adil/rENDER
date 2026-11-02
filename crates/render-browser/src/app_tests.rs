@@ -62,6 +62,8 @@ use crate::render_worker::merge_current_style_sheets;
 use render_browser::chrome::ChromeLayout;
 use render_browser::chrome::HitTarget;
 use render_browser::chrome::Point;
+use render_browser::chrome::ToolbarButton;
+use render_browser::chrome::WindowControl;
 use render_browser::editor::AddressCommand;
 use render_browser::editor::AddressEditor;
 use render_browser::font_backend::SystemFontBackend;
@@ -131,6 +133,7 @@ fn test_render_identity(
         device_scale: 1.0,
         external_styles_generation: 0,
         animation_time_millis: 0,
+        dark_mode: false,
     }
 }
 
@@ -2733,6 +2736,7 @@ fn headless_app_with_render_worker(
         theme: render_browser::chrome::ChromeTheme::Light,
         cursor: Point { x: 0.0, y: 0.0 },
         hot: HitTarget::Chrome,
+        pressed: None,
         cursor_icon: winit::window::CursorIcon::Default,
         drag: None,
         tab_drag_paint: None,
@@ -4290,5 +4294,31 @@ fn a_hover_change_during_scroll_keeps_the_composited_frame() {
     assert_eq!(
         app.pages[&tab].frame.len(),
         viewport.width as usize * viewport.height as usize
+    );
+}
+
+#[test]
+fn chrome_buttons_use_the_arrow_cursor_while_the_address_field_uses_text() {
+    let (mut app, _tab) = headless_app_with("<main>cursor</main>");
+    app.hot = HitTarget::Toolbar(ToolbarButton::Reload);
+    assert_eq!(app.hover_cursor_icon(), winit::window::CursorIcon::Default);
+    app.hot = HitTarget::NewTab;
+    assert_eq!(app.hover_cursor_icon(), winit::window::CursorIcon::Default);
+    app.hot = HitTarget::WindowControl(WindowControl::Close);
+    assert_eq!(app.hover_cursor_icon(), winit::window::CursorIcon::Default);
+    app.hot = HitTarget::AddressBar;
+    assert_eq!(app.hover_cursor_icon(), winit::window::CursorIcon::Text);
+}
+
+#[test]
+fn switching_appearance_invalidates_the_retained_page_raster() {
+    let (mut app, tab) = headless_app_with("<main>theme</main>");
+    assert_eq!(app.theme, render_browser::chrome::ChromeTheme::Light);
+    app.pages.get_mut(&tab).expect("page").compositor = Some(simple_compositor());
+    app.apply_chrome_theme(render_browser::chrome::ChromeTheme::Dark);
+    assert_eq!(app.theme, render_browser::chrome::ChromeTheme::Dark);
+    assert!(
+        app.pages[&tab].compositor.is_none(),
+        "the old raster was painted with the previous palette"
     );
 }

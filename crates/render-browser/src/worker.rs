@@ -34,6 +34,10 @@ pub struct RenderIdentity {
     /// CSS animation timeline position for this frame, in milliseconds since
     /// the document started. The render worker samples `@keyframes` there.
     pub animation_time_millis: u32,
+    /// The window's effective dark appearance. Pages receive it as
+    /// `prefers-color-scheme` and the system palette, exactly as they receive
+    /// the window's DPR.
+    pub dark_mode: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -590,6 +594,7 @@ mod tests {
             device_scale: 1.0,
             external_styles_generation: 3,
             animation_time_millis: 0,
+            dark_mode: false,
         }
     }
 

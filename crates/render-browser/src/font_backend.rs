@@ -124,7 +124,7 @@ use render_core::paint::{
     TextShaper,
 };
 
-use crate::chrome::{Canvas, Point, TextPainter};
+use crate::chrome::{Canvas, Point, TextLineMetrics, TextPainter};
 use crate::font_faces::{DocumentFonts, DocumentRule, ResolvedSource};
 use crate::font_matching::{Face, FaceTable, Family, FamilyWalk};
 
@@ -1404,6 +1404,18 @@ impl TextPainter for SystemFontBackend {
                     .map_or(0.0, |(font, _, _)| advance_of(&font, character, size))
             })
             .sum()
+    }
+
+    fn line_metrics(&self, size: f32) -> TextLineMetrics {
+        let instance = self.resolve(&FontRequest::initial());
+        let (ascent, descent) = self.face_for(&instance, ' ').map_or_else(
+            || {
+                let face = NominalFace::Proportional;
+                (face.ascent_em() * size, face.descent_em() * size)
+            },
+            |(font, _, _)| line_metrics(&font, size),
+        );
+        TextLineMetrics { ascent, descent }
     }
 
     #[allow(

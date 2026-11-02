@@ -329,6 +329,7 @@ mod tests {
             device_scale: 1.0,
             external_styles_generation: 0,
             animation_time_millis: 0,
+            dark_mode: false,
         }
     }
 

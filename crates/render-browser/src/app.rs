@@ -61,6 +61,8 @@ use render_browser::chrome::Canvas;
 use render_browser::chrome::ChromeLayout;
 use render_browser::chrome::ChromeTheme;
 use render_browser::chrome::HitTarget;
+use render_browser::chrome::MIN_WINDOW_HEIGHT;
+use render_browser::chrome::MIN_WINDOW_WIDTH;
 use render_browser::chrome::Point;
 use render_browser::chrome::Rect;
 use render_browser::chrome::ScrollbarGeometry;
@@ -287,6 +289,9 @@ pub(super) struct BrowserApp {
     pub(super) theme: ChromeTheme,
     pub(super) cursor: Point,
     pub(super) hot: HitTarget,
+    /// Chrome control held by the primary button. Painted darker for the
+    /// duration of the press, and cleared on release or focus loss.
+    pub(super) pressed: Option<HitTarget>,
     pub(super) cursor_icon: CursorIcon,
     pub(super) drag: Option<TabDrag>,
     /// Live tab-drag paint state: the dragged tab and per-tab paint offsets.
@@ -393,6 +398,7 @@ impl BrowserApp {
             theme: ChromeTheme::Light,
             cursor: Point::default(),
             hot: HitTarget::Chrome,
+            pressed: None,
             cursor_icon: CursorIcon::Default,
             drag: None,
             tab_drag_paint: None,
@@ -428,7 +434,7 @@ impl BrowserApp {
                 f64::from(INITIAL_WIDTH),
                 f64::from(INITIAL_HEIGHT),
             ))
-            .with_min_inner_size(LogicalSize::new(560.0, 360.0))
+            .with_min_inner_size(LogicalSize::new(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT))
             // A screenshot run is a measurement, not an interactive session:
             // keep the window off screen so it cannot steal focus or cover
             // other work while the page settles.
@@ -436,6 +442,15 @@ impl BrowserApp {
             .with_active(self.screenshot.is_none());
         let window = Arc::new(event_loop.create_window(attributes)?);
         self.theme = window.theme().map_or(ChromeTheme::Light, theme_from_winit);
+        // Diagnostic/screenshot override for verifying both palettes without
+        // changing the user's system appearance.
+        if let Ok(value) = env::var("RENDER_CHROME_THEME") {
+            match value.as_str() {
+                "dark" => self.theme = ChromeTheme::Dark,
+                "light" => self.theme = ChromeTheme::Light,
+                _ => {}
+            }
+        }
         // Prefer the GPU swapchain path. The compositor worker owns the
         // presenter and presents scroll frames on its own thread; softbuffer is
         // the explicit fallback when this process has no usable adapter,
@@ -512,6 +527,31 @@ impl BrowserApp {
         self.mark_chrome_damage(size);
         self.compose_frame(size);
         self.update_window_title();
+    }
+
+    /// Switches the chrome palette and asks each page to re-render with the
+    /// window's new `prefers-color-scheme`. Retained compositor rasters were
+    /// painted with the old palette, so they cannot be reused for this frame.
+    pub(super) fn apply_chrome_theme(&mut self, theme: ChromeTheme) {
+        if self.theme == theme {
+            return;
+        }
+        self.theme = theme;
+        for page in self.pages.values_mut() {
+            page.compositor = None;
+        }
+        let Some((size, scale)) = self
+            .window
+            .as_ref()
+            .map(|window| (window.inner_size(), finite_f32(window.scale_factor())))
+        else {
+            return;
+        };
+        if let Some(layout) = &self.layout {
+            let viewport = css_content_viewport(size, layout.chrome_height, scale);
+            self.schedule_page_render(self.tabs.active_id(), viewport, false);
+        }
+        self.repaint_chrome();
     }
 
     /// Publishes the window's device scale to every document, so a script that
@@ -599,6 +639,7 @@ impl BrowserApp {
             external_styles_generation: page.external_styles_generation,
             animation_time_millis: u32::try_from(page.created_at.elapsed().as_millis())
                 .unwrap_or(u32::MAX),
+            dark_mode: self.theme == ChromeTheme::Dark,
         };
         if can_composite {
             let payload = CompositorScroll {
@@ -1097,12 +1138,14 @@ impl BrowserApp {
         }
         // The forward button shows only while the active page has a forward
         // entry, so the chrome state is synced from history on every compose.
-        let forward_available = self
+        let (back_available, forward_available) = self
             .pages
             .get(&self.tabs.active_id())
-            .is_some_and(|page| page.history.can_go_forward());
+            .map_or((false, false), |page| {
+                (page.history.can_go_back(), page.history.can_go_forward())
+            });
         if let Some(layout) = self.layout.as_mut() {
-            layout.set_forward_available(forward_available);
+            layout.set_history_available(back_available, forward_available);
         }
         let Some(layout) = &self.layout else {
             return;
@@ -1168,6 +1211,7 @@ impl BrowserApp {
             &self.editor,
             self.theme,
             self.hot,
+            self.pressed,
             maximized,
             drag_paint,
             self.fonts.as_ref(),
@@ -3902,6 +3946,20 @@ impl BrowserApp {
             self.begin_scrollbar_interaction(&geometry);
             return;
         }
+        // Pressed chrome controls darken on the mouse-down frame. The action
+        // itself still runs on the same event, so a click never feels delayed.
+        self.pressed = matches!(
+            target,
+            HitTarget::Tab(_)
+                | HitTarget::CloseTab(_)
+                | HitTarget::NewTab
+                | HitTarget::Toolbar(_)
+                | HitTarget::WindowControl(_)
+        )
+        .then_some(target);
+        if self.pressed.is_some() {
+            self.repaint_chrome();
+        }
         match target {
             HitTarget::Tab(id) => {
                 self.drag = Some(TabDrag::new(id, self.cursor.x));
@@ -4465,7 +4523,7 @@ impl BrowserApp {
 
     /// The pointer icon for the current hit target, including the pointer over
     /// a navigable page element and the default over the scrollbar overlay.
-    fn hover_cursor_icon(&self) -> CursorIcon {
+    pub(super) fn hover_cursor_icon(&self) -> CursorIcon {
         match self.hot {
             HitTarget::AddressBar => CursorIcon::Text,
             HitTarget::Content if self.scrollbar_hot || self.scrollbar_drag.is_some() => {
@@ -4483,10 +4541,13 @@ impl BrowserApp {
                     )
                 })
                 .map_or(CursorIcon::Default, |_| CursorIcon::Pointer),
-            HitTarget::NewTab | HitTarget::Toolbar(_) | HitTarget::WindowControl(_) => {
-                CursorIcon::Pointer
-            }
-            HitTarget::Tab(_)
+            // Native chrome uses the arrow over every titlebar/toolbar
+            // control; a hand cursor is a page-link affordance, not an app
+            // button affordance on macOS and Windows.
+            HitTarget::NewTab
+            | HitTarget::Toolbar(_)
+            | HitTarget::WindowControl(_)
+            | HitTarget::Tab(_)
             | HitTarget::CloseTab(_)
             | HitTarget::TitleBar
             | HitTarget::Chrome => CursorIcon::Default,
@@ -4878,6 +4939,7 @@ impl BrowserApp {
 
     pub(super) fn handle_pointer_release(&mut self) {
         self.left_pointer_down = false;
+        let had_pressed_chrome = self.pressed.take().is_some();
         // The active chain ends at the release, before the click's default
         // action, so a navigation cannot leave `:active` stuck on the document
         // it replaced.
@@ -4894,9 +4956,9 @@ impl BrowserApp {
         if let Some(intent) = release_intent {
             self.handle_tab_intent(intent);
         }
-        if was_dragging {
-            // The last live-drag frame still shows the tab at the pointer;
-            // recompose so it returns to its slot even when nothing reordered.
+        if was_dragging || had_pressed_chrome {
+            // The last live-drag/pressed frame still reflects the held state;
+            // recompose so the control returns to rest.
             self.repaint_chrome();
         }
         if self.address_selecting {
@@ -5601,8 +5663,7 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
                     self.handle_pointer_release();
                 }
             WindowEvent::ThemeChanged(theme) => {
-                self.theme = theme_from_winit(theme);
-                self.repaint_chrome();
+                self.apply_chrome_theme(theme_from_winit(theme));
             }
             WindowEvent::CursorMoved { position, .. } => self.handle_cursor_move(position),
             WindowEvent::CursorLeft { .. } => self.clear_content_hover(),
@@ -5630,6 +5691,7 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
                 self.address_menu = None;
                 self.close_content_editor();
                 self.left_pointer_down = false;
+                self.pressed = None;
                 self.set_content_active(None);
                 self.drag = None;
                 self.tab_drag_paint = None;

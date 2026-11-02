@@ -274,6 +274,11 @@ pub(super) fn process_page_render(
             let mut options = DocumentRenderOptions {
                 animation_time,
                 device_scale,
+                color_scheme: if job.identity.dark_mode {
+                    render_core::css::selector::ColorScheme::Dark
+                } else {
+                    render_core::css::selector::ColorScheme::Light
+                },
                 ..DocumentRenderOptions::default()
             };
             // Identity dimensions are CSS pixels. Layout and the returned
@@ -844,6 +849,7 @@ mod tests {
             device_scale: 2.0,
             external_styles_generation: 0,
             animation_time_millis: 0,
+            dark_mode: false,
         };
         let payload = PageRenderPayload::Full(Box::new(FullPageRenderPayload {
             document,
