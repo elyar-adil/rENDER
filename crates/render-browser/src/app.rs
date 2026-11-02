@@ -1773,8 +1773,9 @@ impl BrowserApp {
                     );
                 }
             }
+            let padding = format!("{}/{}", property("padding-left"), property("padding-right"));
             eprintln!(
-                "layout <{}> id={} class={} rect={:?} display={} position={} z={} opacity={} visibility={} top={} left={} right={} bottom={} width={} height={} margin={} float={} transform={} overflow={} bg={} bgimg={}{}",
+                "layout <{}> id={} class={} rect={:?} display={} position={} z={} opacity={} visibility={} top={} left={} right={} bottom={} width={} height={} min-width={} max-width={} flex={} flex-basis={} flex-shrink={} padding={} box-sizing={} justify={} align={} margin={} float={} transform={} overflow={} bg={} bgimg={}{}",
                 element.local_name,
                 id_attr,
                 class,
@@ -1790,6 +1791,15 @@ impl BrowserApp {
                 property("bottom"),
                 property("width"),
                 property("height"),
+                property("min-width"),
+                property("max-width"),
+                property("flex"),
+                property("flex-basis"),
+                property("flex-shrink"),
+                padding,
+                property("box-sizing"),
+                property("justify-content"),
+                property("align-items"),
                 property("margin"),
                 property("float"),
                 property("transform"),
