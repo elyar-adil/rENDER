@@ -1771,9 +1771,12 @@ impl Page {
     /// abort the pump that is advancing playback.
     fn drain_runtime_microtasks(&mut self) {
         while let Some(microtask) = self.runtime.take_next_microtask() {
-            let _ = self
+            if let Err(error) = self
                 .runtime
-                .invoke_microtask(self.document.dom_mut(), microtask);
+                .invoke_microtask(self.document.dom_mut(), microtask)
+            {
+                eprintln!("render-core microtask failed: {error}");
+            }
         }
     }
 

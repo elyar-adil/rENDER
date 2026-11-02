@@ -146,7 +146,8 @@ impl ModuleGraph {
         let key = module_key(requested);
         match outcome {
             Ok((final_url, source)) => match CompiledScript::compile_module(&source, limits) {
-                Ok(compiled) => {
+                Ok(mut compiled) => {
+                    compiled.set_source_name(final_url.as_str());
                     self.modules.insert(
                         key,
                         GraphModule {
