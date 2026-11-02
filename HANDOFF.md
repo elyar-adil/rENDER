@@ -174,7 +174,9 @@ python tools/check_site_neutrality.py                       0 blocking, 31 advis
 - `305e1d1`：页面 canvas 像素发布到 render worker 的 image store；canvas draw 也算一次需要重绘的原因。
 - `3aade6d`：匿名 line box 不再输出 `overflow:hidden` clip，绝对定位的“获取短信验证码”按钮不再被父级 `.SignFlow` 的 line box 裁掉。
 
-最终 live 页（1180×780 CSS / DPR 2）连续 3 次：`ready=Interactive dom_elements=235–236 boxes=95`，表单、二维码、短信按钮都在；截图 `/tmp/zhihu-detail.png` / `/tmp/zhihu-run1.png`。有一次早期运行仍落到“出了一点问题”，随后无法复现，记为 script/CSSOM 插入时序的残留风险。剩余：CSSOM 只是功能子集（`media`/`disabled`/`replace` 等未实现，link sheet 的 insertRule 不进 cascade）；`getComputedStyle()` 仍返回空值；第三方验证码 bundle 仍有一个 `callee[] undefined` 的独立语义 lead。
+最终 live 页（1180×780 CSS / DPR 2）：`ready=Interactive dom_elements=268 boxes=95`，表单、二维码、短信按钮、微信/QQ/微博圆形图标都在；截图 `/tmp/final2-zhihu.png`。后来 captcha 引入 `Worker is not defined`，Worker 实现后不再进入 error boundary；`scripts_threw=1` 是 captcha 图标 chunk 的 step limit，不影响表单。
+
+剩余：CSSOM 只是功能子集（`media`/`disabled`/`replace` 等未实现，link sheet 的 insertRule 不进 cascade）；`getComputedStyle()` 仍返回空值；背景插画在 live 2× 截图中未绘制（静态资源/懒加载待查）。
 
 ## 首次绘制：样式表现在是 render-blocking
 
@@ -196,7 +198,33 @@ python tools/check_site_neutrality.py                       0 blocking, 31 advis
 
 已合并 `2d999d8`（URLSearchParams/URL.searchParams）、`832f64e`（对象/数组字面量在求值后续成员时 root 住已构造值，避免 GC 丢成员）、`49c94bf`（`modulepreload`/preload/stylesheet link 补发 `load`，lazy import 不再永久 pending）。
 
-本地 replay 已经走到 `ENTRY hydrated`，但 React 随后渲染 root error boundary（“Something went wrong”），live 仍 blank。错误被 app 送到 Sentry 而非 console，`x-errors` agent 正在注入探针取具体 render error；这已不是 Streams/Intl/URL 的启动缺失。
+本地 replay 走到 `ENTRY hydrated` 后曾渲染 root error boundary。`ddce587` 等修掉了真正的异常链：await 中 pending promise 的 reaction list 未被 GC root、`URL.parse` 忽略 URL-object base、`Response.arrayBuffer` 缺失且 body 被 lossy UTF-8 解码、`crypto.subtle.digest` 缺失、`oninput` IDL 属性缺失、`RENDER_JS_FRAME_OFFSETS` 改写 optional-chain sentinel、module stack 匿名。
+
+最终 live x.com（1180×780 / DPR 2，30s）：
+
+```text
+ready=Complete dom_elements=452 boxes=101 scripts_failed=0 scripts_threw=0
+forms=1 inputs=2 buttons=3 modal=1 "Something went wrong"=0
+```
+
+登录弹窗、手机/Google/Apple 三个按钮、邮箱输入、Continue、法律文本都完整可见；截图 `/tmp/final2-x.png`。弹窗曾横向裁切，`e70d37d`/`8358b38` 修了 `inset` shorthand 未展开（绝对定位滚动容器 shrink-wrap 成 248px）和 column flex 的 border-box/`flex-grow` 测量高度问题，几何与 Edge 一致（modal 700、column 380、input 360）。Google GSI iframe 仍是空白嵌套文档，fallback 面已正确居中。
+
+## Web Worker
+
+`a19ea3a` 实现了 dedicated Web Worker：异步构造、URL/data:/Blob 脚本、隔离 realm（无 window/document）、postMessage/onmessage/onerror、importScripts、close/terminate、structured clone + ArrayBuffer transfer、worker 内 timers/fetch/console/nested Worker。限制：同线程同堆隔离（无真正并行）、classic worker only、无 SharedWorker/module worker/MessagePort/worker crypto。12 个 worker 测试 + 1 个 page test。它解除了知乎 captcha 的 `Worker is not defined` 错误边界。
+
+## 页面文本选择
+
+`7d9c1e5` 接入 `PointerSelection`：鼠标按下/拖动/Shift 点击/双击选词，高亮 overlay 按 chrome/scroll/DPR 转换，Cmd/Ctrl+C 复制选中文本，导航/DOM mutation 清理，滚动跟随；链接未拖动时仍正常导航。覆盖两段文本、双击、复制、链接、导航、滚动、DPR2 测试。剩余：selectionchange/selectstart、iframe 内选择、拖拽 autoscroll、三击/键盘扩展。
+
+## 字体按需解码与栅格/容器优化
+
+- `d00fd1a`：安装字体改为 `FaceSlot::Lazy` + cmap 覆盖位图（约 1.1MB/8 faces），首次使用时才 `fontdue` 解码。`render-perf generated first_visible` 523→164ms，peak RSS 881→278MB；首页 941→594–609MB；Baidu 12s 3172→2832MB。Latin/CJK/symbol 截图 1×/2× PNG 相同。剩余：PingFang 选中后仍 eager 解析全部 glyph（~250–280MB），需要 per-glyph/atlas。
+- `1134f66`/`41cf5a6`/`4cc903d`：offscreen stacking context 按内容 bounds 裁剪并池化，GitHub styled raster 1105→**30.7ms**（全页 0 像素差）；container feedback 从 3 次全 cascade 改为 seeded + 增量，GitHub 2.0s→0.33s，重 cascade 6372→951+96。Baidu 剩余 raster 主要 11 个 linear gradient（~150ms）。
+
+## Google 结果页最终
+
+`9178c5e`、`05637ba` 后，consented profile 的 Google 结果页真实可用：`ready=Interactive dom_elements=2530 boxes=940 scripts_failed=0 scripts_threw=0`，结果标题/URL/snippet 出现；`#center_col` y 368→200（Edge 200），结果行高与 Edge 基本一致。截图 `/tmp/google-results-after.png`。剩余 fresh-profile consent、`#rso` 约 13.6px、动态翻译行和 `/complete/s` 错误。
 
 ## 原生 chrome：macOS 约定
 
@@ -233,24 +261,24 @@ python tools/check_site_neutrality.py                       0 blocking, 31 advis
 
 ## 包体与内存
 
-macOS release：`render-browser` **16 MB**，gzip **7.8 MB**，xz **5.3 MB**；额外 Homebrew `libdav1d` 0.78 MB。Edge.app 实测 1.7 GB，Chrome 未安装（典型 1.5–2 GB）。体积约 1/100，启动也更快；但峰值 RSS 仍高于 Chromium headless（~760–850MB vs ~267MB），字体懒加载是下一个目标。目前没有 `.app`/安装器/公证。
+macOS release：`render-browser` **16 MB**，gzip **7.8 MB**，xz **5.3 MB**；额外 Homebrew `libdav1d` 0.78 MB。Edge.app 实测 1.7 GB，Chrome 未安装（典型 1.5–2 GB）。体积约 1/100，启动也更快；字体按需解码已把 `render-perf` peak RSS 从 881MB 降到 278MB，但 live Baidu 仍约 2.8GB（JS arena append-only、页面对象/图片）。目前没有 `.app`/安装器/公证。
 
 ## 验证
 
 ```text
 cargo test --workspace                                     all ok
-cargo test -p render-core --lib                            558 passed, 1 ignored
-cargo test -p render-browser --bin render-browser           132 passed
-cargo test -p render-browser --lib                          241 passed
-cargo test -p render-css                                    331 passed
-cargo test -p render-layout                                 399 passed, 1 ignored
-cargo test -p render-js                                     1275 passed
+cargo test -p render-core --lib                            565 passed, 1 ignored
+cargo test -p render-browser --bin render-browser           140 passed
+cargo test -p render-browser --lib                          248 passed
+cargo test -p render-css                                    334 passed
+cargo test -p render-layout                                 403 passed, 1 ignored
+cargo test -p render-js                                     1292 passed
 cargo test -p render-net                                    125 passed
 cargo clippy --workspace --all-targets -- -D warnings       clean
 cargo fmt --all --check                                     clean
 ```
 
-未完成：X 的 React error boundary、字体懒加载/JS arena 回收、CSSOM 子集（`media`/`disabled`/`replace`、link sheet 规则进 cascade）、Google fresh-profile consent、容器反馈仍跑 3 次全 cascade、单脚本 turn 不可抢占、GitHub DPR2 styled raster ~1.05s、hao123 `.search` 10px static-position、无边框窗口的系统 traffic lights/圆角阴影。
+未完成：PingFang 全 glyph outline 解析（~250–280MB）、JS arena 不可回收/compaction、CSSOM 子集（`media`/`disabled`/`replace`、link sheet 规则进 cascade）、Google fresh-profile consent、单脚本 turn 不可抢占、Baidu 11 个 linear gradient ~150ms、hao123 `.search` 10px static-position、Zhihu 背景插画未绘制、Worker 无真并行/module worker/MessagePort、selectionchange/iframe 选择/拖拽 autoscroll、无边框窗口的系统 traffic lights/圆角阴影。
 
 ---
 
