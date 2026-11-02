@@ -124,6 +124,21 @@
 
 本地 replay 已经走到 `ENTRY hydrated`，但 React 随后渲染 root error boundary（“Something went wrong”），live 仍 blank。错误被 app 送到 Sentry 而非 console，`x-errors` agent 正在注入探针取具体 render error；这已不是 Streams/Intl/URL 的启动缺失。
 
+## 原生 chrome：macOS 约定
+
+`e68e665` 把窗口 chrome 从“Windows 风格按钮 + 网页式圆角”改成 macOS 约定：
+
+- 红黄绿 traffic lights 移到左上，12pt、20pt 间距，hover 显示符号、pressed 变暗；Windows/Linux 仍用右侧 caption buttons；
+- chrome 96→90pt，tabs 34→32pt，地址栏 36→30pt、半径 8、13px 文本；active tab 与 toolbar 合缝；
+- 所有圆角/选中态用距离场抗锯齿，2× 下分隔线精确 1 物理像素；
+- tab/地址栏/菜单文本按字体 ascent/descent 居中；
+- Back 不可用时保留槽位但变暗且不响应，Forward 不可用时移除；
+- close-tab hover 圆底、红色 pressed；地址栏 hover/focus ring；菜单 accent hover、Redo、macOS `⌘` 快捷键；
+- chrome 按钮用原生箭头光标，地址栏用 text cursor；
+- 系统浅/深色传入页面 `prefers-color-scheme`，主题变化使 retained compositor 失效。
+
+离屏截图（隐藏窗口，1180×780 logical / DPR 2）：`.artifacts/ui-native/after/home.png`、`home-dark.png`、`comparison-before-after.png`；主树验证图 `/tmp/home-ui.png`。`render-browser` lib 241 passed、bin 130 passed。剩余：窗口仍是无边框自绘 traffic lights（没有系统圆角/阴影），需要可见窗口验证才能换成真 `NSWindow` 控件；无 tab overflow/favicon/security indicator；chrome 仍只支持指针。
+
 ## 包体与内存
 
 macOS release：`render-browser` **16 MB**，gzip **7.8 MB**，xz **5.3 MB**；额外 Homebrew `libdav1d` 0.78 MB。Edge.app 实测 1.7 GB，Chrome 未安装（典型 1.5–2 GB）。体积约 1/100，启动也更快；但峰值 RSS 仍高于 Chromium headless（~760–850MB vs ~267MB），字体懒加载是下一个目标。目前没有 `.app`/安装器/公证。
