@@ -2955,6 +2955,40 @@ mod tests {
     }
 
     #[test]
+    fn a_universal_pseudo_rule_without_content_generates_no_style() {
+        let output = parse_document("<!doctype html><div id='plain'></div><div id='host'></div>");
+        let sheet =
+            parse_stylesheet("*::before { box-sizing: border-box } #host::before { content: 'x' }");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::new(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let plain = target_id(&output.dom, "#plain");
+        let host = target_id(&output.dom, "#host");
+
+        assert!(
+            !styles.contains_key(&crate::pseudo::style_source(
+                plain,
+                crate::pseudo::PseudoElement::Before
+            )),
+            "a matched box-sizing rule without content must not generate a pseudo style"
+        );
+        assert!(
+            styles.contains_key(&crate::pseudo::style_source(
+                host,
+                crate::pseudo::PseudoElement::Before
+            )),
+            "an explicit content declaration still generates the pseudo style"
+        );
+    }
+
+    #[test]
     fn inherited_custom_properties_are_already_computed() {
         let output =
             parse_document("<!doctype html><div id='parent'><span id='child'></span></div>");
