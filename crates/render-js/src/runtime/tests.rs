@@ -46,6 +46,58 @@ fn location_exposes_normalized_committed_url_components() {
 }
 
 #[test]
+fn object_literals_keep_earlier_members_across_collection() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    // Evaluating a later member allocates; the partial object and its earlier
+    // values must stay reachable when that allocation collects garbage.
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var bad = 0;
+                for (var k = 0; k < 50000; k++) {
+                    var segments = "/i/bookmarks/add/$tweetId".split("/").filter(Boolean);
+                    var literal = {
+                        fixedSegments: segments,
+                        lowercaseFixedSegments: segments.map(function (part) { return part.toLowerCase(); }),
+                        splat: false
+                    };
+                    if (!("fixedSegments" in literal) || literal.fixedSegments === undefined) bad++;
+                }
+                bad;
+            "#,
+        )
+        .expect("object literal stress should execute");
+    assert_eq!(outcome.value, JsValue::Number(0.0));
+}
+
+#[test]
+fn array_literals_keep_earlier_elements_across_collection() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var bad = 0;
+                for (var k = 0; k < 50000; k++) {
+                    var first = "/i/bookmarks/add/$tweetId".split("/");
+                    var literal = [
+                        first,
+                        first.map(function (part) { return part.toLowerCase(); }),
+                        "splat"
+                    ];
+                    if (literal[0] === undefined || literal[0].length !== 5) bad++;
+                }
+                bad;
+            "#,
+        )
+        .expect("array literal stress should execute");
+    assert_eq!(outcome.value, JsValue::Number(0.0));
+}
+
+#[test]
 fn url_search_params_parse_serialize_and_iterate() {
     let mut parsed = parse_document("<!doctype html><p></p>");
     let mut runtime = JsRuntime::new(&parsed.dom);

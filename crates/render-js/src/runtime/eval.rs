@@ -3939,8 +3939,23 @@ impl JsRuntime {
         dom: &mut Dom,
         properties: &[ObjectProperty],
     ) -> Result<JsValue, JsError> {
+        // Evaluating a later member can allocate and collect garbage while
+        // earlier members are only reachable through this partial object.
+        // Root it for the whole literal, and release the root on every exit.
+        let pinned = self.transient_roots.len();
+        let result = self.evaluate_object_literal_inner(dom, properties);
+        self.transient_roots.truncate(pinned);
+        result
+    }
+
+    fn evaluate_object_literal_inner(
+        &mut self,
+        dom: &mut Dom,
+        properties: &[ObjectProperty],
+    ) -> Result<JsValue, JsError> {
         self.ensure_heap_capacity(1)?;
         let object = self.realm.create_ordinary_object();
+        self.transient_roots.push(object);
         for property in properties {
             if matches!(property.key, PropertyKey::Spread) {
                 // CopyDataProperties(object, fromValue, « ») (ECMA-262 13.2.5.5): a
@@ -3948,6 +3963,7 @@ impl JsRuntime {
                 let source = self.evaluate(dom, &property.value)?;
                 if !matches!(source, JsValue::Null | JsValue::Undefined) {
                     let source = self.to_object(&source)?;
+                    self.transient_roots.push(source);
                     self.copy_data_properties(dom, object, source, &[])?;
                 }
                 continue;
@@ -4027,6 +4043,9 @@ impl JsRuntime {
             } else {
                 self.evaluate(dom, &property.value)?
             };
+            if let JsValue::Object(value) = &value {
+                self.transient_roots.push(*value);
+            }
             if property.method || property.accessor.is_some() {
                 self.set_method_home_object(&value, object);
             }
@@ -4168,8 +4187,22 @@ impl JsRuntime {
         dom: &mut Dom,
         elements: &[Expr],
     ) -> Result<JsValue, JsError> {
+        // The array and its already-evaluated elements must survive garbage
+        // collection triggered while later elements run.
+        let pinned = self.transient_roots.len();
+        let result = self.evaluate_array_literal_inner(dom, elements);
+        self.transient_roots.truncate(pinned);
+        result
+    }
+
+    fn evaluate_array_literal_inner(
+        &mut self,
+        dom: &mut Dom,
+        elements: &[Expr],
+    ) -> Result<JsValue, JsError> {
         self.ensure_heap_capacity(1)?;
         let object = self.realm.create_array();
+        self.transient_roots.push(object);
         // One slot per index: an elision leaves its slot empty, so the hole has
         // no property and reads through the prototype chain like any other.
         let mut slots: Vec<Option<JsValue>> = Vec::with_capacity(elements.len());
@@ -4180,6 +4213,11 @@ impl JsRuntime {
             }
             let mut produced = Vec::new();
             self.evaluate_argument(dom, expression, &mut produced)?;
+            for value in &produced {
+                if let JsValue::Object(element) = value {
+                    self.transient_roots.push(*element);
+                }
+            }
             slots.extend(produced.into_iter().map(Some));
         }
         for (index, slot) in slots.iter().enumerate() {
