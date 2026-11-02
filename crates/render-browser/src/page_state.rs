@@ -136,6 +136,11 @@ pub(super) struct PageState {
     /// until the stylesheets resolve.
     pub(super) held_scripts: Option<ScriptBatchPreparation>,
     pub(super) started_scripts: HashSet<render_core::dom::NodeId>,
+
+    /// Modulepreload `<link>` elements whose `load` event has been queued.
+    /// They are not fetched here: the `import()` the loader is waiting for
+    /// performs the real fetch, so the event only releases that wait.
+    pub(super) modulepreload_links: HashSet<render_core::dom::NodeId>,
     pub(super) initial_script_scan_completed: bool,
     /// The DOM changed in a page turn run from an input handler. The caller may
     /// ignore that turn's change flag, so the event loop takes this instead and
@@ -357,6 +362,7 @@ impl PageState {
             pending_dynamic_imports: Vec::new(),
             held_scripts: None,
             started_scripts: HashSet::new(),
+            modulepreload_links: HashSet::new(),
             initial_script_scan_completed: false,
             dom_changed_in_turn: false,
             render_dirty: false,
@@ -490,6 +496,7 @@ impl PageState {
         self.styles_resolved = false;
         self.scripts_resolved = false;
         self.started_scripts.clear();
+        self.modulepreload_links.clear();
         self.initial_script_scan_completed = false;
         self.render_dirty = false;
         self.render_dirty_viewport = None;
@@ -991,6 +998,7 @@ impl PageState {
             Err(error) => eprintln!("render-browser page pump failed: {error}"),
         }
         self.drain_console();
+        self.dispatch_modulepreload_loads();
         let revision_after = self.page.document().dom().revision().as_u64();
         self.dom_revision = revision_after;
         // Canvas pixels change outside the DOM revision; they are a repaint
@@ -1021,6 +1029,39 @@ impl PageState {
             now.as_secs_f32(),
         ) || self.transition_state.has_active()
             || self.page.has_active_web_animations()
+    }
+
+    /// Releases module loaders that wait on a `<link rel=modulepreload>` load
+    /// event. The loader's `import()` performs the transfer; the event only
+    /// lifts the preload barrier, so no second fetch is issued here.
+    fn dispatch_modulepreload_loads(&mut self) {
+        let dom = self.page.document().dom();
+        let mut pending = vec![dom.document()];
+        let mut links = Vec::new();
+        while let Some(node) = pending.pop() {
+            if let Some(node_ref) = dom.node(node)
+                && let render_core::dom::NodeKind::Element(element) = node_ref.kind()
+                && element.local_name == "link"
+                && element.attributes.iter().any(|attribute| {
+                    attribute.local_name == "rel"
+                        && attribute.value.split_ascii_whitespace().any(|token| {
+                            token.eq_ignore_ascii_case("modulepreload")
+                                || token.eq_ignore_ascii_case("preload")
+                                || token.eq_ignore_ascii_case("stylesheet")
+                        })
+                })
+                && !self.modulepreload_links.contains(&node)
+            {
+                links.push(node);
+            }
+            if let Some(children) = dom.children(node) {
+                pending.extend(children.iter().copied());
+            }
+        }
+        for node in links {
+            self.modulepreload_links.insert(node);
+            let _ = self.page.queue_dom_event(PageDomEvent::new(node, "load"));
+        }
     }
 
     /// Whether the page still has script work that requires future turns.

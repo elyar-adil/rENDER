@@ -982,6 +982,34 @@ fn script_assigned_document_title_propagates_to_the_committed_title() {
 }
 
 #[test]
+fn modulepreload_links_release_lazy_importers_with_a_load_event() {
+    let mut page = PageState::new(PageSource {
+        html: "<!doctype html><html><body><p>lazy</p></body></html>".into(),
+        title: "modulepreload".into(),
+        target: NavigationTarget::Url(Url::parse("https://example.test/").expect("page URL")),
+    });
+    page.page
+        .queue_script(
+            "var link = document.createElement('link');\
+             link.rel = 'modulepreload';\
+             link.href = '/chunk.js';\
+             link.addEventListener('load', function () {\
+               document.title = 'preload released';\
+             });\
+             document.head.appendChild(link);",
+        )
+        .expect("modulepreload script should queue");
+
+    // The first pass inserts the link and queues its load event; the second
+    // pass runs the listener that releases a loader waiting on the preload.
+    let _ = page.run_page_turns();
+    let _ = page.run_page_turns();
+
+    assert!(page.sync_committed_title());
+    assert_eq!(page.navigation.committed().title, "preload released");
+}
+
+#[test]
 fn dom_content_loaded_fires_once_on_an_interactive_document_and_load_follows_when_settled() {
     let (mut app, tab) = headless_app_with(
         "<!doctype html><title>start</title><script>\
