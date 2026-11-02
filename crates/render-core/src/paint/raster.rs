@@ -3773,18 +3773,10 @@ fn blit_translated(
     // corresponding source texel. The source layer may be smaller than the
     // full surface, so its bounds are part of the same intersection; computing
     // it once removes every per-pixel bounds test from the row loop below.
-    let column_start = (left - translate_x)
-        .max(i64::from(source_left))
-        .max(0);
-    let column_end = (right - translate_x)
-        .min(source_right)
-        .min(source_width);
-    let row_start = (top - translate_y)
-        .max(i64::from(source_top))
-        .max(0);
-    let row_end = (bottom - translate_y)
-        .min(source_bottom)
-        .min(source_height);
+    let column_start = (left - translate_x).max(i64::from(source_left)).max(0);
+    let column_end = (right - translate_x).min(source_right).min(source_width);
+    let row_start = (top - translate_y).max(i64::from(source_top)).max(0);
+    let row_end = (bottom - translate_y).min(source_bottom).min(source_height);
     if column_start >= column_end || row_start >= row_end {
         return true;
     }
