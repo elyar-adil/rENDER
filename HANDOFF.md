@@ -1,3 +1,90 @@
+# 交接文档 (2026-11-02, 续六十九) — 常用站点体验收敛：滚动/渲染性能、百度布局、字体继承、X/知乎诊断
+
+本轮把目标从“广撒网补能力”收敛到少数常用页面：百度搜索、Google、知乎、X。所有修复仍然走通用 HTML/CSS/DOM/JS/layout/paint 路径，没有站点特判。
+
+## 性能：滚动与主渲染链路
+
+滚动（Apple M1 Pro，release；`render-scroll-bench`，120 帧）：
+
+| 指标 | 修复前 | 修复后 |
+| --- | ---: | ---: |
+| retained compositor | 1909 µs/帧 | **581–640 µs/帧** |
+| full raster | 3450 µs/帧 | **725 µs/帧** |
+| Baidu retained 回退 | ~254 ms/帧 | 已修掉 fixed-in-clip 触发点；剩余问题是非空 `scale(-1)` stacking context，尚未安全提取 |
+
+主要提交：`cbee346`、`2c43a6a`、`0a0c971`、`398be99`、`a2dd631`。修复内容：
+- retained band blit 预计算 clip 边界并整行拷贝，去掉逐像素 clip 测试；
+- wheel 输入合并到下一次 redraw，一次滚动一帧、一次 compositor submit、一次 present；
+- hover 变化不再抢占 composited scroll frame；
+- GPU presenter 只上传滚动区域，不再整窗转换/上传；
+- fixed 元素在 clip 内不再让整个 retained scene 回退；
+- 直接 present 后 CPU frame 懒重建，避免上传旧滚动位置。
+
+主渲染链路（`render-perf --fixture all --iterations 5`，p50）：
+
+| fixture | first_render 前 → 后 | scroll_render 前 → 后 |
+| --- | ---: | ---: |
+| generated | 218.8 → **126.0 ms** | 60.8 → **14.7 ms** |
+| hn | 57.3 → **22.9 ms** | 4.23 → **2.24 ms** |
+| portal | 176.9 → **74.9 ms** | 82.5 → **5.58 ms** |
+
+主要提交：`a6290d3`。优化了 selector match（去掉每元素 `@layer` HashMap 和大小写 String 分配）、transition 无动画时的快照、cascade 只遍历声明/继承属性、intrinsic width 缓存、border/fill/clip/offscreen warp 的 raster 快路径。像素哈希与基线逐字节一致。
+
+## 百度布局：三处通用缺陷 + 字体继承
+
+对 Baidu 结果页离线快照与 Edge 同视口截图逐项比对，修复（提交 `348a601`、`d9926c0`）：
+
+1. **inline-block shrink-to-fit 忽略前置 float**：`.toplist1-tr` 从 348×54 回到 348×32，右侧栏高度从 1161 回到 839。
+2. **inline-flex 忽略定宽空子项**：图标 14px + margin 6px 不再贡献 0，“大家还在搜” chips 不再被压窄、文字不再上下溢出。
+3. **表格自动宽度忽略定宽块后代**：300px 子块不再让表格塌成 44px。
+4. **`font-family` 没有进入继承注册表**：嵌套 `<span>`/`<b>`/`::before` 之前全部退回 `system-ui`，导致图标字体空白、字号从 28px 跳到 42px；现在按 CSS Fonts 4 §2.2 继承，`@supports (font-family: ...)` 也改为 supported（`render-css` 320 passed，`render-js` 1235 passed）。
+
+修复后的百度截图：`/tmp/baidu-after.png`；Edge 参考：`/tmp/render-site-diag/edge-1180.png`。结构已经正常，剩余最大差异是 **Retina DPR**：rENDER 把 2360 物理像素当成 CSS 视口、`devicePixelRatio=1`，导致页面按 2360px 宽度排版；Chrome 是 1180 CSS px、DPR 2。媒体查询、列宽、字号都因此不同。这是下一轮最高优先级，需要把 layout 保持在 CSS px、只对 paint/raster 做设备缩放，并同步 scroll/hit-test/JS viewport 单位。
+
+## 字体：启动与内存
+
+- macOS PingFang 之前取 collection index 0（香港字形），改为 index 2（简体 SC）；
+- `fontdue` 的 `load_substitutions=false`，不再为 GSUB 加载全部 glyph；
+- 修复 macOS 上 Menlo 是 `.ttc` 导致 6 个 document-face 测试失败的问题。
+
+`render-perf index` 的 `first_visible` 从 ~605ms 降到 ~410ms，峰值 RSS 从 ~970MB 降到 ~760–850MB。仍不敌 Chrome：PingFang ≈310MB、Arial Unicode ≈310MB 是 eager 加载，下一步需要按 cmap 覆盖懒加载可选字体。
+
+## X 登录页空白
+
+实测不是网络/CSS/登录态：HTML 200、28,320B、0 form/input/button；JS shell 未启动。三个独立 blocker：
+
+1. **lexer 把命名函数体后的 `/` 当除法**：`function Fn(){...}\n/(?:^|;\s*)gt=/` 报 `unsupported character '\'`。已在 `cabdf0e` 修复：`paren_opens_block` 识别 `function NAME(`、`function* NAME(`、方法体等。
+2. **`ReadableStream` 缺失**：X 的 TSR router 在顶层 `new ReadableStream`，缺失导致 hydration 数据不生成。
+3. **`Intl` 缺失**：startup chunk 顶层 `new Intl.Segmenter`，缺失导致整个 module graph 中止。
+
+第 2、3 项已交给独立 worktree `js-streams-intl` 实现真实 Streams/Intl 子集并跑 reduced tests；尚未合并。X 的 CSS 本身没有问题：把 Edge 的 post-JS DOM + 捕获 CSS 交给 rENDER，表单可见。
+
+## 知乎登录页
+
+独立 worktree `zhihu-signin` 正在诊断“出现小问题”、二维码不显示、验证码按钮缺失；要求同样给通用修复和 reduced test，尚未合并。
+
+## 包体与内存
+
+macOS release：`render-browser` **16 MB**，gzip **7.8 MB**，xz **5.3 MB**；额外 Homebrew `libdav1d` 0.78 MB。Edge.app 实测 1.7 GB，Chrome 未安装（典型 1.5–2 GB）。体积约 1/100，启动也更快；但峰值 RSS 仍高于 Chromium headless（~760–850MB vs ~267MB），字体懒加载是下一个目标。目前没有 `.app`/安装器/公证。
+
+## 验证
+
+```text
+cargo test --workspace                                     all ok
+cargo test -p render-core --lib                            538 passed, 1 ignored
+cargo test -p render-browser --bin render-browser           121 passed
+cargo test -p render-browser --lib                          232 passed
+cargo test -p render-css                                    320 passed
+cargo test -p render-layout                                 392 passed, 1 ignored
+cargo test -p render-js                                     1235 passed
+cargo clippy --workspace --all-targets -- -D warnings       clean
+cargo fmt --all --check                                     clean
+```
+
+未完成：DPR/viewport 架构、字体懒加载、X 的 Streams/Intl 合并、知乎修复合并、Baidu/Google 在真实 Retina 屏上的 Chrome 对比复测。
+
+---
+
 # 交接文档 (2026-11-02, 续六十八) — iframe/Selection、HTTP/2、提交饥饿修复、解释器与 raster 性能、HTML5 解析
 
 本轮针对“几乎所有网站慢/卡死”的实测诊断收口，全部无站点特判。主要提交：
