@@ -649,6 +649,12 @@ impl Lexer<'_> {
                             .rev()
                             .nth(reverse_index + 1)
                             .map(|token| token.kind.clone());
+                        let before_name = self
+                            .tokens
+                            .iter()
+                            .rev()
+                            .nth(reverse_index + 2)
+                            .map(|token| &token.kind);
                         return matches!(
                             before,
                             Some(
@@ -659,7 +665,31 @@ impl Lexer<'_> {
                                     | TokenKind::For
                                     | TokenKind::Switch
                             )
-                        );
+                        ) || match before {
+                            // `function name(`, `function* name(` and
+                            // `async function name(` open a function body,
+                            // not an object literal. The token before `(` is
+                            // the name, so the keyword is one token further
+                            // back.
+                            Some(TokenKind::Identifier(_) | TokenKind::PrivateName(_)) => {
+                                matches!(
+                                    before_name,
+                                    Some(
+                                        TokenKind::Function
+                                            | TokenKind::Star
+                                            | TokenKind::LeftBrace
+                                            | TokenKind::RightBrace
+                                            | TokenKind::Comma
+                                            | TokenKind::Semicolon
+                                    )
+                                ) || matches!(
+                                    before_name,
+                                    Some(TokenKind::Identifier(name))
+                                        if matches!(name.as_str(), "get" | "set" | "async" | "static")
+                                )
+                            }
+                            _ => false,
+                        };
                     }
                     depth -= 1;
                 }
@@ -1659,6 +1689,37 @@ mod tests {
             expression, "/[}]/.test(value)",
             "the regexp body, including its closing brace, stays in the expression"
         );
+    }
+
+    #[test]
+    fn tokenizes_regex_after_a_named_function_or_method_body() {
+        // A regex literal may follow a function declaration's closing brace.
+        // The token before `(` is the function's name, not the `function`
+        // keyword, so the brace must still classify as a block.
+        for source in [
+            r"function Fn(e){return e}/(?:^|;\s*)gt=/.test(document.cookie);",
+            r"function* g(){}/x/.test('x');",
+            r"async function h(){}/x/.test('x');",
+            r"const o={m(){}/x/.test('x')};",
+            r"class C{static m(){}/x/.test('x')}",
+        ] {
+            let tokens = tokenize(source, &RuntimeLimits::default())
+                .unwrap_or_else(|error| panic!("{source}: {error}"));
+            assert_eq!(
+                tokens
+                    .iter()
+                    .filter(|token| matches!(token.kind, TokenKind::RegexLiteral { .. }))
+                    .count(),
+                1,
+                "{source}"
+            );
+        }
+        // A slash after a call remains division even when the callee is named.
+        tokenize(
+            "function f(){}; var x = f() / 2;",
+            &RuntimeLimits::default(),
+        )
+        .expect("division after a call still tokenizes");
     }
 
     #[test]

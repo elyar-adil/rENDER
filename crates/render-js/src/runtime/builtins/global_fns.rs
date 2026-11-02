@@ -2081,9 +2081,9 @@ mod tests {
         assert_eq!(supports(&["display", "flex"]), "true");
         assert_eq!(supports(&["(display: grid)"]), "true");
         assert_eq!(supports(&["(color: rgb(1, 2, 3))"]), "true");
-        // `render-layout`'s text carries no family, so no engine grammar for
-        // `font-family` exists and §6.1 says that is unsupported.
-        assert_eq!(supports(&["(font-family: Arial)"]), "false");
+        // `font-family` has metadata and layout reads it, so the declaration
+        // is supported even though no grammar validates the value.
+        assert_eq!(supports(&["(font-family: Arial)"]), "true");
         // A shorthand is the conjunction over its longhands, so `font` is
         // unsupported for exactly that reason.
         assert_eq!(supports(&["(font: 12px/1.5 Arial)"]), "false");
