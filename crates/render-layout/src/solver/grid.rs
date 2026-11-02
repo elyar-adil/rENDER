@@ -271,6 +271,7 @@ impl Solver<'_> {
                         // children (CSS Grid §6).
                         specified_height.is_some(),
                         false,
+                        None,
                     ),
                 _ => self.layout_anonymous_block(
                     node,

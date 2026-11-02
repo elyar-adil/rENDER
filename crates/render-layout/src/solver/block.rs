@@ -301,6 +301,7 @@ impl Solver<'_> {
                     None,
                     containing_height_definite,
                     true,
+                    None,
                 )
             }
             FormattingNodeKind::AtomicInline { .. } => self.layout_block_with_containing_height(
@@ -314,6 +315,7 @@ impl Solver<'_> {
                 None,
                 containing_height_definite,
                 true,
+                None,
             ),
             FormattingNodeKind::Root => None,
         }
@@ -350,6 +352,7 @@ impl Solver<'_> {
             forced_content_width,
             false,
             true,
+            None,
         )
     }
 
@@ -377,6 +380,11 @@ impl Solver<'_> {
         // table cells establish independent formatting contexts and pass
         // `false` (CSS 2.1 §8.3.1, Flexbox §4, Grid §6).
         collapse_children: bool,
+        // A flex item in a column has a used main size before its children are
+        // laid out; this supplies that content height so absolutely positioned
+        // and percentage-height descendants resolve against the final size
+        // instead of the zero tentative height of an auto-height parent.
+        forced_content_height: Option<f32>,
     ) -> Option<BlockResult> {
         let node = self.formatting.get(node_id)?.clone();
         let style = node
@@ -663,36 +671,38 @@ impl Solver<'_> {
             .flatten();
         let top = self.resolve_inset(style, "top", containing.size.height, node.source);
         let bottom = self.resolve_inset(style, "bottom", containing.size.height, node.source);
-        let specified_content_height = css_height
-            .or(replaced_size.map(|size| size.height))
-            .or(aspect_ratio_height)
-            .map(|height| match (css_height.is_some(), box_sizing) {
-                (true, BoxSizing::BorderBox) => {
-                    (height - padding.vertical() - border.vertical()).max(0.0)
-                }
-                _ => height,
-            })
-            .or_else(|| {
-                // CSS 2 §10.6.4: an absolutely positioned non-replaced box
-                // with auto height and both block insets resolves its used
-                // height before its percentage-height descendants are laid
-                // out. Resizing only after child layout leaves them at a
-                // provisional 0px basis (common in carousel overlays).
-                if out_of_flow {
-                    top.zip(bottom).map(|(top, bottom)| {
-                        (containing.size.height
-                            - top
-                            - bottom
-                            - margin_top
-                            - margin_bottom
-                            - border.vertical()
-                            - padding.vertical())
-                        .max(0.0)
-                    })
-                } else {
-                    None
-                }
-            });
+        let specified_content_height = forced_content_height.or_else(|| {
+            css_height
+                .or(replaced_size.map(|size| size.height))
+                .or(aspect_ratio_height)
+                .map(|height| match (css_height.is_some(), box_sizing) {
+                    (true, BoxSizing::BorderBox) => {
+                        (height - padding.vertical() - border.vertical()).max(0.0)
+                    }
+                    _ => height,
+                })
+                .or_else(|| {
+                    // CSS 2 §10.6.4: an absolutely positioned non-replaced box
+                    // with auto height and both block insets resolves its used
+                    // height before its percentage-height descendants are laid
+                    // out. Resizing only after child layout leaves them at a
+                    // provisional 0px basis (common in carousel overlays).
+                    if out_of_flow {
+                        top.zip(bottom).map(|(top, bottom)| {
+                            (containing.size.height
+                                - top
+                                - bottom
+                                - margin_top
+                                - margin_bottom
+                                - border.vertical()
+                                - padding.vertical())
+                            .max(0.0)
+                        })
+                    } else {
+                        None
+                    }
+                })
+        });
         // A specified (or replaced) content height is definite, so in-flow
         // children may resolve percentage heights against it; a content-sized
         // parent is indefinite (CSS 2 §10.5) and only contributes a tentative
@@ -1419,6 +1429,7 @@ impl Solver<'_> {
                 None,
                 false,
                 false,
+                None,
             );
         }
         let fragment = self.allocate_fragment(
@@ -1576,6 +1587,7 @@ impl Solver<'_> {
                 // A float establishes its own block formatting context, so
                 // its margins never collapse with its children's.
                 false,
+                None,
             )?;
             let outer = self.fragment_outer_rect(result.fragment)?;
             if outer.size.width <= available || available >= containing.size.width {

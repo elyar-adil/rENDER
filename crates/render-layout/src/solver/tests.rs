@@ -230,6 +230,99 @@ fn text_align_centers_inline_text_inside_a_fixed_width_box() {
 }
 
 #[test]
+fn border_box_percentage_width_includes_padding_in_the_used_width() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='outer'><div id='box'>x</div></div></body>",
+        "html, body, #outer, #box { display:block; margin:0 } #outer { width:700px } #box { box-sizing:border-box; width:100%; padding-left:160px; padding-right:160px }",
+        800.0,
+    );
+    let box_node = find(&output.dom, "#box");
+    let fragment = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(box_node))
+        .expect("box fragment");
+    assert_eq!(fragment.rect.size.width, 700.0);
+    let FragmentKind::Box(geometry) = &fragment.kind else {
+        panic!("expected box fragment")
+    };
+    assert_eq!(geometry.content_rect.size.width, 380.0);
+}
+
+#[test]
+fn absolute_box_with_top_and_bottom_stretches_to_the_containing_block() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='outer'><div id='inner'>x</div></div></body>",
+        "html, body, #outer, #inner { display:block; margin:0 } \
+         #outer { position:relative; width:700px; height:536px } \
+         #inner { position:absolute; top:0; right:0; bottom:0; left:0 }",
+        800.0,
+    );
+    let inner = find(&output.dom, "#inner");
+    let fragment = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(inner))
+        .expect("inner fragment");
+    assert_eq!(fragment.rect.size.width, 700.0);
+    assert_eq!(fragment.rect.size.height, 536.0);
+}
+
+#[test]
+fn growing_column_item_gives_absolute_children_its_final_height() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='form'><div id='main'><div id='abs'></div></div></div></body>",
+        "html, body, #form, #main, #abs { display:block; margin:0 } \
+         #form { display:flex; flex-direction:column; width:700px; height:536px } \
+         #main { flex-grow:1; position:relative } \
+         #abs { position:absolute; top:0; right:0; bottom:0; left:0 }",
+        800.0,
+    );
+    let main = find(&output.dom, "#main");
+    let main_fragment = layout
+        .fragments
+        .iter()
+        .filter(|fragment| fragment.source == Some(main))
+        .last()
+        .expect("main fragment");
+    assert_eq!(main_fragment.rect.size.height, 536.0);
+    let abs = find(&output.dom, "#abs");
+    let abs_fragment = layout
+        .fragments
+        .iter()
+        .filter(|fragment| fragment.source == Some(abs))
+        .last()
+        .expect("absolute fragment");
+    assert_eq!(abs_fragment.rect.size.height, 536.0);
+}
+
+#[test]
+fn flex_item_border_box_percentage_width_leaves_room_for_padding() {
+    for direction in ["row", "column"] {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><div id='outer'><div id='box'>x</div></div></body>",
+            &format!(
+                "html, body, #outer, #box {{ display:block; margin:0 }} \
+                 #outer {{ display:flex; flex-direction:{direction}; width:700px }} \
+                 #box {{ box-sizing:border-box; width:100%; padding-left:160px; padding-right:160px }}"
+            ),
+            800.0,
+        );
+        let box_node = find(&output.dom, "#box");
+        let fragment = layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(box_node))
+            .expect("box fragment");
+        assert_eq!(fragment.rect.size.width, 700.0, "{direction}");
+        let FragmentKind::Box(geometry) = &fragment.kind else {
+            panic!("expected box fragment")
+        };
+        assert_eq!(geometry.content_rect.size.width, 380.0, "{direction}");
+    }
+}
+
+#[test]
 fn block_width_resolves_mixed_percentages_box_sizing_and_auto_margins() {
     let (output, _, layout) = pipeline(
         "<!doctype html><body><div id='box'></div></body>",

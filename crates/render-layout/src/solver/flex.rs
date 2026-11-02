@@ -641,6 +641,7 @@ impl Solver<'_> {
                         // children (CSS Flexbox §4).
                         specified_height.is_some(),
                         false,
+                        None,
                     ),
                 _ => self.layout_anonymous_block(
                     item.node,
@@ -686,6 +687,79 @@ impl Solver<'_> {
             Self::distribute_flex_space(&mut items, available_main - gaps);
         } else if !horizontal {
             available_main = items.iter().map(|item| item.target_outer).sum::<f32>() + gaps;
+        }
+        // A column item's used main size is known only after space is
+        // distributed. Relaying it out with that height makes percentage and
+        // absolutely positioned descendants resolve against the final size;
+        // resizing the fragment afterwards would leave them on the tentative
+        // auto height computed in the measuring pass.
+        if !horizontal {
+            let resized: Vec<(usize, FormattingNodeId, Option<NodeId>, f32)> = items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| (item.target_outer - item.base_outer).abs() > 0.01)
+                .map(|(index, item)| (index, item.node, item.source, item.target_outer))
+                .collect();
+            for (index, node, source, target_outer) in resized {
+                let item_style = self
+                    .formatting
+                    .get(node)
+                    .and_then(|node| node.style_source)
+                    .and_then(|style_source| self.styles.get(&style_source));
+                let item_align = self.flex_item_align(node, align);
+                let outer_width = self.flex_cross_outer_size(
+                    node,
+                    item_style,
+                    containing.size.width,
+                    item_align,
+                    source,
+                );
+                let forced_content_width =
+                    self.flex_content_width(item_style, outer_width, containing.size.width, source);
+                let vertical_extras =
+                    self.flex_outer_extras(item_style, false, containing.size.width, source);
+                let content_height = (target_outer - vertical_extras).max(0.0);
+                if matches!(
+                    self.formatting.get(node).map(|node| &node.kind),
+                    Some(FormattingNodeKind::BlockContainer { .. })
+                ) && let Some(result) = self.layout_block_with_containing_height(
+                    node,
+                    PhysicalRect::new(
+                        containing.origin.x,
+                        containing.origin.y,
+                        outer_width,
+                        target_outer,
+                    ),
+                    container_rtl,
+                    positioning_containing,
+                    positioning_containing_rtl,
+                    containing.origin.y,
+                    depth,
+                    Some(forced_content_width),
+                    true,
+                    false,
+                    Some(content_height),
+                ) {
+                    // Keep the original fragment identity: the embedding's
+                    // geometry index is keyed by the fragment the first pass
+                    // already published, so leaving that slot at the measuring
+                    // size would paint the old position behind the new one.
+                    let fragment = match items[index].fragment {
+                        Some(previous) => {
+                            let mut replacement =
+                                self.fragments[result.fragment.as_u32() as usize].clone();
+                            replacement.id = previous;
+                            self.fragments[previous.as_u32() as usize] = replacement;
+                            previous
+                        }
+                        None => result.fragment,
+                    };
+                    items[index].fragment = Some(fragment);
+                    items[index].natural_outer_cross = self
+                        .fragment_outer_rect(fragment)
+                        .map_or(outer_width, |rect| rect.size.width);
+                }
+            }
         }
         let natural_cross = items
             .iter()
@@ -1262,8 +1336,17 @@ impl Solver<'_> {
         if align == AlignItems::Stretch && self.flex_cross_is_auto(node, "width") {
             available
         } else {
-            self.resolve_size(style, "width", available, source)
-                .unwrap_or_else(|| {
+            let border_box = matches!(
+                style.and_then(|style| style.typed("box-sizing")),
+                Some(TypedPropertyValue::BoxSizing(BoxSizing::BorderBox))
+            );
+            match self.resolve_size(style, "width", available, source) {
+                // A specified width is already the outer size under
+                // `box-sizing: border-box`; adding the padding and border a
+                // second time turns a 100%-wide item into 100% + extras.
+                Some(width) if border_box => width,
+                Some(width) => width + extras,
+                None => {
                     // CSS Flexbox §9.4.8: an auto cross size is the fit-content
                     // size, `min(max-content, max(min-content, available))`.
                     // Without the min-content floor the clamp is a bare
@@ -1279,9 +1362,9 @@ impl Solver<'_> {
                         self.intrinsic_flex_size(node, true, available, 0),
                         self.flex_intrinsic_size(node, true, available, 0, true)
                             .max(available),
-                    )
-                })
-                + extras
+                    ) + extras
+                }
+            }
         }
     }
 

@@ -458,6 +458,7 @@ impl Solver<'_> {
                     // A table cell establishes an independent formatting
                     // context; its margins do not collapse with its content.
                     false,
+                    None,
                 ) else {
                     continue;
                 };
