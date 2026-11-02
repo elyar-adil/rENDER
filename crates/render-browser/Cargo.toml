@@ -22,16 +22,27 @@ render-core = { path = "../render-core" }
 render-net = { path = "../render-net" }
 pollster = "1.0"
 softbuffer = { version = "0.4.8", default-features = false }
-wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
+# `default-features = false` means every target must select its own graphics
+# backend. Leaving `metal` out makes `wgpu::Instance::new` panic on macOS
+# because no implemented backend feature is enabled.
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl"] }
 winit = { version = "0.30.12", default-features = false, features = ["rwh_06"] }
 woff2 = { package = "woff2-patched", version = "0.4.0" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["dx12"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["metal"] }
 
 # winit and softbuffer have no window-system backend on Linux unless one is
 # selected, and the build fails with `compile_error!` without it. X11 and
 # Wayland are loaded at run time (`*-dlopen`), so building needs no system
 # development packages and the binary still runs on either session type.
+# `vulkan` and `gles` cover the wgpu presenter's `PRIMARY` backends on Linux.
 [target.'cfg(target_os = "linux")'.dependencies]
 softbuffer = { version = "0.4.8", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["vulkan", "gles"] }
 winit = { version = "0.30.12", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
 
 [lints]
