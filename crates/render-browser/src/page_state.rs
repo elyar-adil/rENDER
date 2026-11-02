@@ -47,6 +47,8 @@ use render_net::Url;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::env;
+use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::dpi::PhysicalSize as WindowSize;
@@ -320,14 +322,51 @@ fn page_options() -> PageOptions {
     }
 }
 
+/// `RENDER_PROBE_SCRIPT` inserts one diagnostic script as the first script of
+/// the document. It is site-neutral: the file is whatever the operator writes,
+/// and the insertion point is the document's own `<head>` (or `<html>`), so a
+/// probe observes the page before any page script runs without changing the
+/// URL, origin or cookies.
+fn page_html_with_probe(html: &str) -> String {
+    let Ok(path) = env::var("RENDER_PROBE_SCRIPT") else {
+        return html.to_owned();
+    };
+    let script = match fs::read_to_string(&path) {
+        Ok(script) => script,
+        Err(error) => {
+            eprintln!("render-browser probe script not loaded from {path}: {error}");
+            return html.to_owned();
+        }
+    };
+    let probe = format!("<script>{script}</script>");
+    let lower = html.to_ascii_lowercase();
+    for anchor in ["<head", "<html"] {
+        if let Some(start) = lower.find(anchor)
+            && let Some(end) = html[start..].find('>')
+        {
+            let at = start + end + 1;
+            let mut output = String::with_capacity(html.len() + probe.len());
+            output.push_str(&html[..at]);
+            output.push_str(&probe);
+            output.push_str(&html[at..]);
+            return output;
+        }
+    }
+    let mut output = String::with_capacity(html.len() + probe.len());
+    output.push_str(&probe);
+    output.push_str(html);
+    output
+}
+
 impl PageState {
     pub(super) fn new(source: PageSource) -> Self {
         let mut first_entry = HistoryEntry::new(source.target.history_url());
         first_entry.document = Some(FIRST_DOCUMENT_SERIAL);
         let history = SessionHistory::new(first_entry, NavigationLimits::default())
             .expect("browser-created page URLs fit the session-history limits");
+        let html = page_html_with_probe(&source.html);
         let page = Page::with_options_and_url_unrendered(
-            &source.html,
+            &html,
             page_options(),
             &source.target.history_url(),
         );
@@ -463,8 +502,9 @@ impl PageState {
         if !cancellations.is_empty() {
             let _ = self.run_page_turns();
         }
+        let html = page_html_with_probe(&source.html);
         self.page = Page::with_options_and_url_unrendered(
-            &source.html,
+            &html,
             page_options(),
             &source.target.history_url(),
         );

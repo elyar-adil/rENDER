@@ -1454,6 +1454,16 @@ impl BrowserApp {
             self.debug_layout_dump();
         }
         eprintln!("render-browser health {}", self.health_line());
+        if let Some(path) = env::var_os("RENDER_DUMP_DOM")
+            && let Some(page) = self.pages.get(&self.tabs.active_id())
+        {
+            let dom = page.page.document().dom();
+            let markup = render_core::html::serialize_html_node(dom, dom.document());
+            match std::fs::write(&path, markup) {
+                Ok(()) => eprintln!("render-browser DOM written to {}", path.display()),
+                Err(error) => eprintln!("render-browser DOM write failed: {error}"),
+            }
+        }
         match write_frame_png(&self.frame, self.frame_size, &request.path) {
             Ok(()) => eprintln!(
                 "render-browser screenshot written to {}",
