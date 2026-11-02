@@ -42,7 +42,7 @@ use crate::layout::{PhysicalPoint, PhysicalRect, PhysicalSize, StickyConstraint}
 
 use super::color::Color;
 use super::display_list::{
-    BlendMode, DisplayCommand, DisplayItem, DisplayList, FilterEffect, MaskLayer,
+    BlendMode, ClipShape, DisplayCommand, DisplayItem, DisplayList, FilterEffect, MaskLayer,
     PaintCoordinateSpace, Transform2D,
 };
 use super::raster::{
@@ -119,6 +119,21 @@ struct RootSegment {
     end: usize,
     bounds: PhysicalRect,
     space: PaintCoordinateSpace,
+    /// Clips that were already open when this segment starts.
+    ///
+    /// A segment normally begins before its own clip commands, so this is
+    /// empty. It is non-empty when a coordinate-space change split the display
+    /// list inside a clip: the document side replays the clip while
+    /// rasterizing its bands, and the viewport side applies it at composite
+    /// time because its source surface is scroll-independent.
+    clips: Vec<InheritedClip>,
+}
+
+/// One clip open at a root-segment boundary.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct InheritedClip {
+    shape: ClipShape,
+    space: PaintCoordinateSpace,
 }
 
 /// Per-frame compositor counters.
@@ -177,6 +192,8 @@ impl CompositorCache {
         let mut index = 0_usize;
         let mut root_start = 0_usize;
         let mut root_space: Option<PaintCoordinateSpace> = None;
+        let mut root_clips: Vec<InheritedClip> = Vec::new();
+        let mut active_clips: Vec<InheritedClip> = Vec::new();
         let mut clip_depth = 0_usize;
         while index < items.len() {
             let item = &items[index];
@@ -187,24 +204,28 @@ impl CompositorCache {
                         root_space = Some(space);
                     }
                     if root_space != Some(space) {
-                        if clip_depth != 0 {
-                            return None;
-                        }
-                        push_segment(
+                        split_root_segment(
                             items,
                             viewport,
-                            root_start,
+                            &mut root_start,
+                            &mut root_space,
+                            &root_clips,
                             index,
-                            root_space,
+                            space,
                             &mut segments,
                             &mut ops,
                         )?;
-                        root_start = index;
-                        root_space = Some(space);
+                        root_clips.clone_from(&active_clips);
                     }
                     match item.command {
-                        DisplayCommand::PushClip(_) => clip_depth += 1,
-                        DisplayCommand::PopClip => clip_depth = clip_depth.saturating_sub(1),
+                        DisplayCommand::PushClip(shape) => {
+                            active_clips.push(InheritedClip { shape, space });
+                            clip_depth += 1;
+                        }
+                        DisplayCommand::PopClip => {
+                            active_clips.pop();
+                            clip_depth = clip_depth.saturating_sub(1);
+                        }
                         _ => unreachable!("matched clip commands"),
                     }
                     index += 1;
@@ -239,6 +260,7 @@ impl CompositorCache {
                         root_start,
                         index,
                         root_space,
+                        &root_clips,
                         &mut segments,
                         &mut ops,
                     )?;
@@ -267,11 +289,23 @@ impl CompositorCache {
                     // A context inside an ambient clip would need that clip
                     // copied into its layer and removed from the root segment.
                     // The conservative answer is the complete raster path.
+                    let start = index + 1;
+                    let end = matching_pop(items, index)?;
+                    if start == end {
+                        // An empty scope paints no pixels. Leave the balanced
+                        // push/pop in the surrounding segment so the band
+                        // rasterizer replays it; extracting a layer would
+                        // require an empty bounds rectangle.
+                        if root_space.is_some_and(|current| current != space) {
+                            return None;
+                        }
+                        root_space = Some(space);
+                        index = end + 1;
+                        continue;
+                    }
                     if clip_depth != 0 || context.blend_mode != BlendMode::Normal {
                         return None;
                     }
-                    let start = index + 1;
-                    let end = matching_pop(items, index)?;
                     if items[start..end]
                         .iter()
                         .any(|item| item.coordinate_space != space)
@@ -311,6 +345,7 @@ impl CompositorCache {
                         root_start,
                         index,
                         root_space,
+                        &root_clips,
                         &mut segments,
                         &mut ops,
                     )?;
@@ -336,19 +371,22 @@ impl CompositorCache {
                     if let Some(current) = root_space
                         && current != space
                     {
-                        if clip_depth != 0 {
-                            return None;
-                        }
-                        push_segment(
+                        split_root_segment(
                             items,
                             viewport,
-                            root_start,
+                            &mut root_start,
+                            &mut root_space,
+                            &root_clips,
                             index,
-                            Some(current),
+                            space,
                             &mut segments,
                             &mut ops,
                         )?;
-                        root_start = index;
+                        root_clips = if clip_depth == 0 {
+                            Vec::new()
+                        } else {
+                            active_clips.clone()
+                        };
                     }
                     root_space = Some(space);
                     index += 1;
@@ -361,6 +399,7 @@ impl CompositorCache {
             root_start,
             items.len(),
             root_space,
+            &root_clips,
             &mut segments,
             &mut ops,
         )?;
@@ -429,6 +468,7 @@ impl CompositorCache {
                         1.0,
                         segment.space,
                         None,
+                        &segment.clips,
                         viewport_origin,
                         glyphs,
                         images,
@@ -463,6 +503,7 @@ impl CompositorCache {
                             layer.opacity,
                             layer.space,
                             layer.sticky,
+                            &[],
                             viewport_origin,
                             glyphs,
                             images,
@@ -503,6 +544,7 @@ impl CompositorCache {
         opacity: f32,
         space: PaintCoordinateSpace,
         sticky: Option<StickyConstraint>,
+        clips: &[InheritedClip],
         viewport_origin: PhysicalPoint,
         glyphs: &dyn GlyphMaskProvider,
         images: Option<&ImageResources>,
@@ -532,6 +574,18 @@ impl CompositorCache {
         }
         .then(&transform);
         let viewport_rect = viewport_rect(self.viewport);
+        // A viewport segment split out of a document clip keeps its source
+        // surface scroll-independent, so its inherited clips are applied here
+        // in viewport coordinates. Document segments replay clips while
+        // rasterizing their bands instead.
+        let composite_clip = if space == PaintCoordinateSpace::Viewport {
+            let Some(clip) = inherited_viewport_clip(clips, viewport_origin, viewport_rect) else {
+                return 0;
+            };
+            clip
+        } else {
+            viewport_rect
+        };
         let band_height = if space == PaintCoordinateSpace::Viewport {
             ceil_to_u32(self.viewport.height).max(1)
         } else {
@@ -628,14 +682,30 @@ impl CompositorCache {
                         y: bounds.origin.y + local_y,
                     }
                 };
-                let raster = CpuRasterizer.rasterize_item_slice(
-                    &self.display_list.items()[start..end],
-                    band_size,
-                    Color::TRANSPARENT,
-                    glyphs,
-                    raster_origin,
-                    images,
-                );
+                let raster = if space == PaintCoordinateSpace::Document && !clips.is_empty() {
+                    let inherited = clips
+                        .iter()
+                        .map(|clip| (clip.shape, clip.space))
+                        .collect::<Vec<_>>();
+                    CpuRasterizer.rasterize_item_slice_with_clips(
+                        &self.display_list.items()[start..end],
+                        band_size,
+                        Color::TRANSPARENT,
+                        glyphs,
+                        raster_origin,
+                        images,
+                        &inherited,
+                    )
+                } else {
+                    CpuRasterizer.rasterize_item_slice(
+                        &self.display_list.items()[start..end],
+                        band_size,
+                        Color::TRANSPARENT,
+                        glyphs,
+                        raster_origin,
+                        images,
+                    )
+                };
                 diagnostics.extend(raster.diagnostics);
                 entry.insert(raster.surface);
                 state.stats.bands_rasterized = state.stats.bands_rasterized.saturating_add(1);
@@ -658,7 +728,7 @@ impl CompositorCache {
                 ..Transform2D::default()
             };
             let mapped = to_viewport.then(&transform.then(&band_origin));
-            let clip = Some(viewport_rect);
+            let clip = Some(composite_clip);
             if !composite_surface(output, source, mapped, opacity, clip, control) {
                 break;
             }
@@ -927,19 +997,53 @@ fn matching_sticky_pop(items: &[DisplayItem], push: usize) -> Option<usize> {
     None
 }
 
+/// Starts a new root segment at `index` after closing the segment that ends
+/// there.
+#[allow(clippy::too_many_arguments)]
+fn split_root_segment(
+    items: &[DisplayItem],
+    viewport: PhysicalSize,
+    root_start: &mut usize,
+    root_space: &mut Option<PaintCoordinateSpace>,
+    root_clips: &[InheritedClip],
+    index: usize,
+    next_space: PaintCoordinateSpace,
+    segments: &mut Vec<RootSegment>,
+    ops: &mut Vec<LayerOp>,
+) -> Option<()> {
+    push_segment(
+        items,
+        viewport,
+        *root_start,
+        index,
+        *root_space,
+        root_clips,
+        segments,
+        ops,
+    )?;
+    *root_start = index;
+    *root_space = Some(next_space);
+    Some(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the segment boundary is one parser state: source range, space, inherited clips and the two output lists"
+)]
 fn push_segment(
     items: &[DisplayItem],
     viewport: PhysicalSize,
     start: usize,
     end: usize,
     space: Option<PaintCoordinateSpace>,
+    clips: &[InheritedClip],
     segments: &mut Vec<RootSegment>,
     ops: &mut Vec<LayerOp>,
 ) -> Option<()> {
     if start >= end {
         return Some(());
     }
-    let segment = make_segment(items, viewport, start, end, space?)?;
+    let segment = make_segment(items, viewport, start, end, space?, clips)?;
     ops.push(LayerOp::Segment(segments.len()));
     segments.push(segment);
     Some(())
@@ -951,12 +1055,37 @@ fn make_segment(
     start: usize,
     end: usize,
     space: PaintCoordinateSpace,
+    clips: &[InheritedClip],
 ) -> Option<RootSegment> {
     if items[start..end]
         .iter()
         .any(|item| item.coordinate_space != space)
     {
         return None;
+    }
+    // A viewport segment's surface is cached independently of the scroll
+    // offset, so its inherited clips are applied when it is composited. That
+    // only supports axis-aligned rectangles exactly; anything else keeps the
+    // complete-raster fallback. A document segment replays its clips while
+    // rasterizing each band, and that replay is only valid for clips that live
+    // in document coordinates.
+    match space {
+        PaintCoordinateSpace::Viewport => {
+            if clips
+                .iter()
+                .any(|clip| !matches!(clip.shape, ClipShape::Rect(_)))
+            {
+                return None;
+            }
+        }
+        PaintCoordinateSpace::Document => {
+            if clips
+                .iter()
+                .any(|clip| clip.space != PaintCoordinateSpace::Document)
+            {
+                return None;
+            }
+        }
     }
     let bounds = if space == PaintCoordinateSpace::Viewport {
         viewport_rect(viewport)
@@ -971,6 +1100,7 @@ fn make_segment(
         end,
         bounds,
         space,
+        clips: clips.to_vec(),
     })
 }
 
@@ -984,6 +1114,46 @@ fn intersect_rect(first: PhysicalRect, second: PhysicalRect) -> Option<PhysicalR
     let right = first.right().min(second.right());
     let bottom = first.bottom().min(second.bottom());
     (right > left && bottom > top).then(|| PhysicalRect::new(left, top, right - left, bottom - top))
+}
+
+/// Resolves inherited clips into one viewport-space rectangle.
+///
+/// The complete rasterizer's all-rect fast path includes integer pixel `x`
+/// when `x >= left && x < right` in the clip's own coordinates. Rounding the
+/// edges to `ceil(left)` / `ceil(right)` before handing them to the blit's
+/// pixel-centre test preserves exactly that set of pixels.
+fn inherited_viewport_clip(
+    clips: &[InheritedClip],
+    viewport_origin: PhysicalPoint,
+    viewport: PhysicalRect,
+) -> Option<PhysicalRect> {
+    let mut clip = viewport;
+    for inherited in clips {
+        let ClipShape::Rect(rect) = inherited.shape else {
+            return None;
+        };
+        let rect = match inherited.space {
+            PaintCoordinateSpace::Document => PhysicalRect::new(
+                rect.origin.x - viewport_origin.x,
+                rect.origin.y - viewport_origin.y,
+                rect.size.width,
+                rect.size.height,
+            ),
+            PaintCoordinateSpace::Viewport => rect,
+        };
+        let left = rect.origin.x.ceil();
+        let top = rect.origin.y.ceil();
+        let right = rect.right().ceil();
+        let bottom = rect.bottom().ceil();
+        if !left.is_finite() || !top.is_finite() || !right.is_finite() || !bottom.is_finite() {
+            return None;
+        }
+        clip = intersect_rect(
+            clip,
+            PhysicalRect::new(left, top, right - left, bottom - top),
+        )?;
+    }
+    Some(clip)
 }
 
 fn item_bounds(items: &[DisplayItem]) -> Option<PhysicalRect> {
@@ -1035,7 +1205,8 @@ mod tests {
     use crate::dom::DomRevision;
     use crate::layout::{PhysicalPoint, PhysicalRect, PhysicalSize};
     use crate::paint::display_list::{
-        FilterEffect, FilterOperation, GradientStop, LinearGradient, MaskImage, MaskLayer,
+        ClipShape, FilterEffect, FilterOperation, GradientStop, LinearGradient, MaskImage,
+        MaskLayer,
     };
     use crate::paint::{
         BlendMode, Color, CompositingReason, CpuRasterizer, DisplayCommand, DisplayItem,
@@ -1810,5 +1981,159 @@ mod tests {
                 "viewport-space filter and mask",
             );
         }
+    }
+
+    /// A fixed-position item inside an overflow clip is legal in a display
+    /// list: the complete raster applies the scrolled document clip to the
+    /// viewport-space item. The retained path must keep that scene instead of
+    /// rejecting it and forcing a full raster for every scroll frame.
+    #[test]
+    fn a_viewport_item_inside_a_document_clip_stays_retained() {
+        let viewport = PhysicalSize {
+            width: 120.0,
+            height: 100.0,
+        };
+        let clip = PhysicalRect::new(8.0, 8.0, 80.0, 50.0);
+        let mut fixed = item(
+            2,
+            PhysicalRect::new(0.0, 0.0, 40.0, 20.0),
+            rect(0.0, 0.0, 40.0, 20.0, Color::rgb(200, 40, 40)),
+        );
+        fixed.coordinate_space = PaintCoordinateSpace::Viewport;
+        let items = vec![
+            item(0, clip, DisplayCommand::PushClip(ClipShape::Rect(clip))),
+            item(
+                1,
+                clip,
+                rect(0.0, 0.0, 120.0, 300.0, Color::rgb(238, 238, 238)),
+            ),
+            fixed,
+            item(3, clip, DisplayCommand::PopClip),
+            item(
+                4,
+                PhysicalRect::new(0.0, 60.0, 120.0, 240.0),
+                rect(0.0, 60.0, 120.0, 240.0, Color::rgb(10, 120, 10)),
+            ),
+        ];
+        let display = std::sync::Arc::new(list(viewport, items));
+        let cache =
+            CompositorCache::from_display_list(std::sync::Arc::clone(&display), Color::WHITE)
+                .expect("a viewport item inside a document clip is retainable");
+        for y in [0.0, 7.0, 30.0, 55.0, 90.0] {
+            assert_matches_complete_raster(
+                &cache,
+                &display,
+                Color::WHITE,
+                PhysicalPoint { x: 0.0, y },
+                "viewport item inside a document clip",
+            );
+        }
+    }
+
+    /// The composite-time clip only supports axis-aligned rectangles. A
+    /// rounded clip around a coordinate-space boundary must keep the
+    /// conservative complete-raster fallback instead of approximating it.
+    #[test]
+    fn a_rounded_clip_across_a_coordinate_space_boundary_falls_back() {
+        let viewport = PhysicalSize {
+            width: 120.0,
+            height: 100.0,
+        };
+        let clip = ClipShape::RoundedRect {
+            rect: PhysicalRect::new(8.0, 8.0, 80.0, 50.0),
+            radii: crate::paint::display_list::CornerRadii {
+                top_left: 6.0,
+                top_right: 6.0,
+                bottom_right: 6.0,
+                bottom_left: 6.0,
+            },
+        };
+        let mut fixed = item(
+            2,
+            PhysicalRect::new(0.0, 0.0, 40.0, 20.0),
+            rect(0.0, 0.0, 40.0, 20.0, Color::rgb(200, 40, 40)),
+        );
+        fixed.coordinate_space = PaintCoordinateSpace::Viewport;
+        let items = vec![
+            item(
+                0,
+                PhysicalRect::new(8.0, 8.0, 80.0, 50.0),
+                DisplayCommand::PushClip(clip),
+            ),
+            fixed,
+            item(
+                3,
+                PhysicalRect::new(8.0, 8.0, 80.0, 50.0),
+                DisplayCommand::PopClip,
+            ),
+        ];
+        let display = list(viewport, items);
+        assert!(
+            CompositorCache::from_display_list(std::sync::Arc::new(display), Color::WHITE)
+                .is_none(),
+            "the complete-raster fallback must remain for an unsupported clip shape"
+        );
+    }
+
+    /// The all-rect fast path of the complete rasterizer admits integer pixel
+    /// `x` when `x >= left && x < right`. Rounding clip edges outward to whole
+    /// pixels reproduces exactly that set when they reach the blit.
+    #[test]
+    fn inherited_viewport_clips_follow_the_rect_cell_rule() {
+        let viewport = PhysicalRect::new(0.0, 0.0, 120.0, 100.0);
+        let clips = [super::InheritedClip {
+            shape: ClipShape::Rect(PhysicalRect::new(8.4, 7.6, 80.2, 50.3)),
+            space: PaintCoordinateSpace::Document,
+        }];
+        assert_eq!(
+            super::inherited_viewport_clip(&clips, PhysicalPoint { x: 0.0, y: 0.0 }, viewport),
+            Some(PhysicalRect::new(9.0, 8.0, 80.0, 50.0))
+        );
+        assert_eq!(
+            super::inherited_viewport_clip(&clips, PhysicalPoint { x: 10.0, y: 4.0 }, viewport),
+            Some(PhysicalRect::new(0.0, 4.0, 79.0, 50.0))
+        );
+    }
+
+    /// An empty stacking context paints no pixels anywhere. It must not force
+    /// the complete-raster fallback just because its bounds are empty.
+    #[test]
+    fn an_empty_stacking_context_does_not_invalidate_the_scene() {
+        let viewport = PhysicalSize {
+            width: 80.0,
+            height: 60.0,
+        };
+        let bounds = PhysicalRect::new(0.0, 0.0, 80.0, 60.0);
+        let items = vec![
+            item(0, bounds, rect(0.0, 0.0, 80.0, 60.0, Color::WHITE)),
+            item(
+                1,
+                bounds,
+                DisplayCommand::PushStackingContext(context(
+                    Transform2D {
+                        translate_x: 8.0,
+                        ..Transform2D::default()
+                    },
+                    0.0,
+                )),
+            ),
+            item(2, bounds, DisplayCommand::PopStackingContext),
+            item(
+                3,
+                PhysicalRect::new(10.0, 10.0, 20.0, 20.0),
+                rect(10.0, 10.0, 20.0, 20.0, Color::rgb(0, 0, 255)),
+            ),
+        ];
+        let display = std::sync::Arc::new(list(viewport, items));
+        let cache =
+            CompositorCache::from_display_list(std::sync::Arc::clone(&display), Color::WHITE)
+                .expect("an empty stacking context is retainable");
+        assert_matches_complete_raster(
+            &cache,
+            &display,
+            Color::WHITE,
+            PhysicalPoint::default(),
+            "empty stacking context",
+        );
     }
 }

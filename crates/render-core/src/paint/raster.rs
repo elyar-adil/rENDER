@@ -299,9 +299,44 @@ impl CpuRasterizer {
         viewport_origin: PhysicalPoint,
         images: Option<&ImageResources>,
     ) -> CpuRasterOutput {
+        self.rasterize_item_slice_with_clips(
+            items,
+            viewport,
+            background,
+            glyphs,
+            viewport_origin,
+            images,
+            &[],
+        )
+    }
+
+    /// Rasterizes a display-list slice whose owning clip commands were opened
+    /// before the slice starts.
+    ///
+    /// The retained compositor splits a root segment when a coordinate-space
+    /// change occurs inside a clip. The document side then needs the open clip
+    /// replayed so its bands keep the same clip the complete raster applies.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the slice rasterizer carries the source range, viewport, glyph/image providers and inherited clip stack"
+    )]
+    pub fn rasterize_item_slice_with_clips(
+        &self,
+        items: &[DisplayItem],
+        viewport: PhysicalSize,
+        background: Color,
+        glyphs: &dyn GlyphMaskProvider,
+        viewport_origin: PhysicalPoint,
+        images: Option<&ImageResources>,
+        inherited_clips: &[(ClipShape, PaintCoordinateSpace)],
+    ) -> CpuRasterOutput {
         let width = ceil_to_u32(viewport.width);
         let height = ceil_to_u32(viewport.height);
         let mut state = RasterState::new(width, height, background, viewport_origin, images);
+        for (shape, space) in inherited_clips {
+            let offset = state.item_offset(*space);
+            state.push_clip(*shape, offset);
+        }
         for item in items {
             state.process_item(item, glyphs, images);
         }
