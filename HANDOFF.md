@@ -39,7 +39,16 @@
 3. **表格自动宽度忽略定宽块后代**：300px 子块不再让表格塌成 44px。
 4. **`font-family` 没有进入继承注册表**：嵌套 `<span>`/`<b>`/`::before` 之前全部退回 `system-ui`，导致图标字体空白、字号从 28px 跳到 42px；现在按 CSS Fonts 4 §2.2 继承，`@supports (font-family: ...)` 也改为 supported（`render-css` 320 passed，`render-js` 1235 passed）。
 
-修复后的百度截图：`/tmp/baidu-after.png`；Edge 参考：`/tmp/render-site-diag/edge-1180.png`。结构已经正常，剩余最大差异是 **Retina DPR**：rENDER 把 2360 物理像素当成 CSS 视口、`devicePixelRatio=1`，导致页面按 2360px 宽度排版；Chrome 是 1180 CSS px、DPR 2。媒体查询、列宽、字号都因此不同。这是下一轮最高优先级，需要把 layout 保持在 CSS px、只对 paint/raster 做设备缩放，并同步 scroll/hit-test/JS viewport 单位。
+修复后的百度截图：`/tmp/baidu-after.png`；Edge 参考：`/tmp/render-site-diag/edge-1180.png`。结构已经正常。当时最大的剩余差异是 **Retina DPR**：rENDER 把 2360 物理像素当成 CSS 视口、`devicePixelRatio=1`，导致页面按 2360px 宽度排版。
+
+**DPR 已修**（`e94fd2c`、`2d942b4`、`c803cb3`）：`RenderIdentity.device_scale` 携带窗口缩放；layout/viewport/media query/`innerWidth`/`getBoundingClientRect`/scroll/hit-test/几何全部是 CSS px；`DisplayList::scaled(scale)` 在 raster 前缩放所有几何和字号，所以 14px CSS 文本请求 28px 的 glyph mask，不是位图放大；`PageState.surface_size` 单独保存物理帧大小，chrome/scrollbar/present 保持物理。百度在 1180×780 logical / DPR 2 下：
+
+| node | rENDER | Edge |
+| --- | ---: | ---: |
+| `#content_left` | 150, 98, 608×2325.33 | 150, 98, 608×2321.31 |
+| `#content_right` | 878, 119, 348×855 | 878, 119, 348×839 |
+
+修复后截图 `/tmp/baidu-dpr-merged.png`；Edge 参考 `/tmp/render-site-diag/edge-1180.png`。`innerWidth=1180`、`devicePixelRatio=2`、`@media (min-width:2000px)` 不再误匹配。剩余限制：CSS `resolution`/`-webkit-device-pixel-ratio` 媒体查询尚未实现；非整数 DPI 会有一物理像素取整差；文本按 CSS 字号 shape 后按设备字号重新栅格，没有设备字号 re-shape。
 
 ## 字体：启动与内存
 
