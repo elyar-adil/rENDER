@@ -504,6 +504,10 @@ pub struct DisplayItem {
     pub id: DisplayItemId,
     pub fragment: FragmentId,
     pub source: Option<NodeId>,
+    /// Conservative paint bounds in `coordinate_space`. Every pixel the
+    /// command or its effects can write lies inside this rectangle; the
+    /// rasterizer uses it to limit offscreen-layer scans instead of walking
+    /// the whole viewport.
     pub bounds: PhysicalRect,
     pub coordinate_space: PaintCoordinateSpace,
     pub command: DisplayCommand,

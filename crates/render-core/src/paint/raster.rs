@@ -1,4 +1,9 @@
 //! Deterministic CPU reference rasterizer.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 
 use std::error::Error;
 use std::fmt;
@@ -77,26 +82,63 @@ impl Surface {
     /// 1280x720 warp from sampling 900k transparent pixels to move a tooltip.
     #[must_use]
     fn content_bounds(&self) -> Option<(u32, u32, u32, u32)> {
+        self.content_bounds_in(None)
+    }
+
+    /// Tight non-transparent bounds inside `area` (or the whole surface when
+    /// `None`).
+    ///
+    /// A stacking context's offscreen surface is viewport-sized, but its
+    /// painted content is normally a small element. Scanning only the bounds
+    /// the display list already declared keeps that bookkeeping proportional
+    /// to content instead of to the viewport: a page with hundreds of small
+    /// opacity/transform layers otherwise scans billions of transparent
+    /// pixels.
+    #[must_use]
+    fn content_bounds_in(&self, area: Option<PhysicalRect>) -> Option<(u32, u32, u32, u32)> {
         let width = usize::try_from(self.width).ok()?;
         if width == 0 || self.pixels.len() < width {
+            return None;
+        }
+        let (start_x, start_y, end_x, end_y) = match area {
+            Some(area) => {
+                let x = area.origin.x.floor().max(0.0) as u32;
+                let y = area.origin.y.floor().max(0.0) as u32;
+                (
+                    x.min(self.width),
+                    y.min(self.height),
+                    ceil_to_u32(area.right()).min(self.width),
+                    ceil_to_u32(area.bottom()).min(self.height),
+                )
+            }
+            None => (0, 0, self.width, self.height),
+        };
+        if start_x >= end_x || start_y >= end_y {
             return None;
         }
         let mut top = None;
         let mut bottom = 0_usize;
         let mut left = self.width;
         let mut right = 0_u32;
-        for (row, pixels) in self.pixels.chunks_exact(width).enumerate() {
-            let Some(first) = pixels.iter().position(|pixel| pixel.alpha != 0) else {
+        let x0 = usize::try_from(start_x).unwrap_or(0);
+        let x1 = usize::try_from(end_x).unwrap_or(0);
+        let y0 = usize::try_from(start_y).unwrap_or(0);
+        let y1 = usize::try_from(end_y).unwrap_or(0);
+        for (row, pixels) in self.pixels.chunks_exact(width).enumerate().take(y1) {
+            if row < y0 {
+                continue;
+            }
+            let Some(first) = pixels[x0..x1].iter().position(|pixel| pixel.alpha != 0) else {
                 continue;
             };
-            let last = pixels
+            let last = pixels[x0..x1]
                 .iter()
                 .rposition(|pixel| pixel.alpha != 0)
                 .unwrap_or(first);
             top.get_or_insert(row);
             bottom = row + 1;
-            left = left.min(u32::try_from(first).unwrap_or(0));
-            right = right.max(u32::try_from(last + 1).unwrap_or(self.width));
+            left = left.min(u32::try_from(x0 + first).unwrap_or(0));
+            right = right.max(u32::try_from(x0 + last + 1).unwrap_or(self.width));
         }
         let top = u32::try_from(top?).unwrap_or(0);
         let bottom = u32::try_from(bottom).unwrap_or(self.height);
@@ -106,6 +148,29 @@ impl Surface {
             right.saturating_sub(left),
             bottom.saturating_sub(top),
         ))
+    }
+
+    /// Clears one rectangle to transparent. Used when a stacked surface is
+    /// returned to the layer pool: only the pixels that were painted need to
+    /// be reset, so reuse does not rewrite the whole viewport.
+    fn clear_rect(&mut self, rect: PhysicalRect) {
+        let x0 = rect.origin.x.floor().max(0.0) as u32;
+        let y0 = rect.origin.y.floor().max(0.0) as u32;
+        let x1 = ceil_to_u32(rect.right()).min(self.width);
+        let y1 = ceil_to_u32(rect.bottom()).min(self.height);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let width = usize::try_from(self.width).unwrap_or(0);
+        let x0 = usize::try_from(x0).unwrap_or(0);
+        let x1 = usize::try_from(x1).unwrap_or(0);
+        for row in usize::try_from(y0).unwrap_or(0)..usize::try_from(y1).unwrap_or(0) {
+            let start = row.saturating_mul(width).saturating_add(x0);
+            let end = row.saturating_mul(width).saturating_add(x1);
+            if let Some(pixels) = self.pixels.get_mut(start..end) {
+                pixels.fill(Color::TRANSPARENT);
+            }
+        }
     }
 
     #[must_use]
@@ -284,6 +349,105 @@ impl<'a> RasterRequest<'a> {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CpuRasterizer;
+
+/// `RENDER_RASTER_PROFILE=1` diagnostic: accumulated time per display command.
+/// A command's cost often belongs to a different command than the one that
+/// looks expensive (`PopStackingContext` performs the offscreen composite), so
+/// this reports the wall time `process_item` spent for each item kind.
+#[derive(Default)]
+struct RasterProfile {
+    entries: std::collections::BTreeMap<&'static str, (u64, std::time::Duration)>,
+}
+
+/// Aggregate cost inside `warp_top_layer`, printed with `RENDER_RASTER_PROFILE`.
+#[derive(Default)]
+struct PopProfile {
+    layers: u64,
+    full_scans: u64,
+    tentative_scans: u64,
+    bounds_pixels: u64,
+    claimed_pixels: u64,
+    full_claimed_layers: u64,
+    effects: std::time::Duration,
+    bounds: std::time::Duration,
+    composite: std::time::Duration,
+    clear: std::time::Duration,
+}
+
+impl PopProfile {
+    fn print(&self) {
+        eprintln!(
+            "render-raster pop layers={} full_scans={} tentative_scans={} claimed_mpix={:.2} bounds_mpix={:.2} full_claimed_layers={} effects={:?} bounds={:?} composite={:?} clear={:?}",
+            self.layers,
+            self.full_scans,
+            self.tentative_scans,
+            self.claimed_pixels as f64 / 1_000_000.0,
+            self.bounds_pixels as f64 / 1_000_000.0,
+            self.full_claimed_layers,
+            self.effects,
+            self.bounds,
+            self.composite,
+            self.clear,
+        );
+    }
+}
+
+impl RasterProfile {
+    fn record(&mut self, label: &'static str, elapsed: std::time::Duration) {
+        let entry = self.entries.entry(label).or_default();
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 += elapsed;
+    }
+
+    fn print(&self) {
+        let mut rows = self
+            .entries
+            .iter()
+            .map(|(label, (count, elapsed))| (*label, *count, *elapsed))
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|(_, _, elapsed)| std::cmp::Reverse(*elapsed));
+        let total: std::time::Duration = rows.iter().map(|(_, _, elapsed)| *elapsed).sum();
+        eprintln!(
+            "render-raster profile total={total:?} commands={}",
+            rows.len()
+        );
+        for (label, count, elapsed) in rows.iter().take(24) {
+            let mean = elapsed
+                .checked_div(u32::try_from(*count).unwrap_or(1))
+                .unwrap_or_default();
+            eprintln!("render-raster {label:<28} count={count:<6} total={elapsed:?} mean={mean:?}");
+        }
+    }
+}
+
+fn raster_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RENDER_RASTER_PROFILE").is_some())
+}
+
+fn command_label(command: &DisplayCommand) -> &'static str {
+    match command {
+        DisplayCommand::SolidRect { .. } => "solid",
+        DisplayCommand::Border(_) => "border",
+        DisplayCommand::BoxShadow(_) => "box-shadow",
+        DisplayCommand::PushClip(_) => "push-clip",
+        DisplayCommand::PopClip => "pop-clip",
+        DisplayCommand::PushTransform(_) => "push-transform",
+        DisplayCommand::PopTransform => "pop-transform",
+        DisplayCommand::GlyphRun(_) => "glyph-run",
+        DisplayCommand::TextDecoration(_) => "text-decoration",
+        DisplayCommand::TextShadow(_) => "text-shadow",
+        DisplayCommand::ListMarker(_) => "list-marker",
+        DisplayCommand::Image(_) => "image",
+        DisplayCommand::LinearGradient(_) => "linear-gradient",
+        DisplayCommand::RadialGradient(_) => "radial-gradient",
+        DisplayCommand::ConicGradient(_) => "conic-gradient",
+        DisplayCommand::PushStackingContext(_) => "push-stacking-context",
+        DisplayCommand::PopStackingContext => "pop-stacking-context",
+        DisplayCommand::PushSticky(_) => "push-sticky",
+        DisplayCommand::PopSticky => "pop-sticky",
+    }
+}
 
 impl CpuRasterizer {
     #[must_use]
@@ -493,8 +657,16 @@ impl CpuRasterizer {
         let width = ceil_to_u32(list.viewport.width);
         let height = ceil_to_u32(list.viewport.height);
         let mut state = RasterState::new(width, height, background, viewport_origin, images);
+        let mut profile = raster_profile_enabled().then(RasterProfile::default);
         for item in list.items() {
+            let started = profile.as_ref().map(|_| std::time::Instant::now());
             state.process_item(item, glyphs, images);
+            if let (Some(profile), Some(started)) = (profile.as_mut(), started) {
+                profile.record(command_label(&item.command), started.elapsed());
+            }
+        }
+        if let Some(profile) = &profile {
+            profile.print();
         }
         state.finish()
     }
@@ -517,14 +689,22 @@ impl CpuRasterizer {
             images,
             Some(control),
         );
+        let mut profile = raster_profile_enabled().then(RasterProfile::default);
         for item in list.items() {
             if control.is_cancelled() || state.was_cancelled() {
                 return Err(RasterCancelled);
             }
+            let started = profile.as_ref().map(|_| std::time::Instant::now());
             state.process_item(item, glyphs, images);
+            if let (Some(profile), Some(started)) = (profile.as_mut(), started) {
+                profile.record(command_label(&item.command), started.elapsed());
+            }
         }
         if control.is_cancelled() || state.was_cancelled() {
             return Err(RasterCancelled);
+        }
+        if let Some(profile) = &profile {
+            profile.print();
         }
         state.finish_cancellable()
     }
@@ -545,6 +725,9 @@ enum StackingFrame {
         opacity: f32,
         filter: Option<FilterEffect>,
         mask: Option<MaskLayer>,
+        /// Union of the item bounds painted into this surface, in surface
+        /// pixels. `None` when nothing has painted yet.
+        painted: Option<PhysicalRect>,
     },
 }
 
@@ -556,6 +739,9 @@ struct ClipRegion {
 }
 
 const MAX_CLIP_SHAPES: usize = 16;
+/// Offscreen surfaces kept for reuse between sibling stacking contexts. Each
+/// is one viewport at physical resolution, so the bound is deliberately small.
+const MAX_POOLED_LAYERS: usize = 4;
 
 impl ClipRegion {
     const fn rect(rect: PhysicalRect) -> Self {
@@ -572,6 +758,11 @@ struct RasterState<'a> {
     height: u32,
     /// Paint surfaces, outermost first; the last entry receives all items.
     layers: Vec<Surface>,
+    /// Full-viewport transparent surfaces returned by a finished stacking
+    /// context. Reusing them avoids allocating and clearing a viewport-sized
+    /// buffer for every small opacity/transform layer. Bounded so a deeply
+    /// nested page cannot retain an unbounded amount of memory.
+    pooled_layers: Vec<Surface>,
     clips: Vec<ClipRegion>,
     /// Open stacking contexts, innermost last.
     frames: Vec<StackingFrame>,
@@ -594,6 +785,7 @@ struct RasterState<'a> {
     images: Option<&'a ImageResources>,
     control: Option<&'a dyn RasterControl>,
     cancelled: bool,
+    pop_profile: Option<PopProfile>,
 }
 
 impl<'a> RasterState<'a> {
@@ -619,6 +811,7 @@ impl<'a> RasterState<'a> {
             width,
             height,
             layers: vec![Surface::new(width, height, background)],
+            pooled_layers: Vec::new(),
             clips: vec![ClipRegion::rect(PhysicalRect::new(
                 0.0,
                 0.0,
@@ -638,6 +831,7 @@ impl<'a> RasterState<'a> {
             images,
             control,
             cancelled: false,
+            pop_profile: raster_profile_enabled().then(PopProfile::default),
         }
     }
 
@@ -654,6 +848,7 @@ impl<'a> RasterState<'a> {
             width,
             height,
             layers: vec![surface],
+            pooled_layers: Vec::new(),
             clips: vec![ClipRegion::rect(clip)],
             frames: Vec::new(),
             translation: PhysicalPoint::default(),
@@ -668,6 +863,7 @@ impl<'a> RasterState<'a> {
             images,
             control,
             cancelled: false,
+            pop_profile: raster_profile_enabled().then(PopProfile::default),
         }
     }
 
@@ -682,6 +878,9 @@ impl<'a> RasterState<'a> {
             return;
         }
         let offset = self.item_offset(item.coordinate_space);
+        if command_paints(&item.command) {
+            self.note_item_bounds(item.bounds, offset);
+        }
         match &item.command {
             DisplayCommand::SolidRect { rect, color } => {
                 let clip = self.current_clip();
@@ -700,7 +899,12 @@ impl<'a> RasterState<'a> {
             DisplayCommand::PushClip(shape) => self.push_clip(*shape, offset),
             DisplayCommand::PopClip => self.pop_clip(item.id),
             DisplayCommand::PushStackingContext(context) => {
-                self.push_stacking_context(context.clone(), item.coordinate_space);
+                self.push_stacking_context(
+                    context.clone(),
+                    item.coordinate_space,
+                    item.bounds,
+                    offset,
+                );
             }
             DisplayCommand::PopStackingContext => self.pop_stacking_context(item.id),
             DisplayCommand::PushSticky(constraint) => self.push_sticky(constraint),
@@ -801,6 +1005,24 @@ impl<'a> RasterState<'a> {
             // its fixed descendants.
             PaintCoordinateSpace::Viewport => self.translation,
         }
+    }
+
+    /// Adds one painted rectangle to the innermost offscreen layer's tracking
+    /// box. The root surface needs no tracking: it is never cropped.
+    fn note_layer_bounds(&mut self, rect: PhysicalRect) {
+        let Some(StackingFrame::Layer { painted, .. }) = self
+            .frames
+            .iter_mut()
+            .rev()
+            .find(|frame| matches!(frame, StackingFrame::Layer { .. }))
+        else {
+            return;
+        };
+        *painted = Some(painted.map_or(rect, |current| union_rect(current, rect)));
+    }
+
+    fn note_item_bounds(&mut self, bounds: PhysicalRect, offset: PhysicalPoint) {
+        self.note_layer_bounds(translate_rect(bounds, offset));
     }
 
     /// CSS Positioned Layout 4 §4.1: the box and its containing block are
@@ -1266,6 +1488,8 @@ impl<'a> RasterState<'a> {
         &mut self,
         context: StackingContext,
         coordinate_space: PaintCoordinateSpace,
+        bounds: PhysicalRect,
+        offset: PhysicalPoint,
     ) {
         // A pure translation at full opacity only shifts where items paint:
         // accumulate it into the offset instead of paying for an offscreen
@@ -1298,9 +1522,22 @@ impl<'a> RasterState<'a> {
             opacity: context.opacity,
             filter: context.filter,
             mask: context.mask,
+            painted: Some(translate_rect(bounds, offset)),
         });
-        self.layers
-            .push(Surface::new(self.width, self.height, Color::TRANSPARENT));
+        let surface = self.take_layer_surface();
+        self.layers.push(surface);
+    }
+
+    fn take_layer_surface(&mut self) -> Surface {
+        self.pooled_layers
+            .pop()
+            .unwrap_or_else(|| Surface::new(self.width, self.height, Color::TRANSPARENT))
+    }
+
+    fn pool_layer(&mut self, layer: Surface) {
+        if self.pooled_layers.len() < MAX_POOLED_LAYERS {
+            self.pooled_layers.push(layer);
+        }
     }
 
     fn pop_stacking_context(&mut self, item: DisplayItemId) {
@@ -1316,6 +1553,7 @@ impl<'a> RasterState<'a> {
                 opacity,
                 filter,
                 mask,
+                painted,
             }) => self.warp_top_layer(
                 transform,
                 offset,
@@ -1323,6 +1561,7 @@ impl<'a> RasterState<'a> {
                 opacity,
                 filter.as_ref(),
                 mask.as_ref(),
+                painted,
             ),
             None => {
                 self.diagnostics.push(RasterDiagnostic {
@@ -1340,6 +1579,11 @@ impl<'a> RasterState<'a> {
     /// Layer pixels hold `document point + push-time offset`, so the mapping
     /// from layer pixels to parent pixels is
     /// `T(offset) �?transform �?T(−offset)`.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "compositing one layer is one ordered effects/bounds/blit/clear sequence"
+    )]
     fn warp_top_layer(
         &mut self,
         transform: Transform2D,
@@ -1348,16 +1592,68 @@ impl<'a> RasterState<'a> {
         opacity: f32,
         filter: Option<&FilterEffect>,
         mask: Option<&MaskLayer>,
+        painted: Option<PhysicalRect>,
     ) {
         let mut layer = self.layers.pop().expect("layer frame has a surface");
         let mask_offset = match coordinate_space {
             PaintCoordinateSpace::Document => offset,
             PaintCoordinateSpace::Viewport => PhysicalPoint::default(),
         };
+        let effects_started = std::time::Instant::now();
         apply_layer_effects(&mut layer, filter, mask, mask_offset, self.images);
+        let effects_elapsed = effects_started.elapsed();
+        if let Some(profile) = self.pop_profile.as_mut() {
+            profile.effects += effects_elapsed;
+        }
         // Effects can only add pixels where the mask/filter put them, so the
-        // tight box is taken after them.
-        let Some(bounds) = layer.content_bounds() else {
+        // tight box is taken after them. Without an effect the display list's
+        // own item bounds already contain every painted pixel; scan only that
+        // window (plus a small antialiasing margin) instead of the whole
+        // viewport. A result touching the window edge falls back to the full
+        // scan, so an item whose bounds understate its paint cannot be clipped.
+        let bounds_started = std::time::Instant::now();
+        let claimed_pixels = painted.map_or(0, |area| {
+            let width = area.size.width.max(0.0) as u64;
+            let height = area.size.height.max(0.0) as u64;
+            width
+                .saturating_mul(height)
+                .min(u64::from(layer.width()).saturating_mul(u64::from(layer.height())))
+        });
+        let full_scan = filter.is_some() || mask.is_some();
+        let bounds = if full_scan {
+            layer.content_bounds()
+        } else {
+            // `DisplayItem::bounds` is the paint contract: every command stays
+            // inside the bounds it declared, including shadows and decorations,
+            // which get their own items. The small margin absorbs antialiasing
+            // and glyph overhang at the edge of a line box. A layer whose
+            // content lies entirely outside the viewport therefore scans an
+            // empty window and returns immediately instead of walking every
+            // pixel of the surface.
+            painted.and_then(|area| layer.content_bounds_in(Some(inflate_rect(area, 4.0))))
+        };
+        let bounds_elapsed = bounds_started.elapsed();
+        if let Some(profile) = self.pop_profile.as_mut() {
+            profile.layers = profile.layers.saturating_add(1);
+            profile.full_scans = profile.full_scans.saturating_add(u64::from(full_scan));
+            profile.tentative_scans = profile
+                .tentative_scans
+                .saturating_add(u64::from(!full_scan));
+            profile.bounds_pixels = profile.bounds_pixels.saturating_add(if full_scan {
+                u64::from(layer.width()).saturating_mul(u64::from(layer.height()))
+            } else {
+                claimed_pixels
+            });
+            profile.claimed_pixels = profile.claimed_pixels.saturating_add(claimed_pixels);
+            if claimed_pixels * 2
+                > u64::from(layer.width()).saturating_mul(u64::from(layer.height()))
+            {
+                profile.full_claimed_layers = profile.full_claimed_layers.saturating_add(1);
+            }
+            profile.bounds += bounds_elapsed;
+        }
+        let Some(bounds) = bounds else {
+            self.pool_layer(layer);
             return;
         };
         let into_layer = Transform2D {
@@ -1373,6 +1669,7 @@ impl<'a> RasterState<'a> {
         let mapped = into_parent.then(&transform.then(&into_layer));
         let clip = self.current_clip().map(|clip| clip.rect);
         let control = self.control;
+        let composite_started = std::time::Instant::now();
         let parent = self.layers.last_mut().expect("parent surface");
         let composited = if let Some((translate_x, translate_y)) = integer_translation(&mapped) {
             blit_translated(
@@ -1398,9 +1695,36 @@ impl<'a> RasterState<'a> {
                 control,
             )
         };
+        if let Some(profile) = self.pop_profile.as_mut() {
+            profile.composite += composite_started.elapsed();
+        }
         if !composited {
             self.cancelled = true;
         }
+        let mapped_bounds = map_rect_bounds(
+            &mapped,
+            PhysicalRect::new(
+                u32_to_f32(bounds.0),
+                u32_to_f32(bounds.1),
+                u32_to_f32(bounds.2),
+                u32_to_f32(bounds.3),
+            ),
+        );
+        self.note_layer_bounds(mapped_bounds);
+        // The surface has served its purpose. Clearing only the tight content
+        // box leaves it fully transparent for the next sibling layer while
+        // touching pixels that were actually written, not the whole viewport.
+        let clear_started = std::time::Instant::now();
+        layer.clear_rect(PhysicalRect::new(
+            u32_to_f32(bounds.0),
+            u32_to_f32(bounds.1),
+            u32_to_f32(bounds.2),
+            u32_to_f32(bounds.3),
+        ));
+        if let Some(profile) = self.pop_profile.as_mut() {
+            profile.clear += clear_started.elapsed();
+        }
+        self.pool_layer(layer);
     }
 
     fn current_surface(&mut self) -> &mut Surface {
@@ -1428,6 +1752,7 @@ impl<'a> RasterState<'a> {
                 opacity,
                 filter,
                 mask,
+                painted,
             } = frame
             else {
                 continue;
@@ -1439,6 +1764,7 @@ impl<'a> RasterState<'a> {
                 opacity,
                 filter.as_ref(),
                 mask.as_ref(),
+                painted,
             );
         }
         self.output()
@@ -1453,6 +1779,7 @@ impl<'a> RasterState<'a> {
                 opacity,
                 filter,
                 mask,
+                painted,
             } = frame
             else {
                 continue;
@@ -1467,6 +1794,7 @@ impl<'a> RasterState<'a> {
                 opacity,
                 filter.as_ref(),
                 mask.as_ref(),
+                painted,
             );
             if self.was_cancelled() {
                 return Err(RasterCancelled);
@@ -1479,6 +1807,9 @@ impl<'a> RasterState<'a> {
     }
 
     fn output(mut self) -> CpuRasterOutput {
+        if let Some(profile) = &self.pop_profile {
+            profile.print();
+        }
         CpuRasterOutput {
             surface: self.layers.pop().expect("root surface"),
             diagnostics: self.diagnostics,
@@ -1492,6 +1823,66 @@ fn translate_rect(rect: PhysicalRect, offset: PhysicalPoint) -> PhysicalRect {
         rect.origin.y + offset.y,
         rect.size.width,
         rect.size.height,
+    )
+}
+
+fn union_rect(left: PhysicalRect, right: PhysicalRect) -> PhysicalRect {
+    let x = left.origin.x.min(right.origin.x);
+    let y = left.origin.y.min(right.origin.y);
+    PhysicalRect::new(
+        x,
+        y,
+        left.right().max(right.right()) - x,
+        left.bottom().max(right.bottom()) - y,
+    )
+}
+
+fn inflate_rect(rect: PhysicalRect, amount: f32) -> PhysicalRect {
+    PhysicalRect::new(
+        rect.origin.x - amount,
+        rect.origin.y - amount,
+        rect.size.width + amount * 2.0,
+        rect.size.height + amount * 2.0,
+    )
+}
+
+/// Maps a rectangle's four corners through an affine transform and returns the
+/// axis-aligned box containing them.
+fn map_rect_bounds(transform: &Transform2D, rect: PhysicalRect) -> PhysicalRect {
+    let corners = [
+        (rect.origin.x, rect.origin.y),
+        (rect.right(), rect.origin.y),
+        (rect.origin.x, rect.bottom()),
+        (rect.right(), rect.bottom()),
+    ];
+    let mapped = corners.map(|(x, y)| transform.apply(x, y));
+    let min_x = mapped.iter().map(|(x, _)| *x).fold(f32::INFINITY, f32::min);
+    let min_y = mapped.iter().map(|(_, y)| *y).fold(f32::INFINITY, f32::min);
+    let max_x = mapped
+        .iter()
+        .map(|(x, _)| *x)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let max_y = mapped
+        .iter()
+        .map(|(_, y)| *y)
+        .fold(f32::NEG_INFINITY, f32::max);
+    PhysicalRect::new(min_x, min_y, max_x - min_x, max_y - min_y)
+}
+
+/// Commands that can write pixels into the current layer. Push/pop controls
+/// describe structure; `TextShadow` queues the parameters for the glyph run
+/// that follows, but its bounds still describe pixels that run will paint.
+fn command_paints(command: &DisplayCommand) -> bool {
+    !matches!(
+        command,
+        DisplayCommand::PushClip(_)
+            | DisplayCommand::PopClip
+            | DisplayCommand::PushTransform(_)
+            | DisplayCommand::PopTransform
+            | DisplayCommand::PushStackingContext(_)
+            | DisplayCommand::PopStackingContext
+            | DisplayCommand::PushSticky(_)
+            | DisplayCommand::PopSticky
     )
 }
 
@@ -5574,6 +5965,56 @@ mod tests {
             },
             items,
         }
+    }
+
+    #[test]
+    fn pooled_stacking_context_surfaces_do_not_leak_sibling_pixels() {
+        // The first context paints a red box outside the clip that is active
+        // when it composites, so the red never reaches the root. The second
+        // context reuses the pooled surface: if the red pixels survived the
+        // reuse, its content box would include them and composite red into the
+        // final image.
+        let items = vec![
+            command_item(
+                0,
+                DisplayCommand::PushStackingContext(stacking_context(Transform2D::default(), 0.5)),
+            ),
+            command_item(
+                1,
+                DisplayCommand::SolidRect {
+                    rect: PhysicalRect::new(1.0, 1.0, 4.0, 4.0),
+                    color: Color::rgb(255, 0, 0),
+                },
+            ),
+            command_item(
+                2,
+                DisplayCommand::PushClip(ClipShape::Rect(PhysicalRect::new(10.0, 10.0, 5.0, 5.0))),
+            ),
+            command_item(3, DisplayCommand::PopStackingContext),
+            command_item(4, DisplayCommand::PopClip),
+            command_item(
+                5,
+                DisplayCommand::PushStackingContext(stacking_context(Transform2D::default(), 0.5)),
+            ),
+            command_item(
+                6,
+                DisplayCommand::SolidRect {
+                    rect: PhysicalRect::new(9.0, 9.0, 4.0, 4.0),
+                    color: Color::rgb(0, 255, 0),
+                },
+            ),
+            command_item(7, DisplayCommand::PopStackingContext),
+        ];
+        let output = CpuRasterizer.rasterize(&item_list(20.0, items), Color::WHITE, &block_masks());
+        let surface = &output.surface;
+        assert_eq!(
+            surface.pixel(1, 1),
+            Some(Color::WHITE),
+            "the second layer must not see the first layer's clipped red pixels"
+        );
+        let green = surface.pixel(11, 11).expect("second box pixel");
+        assert_eq!((green.green, green.alpha), (255, 255));
+        assert!(green.red < 200, "second box is green: {green:?}");
     }
 
     #[test]
