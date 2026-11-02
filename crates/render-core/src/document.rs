@@ -1978,7 +1978,7 @@ fn render_dom(
     // spin. No container feature means no extra layout at all.
     if sheets_use_container_features(&cascade_inputs, dom) {
         let container_started = std::time::Instant::now();
-        for _ in 0..3 {
+        for pass in 0..3 {
             let formatting =
                 build_formatting_tree_from_root(dom, root, &styles, &options.formatting_limits);
             let layout = layout_formatting_tree_with_images_and_containers(
@@ -1992,6 +1992,15 @@ fn render_dom(
             );
             let measured = build_container_context(dom, root, &styles, &layout);
             let measured = std::sync::Arc::new(measured);
+            if stage_timing {
+                eprintln!(
+                    "stage container-feedback pass {pass}: containers={} viewport={}x{} root_font_size={}",
+                    measured.containers.len(),
+                    measured.viewport_width,
+                    measured.viewport_height,
+                    measured.root_font_size,
+                );
+            }
             if measured == match_context.containers {
                 break;
             }

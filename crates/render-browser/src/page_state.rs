@@ -759,6 +759,14 @@ impl PageState {
                 (task, (owner, source_order, final_url))
             })
             .collect::<HashMap<_, _>>();
+        if std::env::var_os("RENDER_DEBUG_FRAME").is_some() {
+            for (task, (owner, source_order, final_url)) in &origins {
+                eprintln!(
+                    "render-browser script task {task:?} node {owner:?} source {source_order} {}",
+                    final_url.as_ref().map_or("inline", Url::as_str)
+                );
+            }
+        }
         let mut turns = 0_usize;
         let started = Instant::now();
         loop {
@@ -778,6 +786,7 @@ impl PageState {
                 break;
             }
             turns += 1;
+            let turn_started = Instant::now();
             match self.page.run_one_turn_without_render() {
                 Ok(Some(turn)) => {
                     let mut turn_origin = None;
@@ -796,6 +805,18 @@ impl PageState {
                                 self.script_runtime_errors.saturating_add(1);
                             self.report_script_failure(&error, turn_origin);
                         }
+                    }
+                    let elapsed = turn_started.elapsed();
+                    if elapsed >= Duration::from_millis(250)
+                        && std::env::var_os("RENDER_DEBUG_FRAME").is_some()
+                    {
+                        let origin = turn_origin
+                            .and_then(|(_, _, url)| url.as_ref())
+                            .map_or("inline", Url::as_str);
+                        eprintln!(
+                            "render-browser slow script turn {elapsed:?} steps={} {origin}",
+                            self.page.runtime().steps_consumed()
+                        );
                     }
                 }
                 Ok(None) => break,
