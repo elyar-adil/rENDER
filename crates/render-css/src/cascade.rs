@@ -1967,7 +1967,7 @@ fn expanded_declaration(name: &str, value: &str) -> Vec<(String, String)> {
     if name.eq_ignore_ascii_case("background") {
         return expand_background_shorthand(value);
     }
-    if matches!(name, "margin" | "padding") {
+    if matches!(name, "margin" | "padding" | "inset") {
         return expand_box_shorthand(name, value);
     }
     if matches!(
@@ -2581,7 +2581,16 @@ fn expand_box_shorthand(name: &str, value: &str) -> Vec<(String, String)> {
     ["top", "right", "bottom", "left"]
         .into_iter()
         .zip(edges)
-        .map(|(edge, value)| (format!("{name}-{edge}"), value.to_owned()))
+        .map(|(edge, value)| {
+            // `inset` names the physical longhands directly; margin and
+            // padding compose their own prefixed names.
+            let longhand = if name == "inset" {
+                edge.to_owned()
+            } else {
+                format!("{name}-{edge}")
+            };
+            (longhand, value.to_owned())
+        })
         .collect()
 }
 
@@ -4854,6 +4863,38 @@ mod tests {
         assert_eq!(
             style.get("font-family").map(|value| value.value.as_str()),
             Some("Arial, sans-serif")
+        );
+    }
+
+    #[test]
+    fn inset_shorthand_sets_the_physical_offsets() {
+        let (dom, target) = document_and_target();
+        let sheet = parse_stylesheet("#target { inset: 1px 2px 3px }");
+        let style = cascade_element(
+            &dom,
+            target,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+
+        assert_eq!(
+            style.get("top").map(|value| value.value.as_str()),
+            Some("1px")
+        );
+        assert_eq!(
+            style.get("right").map(|value| value.value.as_str()),
+            Some("2px")
+        );
+        assert_eq!(
+            style.get("bottom").map(|value| value.value.as_str()),
+            Some("3px")
+        );
+        assert_eq!(
+            style.get("left").map(|value| value.value.as_str()),
+            Some("2px")
         );
     }
 
