@@ -103,6 +103,7 @@ mod shadow_tests;
 #[cfg(test)]
 mod streams_tests;
 pub(crate) mod types;
+mod worker;
 
 #[cfg(test)]
 mod temporal_tests;
@@ -110,6 +111,8 @@ mod temporal_tests;
 mod tests;
 #[cfg(test)]
 mod using_tests;
+#[cfg(test)]
+mod worker_tests;
 
 pub use types::{
     ConsoleLevel, ConsoleMessage, DocumentReadyState, ElementRect, FetchCredentials, FetchOutcome,
@@ -287,6 +290,15 @@ pub struct JsRuntime {
     /// Supplies the text of documents and scripts that nested browsing contexts
     /// load by URL.
     document_loader: Option<Box<dyn DocumentLoader>>,
+    /// Dedicated workers by id. A worker is an isolated realm in this runtime
+    /// (see [`worker`] for the execution model).
+    workers: BTreeMap<u64, worker::WorkerRecord>,
+    next_worker_id: u64,
+    /// `Worker` object -> listeners. A worker is an `EventTarget` but not a DOM
+    /// node, so its registrations live here instead of the DOM event table.
+    worker_event_listeners: BTreeMap<ObjectId, BTreeMap<String, Vec<types::Listener>>>,
+    /// Fetch id -> worker whose classic script that transfer loads.
+    pending_worker_scripts: BTreeMap<u64, u64>,
     next_symbol_id: u64,
     /// `Symbol.for` registry: registry key -> symbol id.
     global_symbol_registry: BTreeMap<String, u64>,
@@ -511,6 +523,10 @@ impl JsRuntime {
             internal_tasks: BTreeMap::new(),
             nested_scan_revision: None,
             document_loader: None,
+            workers: BTreeMap::new(),
+            next_worker_id: 1,
+            worker_event_listeners: BTreeMap::new(),
+            pending_worker_scripts: BTreeMap::new(),
             next_symbol_id: crate::value::FIRST_DYNAMIC_SYMBOL_ID,
             global_symbol_registry: BTreeMap::new(),
             call_stack: Vec::new(),
@@ -1000,10 +1016,20 @@ impl JsRuntime {
     /// microtask checkpoint); a failure rejects the promise with a
     /// `TypeError` or fires the `readystatechange`/`error` callbacks.
     pub fn settle_fetch(&mut self, dom: &mut Dom, id: u64, outcome: Result<FetchOutcome, String>) {
+        // A worker script is fetched through the same transfer queue as
+        // `fetch()`, but its response starts a realm rather than settling a
+        // promise or XHR object.
+        if self.settle_worker_script_fetch(dom, id, outcome.clone()) {
+            return;
+        }
         let promise_index = self.pending_fetch_promises.remove(&id);
         let Some(target) = self.pending_fetch_targets.remove(&id) else {
             return;
         };
+        // A fetch made by a worker settles its promise/response in the worker's
+        // realm, not in whichever realm the embedding polled from.
+        let realm = self.realm.object_realm(target);
+        let previous_realm = self.realm.enter_realm(realm);
         match self.realm.host(target) {
             Some(ObjectHost::Promise(_)) => {
                 let Some(promise_index) = promise_index else {
@@ -1035,6 +1061,7 @@ impl JsRuntime {
             }
             _ => {}
         }
+        self.realm.enter_realm(previous_realm);
     }
 
     /// Install border-box geometry captured from the latest layout pass. Keys
@@ -1104,7 +1131,9 @@ impl JsRuntime {
     ///
     /// An exception that escapes the handler is reported as an uncaught
     /// exception (HTML 8.1.8.2, "report the exception") before this returns, so
-    /// the window `error` event runs for both the function and the string form.
+    /// the realm's `error` event runs for both the function and the string
+    /// form: the window's for a page timer, the owning `Worker` object's for a
+    /// worker timer.
     pub fn fire_timer_reporting(
         &mut self,
         dom: &mut Dom,
@@ -1127,6 +1156,7 @@ impl JsRuntime {
         self.calls_active = 0;
         self.dom_nodes_created = 0;
         self.environment.clear();
+        let previous_realm = self.realm.enter_realm(entry.realm);
         let outcome = match &entry.handler {
             TimerHandler::Callback(callback) => {
                 let outcome = self.call(dom, *callback, &entry.arguments).map(|_| ());
@@ -1137,8 +1167,11 @@ impl JsRuntime {
             }
             // `execute` reports its own compile and runtime failures, exactly as
             // it does for any classic script, so nothing is reported twice.
-            TimerHandler::Script(source) => self.execute(dom, source).map(|_| ()),
+            TimerHandler::Script(source) => self
+                .with_realm(entry.realm, |runtime| runtime.execute(dom, source))
+                .map(|_| ()),
         };
+        self.realm.enter_realm(previous_realm);
         self.queue_mutation_deliveries(dom);
         self.sync_nested_contexts(dom);
         let repeats = entry.kind == TimerKind::Interval && self.timers.contains_key(&id);
@@ -1249,10 +1282,17 @@ impl JsRuntime {
         if error.kind() == JsErrorKind::ResourceLimit {
             return;
         }
+        // An exception in a worker's realm belongs to that worker: it fires
+        // `error` at the page-side `Worker` object and is not the page's own
+        // uncaught exception. The `report` resets the execution budget, so a
+        // worker error cannot leave the page with a spent budget either.
         self.steps_remaining = self.limits.max_execution_steps;
         self.calls_active = 0;
         self.dom_nodes_created = 0;
         self.environment.clear();
+        if self.report_worker_uncaught_error(dom, error) {
+            return;
+        }
         let prototype = self
             .realm
             .global("Event")
@@ -1775,7 +1815,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        self.dispatch_fetch_native(dom, function, receiver, arguments)
+        self.dispatch_worker_native(dom, function, receiver, arguments)
     }
 }
 

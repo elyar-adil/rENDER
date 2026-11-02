@@ -1,3 +1,30 @@
+# 交接文档 (2026-11-03) — 通用 Web Worker API
+
+本轮补上 Dedicated Web Worker，让把压缩/遥测/captcha 工作放到 worker 的页面不再因 `ReferenceError: Worker is not defined` 进入全局错误页。实现完全走通用 HTML/JS 路径，没有站点特判。
+
+## 语义与边界
+
+- `new Worker(url, {name})` 立即返回对象；经典脚本在后续任务中加载。URL 相对页面 base 解析，`data:` URL（含 `Blob` + `URL.createObjectURL`）直接解码；HTTP(S) 脚本复用 `PendingFetch` 队列，由浏览器现有网络/CORS/cookie 路径完成，`settle_fetch` 后启动。
+- Worker 是同一 runtime 内的独立 realm：没有 `window`/`document`，有 `self`、`globalThis`、`postMessage`、`importScripts`、`close`、`onmessage`/`onerror`/`onmessageerror`、`addEventListener`/`removeEventListener`、timers、`fetch`、`structuredClone`、`Blob`/`URL`、TextEncoder/Decoder、console、performance、location、navigator、`WorkerGlobalScope`/`DedicatedWorkerGlobalScope`。
+- 消息在 post 时和送达目标 realm 时各做一次结构化克隆，保证接收方对象的原型属于接收 realm；`ArrayBuffer` transfer list 会移动字节并 detach 源 buffer。错误在 Worker 对象上派发 `error`，不会从构造函数同步抛出。
+- `terminate()`/`close()` 停止后续消息、timer 和内部任务；`Worker` 对象保留以便原有引用继续响应。
+- 局限：同线程、同堆的隔离 realm，不是独立 OS 线程；仅 classic worker，不支持 module worker、`SharedWorker`、`MessageChannel`/port、`navigator.serviceWorker`；worker realm 暂未安装 `crypto`。`importScripts` 在无同步 `DocumentLoader`（浏览器）下会报 NetworkError，页面主脚本网络加载不受影响。
+
+## 验证
+
+- `render-js` 新增 12 个 worker 测试：echo、`importScripts` 顺序、terminate、启动前/消息处理中的 error、transfer/detach、timer realm、worker fetch 相对 URL、data URL/Blob、网络 fetch seam、无页面全局、`typeof Worker`。
+- `render-core` 新增 page 测试：worker 脚本经 `take_pending_fetch_requests`/`settle_fetch` 启动并把消息送回页面。
+- 真实知乎 signin（临时 profile，headless `--screenshot`）：页面停在 `https://www.zhihu.com/signin?next=%2F`，无 `__probe_errors`、无“出了一点问题”，二维码/短信登录表单正常绘制。额外探针确认 `typeof Worker === "function"`、自建 Blob worker echo `42`，并观察到页面自身构造 11 个 `data:` worker（Sentry 压缩路径）且无 worker error。健康行仅保留既有的 `scripts_threw=1`（图标 chunk 执行步数上限），与 worker 无关。
+- 截图：`/tmp/zhihu-worker-signin.png`；带 worker 探针的 DOM：`/tmp/zhihu-worker-probe-dom.html`。
+
+## 剩余缺口
+
+- 独立线程、module worker、SharedWorker、MessageChannel/MessagePort、worker `crypto`、FileReader 等 worker 专属 API。
+- `importScripts` 的浏览器网络路径目前没有同步实现；现有页面若在 worker 内 importScripts 远程脚本会收到 NetworkError。
+- worker 内 `onerror` 自身监听未派发；错误只到页面 `Worker` 对象，便于站点按标准处理。
+
+---
+
 # 交接文档 (2026-11-02, 续七十) — 原生页面文字选择与复制
 
 本轮补上了页面正文的鼠标选择/复制，没有站点特判。

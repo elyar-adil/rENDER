@@ -1754,6 +1754,17 @@ impl JsRuntime {
             | NativeFunction::BigIntValueOf => {
                 self.dispatch_bigint_native(dom, function, receiver, arguments)
             }
+            // Worker natives are handled at the head of the dispatch chain;
+            // listing them keeps this match exhaustive.
+            NativeFunction::WorkerPostMessage
+            | NativeFunction::WorkerTerminate
+            | NativeFunction::WorkerAddEventListener
+            | NativeFunction::WorkerRemoveEventListener
+            | NativeFunction::WorkerScopePostMessage
+            | NativeFunction::WorkerScopeImportScripts
+            | NativeFunction::WorkerScopeClose => {
+                self.dispatch_worker_native(dom, function, receiver, arguments)
+            }
         }
     }
 }

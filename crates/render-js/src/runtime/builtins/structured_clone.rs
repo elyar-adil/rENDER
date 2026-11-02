@@ -45,6 +45,10 @@ use render_dom::Dom;
 /// references stay shared.
 type Memo = BTreeMap<ObjectId, ObjectId>;
 
+/// `ArrayBuffer` source objects whose bytes are transferred, not copied, and the
+/// buffer that takes those bytes in the clone.
+pub(in crate::runtime) type TransferMap = BTreeMap<ObjectId, TypedBuffer>;
+
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_structured_clone_native(
         &mut self,
@@ -62,6 +66,18 @@ impl JsRuntime {
         value: &JsValue,
         memo: &mut Memo,
     ) -> Result<JsValue, JsError> {
+        self.structured_clone_value_with_transfers(value, memo, None)
+    }
+
+    /// Structured serialize with an optional transfer list. A source buffer in
+    /// `transfers` is not copied: the clone gets the already-moved bytes, and
+    /// the caller detaches the source after the whole clone succeeds.
+    pub(in crate::runtime) fn structured_clone_value_with_transfers(
+        &mut self,
+        value: &JsValue,
+        memo: &mut Memo,
+        transfers: Option<&TransferMap>,
+    ) -> Result<JsValue, JsError> {
         // Every primitive is transferred by value. A symbol is the one
         // exception: it is not serializable, so it is a `DataCloneError`.
         let object = match value {
@@ -72,13 +88,16 @@ impl JsRuntime {
         if let Some(copied) = memo.get(&object) {
             return Ok(JsValue::Object(*copied));
         }
+        if let Some(buffer) = transfers.and_then(|transfers| transfers.get(&object)) {
+            return Ok(JsValue::Object(self.array_buffer_object(buffer)?));
+        }
         match self.realm.host(object) {
             // `Ordinary` is the default host, so it is what a plain object, an
             // object literal, and a prototype-less object all carry. It is the
             // only host with no internal slots of its own, which is exactly the
             // algorithm's "ordinary object" case.
-            Some(ObjectHost::Ordinary) => self.clone_plain_object(object, memo),
-            Some(ObjectHost::Array) => self.clone_array(object, memo),
+            Some(ObjectHost::Ordinary) => self.clone_plain_object(object, memo, transfers),
+            Some(ObjectHost::Array) => self.clone_array(object, memo, transfers),
             Some(ObjectHost::DateInstance(ms)) => self.clone_date(ms),
             Some(ObjectHost::RegExp(index)) => {
                 let Some(compiled) = self.regexes.get(index) else {
@@ -95,7 +114,7 @@ impl JsRuntime {
                 if kind.is_weak() {
                     return Err(self.data_clone_error(value));
                 }
-                self.clone_collection(kind, &entries, memo)
+                self.clone_collection(kind, &entries, memo, transfers)
             }
             Some(ObjectHost::TypedArray {
                 kind,
@@ -131,7 +150,12 @@ impl JsRuntime {
 
     /// Copy an array's own indexed elements, keeping holes as holes and
     /// preserving a repeated reference to the same element object.
-    fn clone_array(&mut self, object: ObjectId, memo: &mut Memo) -> Result<JsValue, JsError> {
+    fn clone_array(
+        &mut self,
+        object: ObjectId,
+        memo: &mut Memo,
+        transfers: Option<&TransferMap>,
+    ) -> Result<JsValue, JsError> {
         let length = self
             .realm
             .get_property(object, "length")
@@ -153,7 +177,8 @@ impl JsRuntime {
             let Some(descriptor) = self.realm.own_property(object, &key) else {
                 continue;
             };
-            let value = self.structured_clone_value(&descriptor.value, memo)?;
+            let value =
+                self.structured_clone_value_with_transfers(&descriptor.value, memo, transfers)?;
             self.realm.set_property(copy, key, value);
         }
         self.realm
@@ -168,6 +193,7 @@ impl JsRuntime {
         &mut self,
         object: ObjectId,
         memo: &mut Memo,
+        transfers: Option<&TransferMap>,
     ) -> Result<JsValue, JsError> {
         self.ensure_heap_capacity(1)?;
         let copy = self.realm.create_ordinary_object();
@@ -177,7 +203,7 @@ impl JsRuntime {
             .enumerable_own_properties(object)
             .unwrap_or_default();
         for (key, value) in properties {
-            let cloned = self.structured_clone_value(&value, memo)?;
+            let cloned = self.structured_clone_value_with_transfers(&value, memo, transfers)?;
             self.realm.set_property(copy, key, cloned);
         }
         Ok(JsValue::Object(copy))
@@ -205,12 +231,13 @@ impl JsRuntime {
         kind: crate::value::CollectionKind,
         entries: &[(JsValue, JsValue)],
         memo: &mut Memo,
+        transfers: Option<&TransferMap>,
     ) -> Result<JsValue, JsError> {
         let mut cloned = Vec::with_capacity(entries.len());
         for (key, value) in entries {
             cloned.push((
-                self.structured_clone_value(key, memo)?,
-                self.structured_clone_value(value, memo)?,
+                self.structured_clone_value_with_transfers(key, memo, transfers)?,
+                self.structured_clone_value_with_transfers(value, memo, transfers)?,
             ));
         }
         let prototype = self.collection_prototype(kind);

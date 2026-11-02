@@ -6557,6 +6557,7 @@ impl JsRuntime {
                 | ObjectHost::FormDataConstructor
                 | ObjectHost::ResponseConstructor
                 | ObjectHost::BlobConstructor
+                | ObjectHost::WorkerConstructor
                 | ObjectHost::ProxyConstructor
                 | ObjectHost::IntersectionObserverConstructor
                 | ObjectHost::MutationObserverConstructor
@@ -6821,6 +6822,9 @@ impl JsRuntime {
                 self.response_constructor(constructor, arguments)
             }
             Some(ObjectHost::BlobConstructor) => self.blob_constructor(dom, constructor, arguments),
+            Some(ObjectHost::WorkerConstructor) => {
+                self.worker_constructor(dom, constructor, arguments)
+            }
             Some(ObjectHost::ShadowRealmConstructor) => {
                 self.shadow_realm_construct(dom, &new_target)
             }
@@ -7191,6 +7195,9 @@ impl JsRuntime {
                 Err(JsError::type_error("Response constructor requires 'new'"))
             }
             Some(ObjectHost::BlobConstructor) => self.blob_constructor(dom, callee, arguments),
+            Some(ObjectHost::WorkerConstructor) => {
+                Err(JsError::type_error("Worker constructor requires 'new'"))
+            }
             Some(ObjectHost::ProxyConstructor) => {
                 Err(JsError::type_error("Proxy constructor requires 'new'"))
             }

@@ -90,6 +90,7 @@ impl JsRuntime {
                 handler,
                 delay_ms,
                 arguments,
+                realm: self.realm.current_realm(),
             },
         );
         self.pending_timer_requests

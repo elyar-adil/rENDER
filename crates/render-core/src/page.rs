@@ -1443,7 +1443,34 @@ impl Page {
             self.runtime
                 .invoke_microtask(self.document.dom_mut(), microtask)?;
         }
+        // A worker script started by this settlement may have registered
+        // timers or internal tasks. They must enter the page event loop now,
+        // because there is no surrounding runnable to drain them.
+        self.schedule_runtime_timers();
         Ok(())
+    }
+
+    /// Move timer requests queued by script into the page event loop. This is
+    /// the same scheduling the runnable path performs; settlement started
+    /// outside a runnable (a worker script load) needs it too.
+    fn schedule_runtime_timers(&mut self) {
+        for request in self.runtime.take_pending_timer_requests() {
+            match request {
+                TimerRequest::Schedule { id, delay_ms } => {
+                    let delay = timer_delay_duration(delay_ms);
+                    if let Ok(timer_id) = self.event_loop.set_timeout(delay, PageTask::Timer { id })
+                    {
+                        self.js_timers.insert(id, timer_id);
+                    }
+                }
+                TimerRequest::Cancel { id } => {
+                    self.js_timers.remove(&id);
+                    self.event_loop.cancel_timers(
+                        |payload| matches!(payload, PageTask::Timer { id: pending } if *pending == id),
+                    );
+                }
+            }
+        }
     }
 
     /// Virtual-clock instant of the earliest pending timer, if any.
@@ -3371,6 +3398,42 @@ fn page_url_is_visible_to_scripts_in_the_persistent_realm() {
             .value,
         crate::js::JsValue::String("www.baidu.com/s?wd=rust#result".into())
     );
+}
+
+#[test]
+fn page_settle_fetch_starts_a_worker_script_and_delivers_its_message() {
+    let url = Url::parse("https://example.test/app").expect("page URL");
+    let mut page = Page::with_url("<!doctype html><p></p>", &url);
+    page.queue_script(
+        "var worker = new Worker('worker.js'); \
+         worker.onmessage = function (event) { document.title = event.data; };",
+    )
+    .expect("worker script should queue");
+    page.run_one_turn_reference()
+        .expect("turn should run")
+        .expect("script turn");
+    // The load itself is a task queued by the constructor.
+    page.run_one_turn_reference()
+        .expect("turn should run")
+        .expect("worker load turn");
+    let mut requests = page.take_pending_fetch_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url, "https://example.test/worker.js");
+    let request = requests.pop().expect("one worker fetch");
+    page.settle_fetch(
+        request.id,
+        Ok(crate::js::FetchOutcome {
+            status: 200,
+            status_text: "OK".to_owned(),
+            headers: Vec::new(),
+            body: b"postMessage('worker loaded');".to_vec(),
+        }),
+    )
+    .expect("worker script settles");
+    page.run_one_turn_reference()
+        .expect("turn should run")
+        .expect("worker message turn");
+    assert_eq!(page.document_title(), Some("worker loaded".to_owned()));
 }
 
 #[test]

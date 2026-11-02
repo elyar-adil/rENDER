@@ -1372,7 +1372,7 @@ Absent:
 | --- | --- |
 | `ResizeObserver` | Component frameworks gate layout on it. |
 | Customized built-ins, declarative shadow roots (`shadowrootmode`), `slotchange`, and shadow-scoped stylesheets | The autonomous `customElements` and `attachShadow` paths exist; these are the remaining Shadow DOM pieces. `attributeChangedCallback` also does not fire for `classList`/`style`/`dataset`/`Attr.value` writes. |
-| `WebSocket`, `Worker`, `SharedWorker`, `EventSource` | No live-update or off-main-thread execution path. |
+| `WebSocket`, `SharedWorker`, `EventSource` | No live-update or shared-worker execution path. Dedicated `Worker` runs in an isolated same-thread realm with postMessage/importScripts/timers/fetch/terminate, but not on a second OS thread. |
 | `indexedDB`, `Notification`, `PerformanceObserver`, `WebAssembly`, `TransformStream` | Lower frequency on ordinary pages. `ReadableStream` default streams are implemented; see S12 for the remaining stream gaps. |
 
 A missing global is worse than a wrong one, because it throws a `ReferenceError` at
@@ -2274,7 +2274,7 @@ it is deliberately not expressed as a percentage, because the percentages were r
 | absent | why it matters more than a feature gap |
 | --- | --- |
 | **ES modules** | **Largely closed.** `render-js` parses import/export into tables (`src/module.rs`) and links them with live bindings (`src/runtime/module.rs`): named/default/namespace imports, re-exports, `export *`, `export * as`, cycles for hoisted declarations, `import.meta.url`, evaluate-once ordering, remembered failures. `render-core/src/module_graph.rs` assembles the graph and `render-browser/src/scripts.rs` fetches it in rounds. **Still open:** dynamic `import()` resolves through the host loader (browser fetch rounds + import map); CORS enforcement for cross-origin modules and top-level `await`; import maps are parsed for static module graphs (multiple-map merging and dynamic-import loading remain open); module code runs sloppy, not strict; a namespace object is a snapshot rather than a live exotic object; classic scripts still skip `import`/`export` instead of throwing a SyntaxError; `type=module` `async` scheduling is treated as defer; `<script type=module>` inserted after load goes through the same path as classic follow-up scripts but is untested in a live window |
-| **Web Workers** | zero occurrences of `Worker`. Bundles that offload work get nothing |
+| **Web Workers** | Dedicated workers run classic scripts in isolated same-thread realms, with structured-clone/transfer messages, importScripts, timers, fetch, and error events. No OS-thread parallelism, module workers, SharedWorker, or MessageChannel |
 | **History API** | `pushState`/`replaceState` change the URL and `history.state` without a load. Back/forward/go within the document fire `popstate` without a load; entries of another document reload. `history.length` reflects the list at each turn's start |
 | **WebSocket / `requestIdleCallback` / `PerformanceObserver`** | absent |
 | **Iframe painting** | S11 - a nested document runs its scripts in its own realm, but it is not laid out or painted, so embedded content is invisible |

@@ -84,6 +84,12 @@ pub(super) enum InternalTask {
         data: JsValue,
         origin: String,
     },
+    /// Load the classic script of a worker created by `new Worker`.
+    WorkerLoad { worker: u64 },
+    /// Deliver a page-to-worker message in the worker's realm.
+    WorkerMessage { worker: u64, data: JsValue },
+    /// Deliver a worker-to-page message at the page's `Worker` object.
+    WorkerPageMessage { worker: u64, data: JsValue },
 }
 
 /// Where a connected iframe stands.
@@ -285,7 +291,7 @@ impl JsRuntime {
 
     /// Schedules `task` as an event-loop task. The embedding runs it when it
     /// fires the timer, which is the same path a `setTimeout(0)` takes.
-    fn schedule(&mut self, task: InternalTask) {
+    pub(super) fn schedule(&mut self, task: InternalTask) {
         let id = self.next_timer_id;
         self.next_timer_id += 1;
         self.internal_tasks.insert(id, task);
@@ -308,6 +314,16 @@ impl JsRuntime {
                 data,
                 origin,
             } => self.deliver_message(dom, target, source, data, origin),
+            InternalTask::WorkerLoad { worker } => {
+                self.run_worker_load(dom, worker);
+                Ok(())
+            }
+            InternalTask::WorkerMessage { worker, data } => {
+                self.deliver_worker_message(dom, worker, &data)
+            }
+            InternalTask::WorkerPageMessage { worker, data } => {
+                self.deliver_worker_page_message(dom, worker, &data)
+            }
         };
         self.queue_mutation_deliveries(dom);
         self.sync_nested_contexts(dom);

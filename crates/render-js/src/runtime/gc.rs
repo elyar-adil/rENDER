@@ -293,6 +293,8 @@ pub(super) fn mark_host(
         | ObjectHost::Response { .. } => {}
         ObjectHost::Blob { .. }
         | ObjectHost::BlobConstructor
+        | ObjectHost::WorkerConstructor
+        | ObjectHost::Worker(_)
         | ObjectHost::ProxyConstructor
         | ObjectHost::ShadowRealmConstructor
         | ObjectHost::ShadowRealm(_) => {}
@@ -579,6 +581,40 @@ impl JsRuntime {
                 *listeners,
             );
         }
+        for listeners in self
+            .worker_event_listeners
+            .values()
+            .flat_map(listener_values)
+        {
+            mark_object(
+                self,
+                &mut marked,
+                &mut work,
+                &mut marked_environments,
+                *listeners,
+            );
+        }
+        for worker in self.workers.values() {
+            // A running worker stays alive until it terminates, even when the
+            // page drops its `Worker` object: its queued messages and the
+            // object's listeners are still live.
+            mark_object(
+                self,
+                &mut marked,
+                &mut work,
+                &mut marked_environments,
+                worker.object,
+            );
+            for value in &worker.queue {
+                mark_value(
+                    self,
+                    &mut marked,
+                    &mut work,
+                    &mut marked_environments,
+                    value,
+                );
+            }
+        }
         for context in self.canvas_contexts.values() {
             mark_object(
                 self,
@@ -613,11 +649,15 @@ impl JsRuntime {
             );
         }
         for task in self.internal_tasks.values() {
-            if let super::nested::InternalTask::PostMessage {
-                data: JsValue::Object(object),
-                ..
-            } = task
-            {
+            let data = match task {
+                super::nested::InternalTask::PostMessage { data, .. }
+                | super::nested::InternalTask::WorkerMessage { data, .. }
+                | super::nested::InternalTask::WorkerPageMessage { data, .. } => data,
+                super::nested::InternalTask::WorkerLoad { .. }
+                | super::nested::InternalTask::LoadFrame { .. }
+                | super::nested::InternalTask::FrameLoad { .. } => continue,
+            };
+            if let JsValue::Object(object) = data {
                 mark_object(
                     self,
                     &mut marked,
@@ -878,6 +918,8 @@ impl JsRuntime {
         // A media element's registrations do not keep the element itself
         // alive: a dead target's listeners go with it.
         self.media_event_listeners
+            .retain(|object, _| marked.get(object.0).copied().unwrap_or(false));
+        self.worker_event_listeners
             .retain(|object, _| marked.get(object.0).copied().unwrap_or(false));
         let before = self.realm.object_count();
         let reclaimed = self.realm.sweep_unmarked(&marked);

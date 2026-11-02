@@ -1124,6 +1124,15 @@ pub(crate) enum NativeFunction {
     QueueMicrotask,
     /// `Window.prototype.postMessage`, bound to the window it is installed on.
     WindowPostMessage,
+    /// Dedicated Web Worker operations. The object-side methods act on a
+    /// `Worker` instance; the scope-side globals run in the worker's realm.
+    WorkerPostMessage,
+    WorkerTerminate,
+    WorkerAddEventListener,
+    WorkerRemoveEventListener,
+    WorkerScopePostMessage,
+    WorkerScopeImportScripts,
+    WorkerScopeClose,
     PromiseResolve,
     PromiseReject,
     PromiseThen,
@@ -2819,6 +2828,10 @@ pub(crate) enum ObjectHost {
         content_type: String,
     },
     BlobConstructor,
+    /// The `Worker` constructor object.
+    WorkerConstructor,
+    /// A dedicated worker instance, keyed into `JsRuntime::workers`.
+    Worker(u64),
     ProxyConstructor,
     /// The `ShadowRealm` constructor (`ShadowRealm` proposal).
     ShadowRealmConstructor,
@@ -2896,6 +2909,7 @@ impl ObjectHost {
                 | Self::FormDataConstructor
                 | Self::ResponseConstructor
                 | Self::BlobConstructor
+                | Self::WorkerConstructor
                 | Self::ProxyConstructor
                 | Self::ShadowRealmConstructor
                 | Self::WrappedFunction(_)
@@ -3402,6 +3416,44 @@ impl Realm {
         let id = RealmId(self.realms.len());
         let base = self.objects.len();
         let record = Self::install_intrinsics(&mut self.objects, None);
+        for object in &mut self.objects[base..] {
+            object.realm = id;
+        }
+        self.realms.push(record);
+        let previous = self.enter_realm(id);
+        self.install_temporal();
+        self.install_intl();
+        self.enter_realm(previous);
+        id
+    }
+
+    /// The realm of a dedicated worker: `CreateRealm()` plus the worker-global
+    /// APIs (`self`, `postMessage`, `importScripts`, timers, fetch, ...). It has
+    /// no `window`, `document`, or page-realm global, and shares this heap so
+    /// structured clones can move through the runtime's existing algorithm.
+    pub(crate) fn create_worker_realm(&mut self, url: &Url, name: &str) -> RealmId {
+        let id = RealmId(self.realms.len());
+        let base = self.objects.len();
+        let record = Self::install_intrinsics(&mut self.objects, None);
+        for object in &mut self.objects[base..] {
+            object.realm = id;
+        }
+        // `install_intrinsics` leaves the ECMAScript globals alone for a realm
+        // without a document. The worker host globals need the same prototypes
+        // those installers would find in a page.
+        let global = record.global;
+        let object_prototype = record.object_prototype;
+        let function_prototype = record.function_prototype;
+        let error_prototype = record.error_prototype;
+        Self::install_worker_globals(
+            &mut self.objects,
+            global,
+            object_prototype,
+            function_prototype,
+            error_prototype,
+            url,
+            name,
+        );
         for object in &mut self.objects[base..] {
             object.realm = id;
         }
@@ -4290,126 +4342,7 @@ impl Realm {
         // production bundles use them during startup for query routing and
         // telemetry; keeping the objects in the realm also gives ordinary
         // prototype lookup and method calls the same shape as browsers.
-        let url_search_prototype = ObjectId(objects.len());
-        objects.push(JsObject {
-            prototype: Some(object_prototype),
-            ..JsObject::default()
-        });
-        let mut url_search_entries = None;
-        for (name, function) in [
-            ("get", NativeFunction::UrlSearchParamsGet),
-            ("getAll", NativeFunction::UrlSearchParamsGetAll),
-            ("has", NativeFunction::UrlSearchParamsHas),
-            ("set", NativeFunction::UrlSearchParamsSet),
-            ("append", NativeFunction::UrlSearchParamsAppend),
-            ("delete", NativeFunction::UrlSearchParamsDelete),
-            ("sort", NativeFunction::UrlSearchParamsSort),
-            ("toString", NativeFunction::UrlSearchParamsToString),
-            ("forEach", NativeFunction::UrlSearchParamsForEach),
-            ("keys", NativeFunction::UrlSearchParamsKeys),
-            ("values", NativeFunction::UrlSearchParamsValues),
-            ("entries", NativeFunction::UrlSearchParamsEntries),
-        ] {
-            let method = ObjectId(objects.len());
-            objects.push(JsObject {
-                prototype: Some(function_prototype),
-                host: ObjectHost::NativeFunction(function),
-                ..JsObject::default()
-            });
-            if name == "entries" {
-                url_search_entries = Some(method);
-            }
-            objects[url_search_prototype.0].properties.insert(
-                name.to_owned(),
-                PropertyDescriptor::builtin(JsValue::Object(method)),
-            );
-        }
-        if let Some(entries) = url_search_entries {
-            define_symbol_property_on(
-                objects,
-                url_search_prototype,
-                &JsSymbol::well_known("@@iterator"),
-                PropertyDescriptor::builtin(JsValue::Object(entries)),
-            );
-        }
-        let size_getter = ObjectId(objects.len());
-        objects.push(JsObject {
-            prototype: Some(function_prototype),
-            host: ObjectHost::NativeFunction(NativeFunction::UrlSearchParamsSize),
-            ..JsObject::default()
-        });
-        objects[url_search_prototype.0].properties.insert(
-            "size".to_owned(),
-            PropertyDescriptor {
-                getter: Some(size_getter),
-                setter: None,
-                value: JsValue::Undefined,
-                writable: false,
-                enumerable: true,
-                configurable: true,
-            },
-        );
-        let url_search_constructor = ObjectId(objects.len());
-        objects.push(JsObject {
-            prototype: Some(function_prototype),
-            host: ObjectHost::UrlSearchParamsConstructor,
-            ..JsObject::default()
-        });
-        objects[url_search_constructor.0].properties.insert(
-            "prototype".to_owned(),
-            PropertyDescriptor::builtin(JsValue::Object(url_search_prototype)),
-        );
-        objects[global.0].properties.insert(
-            "URLSearchParams".to_owned(),
-            PropertyDescriptor::builtin(JsValue::Object(url_search_constructor)),
-        );
-
-        let url_prototype = ObjectId(objects.len());
-        objects.push(JsObject {
-            prototype: Some(object_prototype),
-            ..JsObject::default()
-        });
-        let url_to_string = ObjectId(objects.len());
-        objects.push(JsObject {
-            prototype: Some(function_prototype),
-            host: ObjectHost::NativeFunction(NativeFunction::UrlToString),
-            ..JsObject::default()
-        });
-        objects[url_prototype.0].properties.insert(
-            "toString".to_owned(),
-            PropertyDescriptor::builtin(JsValue::Object(url_to_string)),
-        );
-        let url_constructor = ObjectId(objects.len());
-        objects.push(JsObject {
-            prototype: Some(function_prototype),
-            host: ObjectHost::UrlConstructor,
-            ..JsObject::default()
-        });
-        objects[url_constructor.0].properties.insert(
-            "prototype".to_owned(),
-            PropertyDescriptor::builtin(JsValue::Object(url_prototype)),
-        );
-        for (name, function) in [
-            ("parse", NativeFunction::UrlParse),
-            ("canParse", NativeFunction::UrlCanParse),
-            ("createObjectURL", NativeFunction::UrlCreateObjectUrl),
-            ("revokeObjectURL", NativeFunction::UrlRevokeObjectUrl),
-        ] {
-            let method = ObjectId(objects.len());
-            objects.push(JsObject {
-                prototype: Some(function_prototype),
-                host: ObjectHost::NativeFunction(function),
-                ..JsObject::default()
-            });
-            objects[url_constructor.0].properties.insert(
-                name.to_owned(),
-                PropertyDescriptor::builtin(JsValue::Object(method)),
-            );
-        }
-        objects[global.0].properties.insert(
-            "URL".to_owned(),
-            PropertyDescriptor::builtin(JsValue::Object(url_constructor)),
-        );
+        Self::install_url_globals(objects, global, object_prototype, function_prototype);
         objects[global.0].properties.insert(
             "Image".to_owned(),
             PropertyDescriptor {
@@ -4767,12 +4700,256 @@ impl Realm {
         );
         Self::install_console(objects, global);
         Self::install_timers(objects, global);
+        Self::install_worker_interface(objects, global, object_prototype, function_prototype);
         HostIntrinsics {
             element_prototype,
             dom_prototypes,
             storage_prototype,
             media_query_list_prototype,
         }
+    }
+
+    /// The host globals of a dedicated worker. A worker has no browsing
+    /// context, so this deliberately omits `window`, `document`, the DOM
+    /// constructors, storage, and CSSOM. It keeps the platform pieces worker
+    /// code actually uses: events, fetch, Blob/URL, encoding, console, timers,
+    /// performance, location, and messaging.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the realm installer needs the intrinsic prototypes it installs against, and one flat sequence keeps the worker globals auditable"
+    )]
+    fn install_worker_globals(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+        error_prototype: ObjectId,
+        url: &Url,
+        name: &str,
+    ) {
+        Self::install_window_event_handlers(objects, global);
+        Self::install_event(objects, global, object_prototype, function_prototype);
+        Self::install_dom_exception(objects, global, error_prototype, function_prototype);
+        Self::install_encoding(objects, global, object_prototype, function_prototype);
+        Self::install_fetch(objects, global, object_prototype, function_prototype);
+        Self::install_performance(objects, global, object_prototype, function_prototype);
+        Self::install_navigator(objects, global, object_prototype, function_prototype);
+        Self::install_url_globals(objects, global, object_prototype, function_prototype);
+        Self::install_console(objects, global);
+        Self::install_timers(objects, global);
+        for name in ["atob", "btoa"] {
+            Self::define_global_function(
+                objects,
+                global,
+                name,
+                if name == "atob" {
+                    NativeFunction::GlobalAtob
+                } else {
+                    NativeFunction::GlobalBtoa
+                },
+            );
+        }
+        // The worker's own messaging and lifecycle entry points. They are
+        // bound to the global so a bare call still names this worker.
+        for (name, function) in [
+            ("postMessage", NativeFunction::WorkerScopePostMessage),
+            ("importScripts", NativeFunction::WorkerScopeImportScripts),
+            ("close", NativeFunction::WorkerScopeClose),
+        ] {
+            let callable = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::BoundFunction {
+                    function,
+                    receiver: global,
+                },
+                ..JsObject::default()
+            });
+            objects[global.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::Object(callable),
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
+        let location = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            host: ObjectHost::Location(url.clone()),
+            ..JsObject::default()
+        });
+        let to_string = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::LocationToString),
+            ..JsObject::default()
+        });
+        objects[location.0].properties.insert(
+            "toString".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(to_string)),
+        );
+        for (name, value) in location_components(url) {
+            objects[location.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::String((value).into())),
+            );
+        }
+        objects[global.0].properties.insert(
+            "location".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(location),
+                writable: false,
+                enumerable: true,
+                configurable: false,
+            },
+        );
+        // A dedicated worker's global object is the `DedicatedWorkerGlobalScope`
+        // instance. Keeping that prototype chain makes `self instanceof
+        // WorkerGlobalScope` true without exposing a window.
+        let scope_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        let dedicated_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(scope_prototype),
+            ..JsObject::default()
+        });
+        for (name, prototype) in [
+            ("WorkerGlobalScope", scope_prototype),
+            ("DedicatedWorkerGlobalScope", dedicated_prototype),
+        ] {
+            let constructor = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::DomConstructor,
+                ..JsObject::default()
+            });
+            objects[constructor.0].properties.insert(
+                "prototype".to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(prototype)),
+            );
+            objects[prototype.0].properties.insert(
+                "constructor".to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(constructor)),
+            );
+            objects[global.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::Object(constructor),
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
+        objects[global.0].prototype = Some(dedicated_prototype);
+        for (property, value) in [
+            ("self", JsValue::Object(global)),
+            ("name", JsValue::String((name.to_owned()).into())),
+        ] {
+            objects[global.0].properties.insert(
+                property.to_owned(),
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value,
+                    writable: false,
+                    enumerable: true,
+                    configurable: false,
+                },
+            );
+        }
+    }
+
+    /// The page-side `Worker` constructor and prototype.
+    fn install_worker_interface(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) {
+        let prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (name, function) in [
+            ("postMessage", NativeFunction::WorkerPostMessage),
+            ("terminate", NativeFunction::WorkerTerminate),
+            ("addEventListener", NativeFunction::WorkerAddEventListener),
+            (
+                "removeEventListener",
+                NativeFunction::WorkerRemoveEventListener,
+            ),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        for name in ["onmessage", "onerror", "onmessageerror"] {
+            objects[prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::Null,
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                },
+            );
+        }
+        let constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::WorkerConstructor,
+            ..JsObject::default()
+        });
+        objects[constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        objects[prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(constructor)),
+        );
+        objects[global.0].properties.insert(
+            "Worker".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(constructor),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
     }
 
     fn define_global_function(
@@ -4799,6 +4976,140 @@ impl Realm {
                 enumerable: false,
                 configurable: true,
             },
+        );
+    }
+
+    /// `URL` and `URLSearchParams`. They are ECMAScript-adjacent web APIs that
+    /// both a document realm and a worker realm install.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the URL and URLSearchParams constructors install as one API pair"
+    )]
+    fn install_url_globals(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) {
+        let url_search_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        let mut url_search_entries = None;
+        for (name, function) in [
+            ("get", NativeFunction::UrlSearchParamsGet),
+            ("getAll", NativeFunction::UrlSearchParamsGetAll),
+            ("has", NativeFunction::UrlSearchParamsHas),
+            ("set", NativeFunction::UrlSearchParamsSet),
+            ("append", NativeFunction::UrlSearchParamsAppend),
+            ("delete", NativeFunction::UrlSearchParamsDelete),
+            ("sort", NativeFunction::UrlSearchParamsSort),
+            ("toString", NativeFunction::UrlSearchParamsToString),
+            ("forEach", NativeFunction::UrlSearchParamsForEach),
+            ("keys", NativeFunction::UrlSearchParamsKeys),
+            ("values", NativeFunction::UrlSearchParamsValues),
+            ("entries", NativeFunction::UrlSearchParamsEntries),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            if name == "entries" {
+                url_search_entries = Some(method);
+            }
+            objects[url_search_prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        if let Some(entries) = url_search_entries {
+            define_symbol_property_on(
+                objects,
+                url_search_prototype,
+                &JsSymbol::well_known("@@iterator"),
+                PropertyDescriptor::builtin(JsValue::Object(entries)),
+            );
+        }
+        let size_getter = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::UrlSearchParamsSize),
+            ..JsObject::default()
+        });
+        objects[url_search_prototype.0].properties.insert(
+            "size".to_owned(),
+            PropertyDescriptor {
+                getter: Some(size_getter),
+                setter: None,
+                value: JsValue::Undefined,
+                writable: false,
+                enumerable: true,
+                configurable: true,
+            },
+        );
+        let url_search_constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::UrlSearchParamsConstructor,
+            ..JsObject::default()
+        });
+        objects[url_search_constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(url_search_prototype)),
+        );
+        objects[global.0].properties.insert(
+            "URLSearchParams".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(url_search_constructor)),
+        );
+
+        let url_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        let url_to_string = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::UrlToString),
+            ..JsObject::default()
+        });
+        objects[url_prototype.0].properties.insert(
+            "toString".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(url_to_string)),
+        );
+        let url_constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::UrlConstructor,
+            ..JsObject::default()
+        });
+        objects[url_constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(url_prototype)),
+        );
+        for (name, function) in [
+            ("parse", NativeFunction::UrlParse),
+            ("canParse", NativeFunction::UrlCanParse),
+            ("createObjectURL", NativeFunction::UrlCreateObjectUrl),
+            ("revokeObjectURL", NativeFunction::UrlRevokeObjectUrl),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[url_constructor.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        objects[global.0].properties.insert(
+            "URL".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(url_constructor)),
         );
     }
 

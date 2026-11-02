@@ -17,6 +17,7 @@ use render_dom::NodeId;
 
 use crate::JsValue;
 use crate::ObjectId;
+use crate::RealmId;
 use crate::parser::Expr;
 use crate::parser::FunctionKind;
 use crate::parser::SourceSpan;
@@ -611,6 +612,10 @@ pub struct TimerEntry {
     /// Extra arguments given to `setTimeout` or `setInterval` after the delay,
     /// passed to the callback on every run.
     pub arguments: Vec<JsValue>,
+    /// The realm the timer was registered in. A timer owned by a worker or an
+    /// iframe runs there, not in whichever realm happened to be current when
+    /// the embedding fired it.
+    pub realm: RealmId,
 }
 
 /// A scheduling request emitted while script executed. `Schedule` entries must
