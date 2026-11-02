@@ -262,6 +262,13 @@ pub(super) struct BrowserApp {
     pub(super) presenter: SharedPresenter,
     pub(super) layout: Option<ChromeLayout>,
     pub(super) frame: Vec<u32>,
+    /// True when the platform presented a composited page directly and the
+    /// CPU frame no longer matches the window.
+    ///
+    /// A later present refreshes it with [`BrowserApp::compose_frame`] before
+    /// uploading, so an operating-system redraw can never show the older
+    /// scroll position.
+    pub(super) cpu_frame_stale: bool,
     /// Wheel movement accumulated since the last redraw, in document pixels.
     ///
     /// A high-resolution trackpad reports several wheel events per display
@@ -376,6 +383,7 @@ impl BrowserApp {
             presenter,
             layout: None,
             frame: Vec::new(),
+            cpu_frame_stale: false,
             pending_scroll_delta: 0.0,
             frame_size: WindowSize::new(0, 0),
             frame_damage: FrameDamage {
@@ -744,17 +752,19 @@ impl BrowserApp {
             );
         }
         if active {
-            if present_time.is_none() {
+            if present_time.is_some() {
+                // A direct platform present already put the new scroll frame
+                // on screen. The CPU frame is refreshed lazily by the next
+                // chrome repaint (or by `present`), so composing it here would
+                // add a second full-window pass for pixels the window shows.
+                self.cpu_frame_stale = true;
+            } else {
                 if let Some(size) = self.window.as_ref().map(|window| window.inner_size()) {
                     self.mark_page_damage(size);
                     self.compose_frame(size);
                 }
                 self.request_redraw();
             }
-            // A direct platform present already put the new scroll frame on
-            // screen. The CPU frame is refreshed lazily by the next chrome
-            // repaint, so composing it here would add a second full-window
-            // pass per scroll frame for pixels the window already shows.
         } else {
             self.repaint_chrome();
         }
@@ -1080,6 +1090,7 @@ impl BrowserApp {
         }
         dump_debug_frame(&self.frame, size);
         self.frame_size = size;
+        self.cpu_frame_stale = false;
     }
 
     /// Paint the insertion caret for the focused page control on top of the
@@ -1667,6 +1678,11 @@ impl BrowserApp {
     }
 
     pub(super) fn present(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.cpu_frame_stale
+            && let Some(size) = self.window.as_ref().map(|window| window.inner_size())
+        {
+            self.compose_frame(size);
+        }
         let width = NonZeroU32::new(self.frame_size.width)
             .ok_or_else(|| io::Error::other("cannot present a zero-width frame"))?;
         let height = NonZeroU32::new(self.frame_size.height)

@@ -2437,6 +2437,7 @@ fn headless_app_with_render_worker(
         presenter: render_browser::compositor::shared_presenter(),
         layout: None,
         frame: Vec::new(),
+        cpu_frame_stale: false,
         pending_scroll_delta: 0.0,
         frame_size: WindowSize::new(800, 600),
         frame_damage: FrameDamage::default(),
