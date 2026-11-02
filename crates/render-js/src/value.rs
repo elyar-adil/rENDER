@@ -4753,6 +4753,7 @@ impl Realm {
         // The worker's own messaging and lifecycle entry points. They are
         // bound to the global so a bare call still names this worker.
         for (name, function) in [
+            ("queueMicrotask", NativeFunction::QueueMicrotask),
             ("postMessage", NativeFunction::WorkerScopePostMessage),
             ("importScripts", NativeFunction::WorkerScopeImportScripts),
             ("close", NativeFunction::WorkerScopeClose),
