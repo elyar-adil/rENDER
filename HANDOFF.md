@@ -139,6 +139,24 @@
 
 离屏截图（隐藏窗口，1180×780 logical / DPR 2）：`.artifacts/ui-native/after/home.png`、`home-dark.png`、`comparison-before-after.png`；主树验证图 `/tmp/home-ui.png`。`render-browser` lib 241 passed、bin 130 passed。剩余：窗口仍是无边框自绘 traffic lights（没有系统圆角/阴影），需要可见窗口验证才能换成真 `NSWindow` 控件；无 tab overflow/favicon/security indicator；chrome 仍只支持指针。
 
+## live 页面性能：GitHub/Baidu 的首屏与请求
+
+`f353224`、`46db402`、`50b8829`、`012cf4c`、`81bc543`：
+
+- **GitHub cascade**：38,610 条规则 / 6,372 元素的 local snapshot，首帧 >20s → **4.15s**；`cascade-match` 2.13s→0.88s，`compute` 868→85ms，`pseudo_compute` 1.37s→12ms，container feedback 7.51s→1.95s。根因是每个元素复制/重算整张 inherited custom-property 表（GitHub `:root` 约 1,000 个变量）、`*,::before,::after { box-sizing:border-box }` 触发无 `content` 的伪元素完整计算、以及 3 次全文档 container 反馈。
+- **GC**：Baidu 常驻约 136k JS 对象，旧的 131,072 硬上限导致几乎每次分配都 full mark-sweep（~45ms，回收 0–41 个）；硬上限改为 524,288，加增长阈值/headroom，脚本边界只在到期时 GC。Baidu live 12s：GC 数千次→9 次，`DOMContentLoaded` 19.5s 未完成→10.2s，`load` 10.7s，10s health `ready=Complete scripts_threw=0`。
+- **重复子资源**：GitHub 同一 CSS 被 link 5–6 次；`HttpTransport` 增加 in-flight coalescer（URL+Accept+Cookie+headers；body/Range/conditional 不共享）。一次运行请求 129→128 logical / 119 unique，传输 15.72MB→11.32MB。
+- **container feedback / slow script turn** 现在会输出 pass 数与 >250ms 的 native callback turn，便于继续定位。
+
+## Google 结果页
+
+`9178c5e`、`05637ba` 后，Google 从 15 元素 interstitial 变成可用结果页（需一次 consent 的 `SOCS` cookie）：
+
+- 根因不是 Google 封禁，而是：脚本 `location.replace` 被 pump 先 `take` 掉、计时器写 `document.cookie` 未同步到 HTTP jar、缺 `CSSStyleRule` 等 CSSOM 全局、transform origin 用 box-local 而非 document-space、transform 重复应用到 text/anonymous box、flex intrinsic 未处理 `max-height`、row-flex 的 cross-axis intrinsic height 把子项高度求和。
+- 修复后 consented profile：`ready=Interactive dom_elements=2530 boxes=940 scripts_failed=0 scripts_threw=0`，真实结果标题/URL/snippet 出现；截图 `/tmp/google-results-after.png`。
+- 之后又修了 Google 的空白带/结果行距：row-flex 的 cross-axis 高度取最高子项（216→48px），非 flex block 的 intrinsic height 加入子项垂直 padding/margin；`#center_col` y 368→200（Edge 200），结果行高 152/136/114→139/123/101（Edge 123/101/123）。`render-layout` 399 passed。
+- 剩余：fresh profile 的 consent 对话框背景/z-order、`#rso` 约 13.6px 偏移、动态“翻译此页”让首行高约 16px、`/complete/s` 的 GET-body/abort 错误。
+
 ## 包体与内存
 
 macOS release：`render-browser` **16 MB**，gzip **7.8 MB**，xz **5.3 MB**；额外 Homebrew `libdav1d` 0.78 MB。Edge.app 实测 1.7 GB，Chrome 未安装（典型 1.5–2 GB）。体积约 1/100，启动也更快；但峰值 RSS 仍高于 Chromium headless（~760–850MB vs ~267MB），字体懒加载是下一个目标。目前没有 `.app`/安装器/公证。
@@ -147,17 +165,18 @@ macOS release：`render-browser` **16 MB**，gzip **7.8 MB**，xz **5.3 MB**；�
 
 ```text
 cargo test --workspace                                     all ok
-cargo test -p render-core --lib                            550 passed, 1 ignored
-cargo test -p render-browser --bin render-browser           128 passed
-cargo test -p render-browser --lib                          232 passed
-cargo test -p render-css                                    328 passed
-cargo test -p render-layout                                 395 passed, 1 ignored
-cargo test -p render-js                                     1274 passed
+cargo test -p render-core --lib                            558 passed, 1 ignored
+cargo test -p render-browser --bin render-browser           132 passed
+cargo test -p render-browser --lib                          241 passed
+cargo test -p render-css                                    331 passed
+cargo test -p render-layout                                 399 passed, 1 ignored
+cargo test -p render-js                                     1275 passed
+cargo test -p render-net                                    125 passed
 cargo clippy --workspace --all-targets -- -D warnings       clean
 cargo fmt --all --check                                     clean
 ```
 
-未完成：字体懒加载、Google/X 的最终可用性、CSSOM 子集（`media`/`disabled`/`replace`、link sheet 规则进 cascade）、绝对定位 flex 子项 static position 忽略 `padding-top` 的 10px、知乎图标圆形底、原生 chrome 的细节打磨。
+未完成：X 的 React error boundary、字体懒加载/JS arena 回收、CSSOM 子集（`media`/`disabled`/`replace`、link sheet 规则进 cascade）、Google fresh-profile consent、容器反馈仍跑 3 次全 cascade、单脚本 turn 不可抢占、GitHub DPR2 styled raster ~1.05s、hao123 `.search` 10px static-position、无边框窗口的系统 traffic lights/圆角阴影。
 
 ---
 
