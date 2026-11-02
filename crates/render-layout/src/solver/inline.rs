@@ -1836,6 +1836,9 @@ impl<'a> Solver<'a> {
     /// in-flow child measured by its min-content width instead of its
     /// max-content one.
     pub(super) fn atomic_inline_min_content_width(&mut self, node_id: FormattingNodeId) -> f32 {
+        if self.is_row_flex_container(node_id) {
+            return self.flex_intrinsic_size(node_id, true, self.options.viewport.width, 0, true);
+        }
         let children = self
             .formatting
             .get(node_id)
@@ -1848,8 +1851,14 @@ impl<'a> Solver<'a> {
             let child_width = self.min_content_width(child);
             if child_float == Float::None {
                 if child_width > f32::EPSILON {
+                    // In-flow content shares the line with a preceding float:
+                    // the float's outer width is part of the preferred minimum
+                    // width, not a separate candidate that the content has to
+                    // beat. Resetting the run before adding it made an
+                    // inline-block with a leading icon measure only the label
+                    // and then wrap the label under the icon in real layout.
+                    widest = widest.max(float_run + child_width);
                     float_run = 0.0;
-                    widest = widest.max(child_width);
                 }
             } else {
                 float_run += self.atomic_outer_intrinsic_width(child, true);
@@ -1859,6 +1868,33 @@ impl<'a> Solver<'a> {
         widest
     }
 
+    /// Whether `node_id` is a row-axis flex container.
+    ///
+    /// Both the block-level and inline-level kind count; an `inline-flex`
+    /// reaches the atomic-inline measurement before `max_content_width`'s
+    /// block-container branch can see it.
+    fn is_row_flex_container(&self, node_id: FormattingNodeId) -> bool {
+        let Some(node) = self.formatting.get(node_id) else {
+            return false;
+        };
+        if !matches!(
+            node.kind,
+            FormattingNodeKind::AtomicInline {
+                context: FormattingContextKind::Flex
+            } | FormattingNodeKind::BlockContainer {
+                context: FormattingContextKind::Flex
+            }
+        ) {
+            return false;
+        }
+        node.style_source
+            .and_then(|source| self.styles.get(&source))
+            .and_then(|style| style.get("flex-direction"))
+            .is_none_or(|direction| {
+                matches!(direction.css_text().trim(), "" | "row" | "row-reverse")
+            })
+    }
+
     pub(super) fn atomic_inline_intrinsic_width(&mut self, node_id: FormattingNodeId) -> f32 {
         let trace = intrinsic_trace_enabled();
         let children = self
@@ -1866,6 +1902,14 @@ impl<'a> Solver<'a> {
             .get(node_id)
             .map(|node| node.children.clone())
             .unwrap_or_default();
+        // An inline-level flex container is still a flex container: its
+        // intrinsic main size is the sum of its items, not the widest child.
+        // `max_content_width` handles the block-level flex container, but an
+        // `AtomicInline { context: Flex }` reaches this function before that
+        // branch, so it must ask the flex solver here.
+        if self.is_row_flex_container(node_id) {
+            return self.flex_intrinsic_size(node_id, true, self.options.viewport.width, 0, false);
+        }
         let mut widest = 0.0_f32;
         let mut float_run = 0.0_f32;
         for child in children {
@@ -1880,8 +1924,12 @@ impl<'a> Solver<'a> {
                 // adjacent floats; doing so makes every link in a real
                 // navigation bar start on a new line.
                 if child_width > f32::EPSILON {
+                    // The first in-flow content after a float occupies the
+                    // remaining part of the same line, so the preferred width
+                    // is the float run plus that content. See the matching
+                    // comment in `atomic_inline_min_content_width`.
+                    widest = widest.max(float_run + child_width);
                     float_run = 0.0;
-                    widest = widest.max(child_width);
                 }
             } else {
                 // Adjacent floats share a line in a shrink-to-fit box. The
@@ -1955,6 +2003,19 @@ impl<'a> Solver<'a> {
                     false,
                 );
             }
+        }
+        // CSS Sizing 3 §5.1: a definite specified size caps the intrinsic
+        // contribution, so an empty `width: 14px` item is 14px wide even though
+        // it has no contents. Without this the icon contributed zero and the
+        // surrounding inline-block/flex container collapsed to its label; the
+        // same omission made a table cell ignore a fixed-width descendant.
+        if let Some(source) = node.source
+            && let Some(style) = node
+                .style_source
+                .and_then(|style_source| self.styles.get(&style_source))
+            && let Some(width) = self.resolve_size_against(Some(style), "width", None, Some(source))
+        {
+            return width.max(0.0);
         }
         node.children
             .into_iter()

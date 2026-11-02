@@ -979,6 +979,8 @@ impl Solver<'_> {
             entry.kind,
             FormattingNodeKind::BlockContainer {
                 context: FormattingContextKind::Flex
+            } | FormattingNodeKind::AtomicInline {
+                context: FormattingContextKind::Flex
             }
         );
         let children = entry.children.clone();

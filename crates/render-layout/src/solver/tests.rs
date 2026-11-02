@@ -540,6 +540,98 @@ fn inline_block_wraps_as_one_unit_when_the_line_is_full() {
 }
 
 #[test]
+fn table_auto_width_includes_a_fixed_width_block_descendant() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id=box><table id=table><tr><td><div id=fixed>short</div></td></tr></table></div></body>",
+        "html, body, div, table, tbody, tr, td { display:block; margin:0; padding:0 } #box { width:348px; display:block } #table { display:table; border-spacing:0 } tbody { display:table-row-group } tr { display:table-row } td { display:table-cell } #fixed { width:300px }",
+        800.0,
+    );
+    let rect = |selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .map_or_else(
+                || panic!("no fragment for {selector}"),
+                |fragment| fragment.rect,
+            )
+    };
+    let table = rect("#table");
+    let fixed = rect("#fixed");
+
+    assert_eq!(fixed.size.width, 300.0);
+    assert!(
+        table.size.width >= 300.0,
+        "the table grows to the fixed-width cell content: {table:?}"
+    );
+}
+
+#[test]
+fn inline_flex_fixed_width_child_contributes_its_width_to_the_container() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id=chip><span id=icon></span><span id=label>abc医疗系统</span></div></body>",
+        "html, body, div, span { margin:0 } #chip { display:inline-flex; align-items:center; font-size:14px; line-height:36px; padding:0 12px; height:36px } #icon { display:inline-block; width:14px; height:14px; margin-right:6px } #label { display:inline-block }",
+        800.0,
+    );
+    let rect = |selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .map_or_else(
+                || panic!("no fragment for {selector}"),
+                |fragment| fragment.rect,
+            )
+    };
+    let chip = rect("#chip");
+    let icon = rect("#icon");
+    let label = rect("#label");
+
+    assert_eq!(chip.size.height, 36.0);
+    assert_eq!(icon.size.width, 14.0);
+    assert!(
+        label.origin.y < 36.0 && label.size.height <= 36.0,
+        "the label stays on one line inside the chip: {label:?}"
+    );
+    assert!(
+        chip.size.width >= 12.0 + 14.0 + 6.0 + label.size.width + 12.0 - 0.01,
+        "the chip width includes padding, the fixed-width icon and its margin: {chip:?}"
+    );
+}
+
+#[test]
+fn inline_block_with_a_leading_float_keeps_its_label_beside_the_icon() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id=chip><span id=icon></span><span id=label>HELLO</span></div></body>",
+        "html, body, div, span { margin:0 } #chip { display:inline-block; font-size:13px; line-height:20px } #icon { float:left; width:18px; height:22px; margin-right:4px } #label { display:inline-block; font-size:14px; line-height:22px }",
+        800.0,
+    );
+    let rect = |selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .map_or_else(
+                || panic!("no fragment for {selector}"),
+                |fragment| fragment.rect,
+            )
+    };
+    let chip = rect("#chip");
+    let icon = rect("#icon");
+    let label = rect("#label");
+
+    assert_eq!(
+        label.origin.y, icon.origin.y,
+        "the label shares the float's line instead of wrapping under it"
+    );
+    assert!(
+        label.origin.x >= icon.size.width + 4.0 - 0.01,
+        "the label starts after the float's outer width: {label:?}"
+    );
+    assert_eq!(chip.size.height, 22.0, "the chip is one line tall, not two");
+}
+
+#[test]
 fn inline_icon_title_and_badge_share_one_line() {
     let (output, _, layout) = pipeline(
         "<!doctype html><body><ul><li id=item><a id=title><i id=icon>^</i><span id=text>headline</span></a><span id=badge>hot</span></li></ul></body>",
