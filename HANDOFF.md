@@ -57,7 +57,13 @@
 2. **`ReadableStream` 缺失**：X 的 TSR router 在顶层 `new ReadableStream`，缺失导致 hydration 数据不生成。
 3. **`Intl` 缺失**：startup chunk 顶层 `new Intl.Segmenter`，缺失导致整个 module graph 中止。
 
-第 2、3 项已交给独立 worktree `js-streams-intl` 实现真实 Streams/Intl 子集并跑 reduced tests；尚未合并。X 的 CSS 本身没有问题：把 Edge 的 post-JS DOM + 捕获 CSS 交给 rENDER，表单可见。
+第 2、3 项已经实现并合并：`45018b5`/`e8a8da9`/`a593c2f`。`ReadableStream` 覆盖 default stream、reader、队列/背压、`tee`、async iteration（byte stream/BYOB/pipeTo 仍显式缺失）；`Intl` 覆盖 `Segmenter`（真实 UAX #29 grapheme/word/sentence）、`NumberFormat`、`DateTimeFormat`、`PluralRules`、`Collator`、`getCanonicalLocales`（仅 en/en-US 数据，无时区库）。`render-js` 1257 passed。
+
+合并后 X 的启动链不再抛 `ReadableStream`/`Intl`：`__INITIAL_DATA__`、`$_TSR.router`、hydration stream 都存在，`streamEnded=true`，但 `router.hydrated` 仍未置位、`#react-root` 不存在、表单仍为 0。下一个具体证据是 `api.x.com/1.1/guest/activate.json` 经诊断代理返回 404；`x-hydration` agent 正在对比 Edge 与 rENDER 的请求头/credentials/响应，随后修通用 fetch/hydration 语义。X 的 CSS 本身没有问题：把 Edge 的 post-JS DOM + 捕获 CSS 交给 rENDER，表单可见。
+
+## hao123：动态样式表被 BigPipe 的 loaded 列表跳过
+
+1× 验证（`/tmp/hao123-lowdpi.png`）下 hao123 的 inline CSS 布局基本正常，但主样式表 `aio-all.c43b43d.css` 没有加载：DOM 里只有 5 个 `dns-prefetch` link，`active_sheets=0`。页面先用 `BigPipe.loadedResource([...,"500d3d9_1c8f"])` 记录 ID，再 `BigPipe.setResourceMap(...)`；`getResource()` 看到 ID 已在 loaded 列表就把资源标成 `loaded=true`，`Resource.load()` 直接 resolve，CSSLoader 从未创建 `<link>`。Edge 打开同一份 `/tmp/hao123.html` 能加载该 CSS（`/tmp/hao123-edge-file.png`），所以这是通用 JS/DOM 语义差异，不是 CSS 解析问题。`hao123-css` agent 正在用 reduced BigPipe repro 定位并修复。另有两张图片因服务器字节与声明 content-type 不符而失败，是独立的资源解码问题。
 
 ## 知乎登录页
 
