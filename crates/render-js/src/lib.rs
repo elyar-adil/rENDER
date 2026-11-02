@@ -76,7 +76,12 @@ impl Default for RuntimeLimits {
             // dedicated script stack (~2 KiB of native stack per interpreter
             // frame) while still bounding runaway recursion.
             max_call_depth: 4_096,
-            max_heap_objects: 131_072,
+            // A page's long-lived object graph is ordinary work, not a leak:
+            // Baidu's search result reaches ~131k live objects after a
+            // collection. The limit still bounds a runaway script, and the
+            // collector grows its next threshold with the live set so a stable
+            // graph near the limit does not collect on every allocation.
+            max_heap_objects: 524_288,
             max_dom_nodes_created: 16_384,
         }
     }

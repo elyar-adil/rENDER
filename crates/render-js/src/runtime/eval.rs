@@ -93,6 +93,24 @@ use render_html::serialize_html_node;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+
+/// Logs a native DOM/builtin dispatch that took long enough to explain a
+/// stalled script turn. The interpreter step counter does not see time spent
+/// inside one native call, so a turn can report a handful of steps and still
+/// block the event loop for hundreds of milliseconds.
+struct NativeSlowTrace {
+    function: NativeFunction,
+    started: std::time::Instant,
+}
+
+impl Drop for NativeSlowTrace {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        if elapsed >= std::time::Duration::from_millis(50) {
+            eprintln!("render-js slow native {:?} took {elapsed:?}", self.function);
+        }
+    }
+}
 use std::rc::Rc;
 
 /// The prelude global the evaluator calls around native node property writes.
@@ -8016,6 +8034,10 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
+        let _slow_trace = Self::native_slow_trace_enabled().then(|| NativeSlowTrace {
+            function,
+            started: std::time::Instant::now(),
+        });
         if Self::native_trace_enabled() {
             eprintln!(
                 "[native] {function:?} receiver={:?} args={}",

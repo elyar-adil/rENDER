@@ -459,16 +459,54 @@ pub(super) fn mark_host(
 
 impl JsRuntime {
     pub(super) fn ensure_heap_capacity(&mut self, additional: usize) -> Result<(), JsError> {
+        let occupied = self.realm.object_count();
+        let requested = occupied.saturating_add(additional);
+        if requested <= self.gc_threshold_objects {
+            return Ok(());
+        }
+        // Reclaim garbage before failing: script batches load many bundles
+        // into one shared realm, and every earlier evaluation's dead objects
+        // would otherwise exhaust the heap permanently.
+        self.collect_garbage_and_update_threshold();
         if self.realm.object_count().saturating_add(additional) > self.limits.max_heap_objects {
-            // Reclaim garbage before failing: script batches load many bundles
-            // into one shared realm, and every earlier evaluation's dead
-            // objects would otherwise exhaust the heap permanently.
-            self.collect_garbage();
-            if self.realm.object_count().saturating_add(additional) > self.limits.max_heap_objects {
-                return Err(JsError::resource("JavaScript object heap limit exceeded"));
-            }
+            return Err(JsError::resource("JavaScript object heap limit exceeded"));
         }
         Ok(())
+    }
+
+    /// Collects only when the heap has grown past the threshold and then moves
+    /// the threshold to leave headroom over the surviving live set.
+    ///
+    /// Script boundaries used to collect unconditionally. Once a page holds a
+    /// large long-lived object graph (Baidu reaches ~136k live objects), every
+    /// one of its later timer scripts paid a full mark-and-sweep that reclaimed
+    /// almost nothing. The threshold makes that cost proportional to garbage
+    /// produced instead of to the number of scripts run.
+    pub(super) fn collect_garbage_if_due(&mut self) {
+        if self.realm.object_count() > self.gc_threshold_objects {
+            self.collect_garbage_and_update_threshold();
+        }
+    }
+
+    fn collect_garbage_and_update_threshold(&mut self) {
+        let occupied = self.realm.object_count();
+        let reclaimed = self.collect_garbage();
+        let live = self.realm.object_count();
+        // Grow the next threshold with the live set, with at least half again
+        // as much headroom. A page whose long-lived object graph is large but
+        // stable must not pay a full mark-and-sweep for every allocation once
+        // its dead objects are gone. A collection that reclaimed almost nothing
+        // buys no future headroom, so stop collecting before the hard limit;
+        // `ensure_heap_capacity` still enforces that limit.
+        let headroom = (live / 2).max(self.limits.max_heap_objects / 8);
+        let threshold = live
+            .saturating_add(headroom)
+            .min(self.limits.max_heap_objects);
+        self.gc_threshold_objects = if reclaimed < occupied / 8 {
+            self.limits.max_heap_objects
+        } else {
+            threshold
+        };
     }
 
     /// Mark-reclaim dead object slots, keeping every live identity stable.

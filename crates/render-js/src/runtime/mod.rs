@@ -145,6 +145,10 @@ pub struct JsRuntime {
     /// `NativeFunction::Host` that calls them.
     host_functions: Vec<HostFunction>,
     limits: RuntimeLimits,
+    /// Heap occupancy at which the next collection is attempted. It trails the
+    /// live set by a headroom so a page whose long-lived heap sits just below
+    /// the hard limit does not collect on every allocation.
+    gc_threshold_objects: usize,
     steps_remaining: usize,
     calls_active: usize,
     dom_nodes_created: usize,
@@ -438,6 +442,7 @@ impl JsRuntime {
         Self {
             realm,
             host_functions: Vec::new(),
+            gc_threshold_objects: limits.max_heap_objects / 4,
             steps_remaining: limits.max_execution_steps,
             calls_active: 0,
             dom_nodes_created: 0,
@@ -1539,9 +1544,10 @@ impl JsRuntime {
         // Nothing from the previous script can still be held by an interpreter
         // frame, so its boxed-wrapper pins go before the collection runs.
         self.transient_roots.clear();
-        // Classic scripts share one realm, so reclaim the previous script's
-        // garbage before allocating objects for this one.
-        self.collect_garbage();
+        // Classic scripts share one realm. Collect only when the heap has
+        // actually grown past the collection threshold: a large stable live set
+        // would otherwise pay a full mark-and-sweep for every later script.
+        self.collect_garbage_if_due();
         self.steps_remaining = self.limits.max_execution_steps;
         self.calls_active = 0;
         self.dom_nodes_created = 0;
@@ -1721,6 +1727,12 @@ impl JsRuntime {
     fn native_trace_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var_os("RENDER_TRACE_NATIVE").is_some())
+    }
+
+    /// `RENDER_TRACE_NATIVE_SLOW` diagnostic: log native dispatches over 50 ms.
+    fn native_slow_trace_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("RENDER_TRACE_NATIVE_SLOW").is_some())
     }
 
     fn consume_step(&mut self) -> Result<(), JsError> {

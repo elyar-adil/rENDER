@@ -346,7 +346,7 @@ impl JsRuntime {
         self.ensure_prelude(dom);
         let from_revision = dom.revision();
         self.transient_roots.clear();
-        self.collect_garbage();
+        self.collect_garbage_if_due();
         self.steps_remaining = self.limits.max_execution_steps;
         self.calls_active = 0;
         self.dom_nodes_created = 0;
