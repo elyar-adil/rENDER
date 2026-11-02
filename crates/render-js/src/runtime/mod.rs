@@ -98,6 +98,8 @@ mod prelude_tests;
 mod realm_tests;
 #[cfg(test)]
 mod shadow_tests;
+#[cfg(test)]
+mod streams_tests;
 pub(crate) mod types;
 
 #[cfg(test)]

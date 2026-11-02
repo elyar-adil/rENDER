@@ -1663,4 +1663,582 @@
       enumerable: false
     });
   }
+
+  // ---------------------------------------------------------- ReadableStream
+  // WHATWG Streams, default (non-byte) streams only. The controller, the
+  // default reader, `cancel`, `tee`, `values` and async iteration are real;
+  // byte streams, `pipeTo`, `pipeThrough` and `TransformStream` are absent
+  // rather than stubbed (see docs/visual_fidelity_gaps.md).
+  //
+  // The algorithms follow the standard's shape: `start` runs synchronously
+  // during construction, `enqueue` either fulfils a waiting read request or
+  // queues the chunk and accounts its `size`, and `pull` is called only while
+  // `desiredSize` is positive or a read is waiting. A pull that is already
+  // running sets `pullAgain`, so a pull callback never re-enters itself.
+  if (typeof global.ReadableStream === 'undefined') {
+    var readableStreamDefaultSize = function () { return 1; };
+    var readableStreamNoop = function () {};
+
+    function readableStreamSlots(stream) {
+      return stream.__readable;
+    }
+
+    function readableStreamControllerSlots(controller) {
+      return controller.__readableController;
+    }
+
+    function readableStreamCanCloseOrEnqueue(slots) {
+      return slots.closeRequested === false && slots.state === 'readable';
+    }
+
+    function readableStreamDesiredSize(slots) {
+      if (slots.state === 'errored') return null;
+      if (slots.state === 'closed') return 0;
+      return slots.highWaterMark - slots.queueTotalSize;
+    }
+
+    function readableStreamFulfilRead(stream, request, value, done) {
+      request.resolve({ value: value, done: done });
+    }
+
+    function readableStreamClose(stream) {
+      var slots = readableStreamSlots(stream);
+      if (slots.state !== 'readable') return;
+      slots.state = 'closed';
+      slots.closeRequested = true;
+      var reader = slots.reader;
+      if (reader !== undefined) {
+        var requests = reader.__readableReader.requests;
+        reader.__readableReader.requests = [];
+        for (var i = 0; i < requests.length; i++) {
+          requests[i].resolve({ value: undefined, done: true });
+        }
+        reader.__readableReader.closedResolve(undefined);
+      }
+    }
+
+    function readableStreamError(stream, error) {
+      var slots = readableStreamSlots(stream);
+      if (slots.state !== 'readable') return;
+      slots.state = 'errored';
+      slots.storedError = error;
+      slots.queue = [];
+      slots.queueTotalSize = 0;
+      var reader = slots.reader;
+      if (reader !== undefined) {
+        var requests = reader.__readableReader.requests;
+        reader.__readableReader.requests = [];
+        for (var i = 0; i < requests.length; i++) {
+          requests[i].reject(error);
+        }
+        reader.__readableReader.closedReject(error);
+      }
+    }
+
+    function readableStreamCloseOrErrorFromStart(stream, error) {
+      // start() throwing rejects every later read with the same reason.
+      readableStreamError(stream, error);
+    }
+
+    function readableStreamShouldCallPull(slots) {
+      if (!readableStreamCanCloseOrEnqueue(slots)) return false;
+      if (!slots.started) return false;
+      if (slots.reader !== undefined && slots.reader.__readableReader.requests.length > 0) {
+        return true;
+      }
+      return readableStreamDesiredSize(slots) > 0;
+    }
+
+    function readableStreamCallPullIfNeeded(stream) {
+      var slots = readableStreamSlots(stream);
+      if (!readableStreamShouldCallPull(slots)) return;
+      if (slots.pulling) {
+        slots.pullAgain = true;
+        return;
+      }
+      slots.pulling = true;
+      var result;
+      try {
+        result = slots.pullAlgorithm.call(slots.source, slots.controller);
+      } catch (error) {
+        slots.pulling = false;
+        readableStreamError(stream, error);
+        return;
+      }
+      Promise.resolve(result).then(function () {
+        slots.pulling = false;
+        if (slots.pullAgain) {
+          slots.pullAgain = false;
+          readableStreamCallPullIfNeeded(stream);
+        }
+      }, function (error) {
+        slots.pulling = false;
+        readableStreamError(stream, error);
+      });
+    }
+
+    function readableStreamCancel(stream, reason) {
+      var slots = readableStreamSlots(stream);
+      if (slots.state === 'closed') return Promise.resolve(undefined);
+      if (slots.state === 'errored') return Promise.reject(slots.storedError);
+      slots.queue = [];
+      slots.queueTotalSize = 0;
+      readableStreamClose(stream);
+      var result;
+      try {
+        result = slots.cancelAlgorithm === undefined
+          ? undefined
+          : slots.cancelAlgorithm.call(slots.source, reason);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      return Promise.resolve(result).then(function () { return undefined; });
+    }
+
+    function readableStreamControllerEnqueue(controller, chunk) {
+      var slots = readableStreamControllerSlots(controller);
+      var stream = slots.stream;
+      var streamSlots = readableStreamSlots(stream);
+      if (!readableStreamCanCloseOrEnqueue(streamSlots)) {
+        throw new TypeError('Cannot enqueue into a stream that is closed or closing');
+      }
+      var size;
+      try {
+        size = Number(streamSlots.sizeAlgorithm.call(undefined, chunk));
+      } catch (error) {
+        readableStreamError(stream, error);
+        throw error;
+      }
+      if (size !== size || size < 0 || size === Infinity) {
+        var error = new RangeError('Invalid chunk size');
+        readableStreamError(stream, error);
+        throw error;
+      }
+      var reader = streamSlots.reader;
+      if (reader !== undefined && reader.__readableReader.requests.length > 0) {
+        var request = reader.__readableReader.requests.shift();
+        readableStreamFulfilRead(stream, request, chunk, false);
+      } else {
+        streamSlots.queue.push({ value: chunk, size: size });
+        streamSlots.queueTotalSize += size;
+      }
+      readableStreamCallPullIfNeeded(stream);
+    }
+
+    function readableStreamControllerClose(controller) {
+      var slots = readableStreamControllerSlots(controller);
+      var stream = slots.stream;
+      var streamSlots = readableStreamSlots(stream);
+      if (!readableStreamCanCloseOrEnqueue(streamSlots)) {
+        throw new TypeError('Cannot close a stream that is closed or closing');
+      }
+      streamSlots.closeRequested = true;
+      if (streamSlots.queue.length === 0) readableStreamClose(stream);
+    }
+
+    function readableStreamControllerError(controller, reason) {
+      var slots = readableStreamControllerSlots(controller);
+      var stream = slots.stream;
+      var streamSlots = readableStreamSlots(stream);
+      if (!readableStreamCanCloseOrEnqueue(streamSlots)) return;
+      readableStreamError(stream, reason);
+    }
+
+    function ReadableStreamDefaultController() {
+      throw new TypeError('Illegal constructor');
+    }
+    var controllerPrototype = ReadableStreamDefaultController.prototype;
+    define(controllerPrototype, 'enqueue', function enqueue(chunk) {
+      if (readableStreamControllerSlots(this) === undefined) {
+        throw new TypeError('Illegal invocation');
+      }
+      readableStreamControllerEnqueue(this, chunk);
+      return undefined;
+    });
+    define(controllerPrototype, 'close', function close() {
+      if (readableStreamControllerSlots(this) === undefined) {
+        throw new TypeError('Illegal invocation');
+      }
+      readableStreamControllerClose(this);
+      return undefined;
+    });
+    define(controllerPrototype, 'error', function error(reason) {
+      if (readableStreamControllerSlots(this) === undefined) {
+        throw new TypeError('Illegal invocation');
+      }
+      readableStreamControllerError(this, reason);
+      return undefined;
+    });
+    defineGetter(controllerPrototype, 'desiredSize', function desiredSize() {
+      var slots = readableStreamControllerSlots(this);
+      if (slots === undefined) return null;
+      return readableStreamDesiredSize(readableStreamSlots(slots.stream));
+    });
+    defineProperty(controllerPrototype, Symbol.toStringTag, {
+      value: 'ReadableStreamDefaultController', configurable: true
+    });
+
+    function ReadableStreamDefaultReader(stream) {
+      if (!(this instanceof ReadableStreamDefaultReader)) {
+        throw new TypeError("Please use the 'new' operator");
+      }
+      if (!(stream instanceof ReadableStream)) {
+        throw new TypeError("Failed to construct 'ReadableStreamDefaultReader': parameter 1 is not of type 'ReadableStream'");
+      }
+      var streamSlots = readableStreamSlots(stream);
+      if (streamSlots.reader !== undefined) {
+        throw new TypeError('ReadableStream is locked');
+      }
+      var resolveClosed, rejectClosed;
+      var closedPromise = new Promise(function (resolve, reject) {
+        resolveClosed = resolve;
+        rejectClosed = reject;
+      });
+      defineProperty(this, '__readableReader', {
+        value: {
+          stream: stream,
+          requests: [],
+          closedPromise: closedPromise,
+          closedResolve: resolveClosed,
+          closedReject: rejectClosed
+        },
+        configurable: false,
+        enumerable: false,
+        writable: false
+      });
+      streamSlots.reader = this;
+      if (streamSlots.state === 'closed') resolveClosed(undefined);
+      else if (streamSlots.state === 'errored') rejectClosed(streamSlots.storedError);
+    }
+    var readerPrototype = ReadableStreamDefaultReader.prototype;
+    define(readerPrototype, 'read', function read() {
+      var readerSlots = this.__readableReader;
+      if (readerSlots === undefined) throw new TypeError('Illegal invocation');
+      var stream = readerSlots.stream;
+      if (stream === undefined) {
+        return Promise.reject(new TypeError('This reader has been released from its stream'));
+      }
+      var slots = readableStreamSlots(stream);
+      if (slots.state === 'closed') {
+        return Promise.resolve({ value: undefined, done: true });
+      }
+      if (slots.state === 'errored') {
+        return Promise.reject(slots.storedError);
+      }
+      if (slots.closeRequested && slots.queue.length === 0) {
+        readableStreamClose(stream);
+        return Promise.resolve({ value: undefined, done: true });
+      }
+      if (slots.queue.length > 0) {
+        var entry = slots.queue.shift();
+        slots.queueTotalSize -= entry.size;
+        if (slots.closeRequested && slots.queue.length === 0) {
+          readableStreamClose(stream);
+        } else {
+          readableStreamCallPullIfNeeded(stream);
+        }
+        return Promise.resolve({ value: entry.value, done: false });
+      }
+      var self = this;
+      return new Promise(function (resolve, reject) {
+        var current = self.__readableReader;
+        if (current === undefined || current.stream !== stream) {
+          reject(new TypeError('This reader has been released from its stream'));
+          return;
+        }
+        current.requests.push({ resolve: resolve, reject: reject });
+        readableStreamCallPullIfNeeded(stream);
+      });
+    });
+    define(readerPrototype, 'cancel', function cancel(reason) {
+      var readerSlots = this.__readableReader;
+      if (readerSlots === undefined) throw new TypeError('Illegal invocation');
+      if (readerSlots.stream === undefined) {
+        return Promise.reject(new TypeError('This reader has been released from its stream'));
+      }
+      return readableStreamCancel(readerSlots.stream, reason);
+    });
+    define(readerPrototype, 'releaseLock', function releaseLock() {
+      var readerSlots = this.__readableReader;
+      if (readerSlots === undefined) throw new TypeError('Illegal invocation');
+      var stream = readerSlots.stream;
+      if (stream === undefined) return;
+      var slots = readableStreamSlots(stream);
+      var requests = readerSlots.requests;
+      readerSlots.requests = [];
+      for (var i = 0; i < requests.length; i++) {
+        requests[i].reject(new TypeError('This reader has been released from its stream'));
+      }
+      readerSlots.closedResolve(undefined);
+      readerSlots.stream = undefined;
+      if (slots.reader === this) slots.reader = undefined;
+    });
+    defineGetter(readerPrototype, 'closed', function closed() {
+      var readerSlots = this.__readableReader;
+      if (readerSlots === undefined) throw new TypeError('Illegal invocation');
+      return readerSlots.closedPromise;
+    });
+    defineGetter(readerPrototype, 'desiredSize', function desiredSize() {
+      var readerSlots = this.__readableReader;
+      if (readerSlots === undefined) throw new TypeError('Illegal invocation');
+      if (readerSlots.stream === undefined) return null;
+      return readableStreamDesiredSize(readableStreamSlots(readerSlots.stream));
+    });
+    defineProperty(readerPrototype, Symbol.toStringTag, {
+      value: 'ReadableStreamDefaultReader', configurable: true
+    });
+
+    function ReadableStream(source, strategy) {
+      if (!(this instanceof ReadableStream)) {
+        throw new TypeError("Please use the 'new' operator");
+      }
+      if (source === undefined || source === null) source = {};
+      if ((typeof source !== 'object' && typeof source !== 'function') || source === null) {
+        throw new TypeError("Failed to construct 'ReadableStream': parameter 1 is not of type 'UnderlyingSource'");
+      }
+      if (strategy === undefined || strategy === null) strategy = {};
+      if (typeof strategy !== 'object' && typeof strategy !== 'function') {
+        throw new TypeError("Failed to construct 'ReadableStream': parameter 2 is not of type 'QueuingStrategy'");
+      }
+      var type = source.type;
+      if (type !== undefined) {
+        // A byte stream needs a BYOB reader and byte-queue semantics; refusing
+        // it is honest, while silently treating it as a default stream would
+        // corrupt chunk accounting for a page that asked for bytes.
+        throw new TypeError('ReadableStream byte streams are not implemented');
+      }
+      var pull = source.pull;
+      var cancel = source.cancel;
+      var start = source.start;
+      if (pull !== undefined && typeof pull !== 'function') {
+        throw new TypeError("Failed to construct 'ReadableStream': pull is not a function");
+      }
+      if (cancel !== undefined && typeof cancel !== 'function') {
+        throw new TypeError("Failed to construct 'ReadableStream': cancel is not a function");
+      }
+      if (start !== undefined && typeof start !== 'function') {
+        throw new TypeError("Failed to construct 'ReadableStream': start is not a function");
+      }
+      var size = strategy.size;
+      if (size !== undefined && typeof size !== 'function') {
+        throw new TypeError("Failed to construct 'ReadableStream': size is not a function");
+      }
+      var highWaterMark = strategy.highWaterMark;
+      if (highWaterMark === undefined) {
+        highWaterMark = 1;
+      } else {
+        highWaterMark = Number(highWaterMark);
+        if (highWaterMark !== highWaterMark || highWaterMark < 0) {
+          throw new RangeError('Invalid highWaterMark');
+        }
+      }
+      var slots = {
+        state: 'readable',
+        storedError: undefined,
+        controller: undefined,
+        reader: undefined,
+        queue: [],
+        queueTotalSize: 0,
+        started: false,
+        closeRequested: false,
+        pulling: false,
+        pullAgain: false,
+        highWaterMark: highWaterMark,
+        sizeAlgorithm: size === undefined ? readableStreamDefaultSize : size,
+        source: source,
+        pullAlgorithm: pull === undefined ? readableStreamNoop : pull,
+        cancelAlgorithm: cancel
+      };
+      defineProperty(this, '__readable', {
+        value: slots,
+        configurable: false,
+        enumerable: false,
+        writable: false
+      });
+      var controller = Object.create(controllerPrototype);
+      defineProperty(controller, '__readableController', {
+        value: { stream: this },
+        configurable: false,
+        enumerable: false,
+        writable: false
+      });
+      slots.controller = controller;
+      var result;
+      try {
+        result = start === undefined ? undefined : start.call(source, controller);
+      } catch (error) {
+        readableStreamCloseOrErrorFromStart(this, error);
+        return;
+      }
+      var stream = this;
+      Promise.resolve(result).then(function () {
+        slots.started = true;
+        readableStreamCallPullIfNeeded(stream);
+      }, function (error) {
+        readableStreamError(stream, error);
+      });
+    }
+    var streamPrototype = ReadableStream.prototype;
+    defineGetter(streamPrototype, 'locked', function locked() {
+      var slots = this.__readable;
+      if (slots === undefined) return false;
+      return slots.reader !== undefined;
+    });
+    define(streamPrototype, 'getReader', function getReader(options) {
+      if (this.__readable === undefined) throw new TypeError('Illegal invocation');
+      if (options !== undefined && options !== null && options.mode !== undefined) {
+        throw new TypeError('ReadableStream BYOB readers are not implemented');
+      }
+      return new ReadableStreamDefaultReader(this);
+    });
+    define(streamPrototype, 'cancel', function cancel(reason) {
+      if (this.__readable === undefined) throw new TypeError('Illegal invocation');
+      return readableStreamCancel(this, reason);
+    });
+    define(streamPrototype, 'values', function values(options) {
+      if (this.__readable === undefined) throw new TypeError('Illegal invocation');
+      options = options === undefined || options === null ? {} : options;
+      var stream = this;
+      var reader = new ReadableStreamDefaultReader(this);
+      var done = false;
+      var preventCancel = !!options.preventCancel;
+      var iterator = {
+        next: function next() {
+          if (done) return Promise.resolve({ value: undefined, done: true });
+          return reader.read().then(function (result) {
+            if (result.done) {
+              done = true;
+              reader.releaseLock();
+            }
+            return result;
+          });
+        },
+        return: function (value) {
+          if (done) {
+            reader.releaseLock();
+            return Promise.resolve({ value: value, done: true });
+          }
+          done = true;
+          if (preventCancel) {
+            reader.releaseLock();
+            return Promise.resolve({ value: value, done: true });
+          }
+          return reader.cancel(value).then(function () {
+            reader.releaseLock();
+            return { value: value, done: true };
+          });
+        }
+      };
+      defineProperty(iterator, Symbol.asyncIterator, {
+        value: function asyncIterator() { return this; },
+        writable: true,
+        configurable: true,
+        enumerable: false
+      });
+      return iterator;
+    });
+    defineProperty(streamPrototype, Symbol.asyncIterator, {
+      value: streamPrototype.values,
+      writable: true,
+      configurable: true,
+      enumerable: false
+    });
+    define(streamPrototype, 'tee', function tee() {
+      if (this.__readable === undefined) throw new TypeError('Illegal invocation');
+      if (this.__readable.reader !== undefined) throw new TypeError('ReadableStream is locked');
+      var reader = new ReadableStreamDefaultReader(this);
+      var controllers = [undefined, undefined];
+      var canceled = [false, false];
+      var cancelReason = [undefined, undefined];
+      var resolveCancel = [undefined, undefined];
+      var rejectCancel = [undefined, undefined];
+      var cancelPromises = [
+        new Promise(function (resolve, reject) { resolveCancel[0] = resolve; rejectCancel[0] = reject; }),
+        new Promise(function (resolve, reject) { resolveCancel[1] = resolve; rejectCancel[1] = reject; })
+      ];
+      var reading = false;
+      var readAgain = false;
+      var done = false;
+      function finishCancellation() {
+        if (!canceled[0] || !canceled[1]) return;
+        var reason = cancelReason[0] !== undefined ? cancelReason[0] : cancelReason[1];
+        reader.cancel(reason).then(function () {
+          resolveCancel[0](undefined);
+          resolveCancel[1](undefined);
+        }, function (error) {
+          rejectCancel[0](error);
+          rejectCancel[1](error);
+        });
+      }
+      function distribute() {
+        if (reading) {
+          readAgain = true;
+          return;
+        }
+        if (done) return;
+        reading = true;
+        reader.read().then(function (result) {
+          reading = false;
+          if (result.done) {
+            done = true;
+            if (!canceled[0]) controllers[0].close();
+            if (!canceled[1]) controllers[1].close();
+            return;
+          }
+          for (var branch = 0; branch < 2; branch++) {
+            if (!canceled[branch]) {
+              try {
+                controllers[branch].enqueue(result.value);
+              } catch (error) {
+                // The branch was canceled or closed between the check and the
+                // enqueue; its own cancel algorithm has already run.
+              }
+            }
+          }
+          if (readAgain) {
+            readAgain = false;
+            distribute();
+          }
+        }, function (error) {
+          reading = false;
+          done = true;
+          if (!canceled[0]) controllers[0].error(error);
+          if (!canceled[1]) controllers[1].error(error);
+        });
+      }
+      var branch1 = new ReadableStream({
+        start: function (controller) { controllers[0] = controller; },
+        pull: function () { distribute(); },
+        cancel: function (reason) {
+          canceled[0] = true;
+          cancelReason[0] = reason;
+          finishCancellation();
+          return cancelPromises[0];
+        }
+      });
+      var branch2 = new ReadableStream({
+        start: function (controller) { controllers[1] = controller; },
+        pull: function () { distribute(); },
+        cancel: function (reason) {
+          canceled[1] = true;
+          cancelReason[1] = reason;
+          finishCancellation();
+          return cancelPromises[1];
+        }
+      });
+      return [branch1, branch2];
+    });
+    defineProperty(streamPrototype, Symbol.toStringTag, {
+      value: 'ReadableStream', configurable: true
+    });
+    defineProperty(global, 'ReadableStream', {
+      value: ReadableStream, writable: true, configurable: true, enumerable: false
+    });
+    defineProperty(global, 'ReadableStreamDefaultReader', {
+      value: ReadableStreamDefaultReader, writable: true, configurable: true, enumerable: false
+    });
+    defineProperty(global, 'ReadableStreamDefaultController', {
+      value: ReadableStreamDefaultController, writable: true, configurable: true, enumerable: false
+    });
+  }
 })(this);
