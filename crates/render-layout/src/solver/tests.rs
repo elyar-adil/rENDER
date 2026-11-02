@@ -1148,6 +1148,26 @@ fn single_line_row_honors_order_gap_justification_and_cross_axis_alignment() {
 }
 
 #[test]
+fn flex_intrinsic_height_applies_max_height_before_it_sizes_the_container() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='flex'><div id='item'>\
+           <div id='hidden'><div style='height:100px'></div></div>\
+           <div id='visible'>VISIBLE</div>\
+         </div><div id='snippet'>SNIPPET</div></div></body>",
+        "html, body { display:block; margin:0 } \
+         #flex { display:flex; flex-direction:column } \
+         #item { flex:1 1 100% } \
+         #hidden { max-height:0; overflow:hidden } \
+         #visible, #snippet { height:20px }",
+        400.0,
+    );
+    let flex = fragment(&layout, find(&output.dom, "#flex"));
+    let item = fragment(&layout, find(&output.dom, "#item"));
+    assert_eq!(flex.rect.size.height, 40.0);
+    assert_eq!(item.rect.size.height, 20.0);
+}
+
+#[test]
 fn flex_grow_and_shrink_distribute_content_box_space_with_gap() {
     let (output, _, grown) = pipeline(
         "<!doctype html><body><div id='flex'><div id='a'></div><div id='b'></div></div></body>",

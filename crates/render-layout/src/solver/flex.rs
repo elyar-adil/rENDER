@@ -1104,6 +1104,30 @@ impl Solver<'_> {
         } else {
             content
         };
+        // CSS Sizing §3.1/§4.5: intrinsic sizes honor the box's min/max
+        // constraints. A `max-height:0` fallback block still has children, but
+        // its own content contribution is zero; measuring the children and
+        // ignoring the clamp made a Google result's hidden duplicate site line
+        // inflate the auto-height flex container by its full height.
+        let content = if horizontal {
+            content
+        } else {
+            let non_content =
+                self.flex_non_margin_extras(style.as_ref(), false, basis, entry.source);
+            let box_sizing = match style.as_ref().and_then(|style| style.typed("box-sizing")) {
+                Some(TypedPropertyValue::BoxSizing(value)) => *value,
+                _ => BoxSizing::ContentBox,
+            };
+            self.apply_min_max_height(
+                style.as_ref(),
+                content,
+                self.options.viewport.height,
+                false,
+                entry.source,
+                non_content,
+                box_sizing,
+            )
+        };
         let property = if horizontal { "width" } else { "height" };
         // Intrinsic sizing treats percentage-dependent sizes as auto: the
         // percentage basis would itself depend on content (CSS Sizing §5),

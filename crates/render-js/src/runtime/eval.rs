@@ -5895,8 +5895,12 @@ impl JsRuntime {
                     if index >= rules.len() {
                         return Ok(JsValue::Undefined);
                     }
+                    let interface =
+                        crate::runtime::builtins::style::css_rule_interface(&rules[index]);
                     self.ensure_heap_capacity(1)?;
-                    return Ok(JsValue::Object(self.realm.css_rule_wrapper(node, index)));
+                    return Ok(JsValue::Object(
+                        self.realm.css_rule_wrapper(node, index, interface),
+                    ));
                 }
             }
             // CSSOM §6.3: a top-level rule's text and type.

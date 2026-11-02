@@ -3989,6 +3989,48 @@ fn tab_address(app: &BrowserApp, tab: TabId) -> String {
 const PAGE_URL: &str = "file:///rENDER-test-fixtures/page.html";
 
 #[test]
+fn a_timer_script_navigation_reaches_the_browser_navigation_drain() {
+    let (mut app, tab) = headless_app_with(
+        "<!doctype html><script>\
+         setTimeout(function(){ location.replace('https://127.0.0.1:9/next'); }, 0);\
+         </script>",
+    );
+    run_page_scripts(&mut app, tab);
+    let _ = app.pages.get_mut(&tab).expect("page").run_page_turns();
+    app.drain_all_script_navigations();
+    let page = app.pages.get(&tab).expect("page");
+    assert_eq!(
+        page.navigation.pending_url().map(Url::as_str),
+        Some("https://127.0.0.1:9/next"),
+        "a timer navigation must survive the pump that observes it"
+    );
+}
+
+#[test]
+fn a_timer_cookie_write_reaches_the_http_jar() {
+    let html = "<!doctype html><script>\
+                setTimeout(function(){ document.cookie = 'probe=1; max-age=3600; path=/'; }, 0);\
+                </script>";
+    let (mut app, tab) = headless_app_with(html);
+    let url = Url::parse("https://example.test/page").expect("test URL");
+    app.pages
+        .get_mut(&tab)
+        .expect("page")
+        .navigation
+        .commit(PageSource {
+            html: html.to_owned(),
+            title: "probe".to_owned(),
+            target: NavigationTarget::Url(url.clone()),
+        });
+    run_page_scripts(&mut app, tab);
+    let BrowserApp { pages, cookies, .. } = &mut app;
+    let page = pages.get_mut(&tab).expect("page");
+    page.sync_js_cookies(cookies);
+    let header = cookies.cookie_header(&url);
+    assert!(header.contains("probe=1"), "{header}");
+}
+
+#[test]
 fn a_push_state_moves_the_address_and_history_without_loading_anything() {
     let (mut app, tab) = headless_app_with(
         "<!doctype html><title>start</title><script>\

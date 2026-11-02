@@ -5797,6 +5797,48 @@ mod tests {
     }
 
     #[test]
+    fn nested_vertical_flips_compose_through_their_pivots() {
+        let outer = Transform2D {
+            scale_y: -1.0,
+            translate_y: 130.0,
+            ..Transform2D::default()
+        };
+        let inner = Transform2D {
+            scale_y: -1.0,
+            translate_y: 90.0,
+            ..Transform2D::default()
+        };
+        let nested = item_list(
+            120.0,
+            vec![
+                command_item(
+                    0,
+                    DisplayCommand::PushStackingContext(stacking_context(outer, 1.0)),
+                ),
+                command_item(
+                    1,
+                    DisplayCommand::PushStackingContext(stacking_context(inner, 1.0)),
+                ),
+                command_item(
+                    2,
+                    DisplayCommand::SolidRect {
+                        rect: PhysicalRect::new(1.0, 40.0, 2.0, 10.0),
+                        color: Color::rgb(255, 0, 0),
+                    },
+                ),
+                command_item(3, DisplayCommand::PopStackingContext),
+                command_item(4, DisplayCommand::PopStackingContext),
+            ],
+        );
+        let output = CpuRasterizer.rasterize(&nested, Color::WHITE, &NoGlyphMasks);
+        // inner: y -> 90 - y (40..50 -> 40..50); outer: y -> 130 - y (-> 80..90).
+        assert_eq!(output.surface.pixel(1, 80), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(output.surface.pixel(1, 89), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(output.surface.pixel(1, 40), Some(Color::WHITE));
+        assert!(output.diagnostics.is_empty());
+    }
+
+    #[test]
     fn nested_translation_and_scale_contexts_compose() {
         let translate = Transform2D {
             translate_x: 4.0,

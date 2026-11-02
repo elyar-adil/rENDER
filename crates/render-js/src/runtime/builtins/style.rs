@@ -74,6 +74,23 @@ pub(in crate::runtime) fn css_rule_type_code(rule: &str) -> f64 {
     }
 }
 
+/// The CSSOM interface name for a top-level rule's text (CSSOM §6.3). The
+/// numeric type above is the compatibility surface; the interface name is what
+/// `rule instanceof CSSStyleRule` and the global constructor table need.
+pub(in crate::runtime) fn css_rule_interface(rule: &str) -> &'static str {
+    match css_rule_type_code(rule) as u8 {
+        3 => "CSSImportRule",
+        4 => "CSSMediaRule",
+        5 => "CSSFontFaceRule",
+        6 => "CSSPageRule",
+        7 => "CSSKeyframesRule",
+        10 => "CSSNamespaceRule",
+        12 => "CSSSupportsRule",
+        1 => "CSSStyleRule",
+        _ => "CSSRule",
+    }
+}
+
 /// Whether `rule` is one complete top-level rule: a qualified rule with a
 /// closed block, or an at-rule statement ending in `;` (CSS Syntax §5.4).
 fn is_complete_rule(rule: &str) -> bool {
@@ -414,8 +431,11 @@ impl JsRuntime {
         if index >= rules.len() {
             return Ok(JsValue::Null);
         }
+        let interface = css_rule_interface(&rules[index]);
         self.ensure_heap_capacity(1)?;
-        Ok(JsValue::Object(self.realm.css_rule_wrapper(node, index)))
+        Ok(JsValue::Object(
+            self.realm.css_rule_wrapper(node, index, interface),
+        ))
     }
 
     pub(in crate::runtime) fn require_style_declaration(

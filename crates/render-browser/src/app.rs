@@ -2031,6 +2031,16 @@ impl BrowserApp {
         }
     }
 
+    /// Drain script-requested navigations for every page. The pump must not
+    /// inspect the queue with a consuming `take`: that would leave
+    /// `drain_script_navigations` with nothing to load.
+    pub(super) fn drain_all_script_navigations(&mut self) {
+        let ids: Vec<TabId> = self.pages.keys().copied().collect();
+        for id in ids {
+            self.drain_script_navigations(id);
+        }
+    }
+
     /// Perform any navigations the page's script requested since the last
     /// pump (`location.assign`/`replace`/`href`). Only the newest request is
     /// honored; scripts that redirect repeatedly cannot loop the browser.
@@ -5753,7 +5763,6 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
         self.storage.flush_if_dirty();
         let active = self.tabs.active_id();
         let mut rendered_active = false;
-        let mut navigation_candidates = Vec::new();
         let mut title_candidates = Vec::new();
         let mut script_candidates = Vec::new();
         for (id, page) in &mut self.pages {
@@ -5793,14 +5802,12 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
             page.drain_console();
             page.sync_local_storage(&mut self.storage);
             page.sync_indexed_db(&mut self.storage);
-            if !page
-                .page
-                .runtime_mut()
-                .take_pending_navigations()
-                .is_empty()
-            {
-                navigation_candidates.push(*id);
-            }
+            // A timer or promise callback that writes `document.cookie` runs
+            // during the pump, after the batch that queued it. Its writes must
+            // reach the HTTP jar before the next subresource or script-driven
+            // navigation, or the server sees the document without the cookie
+            // the script just set.
+            page.sync_js_cookies(&mut self.cookies);
         }
         // `load` waits for everything a document loads, so it is checked after
         // this pass has run the resource pipelines.
@@ -5826,9 +5833,7 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
         for id in script_candidates {
             self.start_classic_scripts(id);
         }
-        for id in navigation_candidates {
-            self.drain_script_navigations(id);
-        }
+        self.drain_all_script_navigations();
         if self.take_due_screenshot() {
             event_loop.exit();
             return;

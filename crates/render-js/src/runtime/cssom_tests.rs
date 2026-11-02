@@ -86,6 +86,24 @@ fn a_style_sheets_rule_list_is_read_from_the_element_text() {
 }
 
 #[test]
+fn rule_interfaces_are_globals_and_instances_get_the_typed_prototype() {
+    assert_eq!(
+        eval(
+            "var sheet = $('s2').sheet; \
+             sheet.insertRule('@media (min-width: 1px) { p { color: red } }', 0); \
+             var rules = sheet.cssRules; \
+             [typeof CSSStyleRule, typeof CSSMediaRule, typeof CSSGroupingRule, \
+              CSSStyleRule.prototype instanceof CSSRule, \
+              CSSMediaRule.prototype instanceof CSSGroupingRule, \
+              CSSGroupingRule.prototype instanceof CSSRule, \
+              rules[0] instanceof CSSMediaRule, rules[1] instanceof CSSStyleRule, \
+              rules[0].constructor.name, rules[1].constructor.name].join('|')"
+        ),
+        "function|function|function|true|true|true|true|true|CSSMediaRule|CSSStyleRule"
+    );
+}
+
+#[test]
 fn insert_rule_rewrites_the_style_element_and_the_rule_list() {
     assert_eq!(
         eval(

@@ -1333,7 +1333,20 @@ impl<'a> Builder<'a> {
             FragmentKind::Box(geometry) => geometry.border_rect(),
             FragmentKind::Text(_) => fragment.rect,
         };
-        let transform = self.fragment_transform(style, border_rect, fragment.source);
+        // A transform belongs to the element's principal box, not to every
+        // fragment whose style resolves back to that element. Text runs and
+        // anonymous line boxes inherit the style source, and applying the
+        // matrix again for each of them multiplies the same flip several
+        // times: a column-reverse `scaleY(-1)` list then paints mirrored or
+        // outside its box because the parity is wrong. Only a box fragment
+        // owned by an element applies the element's transform.
+        let transform_owner =
+            matches!(fragment.kind, FragmentKind::Box(_)) && fragment.source.is_some();
+        let transform = if transform_owner {
+            self.fragment_transform(style, border_rect, fragment.source)
+        } else {
+            None
+        };
         let hidden = matches!(
             style.and_then(|style| style.typed("visibility")),
             Some(TypedPropertyValue::Visibility(
@@ -1584,7 +1597,12 @@ impl<'a> Builder<'a> {
             ));
         }
         // transform-origin re-bases the list around a fixed point:
-        // T(origin) × M × T(−origin). It defaults to 50% 50% of the box.
+        // T(origin) × M × T(−origin). It defaults to 50% 50% of the box, and
+        // the pivot is in the same absolute paint space as the commands the
+        // transform wraps: the border box's document origin plus the origin
+        // resolved inside that box. Using the box-local origin alone makes a
+        // `scaleY(-1)` on a box that is not at y=0 move the box instead of
+        // mirroring it in place.
         let origin = style
             .typed("transform-origin")
             .and_then(|value| match value {
@@ -1595,24 +1613,26 @@ impl<'a> Builder<'a> {
                 LengthPercentage::Percentage(0.5),
                 LengthPercentage::Percentage(0.5),
             ));
-        let origin_x = resolve_transform_length(
-            &origin.0,
-            border_rect.size.width,
-            font_size,
-            viewport,
-            node,
-            self.dom,
-            self.containers,
-        );
-        let origin_y = resolve_transform_length(
-            &origin.1,
-            border_rect.size.height,
-            font_size,
-            viewport,
-            node,
-            self.dom,
-            self.containers,
-        );
+        let origin_x = border_rect.origin.x
+            + resolve_transform_length(
+                &origin.0,
+                border_rect.size.width,
+                font_size,
+                viewport,
+                node,
+                self.dom,
+                self.containers,
+            );
+        let origin_y = border_rect.origin.y
+            + resolve_transform_length(
+                &origin.1,
+                border_rect.size.height,
+                font_size,
+                viewport,
+                node,
+                self.dom,
+                self.containers,
+            );
         let to_origin = Transform2D {
             translate_x: origin_x,
             translate_y: origin_y,
@@ -6943,6 +6963,40 @@ mod tests {
         assert!((t.scale_y - 0.0).abs() < 1e-4, "{t:?}");
         assert!((t.translate_x - 75.0).abs() < 1e-4, "{t:?}");
         assert!((t.translate_y - -25.0).abs() < 1e-4, "{t:?}");
+    }
+
+    #[test]
+    fn a_transform_wraps_only_the_elements_own_box_not_its_text_run() {
+        let (_output, display) = paint_body(
+            "<div id=box>TEXT</div>",
+            "#box { display:block; transform: scaleY(-1) }",
+        );
+        // One scope for the element's box. The text fragment resolves the same
+        // style source; re-applying the matrix there would flip the glyphs a
+        // second time and move them out of the box.
+        let scopes = display
+            .list
+            .items()
+            .iter()
+            .filter(|item| matches!(item.command, DisplayCommand::PushStackingContext(_)))
+            .count();
+        assert_eq!(scopes, 1, "{:?}", display.list.items());
+    }
+
+    #[test]
+    fn transform_origin_is_anchored_to_the_box_document_origin() {
+        let (output, display) = transform_display(
+            "html, body, #box, #inner { display:block; margin:0 } \
+             #box { margin-top:40px; width:100px; height:50px; transform: scaleY(-1) }",
+        );
+        let contexts = node_contexts(&output, "#box", &display);
+        assert_eq!(contexts.len(), 1);
+        let t = contexts[0].transform;
+        assert!((t.scale_y + 1.0).abs() < 1e-4, "{t:?}");
+        // The box is at y=40..90; its centre is y=65. scaleY(-1) about that
+        // centre maps y to 130 - y, so the translation is 130. A box-local
+        // origin would produce 50 here and move the box up the page.
+        assert!((t.translate_y - 130.0).abs() < 1e-3, "{t:?}");
     }
 
     #[test]

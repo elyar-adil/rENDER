@@ -5160,6 +5160,68 @@ impl Realm {
             );
             prototypes.insert("CSSStyleSheet", proto);
         }
+        // CSSOM §6.3-6.8: every rule subtype is a `CSSRule`, and the CSSOM
+        // interfaces are globals even though construction is illegal. Feature
+        // detection reads the constructors themselves (`CSSStyleRule`,
+        // `CSSSupportsRule`, ...), so defining only the internal `CSSRule`
+        // wrapper makes otherwise-supported pages throw a `ReferenceError`.
+        let rule_prototype = prototypes["CSSRule"];
+        let rule_constructor = objects[rule_prototype.0]
+            .properties
+            .get("constructor")
+            .and_then(|descriptor| match descriptor.value {
+                JsValue::Object(object) => Some(object),
+                _ => None,
+            });
+        for name in [
+            "CSSStyleRule",
+            "CSSImportRule",
+            "CSSFontFaceRule",
+            "CSSPageRule",
+            "CSSKeyframesRule",
+            "CSSKeyframeRule",
+            "CSSNamespaceRule",
+            "CSSLayerBlockRule",
+            "CSSLayerStatementRule",
+            "CSSContainerRule",
+            "CSSScopeRule",
+            "CSSStartingStyleRule",
+            "CSSPropertyRule",
+            "CSSCounterStyleRule",
+            "CSSFontFeatureValuesRule",
+        ] {
+            let (proto, _) = Self::dom_subinterface(
+                objects,
+                global,
+                function_prototype,
+                name,
+                rule_prototype,
+                rule_constructor,
+            );
+            prototypes.insert(name, proto);
+        }
+        // `CSSMediaRule` and `CSSSupportsRule` are `CSSGroupingRule`s, which is
+        // itself a `CSSRule` (CSSOM §6.4.2, §6.4.3).
+        let (grouping_prototype, grouping_constructor) = Self::dom_subinterface(
+            objects,
+            global,
+            function_prototype,
+            "CSSGroupingRule",
+            rule_prototype,
+            rule_constructor,
+        );
+        prototypes.insert("CSSGroupingRule", grouping_prototype);
+        for name in ["CSSMediaRule", "CSSSupportsRule"] {
+            let (proto, _) = Self::dom_subinterface(
+                objects,
+                global,
+                function_prototype,
+                name,
+                grouping_prototype,
+                Some(grouping_constructor),
+            );
+            prototypes.insert(name, proto);
+        }
         // `length` is an accessor on each list prototype (WebIDL §3.10.4), so
         // `"length" in list` holds through the prototype chain.
         for name in [
@@ -5616,6 +5678,34 @@ impl Realm {
             ObjectHost::DomConstructor,
         );
         objects[global.0].prototype = Some(window_prototype);
+    }
+
+    /// Build a DOM interface whose prototype inherits `parent_prototype`, and
+    /// whose constructor inherits `parent_constructor` (Web IDL interface
+    /// inheritance). Returns the new prototype and constructor.
+    fn dom_subinterface(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        function_prototype: ObjectId,
+        name: &str,
+        parent_prototype: ObjectId,
+        parent_constructor: Option<ObjectId>,
+    ) -> (ObjectId, ObjectId) {
+        let prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(parent_prototype),
+            ..JsObject::default()
+        });
+        let constructor = Self::dom_interface(
+            objects,
+            global,
+            function_prototype,
+            name,
+            prototype,
+            parent_constructor,
+            ObjectHost::DomConstructor,
+        );
+        (prototype, constructor)
     }
 
     /// Create the interface object (constructor) for `prototype` and register
@@ -12597,12 +12687,20 @@ impl Realm {
         wrapper
     }
 
-    /// The `index`th `CSSRule` of the style element `owner`.
-    pub(crate) fn css_rule_wrapper(&mut self, owner: NodeId, index: usize) -> ObjectId {
+    /// The `index`th rule of `owner`, exposed through the CSSOM interface the
+    /// rule's own type defines (`CSSStyleRule` for a qualified rule,
+    /// `CSSMediaRule` for `@media`, ...), so `rule instanceof CSSStyleRule`
+    /// answers correctly.
+    pub(crate) fn css_rule_wrapper(
+        &mut self,
+        owner: NodeId,
+        index: usize,
+        interface: &str,
+    ) -> ObjectId {
         if let Some(wrapper) = self.css_rule_wrappers.get(&(owner, index)) {
             return *wrapper;
         }
-        let prototype = self.dom_prototype("CSSRule");
+        let prototype = self.dom_prototype(interface);
         let wrapper = self.allocate(JsObject {
             prototype: Some(prototype),
             host: ObjectHost::CssRule { owner, index },
