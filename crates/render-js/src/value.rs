@@ -4738,6 +4738,7 @@ impl Realm {
         Self::install_url_globals(objects, global, object_prototype, function_prototype);
         Self::install_console(objects, global);
         Self::install_timers(objects, global);
+        Self::install_worker_interface(objects, global, object_prototype, function_prototype);
         for name in ["atob", "btoa"] {
             Self::define_global_function(
                 objects,

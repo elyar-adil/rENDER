@@ -292,7 +292,7 @@ fn a_remote_worker_script_loads_through_the_fetch_seam() {
 fn the_worker_scope_has_no_page_globals() {
     let documents = worker(&[(
         "scope.js",
-        "postMessage([typeof window, typeof document, typeof importScripts, self === globalThis, self.name].join(','));",
+        "postMessage([typeof window, typeof document, typeof importScripts, typeof Worker, self === globalThis, self.name].join(','));",
     )]);
     let (mut dom, mut runtime) = page("<body></body>", documents);
     run(
@@ -304,7 +304,7 @@ fn the_worker_scope_has_no_page_globals() {
     settle(&mut dom, &mut runtime);
     assert_eq!(
         run(&mut dom, &mut runtime, "got"),
-        "undefined,undefined,function,true,upper"
+        "undefined,undefined,function,function,true,upper"
     );
     assert_eq!(
         run(&mut dom, &mut runtime, "typeof worker.terminate"),
