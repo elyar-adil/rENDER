@@ -3431,50 +3431,86 @@ fn blit_translated(
     clip: Option<PhysicalRect>,
     control: Option<&dyn RasterControl>,
 ) -> bool {
-    let width = i64::from(source.width());
-    let height = i64::from(source.height());
-    for y in 0..height {
-        if control.is_some_and(|control| control.is_cancelled() && y % 64 == 0) {
+    let destination_width = i64::from(destination.width());
+    let destination_height = i64::from(destination.height());
+    let (left, top, right, bottom) =
+        integer_clip_bounds(clip, destination_width, destination_height);
+    if left >= right || top >= bottom {
+        return true;
+    }
+    let source_width = i64::from(source.width());
+    let source_height = i64::from(source.height());
+    // The destination range that both remains inside the clip and has a
+    // corresponding source texel. Computing it once removes every per-pixel
+    // bounds test from the row loop below.
+    let column_start = left.saturating_sub(translate_x).max(0);
+    let column_end = right.saturating_sub(translate_x).min(source_width);
+    let row_start = top.saturating_sub(translate_y).max(0);
+    let row_end = bottom.saturating_sub(translate_y).min(source_height);
+    if column_start >= column_end || row_start >= row_end {
+        return true;
+    }
+    let destination_left = usize::try_from(column_start + translate_x)
+        .expect("clipped destination column fits the surface");
+    let destination_width =
+        usize::try_from(destination_width).expect("destination width fits usize");
+    let source_width = usize::try_from(source_width).expect("source width fits usize");
+    let copy_width = usize::try_from(column_end - column_start).expect("blit width fits usize");
+    for source_y in row_start..row_end {
+        if control.is_some_and(|control| control.is_cancelled() && source_y % 64 == 0) {
             return false;
         }
-        let destination_y = y + translate_y;
-        if destination_y < 0 || destination_y >= i64::from(destination.height()) {
+        let destination_y = source_y + translate_y;
+        let source_start = usize::try_from(source_y)
+            .expect("source row fits usize")
+            .saturating_mul(source_width)
+            + usize::try_from(column_start).expect("source column fits usize");
+        let destination_start = usize::try_from(destination_y)
+            .expect("destination row fits usize")
+            .saturating_mul(destination_width)
+            + destination_left;
+        let source_row = &source.pixels()[source_start..source_start + copy_width];
+        let destination_row =
+            &mut destination.pixels_mut()[destination_start..destination_start + copy_width];
+        if opacity >= 1.0 && source_row.iter().all(|color| color.alpha == u8::MAX) {
+            destination_row.copy_from_slice(source_row);
             continue;
         }
-        for x in 0..width {
-            let destination_x = x + translate_x;
-            if destination_x < 0 || destination_x >= i64::from(destination.width()) {
-                continue;
+        for (destination, source) in destination_row.iter_mut().zip(source_row) {
+            match source.alpha {
+                0 => {}
+                u8::MAX if opacity >= 1.0 => *destination = *source,
+                _ => *destination = blend(*destination, *source, opacity),
             }
-            if let Some(clip) = clip {
-                let px = destination_x as f32 + 0.5;
-                let py = destination_y as f32 + 0.5;
-                if px < clip.origin.x
-                    || py < clip.origin.y
-                    || px >= clip.right()
-                    || py >= clip.bottom()
-                {
-                    continue;
-                }
-            }
-            let source_index =
-                usize::try_from(y * width + x).expect("source index fits the surface");
-            let destination_index =
-                usize::try_from(destination_y * i64::from(destination.width()) + destination_x)
-                    .expect("destination index fits the surface");
-            let color = source.pixels()[source_index];
-            if color.alpha == 0 {
-                continue;
-            }
-            destination.pixels_mut()[destination_index] =
-                if color.alpha == u8::MAX && opacity >= 1.0 {
-                    color
-                } else {
-                    blend(destination.pixels()[destination_index], color, opacity)
-                };
         }
     }
     true
+}
+
+/// Integer half-open destination bounds for the reference blit clip test.
+///
+/// The reference test samples the pixel center (`x + 0.5`) against the float
+/// clip, so a fractional clip edge still includes exactly the integer columns
+/// whose centers lie inside it.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "clip coordinates are bounded surface dimensions; negative values are clamped below"
+)]
+fn integer_clip_bounds(
+    clip: Option<PhysicalRect>,
+    width: i64,
+    height: i64,
+) -> (i64, i64, i64, i64) {
+    let Some(clip) = clip else {
+        return (0, 0, width, height);
+    };
+    let left = ((f64::from(clip.origin.x) - 0.5).ceil() as i64).max(0);
+    let top = ((f64::from(clip.origin.y) - 0.5).ceil() as i64).max(0);
+    let right = ((f64::from(clip.right()) - 0.5).ceil() as i64).min(width);
+    let bottom = ((f64::from(clip.bottom()) - 0.5).ceil() as i64).min(height);
+    (left, top, right, bottom)
 }
 
 fn warp_surface(
@@ -5314,5 +5350,37 @@ mod tests {
         // Red source pixels warp here too, but the clip cuts them off.
         assert_eq!(output.surface.pixel(9, 9), Some(Color::WHITE));
         assert!(output.diagnostics.is_empty());
+    }
+
+    /// An integer translation is blitted directly, so the fast row path must
+    /// preserve the reference clip test for fractional clip edges: a pixel is
+    /// visible exactly when its centre lies inside the clip.
+    #[test]
+    fn a_translated_blit_uses_pixel_centre_clip_testing() {
+        let source = Surface::new(4, 4, Color::rgb(255, 0, 0));
+        let mut destination = Surface::new(4, 4, Color::WHITE);
+        let transform = Transform2D {
+            translate_x: 1.0,
+            ..Transform2D::default()
+        };
+        let clip = PhysicalRect::new(1.5, 0.5, 1.5, 3.0);
+        assert!(super::composite_surface(
+            &mut destination,
+            &source,
+            transform,
+            1.0,
+            Some(clip),
+            None
+        ));
+        for y in 0..4 {
+            for x in 0..4 {
+                let expected = if (1..=2).contains(&x) && y < 3 {
+                    Color::rgb(255, 0, 0)
+                } else {
+                    Color::WHITE
+                };
+                assert_eq!(destination.pixel(x, y), Some(expected), "pixel ({x}, {y})");
+            }
+        }
     }
 }
