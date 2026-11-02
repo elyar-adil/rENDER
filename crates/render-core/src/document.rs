@@ -30,7 +30,8 @@ use crate::dom::{Dom, DomRevision, ElementData, Namespace, Node, NodeId, NodeKin
 use crate::font_face::{FontFaceSheet, FontFaceSource, parse_font_faces};
 use crate::html::{HtmlParseError, QuirksMode, parse_document_with_scripting, serialize_html_node};
 use crate::image::inline_svg::{
-    InlineSvgDiagnostic, InlineSvgDiscovery, discover_inline_svgs_with_colors, svg_geometry,
+    InlineSvgDiagnostic, InlineSvgDiscovery, discover_inline_svgs_with_colors_at_scale,
+    svg_geometry,
 };
 use crate::image::{ImageLimits, ImageResources};
 use crate::layout::{
@@ -2066,9 +2067,12 @@ fn render_dom(
     // its `color` for `currentColor`. The rasters are layered over the
     // caller's images, so layout and paint find them by element like any
     // other image resource.
-    let inline_svg = discover_inline_svgs_with_colors(dom, ImageLimits::default(), |node| {
-        computed_text_color(&styles, node)
-    });
+    let inline_svg = discover_inline_svgs_with_colors_at_scale(
+        dom,
+        ImageLimits::default(),
+        |node| computed_text_color(&styles, node),
+        options.device_scale,
+    );
     let (inline_images, inline_svg_diagnostics) = with_inline_svgs(environment.images, &inline_svg);
     let images = inline_images.as_ref().or(environment.images);
     stages.inline_svg = stage_micros(stage_elapsed("inline-svg", &mut stage_mark));

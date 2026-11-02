@@ -245,6 +245,25 @@ pub fn discover_inline_svgs_with_colors(
     limits: ImageLimits,
     current_color: impl Fn(NodeId) -> Color,
 ) -> InlineSvgDiscovery {
+    discover_inline_svgs_with_colors_at_scale(dom, limits, current_color, 1.0)
+}
+
+/// [`discover_inline_svgs_with_colors`] rasterising at a device scale.
+///
+/// Inline SVG is vector content: a 24 CSS-px icon on a 2x display needs a
+/// 48x48 raster, not a 24x24 bitmap stretched by the display list. Layout and
+/// intrinsic sizes stay in CSS pixels; only the stored raster is larger.
+pub fn discover_inline_svgs_with_colors_at_scale(
+    dom: &Dom,
+    limits: ImageLimits,
+    current_color: impl Fn(NodeId) -> Color,
+    device_scale: f32,
+) -> InlineSvgDiscovery {
+    let device_scale = if device_scale.is_finite() && device_scale > 0.0 {
+        device_scale
+    } else {
+        1.0
+    };
     let selection_context = ImageSelectionContext::default();
     let mut resources = Vec::new();
     let mut diagnostics = Vec::new();
@@ -275,7 +294,15 @@ pub fn discover_inline_svgs_with_colors(
 
         if is_svg_root(element) {
             let color = current_color(node_id);
-            match rasterise(dom, node_id, element, color, limits, selection_context) {
+            match rasterise(
+                dom,
+                node_id,
+                element,
+                color,
+                limits,
+                selection_context,
+                device_scale,
+            ) {
                 Ok((raster, warnings)) => {
                     resources.push(raster);
                     diagnostics.extend(warnings);
@@ -337,6 +364,7 @@ fn rasterise(
     current_color: Color,
     limits: ImageLimits,
     selection_context: ImageSelectionContext,
+    device_scale: f32,
 ) -> Result<(InlineSvgRaster, Vec<InlineSvgDiagnostic>), InlineSvgDiagnostic> {
     let source = serialize_html_node(dom, owner);
     if source.len() > limits.max_encoded_bytes {
@@ -351,6 +379,9 @@ fn rasterise(
         });
     }
     let (width, height) = svg_geometry(element).raster_size();
+    let scale = device_scale.max(1.0);
+    let width = (width as f32 * scale).round().clamp(1.0, u32::MAX as f32) as u32;
+    let height = (height as f32 * scale).round().clamp(1.0, u32::MAX as f32) as u32;
     let (image, filter_diagnostics) = svg::decode_svg_viewport_with_diagnostics(
         source.as_bytes(),
         width,
@@ -363,7 +394,7 @@ fn rasterise(
         code: InlineSvgDiagnosticCode::DecodeFailed,
         message: format!("inline SVG did not rasterise: {error}"),
     })?;
-    let identity = raster_identity(&source, current_color);
+    let identity = raster_identity(&source, current_color, scale);
     Ok((
         InlineSvgRaster {
             owner,
@@ -416,10 +447,14 @@ fn rasterise(
 /// What decides an inline `svg`'s pixels: its serialised markup and the colour
 /// `currentColor` resolves to. The colour is part of the identity because a
 /// colour change under unchanged markup must install a new raster.
-fn raster_identity(source: &str, current_color: Color) -> String {
+fn raster_identity(source: &str, current_color: Color, device_scale: f32) -> String {
     format!(
-        "{source}\u{0}{:02x}{:02x}{:02x}{:02x}",
-        current_color.red, current_color.green, current_color.blue, current_color.alpha
+        "{source}\u{0}{:02x}{:02x}{:02x}{:02x}\u{0}{:08x}",
+        current_color.red,
+        current_color.green,
+        current_color.blue,
+        current_color.alpha,
+        device_scale.to_bits()
     )
 }
 
@@ -593,7 +628,8 @@ mod tests {
     )]
     use super::{
         NEVER_RENDERED_SVG_ELEMENTS, SVG_HTML_INTEGRATION_POINTS, SvgGeometry,
-        discover_inline_svgs, discover_inline_svgs_with_colors, svg_geometry, xlink_href,
+        discover_inline_svgs, discover_inline_svgs_with_colors,
+        discover_inline_svgs_with_colors_at_scale, svg_geometry, xlink_href,
     };
     use crate::css::selector::{MatchContext, parse_selector_list, select_all};
     use crate::dom::{Dom, NodeId, NodeKind};
@@ -873,6 +909,33 @@ mod tests {
                 destination.origin.y as u32 + 1
             ),
             Some(PaintColor::rgb(0, 0, 255))
+        );
+    }
+
+    #[test]
+    fn device_scale_rasterises_inline_svg_at_device_size() {
+        let dom = parse(
+            "<!doctype html><body><svg width=24 height=24 viewBox='0 0 24 24'>\
+             <circle cx=12 cy=12 r=10 fill=black/></svg>",
+        );
+        let limits = ImageLimits::default();
+        let one = discover_inline_svgs(&dom, limits);
+        let two = discover_inline_svgs_with_colors_at_scale(&dom, limits, |_| Color::BLACK, 2.0);
+        assert_eq!(one.resources.len(), 1);
+        assert_eq!(two.resources.len(), 1);
+        assert_eq!(
+            one.resources[0].image.intrinsic_size(),
+            (24, 24),
+            "CSS size at 1x"
+        );
+        assert_eq!(
+            two.resources[0].image.intrinsic_size(),
+            (48, 48),
+            "device-size raster for a 2x display"
+        );
+        assert_ne!(
+            one.resources[0].key.source_snapshot, two.resources[0].key.source_snapshot,
+            "a different device scale needs a different raster identity"
         );
     }
 

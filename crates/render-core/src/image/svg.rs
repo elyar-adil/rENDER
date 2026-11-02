@@ -650,43 +650,110 @@ struct Raster {
     opacity_depth: usize,
 }
 
+/// SVG's `fill-rule` values (SVG 2 §13.3). `nonzero` is the initial value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FillRule {
+    NonZero,
+    EvenOdd,
+}
+
 impl Raster {
     fn fill_polygon(&mut self, points: &[(f32, f32)], color_at: impl Fn(f32, f32) -> Color) {
-        if points.len() < 2 {
+        self.fill_subpaths(&[points.to_vec()], FillRule::NonZero, color_at);
+    }
+
+    /// Fill every subpath of one SVG path with one fill rule.
+    ///
+    /// SVG paints all of a `<path>`'s subpaths as one shape: under `evenodd`
+    /// an inner subpath cuts a hole, and under `nonzero` overlapping windings
+    /// fill. Filling each subpath independently instead paints the hole with
+    /// the fill colour, which is the visible defect on multi-subpath icons
+    /// (Zhihu's WeChat/QQ/Weibo marks).
+    fn fill_subpaths(
+        &mut self,
+        subpaths: &[Vec<(f32, f32)>],
+        fill_rule: FillRule,
+        color_at: impl Fn(f32, f32) -> Color,
+    ) {
+        let edges: Vec<&[(f32, f32)]> = subpaths
+            .iter()
+            .map(Vec::as_slice)
+            .filter(|points| points.len() >= 2)
+            .collect();
+        if edges.is_empty() {
             return;
         }
-        let min_y = points.iter().fold(f32::MAX, |m, p| m.min(p.1));
-        let max_y = points.iter().fold(f32::MIN, |m, p| m.max(p.1));
+        let min_y = edges
+            .iter()
+            .flat_map(|points| points.iter().map(|point| point.1))
+            .fold(f32::MAX, f32::min);
+        let max_y = edges
+            .iter()
+            .flat_map(|points| points.iter().map(|point| point.1))
+            .fold(f32::MIN, f32::max);
         let first_row = (min_y.floor().max(0.0)) as i64;
         let last_row = (max_y.ceil().min(f32::from(u16::MAX))) as i64;
         for row in first_row..=last_row {
             let sample = row as f32 + 0.5;
-            let mut crossings: Vec<f32> = Vec::new();
-            for index in 0..points.len() {
-                let (x1, y1) = points[index];
-                let (x2, y2) = points[(index + 1) % points.len()];
-                if (y1 <= sample && y2 > sample) || (y2 <= sample && y1 > sample) {
-                    let t = (sample - y1) / (y2 - y1);
-                    crossings.push(x1 + t * (x2 - x1));
+            let mut crossings: Vec<(f32, i32)> = Vec::new();
+            for points in &edges {
+                for index in 0..points.len() {
+                    let (x1, y1) = points[index];
+                    let (x2, y2) = points[(index + 1) % points.len()];
+                    if (y1 <= sample && y2 > sample) || (y2 <= sample && y1 > sample) {
+                        let t = (sample - y1) / (y2 - y1);
+                        let direction = if y1 <= sample && y2 > sample { 1 } else { -1 };
+                        crossings.push((x1 + t * (x2 - x1), direction));
+                    }
                 }
             }
             crossings.sort_by(|left, right| {
-                left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+                left.0
+                    .partial_cmp(&right.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
-            for pair in crossings.chunks(2) {
-                if pair.len() < 2 {
-                    break;
+            match fill_rule {
+                FillRule::EvenOdd => {
+                    for pair in crossings.chunks(2) {
+                        if let [(left, _), (right, _)] = pair {
+                            self.fill_span(row, *left, *right, &color_at);
+                        }
+                    }
                 }
-                // Pixel x is covered when its center (x + 0.5) lies in
-                // [x0, x1): start = ceil(x0 - 0.5), end = ceil(x1 - 0.5)-1.
-                let start = (pair[0] - 0.5).ceil().max(0.0) as i64;
-                let end = ((pair[1] - 0.5).ceil() as i64)
-                    .saturating_sub(1)
-                    .min(i64::from(self.width.saturating_sub(1)));
-                for x in start..=end {
-                    self.put(x, row, color_at(x as f32 + 0.5, row as f32 + 0.5));
+                FillRule::NonZero => {
+                    let mut winding = 0_i32;
+                    let mut span_start = None;
+                    for (x, direction) in crossings {
+                        let previous = winding;
+                        winding += direction;
+                        if previous == 0 && winding != 0 {
+                            span_start = Some(x);
+                        } else if previous != 0 && winding == 0 {
+                            if let Some(start) = span_start.take() {
+                                self.fill_span(row, start, x, &color_at);
+                            }
+                        }
+                    }
                 }
             }
+        }
+    }
+
+    fn fill_span(
+        &mut self,
+        row: i64,
+        left: f32,
+        right: f32,
+        color_at: &impl Fn(f32, f32) -> Color,
+    ) {
+        // Pixel x is covered when its center (x + 0.5) lies in [x0, x1):
+        // start = ceil(x0 - 0.5), end = ceil(x1 - 0.5)-1.
+        let start = (left - 0.5).ceil().max(0.0) as i64;
+        let end = ((right - 0.5).ceil() as i64)
+            .saturating_sub(1)
+            .min(i64::from(self.width.saturating_sub(1)));
+        for x in start..=end {
+            self.put(x, row, color_at(x as f32 + 0.5, row as f32 + 0.5));
         }
     }
 
@@ -1327,19 +1394,35 @@ fn walk(
                     points_bounds(&all_points),
                     clip_paths,
                 );
+                // All subpaths of one `<path>` are one shape. Painting them
+                // independently fills holes such as the counters in an icon.
+                let fill_rule = match presentation("fill-rule") {
+                    Some(value) if value.eq_ignore_ascii_case("evenodd") => FillRule::EvenOdd,
+                    _ => FillRule::NonZero,
+                };
+                let local_subpaths: Vec<Vec<(f32, f32)>> = subpaths
+                    .iter()
+                    .filter(|(subpath, _)| subpath.len() >= 2)
+                    .map(|(subpath, _)| subpath.clone())
+                    .collect();
+                let device_subpaths: Vec<Vec<(f32, f32)>> = local_subpaths
+                    .iter()
+                    .map(|subpath| transform_points(subpath, child_transform))
+                    .collect();
+                paint_subpaths(
+                    raster,
+                    &local_subpaths,
+                    &device_subpaths,
+                    child_transform,
+                    child_fill.resolve(None),
+                    fill_rule,
+                    gradients,
+                );
                 for (subpath, closed) in &subpaths {
                     if subpath.len() < 2 {
                         continue;
                     }
                     let device = transform_points(subpath, child_transform);
-                    paint_shape(
-                        raster,
-                        subpath,
-                        &device,
-                        child_transform,
-                        child_fill.resolve(None),
-                        gradients,
-                    );
                     let segments = polyline_segments(&device, *closed);
                     stroke_outline_segments(
                         raster,
@@ -3226,6 +3309,41 @@ fn apply_color_matrix(pixel: Color, matrix: &[f32; 20]) -> Color {
 
 /// Fill one shape with a solid colour or a gradient.
 ///
+/// Fill every subpath of one `<path>` as one shape, with the element's
+/// `fill-rule`. Strokes stay per-subpath because a stroke follows each contour.
+fn paint_subpaths(
+    raster: &mut Raster,
+    local_subpaths: &[Vec<(f32, f32)>],
+    device_subpaths: &[Vec<(f32, f32)>],
+    transform: Affine,
+    paint: Option<Paint>,
+    fill_rule: FillRule,
+    gradients: &[Gradient],
+) {
+    let Some(paint) = paint else {
+        return;
+    };
+    match paint {
+        Paint::Color(color) => {
+            raster.fill_subpaths(device_subpaths, fill_rule, |_, _| color);
+        }
+        Paint::Gradient(index) => {
+            let Some(gradient) = gradients.get(index) else {
+                return;
+            };
+            let local_points: Vec<(f32, f32)> = local_subpaths
+                .iter()
+                .flat_map(|subpath| subpath.iter().copied())
+                .collect();
+            let Some(sampler) = GradientSampler::new(&local_points, transform, gradient) else {
+                return;
+            };
+            raster.fill_subpaths(device_subpaths, fill_rule, |x, y| sampler.color_at(x, y));
+        }
+        Paint::Inherit | Paint::None => {}
+    }
+}
+
 /// The shape's points arrive both in its own user space (needed for
 /// `objectBoundingBox` gradients) and in device space (the scanline fill).
 /// Gradient painting maps each device pixel back through the element
@@ -4431,6 +4549,78 @@ fn path_number(tokens: &[PathToken], index: &mut usize) -> Option<f32> {
     }
 }
 
+/// Flatten one SVG elliptical arc (`A`/`a`) into points, per SVG 2
+/// implementation notes §B.2.4 (endpoint to center parameterisation).
+///
+/// A path `A` command used to fall through to its endpoint as a straight line;
+/// icon sets use arcs for almost every curve, so that turned logos and social
+/// marks into blobs. Radii are corrected as the spec requires when they are
+/// too small to span the endpoints, and the flags choose the centre/angle.
+fn arc_points(
+    from: (f32, f32),
+    to: (f32, f32),
+    rx: f32,
+    ry: f32,
+    rotation_degrees: f32,
+    large_arc: bool,
+    sweep: bool,
+) -> Vec<(f32, f32)> {
+    let phi = rotation_degrees.to_radians();
+    let (sin_phi, cos_phi) = phi.sin_cos();
+    let (x1, y1) = from;
+    let (x2, y2) = to;
+    let dx = (x1 - x2) * 0.5;
+    let dy = (y1 - y2) * 0.5;
+    let x1p = cos_phi.mul_add(dx, sin_phi * dy);
+    let y1p = (-sin_phi).mul_add(dx, cos_phi * dy);
+    let mut rx = rx;
+    let mut ry = ry;
+    let lambda = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry);
+    if lambda > 1.0 {
+        let scale = lambda.sqrt();
+        rx *= scale;
+        ry *= scale;
+    }
+    let rx2 = rx * rx;
+    let ry2 = ry * ry;
+    let numerator = (rx2 * ry2) - (rx2 * y1p * y1p) - (ry2 * x1p * x1p);
+    let denominator = (rx2 * y1p * y1p) + (ry2 * x1p * x1p);
+    let mut coefficient = if denominator <= f32::EPSILON {
+        0.0
+    } else {
+        (numerator.max(0.0) / denominator).sqrt()
+    };
+    if large_arc == sweep {
+        coefficient = -coefficient;
+    }
+    let cxp = coefficient * rx * y1p / ry;
+    let cyp = -coefficient * ry * x1p / rx;
+    let cx = cos_phi.mul_add(cxp, -sin_phi * cyp) + (x1 + x2) * 0.5;
+    let cy = sin_phi.mul_add(cxp, cos_phi * cyp) + (y1 + y2) * 0.5;
+    let vector_angle =
+        |ux: f32, uy: f32, vx: f32, vy: f32| (ux * vy - uy * vx).atan2(ux * vx + uy * vy);
+    let start_vector = ((x1p - cxp) / rx, (y1p - cyp) / ry);
+    let end_vector = ((-x1p - cxp) / rx, (-y1p - cyp) / ry);
+    let theta1 = vector_angle(1.0, 0.0, start_vector.0, start_vector.1);
+    let mut delta = vector_angle(start_vector.0, start_vector.1, end_vector.0, end_vector.1);
+    if !sweep && delta > 0.0 {
+        delta -= std::f32::consts::TAU;
+    } else if sweep && delta < 0.0 {
+        delta += std::f32::consts::TAU;
+    }
+    let steps = (delta.abs() / (std::f32::consts::PI / 24.0)).ceil() as usize;
+    let steps = steps.clamp(4, 128);
+    let mut points = Vec::with_capacity(steps);
+    for step in 1..=steps {
+        let angle = theta1 + delta * (step as f32 / steps as f32);
+        let (sin_angle, cos_angle) = angle.sin_cos();
+        let x = cx + cos_phi * rx * cos_angle - sin_phi * ry * sin_angle;
+        let y = cy + sin_phi * rx * cos_angle + cos_phi * ry * sin_angle;
+        points.push((x, y));
+    }
+    points
+}
+
 fn path_pair(tokens: &[PathToken], index: &mut usize) -> Option<(f32, f32)> {
     let x = path_number(tokens, index)?;
     let y = path_number(tokens, index)?;
@@ -4596,19 +4786,45 @@ fn parse_path(raw: &str) -> Vec<(Vec<(f32, f32)>, bool)> {
                 cursor = (x, y);
             }
             'A' => {
-                // Skip rx ry rotation large-arc sweep; land on the endpoint.
-                for _ in 0..5 {
-                    let _ = path_number(tokens, &mut index);
-                }
+                let Some(rx) = path_number(tokens, &mut index) else {
+                    break;
+                };
+                let Some(ry) = path_number(tokens, &mut index) else {
+                    break;
+                };
+                let Some(rotation) = path_number(tokens, &mut index) else {
+                    break;
+                };
+                let Some(large_arc) = path_number(tokens, &mut index) else {
+                    break;
+                };
+                let Some(sweep) = path_number(tokens, &mut index) else {
+                    break;
+                };
                 let Some((x, y)) = path_pair(tokens, &mut index) else {
                     break;
                 };
-                cursor = if relative {
+                let end = if relative {
                     (cursor.0 + x, cursor.1 + y)
                 } else {
                     (x, y)
                 };
-                current.push(cursor);
+                if rx.abs() <= f32::EPSILON || ry.abs() <= f32::EPSILON {
+                    current.push(end);
+                } else {
+                    current.extend(arc_points(
+                        cursor,
+                        end,
+                        rx.abs(),
+                        ry.abs(),
+                        rotation,
+                        large_arc != 0.0,
+                        sweep != 0.0,
+                    ));
+                }
+                cursor = end;
+                last_cubic_control = None;
+                last_quad_control = None;
             }
             'Z' => {
                 if !current.is_empty() {
@@ -4858,6 +5074,25 @@ mod tests {
         assert_eq!(second.last(), Some(&(2.0, 3.0)));
         assert_eq!(second[second.len() - 2], (0.0, 5.0));
         assert!(*second_closed);
+    }
+
+    #[test]
+    fn parse_path_flattens_an_elliptical_arc_off_the_chord() {
+        // A semicircle from (0,5) to (10,5): the old arc arm dropped every
+        // point except the endpoint, so the shape became a straight chord.
+        let subpaths = parse_path("M0 5 A5 5 0 0 1 10 5");
+        assert_eq!(subpaths.len(), 1);
+        let points = &subpaths[0].0;
+        assert!(
+            points.len() > 4,
+            "the arc should be sampled, got {points:?}"
+        );
+        assert!(
+            points.iter().any(|(_, y)| (*y - 5.0).abs() > 2.0),
+            "the arc leaves the chord: {points:?}"
+        );
+        let (x, y) = *points.last().expect("endpoint");
+        assert!((x - 10.0).abs() < 0.01 && (y - 5.0).abs() < 0.01);
     }
 
     #[test]
@@ -5379,6 +5614,27 @@ mod tests {
         let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
         assert_eq!(image.pixel(4, 4), Some(Color::rgb(0, 255, 255)));
         assert_eq!(image.pixel(1, 1), Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn fill_rule_evenodd_cuts_a_hole_in_a_multi_subpath_path() {
+        let evenodd = br#"<svg width="8" height="8" xmlns="http://www.w3.org/2000/svg">
+            <path fill="red" fill-rule="evenodd" d="M0 0H8V8H0Z M2 2H6V6H2Z"/></svg>"#;
+        let nonzero = br#"<svg width="8" height="8" xmlns="http://www.w3.org/2000/svg">
+            <path fill="red" d="M0 0H8V8H0Z M2 2H6V6H2Z"/></svg>"#;
+        let evenodd = decode_svg(evenodd, ImageLimits::default()).expect("evenodd decodes");
+        let nonzero = decode_svg(nonzero, ImageLimits::default()).expect("nonzero decodes");
+        assert_eq!(evenodd.pixel(1, 1), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(
+            evenodd.pixel(4, 4),
+            Some(Color::TRANSPARENT),
+            "the inner subpath is a hole under evenodd"
+        );
+        assert_eq!(
+            nonzero.pixel(4, 4),
+            Some(Color::rgb(255, 0, 0)),
+            "the same-direction inner subpath stays filled under nonzero"
+        );
     }
 
     #[test]
