@@ -1059,6 +1059,27 @@ impl Solver<'_> {
                     .cloned();
                 child_size
                     + self.flex_outer_extras(child_style.as_ref(), horizontal, basis, child_source)
+            } else if !horizontal {
+                // A block container's intrinsic height is the sum of its
+                // children's *outer* heights. A padded title line inside a
+                // result row was measured without its 10px padding and 3px
+                // margin, so the row's flex-basis:100% base came out 13px
+                // short and the next line painted over the title.
+                let child_node = self.formatting.get(child);
+                let child_is_box = child_node.is_some_and(|node| {
+                    !matches!(node.kind, FormattingNodeKind::Text(_)) && node.source.is_some()
+                });
+                if child_is_box {
+                    let child_source = child_node.and_then(|node| node.source);
+                    let child_style = child_node
+                        .and_then(|node| node.style_source)
+                        .and_then(|source| self.styles.get(&source))
+                        .cloned();
+                    child_size
+                        + self.flex_outer_extras(child_style.as_ref(), false, basis, child_source)
+                } else {
+                    child_size
+                }
             } else if horizontal && self.is_forced_break(child) {
                 // CSS 2.1 §10.3.5: the max-content width of an inline sequence
                 // is its widest line, so a forced break ends the run instead of
@@ -1073,12 +1094,23 @@ impl Solver<'_> {
             line += child_size;
             total += child_size;
         }
-        // A non-flex inline sequence reports the widest of its lines; the flex
-        // case keeps its sum and adds the gap below. Under the min-content
-        // measurement the same sequence reports the width of its widest
-        // unbreakable run, which is a property of the sequence rather than of
-        // any one of its children, and a non-flex block container reports the
-        // widest of its block children.
+        // A row flex container's intrinsic *height* is its tallest item, not
+        // the sum of every item's height. The old `total` branch was correct
+        // only when measuring the main axis: a row of 36px tabs reported
+        // 216px (six tabs tall) as its content height, which inflated the
+        // auto-height column that contained it.
+        let flex_direction = match style
+            .as_ref()
+            .and_then(|style| style.typed("flex-direction"))
+        {
+            Some(TypedPropertyValue::FlexDirection(value)) => *value,
+            _ => FlexDirection::Row,
+        };
+        let main_axis = is_flex
+            && (matches!(
+                flex_direction,
+                FlexDirection::Row | FlexDirection::RowReverse
+            ) == horizontal);
         let content = if !is_flex && horizontal && minimum {
             if matches!(
                 entry.kind,
@@ -1090,10 +1122,12 @@ impl Solver<'_> {
             }
         } else if !is_flex && horizontal {
             widest.max(line)
+        } else if is_flex && !main_axis && !horizontal {
+            broadest
         } else {
             total
         };
-        let content = if is_flex {
+        let content = if main_axis {
             content
                 + self.resolve_gap(
                     style.as_ref(),

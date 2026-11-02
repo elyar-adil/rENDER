@@ -1168,6 +1168,54 @@ fn flex_intrinsic_height_applies_max_height_before_it_sizes_the_container() {
 }
 
 #[test]
+fn column_flex_percentage_basis_includes_child_vertical_padding() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='column'>\
+           <div id='titleblock'>\
+             <div class='title'>TITLE</div><div class='site'>SITE</div>\
+           </div>\
+           <div id='snippet'>SNIPPET</div>\
+         </div></body>",
+        "html, body { display:block; margin:0 } \
+         #column { display:flex; flex-direction:column } \
+         #titleblock { flex:1 1 100% } \
+         .title { height:28px; padding-top:10px } \
+         .site { height:38px } \
+         #snippet { height:44px }",
+        400.0,
+    );
+    let titleblock = fragment(&layout, find(&output.dom, "#titleblock"));
+    let column = fragment(&layout, find(&output.dom, "#column"));
+    assert_eq!(titleblock.rect.size.height, 76.0);
+    assert_eq!(column.rect.size.height, 120.0);
+}
+
+#[test]
+fn row_flex_intrinsic_height_is_the_tallest_child_not_the_sum() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='column'>\
+           <div id='row'>\
+             <div class='chip'></div><div class='chip'></div>\
+             <div class='chip'></div><div class='chip'></div>\
+           </div>\
+           <div id='snippet'></div>\
+         </div></body>",
+        "html, body { display:block; margin:0 } \
+         #column { display:flex; flex-direction:column } \
+         #row { display:flex; flex:1 1 100%; gap:6px; padding-bottom:12px } \
+         .chip { height:36px; width:50px } \
+         #snippet { height:20px }",
+        400.0,
+    );
+    let row = fragment(&layout, find(&output.dom, "#row"));
+    let column = fragment(&layout, find(&output.dom, "#column"));
+    // The row's content height is one 36px line plus 12px padding, not four
+    // 36px items stacked into 156.
+    assert_eq!(row.rect.size.height, 48.0);
+    assert_eq!(column.rect.size.height, 68.0);
+}
+
+#[test]
 fn flex_grow_and_shrink_distribute_content_box_space_with_gap() {
     let (output, _, grown) = pipeline(
         "<!doctype html><body><div id='flex'><div id='a'></div><div id='b'></div></div></body>",
