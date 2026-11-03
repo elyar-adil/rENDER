@@ -86,6 +86,9 @@ fn inline_text_uses_computed_font_size_and_line_height() {
     };
     assert_eq!(text_data.font_size, 24.0);
     assert_eq!(text.rect.size.height, 36.0);
+    // §10.8.1 half-leading is split above and below: (36 - 24) / 2 = 6px,
+    // and the nominal ascent is 0.8em = 19.2px.
+    assert!((text_data.baseline - 25.2).abs() < 0.01);
 }
 
 #[test]
@@ -810,10 +813,13 @@ fn inline_icon_title_and_badge_share_one_line() {
         .expect("headline text fragment");
     assert_eq!(rect("#title").unwrap().size.width, 82.0);
     assert_eq!(rect("#icon").unwrap().origin.x, 0.0);
-    assert_eq!(rect("#icon").unwrap().origin.y, 0.0);
+    assert!(rect("#icon").unwrap().origin.y > 0.0);
     assert_eq!(text_rect.origin.x, 18.0);
     assert_eq!(text_rect.origin.y, 0.0);
     assert_eq!(rect("#badge").unwrap().origin.x, 88.0);
+    // The badge follows a float, so its own line has no direct text run and
+    // keeps the container's strut; only the icon inside the float's line is
+    // baseline-aligned by the atomic-inline pass.
     assert_eq!(rect("#badge").unwrap().origin.y, 0.0);
 }
 
@@ -3252,4 +3258,85 @@ fn layout_containment_contains_floats_like_a_flow_root() {
             .height,
         35.0
     );
+}
+
+/// CSS 2.1 §10.3.7/§10.6.4: `auto` insets use the static position, which is
+/// the parent's flow position. A flex container's content edge sits below its
+/// `padding-top`; the padding box of an outer positioned ancestor is only the
+/// reference for explicit insets, never the fallback static position.
+#[test]
+fn absolute_flex_child_static_position_starts_at_the_content_edge() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body>\
+         <div id='header'><div id='group'><div id='search'></div></div></div>\
+         </body>",
+        "html, body, div { display:block; margin:0 } \
+         #header { position:relative; height:120px } \
+         #group { display:flex; padding-top:10px; height:52px } \
+         #search { position:absolute; width:100px; height:20px }",
+        400.0,
+    );
+    let rect = |selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .expect("fragment")
+            .rect
+    };
+    assert_eq!(rect("#group").origin.y, 0.0);
+    assert_eq!(rect("#group").size.height, 62.0);
+    assert_eq!(rect("#search").origin.y, 10.0);
+}
+
+/// A hot-search row is made of inline-flex links (text inside each atomic
+/// box) followed by an inline-block badge. There is no direct text run in the
+/// line, so the highest atomic baseline defines the row baseline; the badge
+/// must sit its own text baseline on that line instead of at the row's top.
+#[test]
+fn inline_block_badge_baseline_aligns_on_an_atomic_only_line() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='row'>\
+           <a class='item' href='#'>headline</a><span class='badge'>hot</span>\
+         </div></body>",
+        "html, body, div { display:block; margin:0 } \
+         #row { width:600px; height:23px; overflow:hidden; font-size:13px; line-height:23px } \
+         .item { display:inline-flex; align-items:center; font-size:13px; line-height:23px } \
+         .badge { display:inline-block; position:relative; top:-1px; width:16px; height:16px; \
+                  line-height:16px; font-size:12px; background:#ff9812 }",
+        800.0,
+    );
+    let baseline = |needle: &str| {
+        layout
+            .fragments
+            .iter()
+            .find_map(|fragment| match &fragment.kind {
+                FragmentKind::Text(text) if text.text.contains(needle) => Some(text.baseline),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no text fragment for {needle:?}"))
+    };
+    let row = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(find(&output.dom, "#row")))
+        .expect("row fragment")
+        .rect;
+    let badge = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(find(&output.dom, ".badge")))
+        .expect("badge fragment")
+        .rect;
+
+    assert!((baseline("hot") - baseline("headline")).abs() < 0.01);
+    // 23px line around 13px text: (23 - 15.2) / 2 + 10.4 = 14.3px baseline;
+    // the 16px badge's own 12px line puts its baseline at 11.2px from its top.
+    assert!((badge.origin.y - 3.8).abs() < 0.01, "{badge:?}");
+    assert!(
+        (badge.origin.y + badge.size.height - 19.8).abs() < 0.01,
+        "{badge:?}"
+    );
+    assert!(badge.origin.y > row.origin.y);
+    assert!(badge.origin.y + badge.size.height < row.origin.y + row.size.height + 1.0);
 }

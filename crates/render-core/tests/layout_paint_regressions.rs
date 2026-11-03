@@ -1,3 +1,5 @@
+#![allow(clippy::float_cmp)]
+
 use render_core::document::{Document, DocumentRenderOptions};
 use render_core::paint::{Color, DisplayCommand};
 
@@ -222,4 +224,141 @@ mod presentational_attributes {
             Some(NodeKind::Element(_))
         ));
     }
+}
+
+/// The real header pulls itself up by 10px under a higher-z-index white strip.
+/// An absolute search box with `top:auto` must use the flow static position -
+/// the flex container's content edge, below its `padding-top` - or it moves
+/// under the strip and loses the top edge of its multi-layer border.
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "test geometry is non-negative and inside the render surface"
+)]
+fn search_form_top_border_survives_the_higher_header_strip() {
+    use render_core::layout::PhysicalSize;
+
+    let document = Document::parse(
+        "<!doctype html><style>\
+         html, body, div, form { display:block; margin:0; padding:0 }\
+         #layout-header { position:relative; z-index:555; height:86px; background:#fff }\
+         #header { position:relative; top:-10px; z-index:101; background:#fff;\
+                   border-bottom:1px solid #d1d8e5 }\
+         #group { display:flex; padding-top:10px; height:52px }\
+         #search { position:absolute; width:942.5px; height:52px }\
+         #form { display:inline-block; box-sizing:border-box; width:799.5px; height:52px;\
+                 border:1.5px solid transparent; border-radius:15px;\
+                 background:linear-gradient(#fff,#fff) padding-box,\
+                            linear-gradient(160deg,#3377fe,#4c6fff,#8370ff,#ba59ff) border-box }\
+         #hot { height:52px; margin:12px auto 8px; width:990px }\
+         #nav { height:28px; background:#fff }\
+         </style>\
+         <div id=layout-header></div>\
+         <div id=header><div id=group><div id=search><form id=form></form></div></div>\
+         <div id=hot></div></div><div id=nav></div>",
+    );
+    let mut options = DocumentRenderOptions::default();
+    options.layout.viewport = PhysicalSize {
+        width: 1190.0,
+        height: 400.0,
+    };
+    let render = document.render_reference(options);
+    let rect = |id: &str| {
+        let source = target_id(&document, id);
+        render
+            .layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(source))
+            .unwrap_or_else(|| panic!("#{id} must be laid out"))
+            .rect
+    };
+    let strip = rect("layout-header");
+    let form = rect("form");
+    assert_eq!(strip.origin.y + strip.size.height, 86.0);
+    assert_eq!(form.origin.y, 86.0, "the form must clear the strip");
+    assert_eq!(form.size.height, 52.0);
+
+    // The 1.5px gradient border at the form's top edge is painted, not erased
+    // by the white strip that covers the header's lifted 10px band.
+    let x = u32::try_from(form.origin.x as i32 + 300).expect("inside the surface");
+    let top = u32::try_from(form.origin.y as i32).expect("inside the surface");
+    let pixel = render
+        .raster
+        .surface
+        .pixel(x, top)
+        .expect("the form's top edge is inside the surface");
+    assert!(
+        pixel.blue > 180 && pixel.red < 220,
+        "expected the gradient border at the form top, found {pixel:?}"
+    );
+    let above = render
+        .raster
+        .surface
+        .pixel(x, top - 1)
+        .expect("the strip above the form is inside the surface");
+    assert_eq!(
+        (above.red, above.green, above.blue),
+        (255, 255, 255),
+        "the strip above the form stays white"
+    );
+}
+
+/// A clipped hot-search row holds two fallback lines. Atomic inline badges
+/// are baseline-aligned with the row's text, so the hidden second line's
+/// badge sits below the 23px clip instead of leaking a 1px orange sliver at
+/// the row's bottom edge.
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "test geometry is non-negative and inside the render surface"
+)]
+fn clipped_second_hot_row_does_not_leak_its_badge() {
+    let document = Document::parse(
+        "<!doctype html><style>\
+         html, body, div { display:block; margin:0 }\
+         #hot { position:relative; width:600px; height:23px; overflow:hidden;\
+                font-size:13px; line-height:23px }\
+         .row { height:23px; white-space:nowrap }\
+         .item { display:inline-flex; align-items:center; font-size:13px; line-height:23px }\
+         .badge { display:inline-block; position:relative; top:-1px; z-index:-1;\
+                  width:16px; height:16px; line-height:16px; font-size:12px;\
+                  color:#fff; background:#ff9812 }\
+         </style>\
+         <div id=hot>\
+           <div class=row><a class=item href=#>headline</a><span id=b1 class=badge>hot</span></div>\
+           <div class=row><a class=item href=#>second</a><span id=b2 class=badge>hot</span></div>\
+         </div>",
+    );
+    let render = document.render_reference(DocumentRenderOptions::default());
+    let rect = |id: &str| {
+        let source = target_id(&document, id);
+        render
+            .layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(source))
+            .unwrap_or_else(|| panic!("#{id} must be laid out"))
+            .rect
+    };
+    let b1 = rect("b1");
+    let b2 = rect("b2");
+    assert!(b1.origin.y > 0.0, "the first badge is baseline-aligned");
+    assert!(
+        b2.origin.y >= 23.0,
+        "the hidden second row badge starts below the clip: {b2:?}"
+    );
+    let x = u32::try_from(b2.origin.x as i32 + 2).expect("inside the surface");
+    let pixel = render
+        .raster
+        .surface
+        .pixel(x, 22)
+        .expect("the row's bottom edge is inside the surface");
+    assert_eq!(
+        (pixel.red, pixel.green, pixel.blue),
+        (255, 255, 255),
+        "no badge pixel may leak into the clipped row"
+    );
 }

@@ -411,6 +411,14 @@ impl Solver<'_> {
         let positioning_contained = establishes_positioning_containing_block(style);
         let establishes_fixed_containing = establishes_fixed_positioning_containing_block(style);
         let saved_fixed_containing = self.fixed_positioning_containing;
+        // CSS 2 §10.3.7/§10.6.4: with `left`/`top` auto, the used inset is the
+        // box's *static position* - where it would have been in normal flow.
+        // That position comes from the parent's formatting context (its
+        // content edge and the flow cursor), not from the padding box of the
+        // positioned ancestor that supplies percentage and inset bases. An
+        // in-flow cursor already lives in the parent's coordinate space, so
+        // keep it across the containing-block substitution below.
+        let static_position_y = margin_box_y;
         let (containing, containing_rtl, containing_height_definite) = match position {
             // A fixed box resolves against the nearest transform/containment
             // ancestor's padding box, or the initial containing block. The
@@ -434,7 +442,7 @@ impl Solver<'_> {
             _ => (containing, containing_rtl, containing_height_definite),
         };
         let margin_box_y = if out_of_flow {
-            containing.origin.y
+            static_position_y
         } else {
             margin_box_y
         };

@@ -2194,10 +2194,12 @@ fn expand_legacy_longhands(name: &str, value: &str) -> Vec<(String, String)> {
             ]
         }
         "overflow" => {
+            // CSS Overflow 3 §2.1: one value sets both axes; with two, the
+            // first is overflow-x and the second is overflow-y.
             let values: Vec<_> = value.split_ascii_whitespace().collect();
             if values.len() == 1 || values.len() == 2 {
-                let y = values[0];
-                let x = values.get(1).copied().unwrap_or(y);
+                let x = values[0];
+                let y = values.get(1).copied().unwrap_or(x);
                 vec![
                     ("overflow-x".to_owned(), x.to_owned()),
                     ("overflow-y".to_owned(), y.to_owned()),
@@ -3176,6 +3178,30 @@ mod tests {
             &MatchContext::default(),
         )[0];
         (output.dom, target)
+    }
+
+    #[test]
+    fn overflow_two_value_shorthand_maps_first_value_to_the_x_axis() {
+        let (dom, target) = document_and_target();
+        let sheet = parse_stylesheet("#target { overflow: hidden auto }");
+        let style = cascade_element(
+            &dom,
+            target,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+
+        assert_eq!(
+            style.get("overflow-x").map(|value| value.value.as_str()),
+            Some("hidden")
+        );
+        assert_eq!(
+            style.get("overflow-y").map(|value| value.value.as_str()),
+            Some("auto")
+        );
     }
 
     #[test]

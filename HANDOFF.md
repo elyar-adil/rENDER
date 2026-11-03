@@ -74,6 +74,56 @@ python tools/check_site_neutrality.py                         0 blocking, 31 adv
 
 ---
 
+# 交接文档 (2026-11-03, 续二) — 搜索框静态定位、行内基线与页头裁切
+
+本轮修复 hao123 首页截图中搜索框上边框缺失、热点提示行贴近/被页头导航行裁切的问题。所有改动仍走通用 CSS 2.1 布局/绘制路径，没有站点特判。
+
+## 根因与修复
+
+- **绝对定位 flex 子项的 static position 用了 containing block 的 padding box**（`crates/render-layout/src/solver/block.rs:407` 一带）。`.search` 是 `.search-group`（`display:flex; padding-top:10px`）的绝对定位子项，但最近的 positioned 祖先 `.searchWrapper` 没有 padding。原实现把 `margin_box_y` 覆盖成 `containing.origin.y`，于是 `.searchForm` 落在 y=76 而不是内容边 y=86；页头 `top:-10px` 上移后，上方 `z-index:555` 的 `.layout-header` 白底正好盖住表单顶部 1.5px 渐变边框。现在保留父级 flow cursor 作为 `auto` inset 的 static position，显式 `top/left` 仍相对 positioned ancestor 解析。
+- **匿名 inline box 重复绘制元素的 background/border**（`crates/render-core/src/paint/display_list.rs:1431`）。inline-block 的匿名行内包装借用了元素的 formatting node/style source，`paint_box` 又在 padding box 上重绘一次，可能盖住元素自己的顶边。现在只有 `fragment.source.is_some()` 的 box 绘制自身装饰。
+- **行内文本 baseline 没有半行距**（`crates/render-layout/src/solver/inline.rs:2677`）。`line-height` 大于字体 ascent+descent 时，所有 leading 都被放在字形下方，文本整体偏高；23px 热点行里的 13px 文本顶部因此被 `overflow:hidden` 裁掉。现在按 §10.8.1 把 half-leading 平分到上下。
+- **atomic inline 未按基线对齐**（`crates/render-layout/src/solver/inline.rs:1057`）。热点行的 `inline-flex` 链接和内联 `inline-block` 徽标都按行顶放置；第二行 fallback 的 16px 徽标因此只露出顶部 1px，看起来像被导航行裁切。现在同一行内 atomic box 的文本基线对齐到行基线；整行只有 atomic 时取最高的 atomic 基线。
+- **`overflow` 两值简写把 x/y 写反**（`crates/render-css/src/cascade.rs:2196`）。`overflow: hidden auto` 之前得到 x=auto/y=hidden；现按 CSS Overflow 3 §2.1 第一个值为 x。
+
+## 几何（保存页 `/tmp/hao123.html`，1728 CSS px）
+
+| 元素 | 修复前 | 修复后 |
+| --- | ---: | ---: |
+| `.searchForm` | y=76, 52 高，顶边框被白条覆盖 | **y=86**, 52 高，四边渐变边框完整 |
+| `.all-hot-search-wrapper` | y=92 | **y=102** |
+| 热点首行文本 baseline | 189.4 | **194.4**（13px 文本在 23px 行内居中） |
+| 首行 `hot-icon` 徽标 | y=178..194 | **y=182.8..198.8** |
+| 第二行 fallback 徽标 | y=201..217（露出 1px） | **y=205.8..221.8**（完全在 23px clip 之外） |
+| `#hao123-govsite` 导航 | y=221 | y=221（不变） |
+
+## 测试
+
+- `render-layout`：`absolute_flex_child_static_position_starts_at_the_content_edge`、`inline_block_badge_baseline_aligns_on_an_atomic_only_line`、`inline_text_uses_computed_font_size_and_line_height`（half-leading=25.2 baseline）。
+- `render-core`：`search_form_top_border_survives_the_higher_header_strip`（像素级验证顶边框未被 z-index 更高的白条擦掉）、`clipped_second_hot_row_does_not_leak_its_badge`（像素级验证第二行徽标不泄漏）、`anonymous_inline_boxes_do_not_repaint_the_elements_box_decorations`，以及 `layout_positioning` 的 reduced header 精确坐标。
+- `render-css`：`overflow_two_value_shorthand_maps_first_value_to_the_x_axis`。
+
+```text
+cargo fmt --all --check                                             clean
+cargo clippy -p render-layout -p render-css -p render-core --all-targets -- -D warnings
+                                                                    clean
+cargo test -p render-layout --lib                                   405 passed, 1 ignored
+cargo test -p render-css --lib                                      335 passed
+cargo test -p render-core --lib                                     566 passed, 1 ignored
+cargo test -p render-core --test layout_positioning --test layout_paint_regressions
+                                                                    17 passed
+python3 tools/check_site_neutrality.py                              0 blocking
+```
+
+## 剩余缺口
+
+- inline 级 `vertical-align` 仍只对表格单元实现；本轮只补了 atomic inline 的默认基线对齐，`top`/`middle`/`bottom`/`text-top` 等值仍未消费，替换元素（图片）保持行顶对齐。
+- atomic 基线移动不重新扩张行盒高度；特别高的 inline-block 可能越过行盒，后续应在行高计算中计入 ascent/descent。
+- `background-clip`/`background-origin` 长属性尚未解析，多层背景绘制仍按层序推断 padding-box/border-box；本轮 `padding-box, border-box` 写法工作正常，但层序相反时会错。
+- 受“不触碰桌面”约束，本轮没有启动浏览器/Playwright/`--screenshot`，所有验证均为 `cargo test` 与 render-core 离屏 raster。
+
+---
+
 # 交接文档 (2026-11-03) — 通用 Web Worker API
 
 本轮补上 Dedicated Web Worker，让把压缩/遥测/captcha 工作放到 worker 的页面不再因 `ReferenceError: Worker is not defined` 进入全局错误页。实现完全走通用 HTML/JS 路径，没有站点特判。

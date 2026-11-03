@@ -1195,9 +1195,17 @@ fn baseline_alignment_uses_each_cells_own_first_line() {
     );
     // A cell with no in-flow line box has no baseline, so its bottom margin
     // edge is aligned with the row's baseline instead.
+    let padded_baseline = layout
+        .fragments
+        .iter()
+        .find_map(|fragment| match &fragment.kind {
+            FragmentKind::Text(text) if text.text.contains("one") => Some(text.baseline),
+            _ => None,
+        })
+        .expect("the padded cell has a first line baseline");
     let empty = rect(&layout, find(dom, "#empty-content"));
     assert!(
-        near(empty.bottom(), row.origin.y + padded.origin.y + 12.8),
+        near(empty.bottom(), padded_baseline),
         "{empty:?} {row:?} {padded:?}"
     );
 }

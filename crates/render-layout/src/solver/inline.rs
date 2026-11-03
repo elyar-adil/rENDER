@@ -1061,8 +1061,80 @@ impl<'a> Solver<'a> {
             (TextAlign::End, true) => TextAlign::Left,
             (value, _) => value,
         };
+        self.align_atomic_inline_baselines(&fragments);
         self.finish_inline_lines(&fragments, containing, text_align, &line_bands);
         (fragments, height)
+    }
+
+    /// CSS 2.1 §10.8.1: inline-level boxes on one line share a baseline.
+    /// Atomic inline boxes (an `inline-block` badge with its own text) are
+    /// placed with their top edge at the line top; that lifts them relative to
+    /// the surrounding text and can make a following row's badge peek through
+    /// an ancestor's `overflow:hidden` edge. Re-home each atomic box's own
+    /// text baseline on the line's baseline.
+    ///
+    /// A line can be made of atomics alone: the hot-search row is a sequence of
+    /// inline-flex links whose text lives inside those atomic boxes, so there
+    /// is no direct text run to read the row baseline from. In that case the
+    /// highest atomic text baseline becomes the line baseline.
+    fn align_atomic_inline_baselines(&mut self, fragments: &[FragmentId]) {
+        let mut line_baselines: BTreeMap<usize, f32> = BTreeMap::new();
+        let mut atomic_baselines: BTreeMap<FragmentId, (usize, f32)> = BTreeMap::new();
+        for fragment in fragments {
+            let Some(placement) = self.inline_bidi.get(fragment).copied() else {
+                continue;
+            };
+            let Some(entry) = self.fragments.get(fragment.as_u32() as usize) else {
+                continue;
+            };
+            match &entry.kind {
+                FragmentKind::Text(text) => {
+                    line_baselines
+                        .entry(placement.line)
+                        .and_modify(|baseline| *baseline = baseline.max(text.baseline))
+                        .or_insert(text.baseline);
+                }
+                FragmentKind::Box(_) => {
+                    if let Some(baseline) = self.fragment_last_text_baseline(*fragment) {
+                        atomic_baselines.insert(*fragment, (placement.line, baseline));
+                        line_baselines
+                            .entry(placement.line)
+                            .and_modify(|line| *line = line.max(baseline))
+                            .or_insert(baseline);
+                    }
+                }
+            }
+        }
+        let mut shifts = Vec::new();
+        for (fragment, (line, atomic_baseline)) in atomic_baselines {
+            let Some(line_baseline) = line_baselines.get(&line).copied() else {
+                continue;
+            };
+            let shift = line_baseline - atomic_baseline;
+            if shift.abs() > 0.01 {
+                shifts.push((fragment, shift));
+            }
+        }
+        for (fragment, shift) in shifts {
+            self.translate_fragment_subtree(fragment, 0.0, shift);
+        }
+    }
+
+    /// The bottom-most text baseline inside `root`, in document coordinates.
+    fn fragment_last_text_baseline(&self, root: FragmentId) -> Option<f32> {
+        let mut pending = vec![root];
+        let mut baseline: Option<f32> = None;
+        while let Some(id) = pending.pop() {
+            let Some(fragment) = self.fragments.get(id.as_u32() as usize) else {
+                continue;
+            };
+            if let FragmentKind::Text(text) = &fragment.kind {
+                baseline =
+                    Some(baseline.map_or(text.baseline, |current| current.max(text.baseline)));
+            }
+            pending.extend(fragment.children.iter().copied());
+        }
+        baseline
     }
 
     /// The three text properties that decide where a line may break, read off
@@ -2700,13 +2772,22 @@ impl<'a> Solver<'a> {
             run.typography.spacing,
         );
         let rect = PhysicalRect::new(run.x, run.y, run.width, run.typography.style.line_height);
+        // CSS 2.1 §10.8.1: the difference between `line-height` and the font's
+        // ascent + descent is half-leading, split equally above and below the
+        // text. Painting the baseline at the line-box top plus the ascent
+        // leaves all of the leading below the glyphs, so text in a line box
+        // taller than its font sits too high and is clipped by an ancestor's
+        // `overflow:hidden` edge (the hot-search row is 23px tall around a
+        // 13px font).
+        let half_leading =
+            (run.typography.style.line_height - (metrics.ascent + metrics.descent)) / 2.0;
         if let Some(fragment) = self.allocate_fragment(
             run.formatting_node,
             run.source,
             rect,
             FragmentKind::Text(TextFragmentData {
                 text: run.text,
-                baseline: run.y + metrics.ascent,
+                baseline: run.y + half_leading + metrics.ascent,
                 font_size: run.typography.style.font_size,
                 font: StoredFontRequest::new(run.typography.style.font),
                 spacing: run.typography.spacing,
