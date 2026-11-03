@@ -1540,38 +1540,72 @@ fn select_srcset_candidate<'a>(
 }
 
 fn parse_srcset(srcset: &str) -> Vec<SrcsetCandidate<'_>> {
-    srcset
-        .split(',')
-        .filter_map(|candidate| {
-            let mut parts = candidate.split_ascii_whitespace();
-            let url = parts.next()?.trim();
-            if url.is_empty() {
-                return None;
+    // A comma separates candidates, but a `data:` URL contains one of its
+    // own. Splitting the whole attribute on commas truncates every data URL
+    // at `base64,`; Apple uses such placeholders in `<source srcset>` and
+    // every one of them failed to load. Walk the string instead: a data URL
+    // keeps consuming characters (including commas) until whitespace, which
+    // is where its descriptor starts.
+    let bytes = srcset.as_bytes();
+    let mut candidates = Vec::new();
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        while index < bytes.len() && (bytes[index] == b',' || bytes[index].is_ascii_whitespace()) {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        let url_start = index;
+        let data_url = srcset[url_start..].starts_with("data:");
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if byte.is_ascii_whitespace() || (byte == b',' && !data_url) {
+                break;
             }
-            let descriptor = match parts.next() {
-                None => SrcsetDescriptor::Density(1.0),
-                Some(value) if value.ends_with('x') => SrcsetDescriptor::Density(
-                    value
-                        .strip_suffix('x')?
-                        .parse::<f32>()
-                        .ok()
-                        .filter(|v| *v > 0.0)?,
-                ),
-                Some(value) if value.ends_with('w') => SrcsetDescriptor::Width(
-                    value
-                        .strip_suffix('w')?
-                        .parse::<u32>()
-                        .ok()
-                        .filter(|v| *v > 0)?,
-                ),
-                Some(_) => return None,
-            };
-            parts
-                .next()
-                .is_none()
-                .then_some(SrcsetCandidate { url, descriptor })
-        })
-        .collect()
+            index += 1;
+        }
+        let url = &srcset[url_start..index];
+        let descriptor_start = index;
+        while index < bytes.len() && bytes[index] != b',' {
+            index += 1;
+        }
+        let descriptor = srcset[descriptor_start..index].trim();
+        index += usize::from(index < bytes.len());
+        if url.is_empty() {
+            continue;
+        }
+        let mut parts = descriptor.split_ascii_whitespace();
+        let descriptor = match parts.next() {
+            None => SrcsetDescriptor::Density(1.0),
+            Some(value) if value.ends_with('x') => {
+                let Some(density) = value
+                    .strip_suffix('x')
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .filter(|value| *value > 0.0)
+                else {
+                    continue;
+                };
+                SrcsetDescriptor::Density(density)
+            }
+            Some(value) if value.ends_with('w') => {
+                let Some(width) = value
+                    .strip_suffix('w')
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .filter(|value| *value > 0)
+                else {
+                    continue;
+                };
+                SrcsetDescriptor::Width(width)
+            }
+            Some(_) => continue,
+        };
+        if parts.next().is_some() {
+            continue;
+        }
+        candidates.push(SrcsetCandidate { url, descriptor });
+    }
+    candidates
 }
 
 fn parse_sizes(sizes: Option<&str>, context: ImageSelectionContext) -> f32 {
@@ -1653,8 +1687,8 @@ mod tests {
 
     use super::{
         DecodedImage, ImageDecodeError, ImageFormat, ImageLimits, ImageResources,
-        ImageSelectionContext, background_url, decode_image, discover_images,
-        discover_images_with_context, image_key_is_current, sniff_image_format,
+        ImageSelectionContext, SrcsetDescriptor, background_url, decode_image, discover_images,
+        discover_images_with_context, image_key_is_current, parse_srcset, sniff_image_format,
     };
     use crate::dom::{ShadowRootMode, SlotAssignmentMode};
     use crate::paint::Color;
@@ -1740,6 +1774,24 @@ mod tests {
             "https://cdn.example/assets/a@2x.png"
         );
         assert!(discovery.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn keeps_commas_inside_a_data_url_srcset_candidate() {
+        let candidates = parse_srcset(
+            "data:image/gif;base64,R0lGODlhAQABAHAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw== 1x, \
+             hero@2x.png 2x",
+        );
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0].url,
+            "data:image/gif;base64,R0lGODlhAQABAHAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw=="
+        );
+        assert_eq!(candidates[1].url, "hero@2x.png");
+        assert!(matches!(
+            candidates[1].descriptor,
+            SrcsetDescriptor::Density(density) if (density - 2.0).abs() < 0.001
+        ));
     }
 
     #[test]

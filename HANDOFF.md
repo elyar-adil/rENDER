@@ -33,6 +33,7 @@ Apple 首页在 headless 中被判定为 tablet / no-retina，根因不在布局
 - `render-js/src/value.rs`：`navigator.userAgent` 与 HTTP 请求头使用同一串 Chrome/120 Windows UA（仍保留 `rENDER/<version>` 标识），并补上 `appVersion`、`vendor`。站点特性检测读的是 JS 属性，旧的 `Mozilla/5.0 rENDER/0.1` 会让它们走降级分支。
 - `render-css/src/cascade.rs`：媒体查询支持 `resolution`、`device-pixel-ratio`、`-webkit-device-pixel-ratio`、`-moz-device-pixel-ratio`；支持 WebKit 的 `-webkit-min-device-pixel-ratio` / `-webkit-max-device-pixel-ratio` 中缀写法。`prefers-reduced-motion`、`prefers-contrast`、`scripting`、`display-mode`、`color-gamut`、`dynamic-range` 等离散特性改为按 `MatchContext` 实际值判断，不再一律 `true`。
 - 分辨率上下文贯通三处：`render-core/src/document.rs` 的样式匹配、`render-core/src/image.rs` 的图片候选选择（`image-set()`/`x` 描述符）、`render-js` 的 `matchMedia`。
+- `render-core/src/image.rs`：`srcset` 不再对整个属性按逗号切分；`data:` URL 里的逗号属于 URL 本身，候选在空白后的描述符处结束。Apple 的 49 个 1×1 GIF 占位符此前都在 `base64,` 处被截断，现在能进入解码阶段。新增解析测试 `keeps_commas_inside_a_data_url_srcset_candidate`。
 - 新增 `render-js` 测试断言 UA 组成；`file:///tmp/dpr.html` 实测脚本读到 `1440x900 dpr=2 mq=true`。
 
 ## 验证
