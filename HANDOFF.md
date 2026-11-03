@@ -259,6 +259,12 @@ forms=1 inputs=2 buttons=3 modal=1 "Something went wrong"=0
 - 之后又修了 Google 的空白带/结果行距：row-flex 的 cross-axis 高度取最高子项（216→48px），非 flex block 的 intrinsic height 加入子项垂直 padding/margin；`#center_col` y 368→200（Edge 200），结果行高 152/136/114→139/123/101（Edge 123/101/123）。`render-layout` 399 passed。
 - 剩余：fresh profile 的 consent 对话框背景/z-order、`#rso` 约 13.6px 偏移、动态“翻译此页”让首行高约 16px、`/complete/s` 的 GET-body/abort 错误。
 
+## 系统性布局细节：line-height 与 getComputedStyle
+
+- `42d87e0`：`line-height: normal` 之前固定 `1.2em`。Chromium 用所选字体的 ascent/descent/line-gap；16px Arial/system-ui 是 18px，PingFang SC 是 22px，而 rENDER 之前统一 19.2px。现在 `TextMeasurer::normal_line_height` 从实际选中的 face 取 metrics，Arial/PingFang 各走自己的 line box。这对每个文本块都会改变累计高度，是“很多网页细节不对”的一个系统性根因。
+- `5de91e5`：`getComputedStyle()` 之前只有 inline 值/空值。现在渲染管线算出的 `ComputedStyle` 会通过 `Page::publish_computed_styles`/`JsRuntime::install_computed_styles` 安装进 JS runtime；`getComputedStyle` 读真实 cascade 结果，支持 camelCase、`getPropertyValue`、`length/item`、`cssFloat`、`::before/::after`（只有生成的伪元素有值），`element.style` 仍只读 inline。测试覆盖 display/padding/font-size/margin/color。
+- 受用户“不要影响桌面”约束，这两项只用 `cargo test`/纯 Rust 验证，没有再启动浏览器、Playwright 或 `--screenshot`；live 复测留到用户允许时。
+
 ## 包体与内存
 
 macOS release：`render-browser` **16 MB**，gzip **7.8 MB**，xz **5.3 MB**；额外 Homebrew `libdav1d` 0.78 MB。Edge.app 实测 1.7 GB，Chrome 未安装（典型 1.5–2 GB）。体积约 1/100，启动也更快；字体按需解码已把 `render-perf` peak RSS 从 881MB 降到 278MB，但 live Baidu 仍约 2.8GB（JS arena append-only、页面对象/图片）。目前没有 `.app`/安装器/公证。
@@ -269,10 +275,10 @@ macOS release：`render-browser` **16 MB**，gzip **7.8 MB**，xz **5.3 MB**；�
 cargo test --workspace                                     all ok
 cargo test -p render-core --lib                            565 passed, 1 ignored
 cargo test -p render-browser --bin render-browser           140 passed
-cargo test -p render-browser --lib                          248 passed
+cargo test -p render-browser --lib                          249 passed
 cargo test -p render-css                                    334 passed
 cargo test -p render-layout                                 403 passed, 1 ignored
-cargo test -p render-js                                     1292 passed
+cargo test -p render-js                                     1293 passed
 cargo test -p render-net                                    125 passed
 cargo clippy --workspace --all-targets -- -D warnings       clean
 cargo fmt --all --check                                     clean
