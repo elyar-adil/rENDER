@@ -1,0 +1,587 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#090c0b">
+  <meta name="description" content="rENDER is an experimental native browser and self-contained browser engine written in Rust. HTML, CSS, JavaScript, layout and painting are implemented in this repository.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="rENDER — A browser engine, built not borrowed">
+  <meta property="og:description" content="A native browser written in Rust. No Chromium. No system WebView. Just the engine, end to end.">
+  <meta property="og:image" content="screenshot_index.png">
+  <title>rENDER — A browser engine, built not borrowed</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%23090c0b'/%3E%3Cpath d='M17 45V19h9v4c2-3 5-5 10-5v9c-6 0-10 3-10 9v9z' fill='%23c7fa65'/%3E%3C/svg%3E">
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #090c0b;
+      --bg-soft: #0d1210;
+      --panel: #111815;
+      --panel-2: #151e19;
+      --line: rgba(210, 235, 220, .11);
+      --line-strong: rgba(210, 235, 220, .2);
+      --text: #edf4ee;
+      --muted: #9aa89e;
+      --quiet: #68766d;
+      --acid: #c7fa65;
+      --acid-ink: #17200d;
+      --mint: #8de6bd;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --max: 1160px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-padding-top: 90px; }
+    body {
+      margin: 0;
+      min-width: 320px;
+      color: var(--text);
+      background:
+        radial-gradient(ellipse at 78% 4%, rgba(91, 143, 95, .13), transparent 34rem),
+        radial-gradient(ellipse at 0% 38%, rgba(70, 105, 74, .08), transparent 32rem),
+        var(--bg);
+      font-family: var(--sans);
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+    body::before {
+      position: fixed;
+      z-index: -1;
+      inset: 0;
+      pointer-events: none;
+      content: "";
+      opacity: .14;
+      background-image: linear-gradient(rgba(210,235,220,.035) 1px, transparent 1px), linear-gradient(90deg, rgba(210,235,220,.035) 1px, transparent 1px);
+      background-size: 68px 68px;
+      mask-image: linear-gradient(to bottom, black, transparent 75%);
+    }
+    a { color: inherit; text-decoration: none; }
+    button { font: inherit; }
+    img { display: block; max-width: 100%; }
+    .wrap { width: min(var(--max), calc(100% - 56px)); margin-inline: auto; }
+    .mono { font-family: var(--mono); }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--mint);
+      font: 11px/1.4 var(--mono);
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    .eyebrow::before {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--acid); box-shadow: 0 0 16px rgba(199,250,101,.7);
+      content: "";
+    }
+
+    .topbar {
+      position: sticky; top: 0; z-index: 20;
+      border-bottom: 1px solid rgba(210,235,220,.08);
+      background: rgba(9,12,11,.78);
+      backdrop-filter: blur(18px);
+    }
+    .nav {
+      min-height: 76px; display: flex; align-items: center; justify-content: space-between; gap: 28px;
+    }
+    .brand { display: inline-flex; align-items: center; gap: 12px; font-size: 19px; font-weight: 760; letter-spacing: -.055em; }
+    .brand-mark {
+      width: 30px; height: 30px; display: grid; place-items: center;
+      border: 1px solid rgba(199,250,101,.35); border-radius: 9px;
+      color: var(--acid); background: rgba(199,250,101,.08);
+      font: 17px/1 var(--mono); letter-spacing: -.12em;
+    }
+    .brand span:last-child { color: #f4f8f3; }
+    .brand b { color: var(--acid); font-weight: 760; }
+    .nav-links { display: flex; align-items: center; gap: 30px; color: #a9b5ac; font-size: 13px; }
+    .nav-links a { transition: color .2s ease; }
+    .nav-links a:hover { color: var(--acid); }
+    .nav-cta {
+      display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+      padding: 11px 15px; border: 1px solid var(--line-strong); border-radius: 7px;
+      font: 12px var(--mono); color: var(--text); transition: border-color .2s, background .2s;
+    }
+    .nav-cta:hover { border-color: rgba(199,250,101,.65); background: rgba(199,250,101,.06); }
+    .nav-cta svg, .button svg { width: 15px; height: 15px; }
+
+    .hero { padding: 106px 0 76px; overflow: hidden; }
+    .hero-grid { display: grid; grid-template-columns: minmax(0, .92fr) minmax(480px, 1.08fr); align-items: center; gap: 56px; }
+    .hero-copy { position: relative; z-index: 2; }
+    .hero h1 {
+      max-width: 660px; margin: 24px 0 22px;
+      font-size: clamp(54px, 6.3vw, 84px); line-height: .99; letter-spacing: -.075em; font-weight: 690;
+    }
+    .hero h1 .accent { color: var(--acid); }
+    .hero-lede { max-width: 570px; margin: 0; color: #aab6ad; font-size: 17px; line-height: 1.8; letter-spacing: -.015em; }
+    .hero-lede strong { color: #e7eee8; font-weight: 560; }
+    .hero-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 34px; }
+    .button {
+      min-height: 48px; display: inline-flex; align-items: center; justify-content: center; gap: 11px;
+      padding: 0 18px; border: 1px solid transparent; border-radius: 7px;
+      font-size: 13px; font-weight: 650; transition: transform .2s, background .2s, border-color .2s;
+    }
+    .button:hover { transform: translateY(-2px); }
+    .button-primary { color: var(--acid-ink); background: var(--acid); }
+    .button-primary:hover { background: #d8ff91; }
+    .button-secondary { color: #d9e3db; border-color: var(--line-strong); background: rgba(255,255,255,.015); }
+    .button-secondary:hover { border-color: rgba(199,250,101,.55); background: rgba(199,250,101,.05); }
+    .hero-note { margin-top: 23px; color: var(--quiet); font: 11px/1.7 var(--mono); }
+
+    .visual { position: relative; min-width: 0; perspective: 1200px; }
+    .visual-glow {
+      position: absolute; width: 78%; height: 70%; top: 10%; right: 3%;
+      background: rgba(123, 198, 117, .17); filter: blur(72px); border-radius: 50%;
+    }
+    .browser-window {
+      position: relative; overflow: hidden; border: 1px solid rgba(207,232,215,.23);
+      border-radius: 13px; background: #131a16;
+      box-shadow: 0 36px 100px rgba(0,0,0,.52), 0 0 0 7px rgba(255,255,255,.018);
+      transform: rotateY(-7deg) rotateX(2deg);
+    }
+    .browser-bar {
+      min-height: 46px; display: flex; align-items: center; gap: 14px; padding: 0 14px;
+      border-bottom: 1px solid rgba(220,240,225,.1); background: #171e1a;
+    }
+    .traffic { display: flex; gap: 6px; flex: none; }
+    .traffic i { width: 8px; height: 8px; border-radius: 50%; background: #536057; }
+    .traffic i:first-child { background: #ef766a; }
+    .traffic i:nth-child(2) { background: #e8bd63; }
+    .traffic i:nth-child(3) { background: #7bc68a; }
+    .tab-pill {
+      width: 128px; padding: 7px 10px; border-radius: 6px 6px 0 0;
+      color: #dce8de; background: #222d26; font-size: 10px; white-space: nowrap;
+    }
+    .address {
+      flex: 1; min-width: 0; padding: 7px 12px; border: 1px solid rgba(220,240,225,.07);
+      border-radius: 5px; color: #7f9285; background: #101612; font: 10px var(--mono);
+      overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+    }
+    .browser-screen { position: relative; background: #f5f5f2; }
+    .browser-screen img { width: 100%; height: auto; aspect-ratio: 1.62; object-fit: cover; object-position: top; }
+    .screen-caption {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px;
+      border-top: 1px solid rgba(220,240,225,.1); color: #7f9084; background: #121915;
+      font: 9px var(--mono); letter-spacing: .07em; text-transform: uppercase;
+    }
+    .screen-caption span:last-child { color: var(--acid); }
+    .mini-window {
+      position: absolute; width: 37%; right: -22px; bottom: -48px; overflow: hidden;
+      border: 1px solid rgba(207,232,215,.26); border-radius: 9px;
+      background: #151d18; box-shadow: 0 18px 50px rgba(0,0,0,.5);
+      transform: rotateY(-5deg) rotateZ(2deg);
+    }
+    .mini-window img { width: 100%; aspect-ratio: 1.35; object-fit: cover; object-position: top; }
+    .mini-label { padding: 8px 10px; color: #a8b7ab; font: 8px var(--mono); letter-spacing: .08em; }
+    .visual-index { position: absolute; left: -28px; bottom: 28px; color: rgba(199,250,101,.55); font: 10px var(--mono); writing-mode: vertical-rl; transform: rotate(180deg); }
+
+    .hero-foot {
+      display: flex; align-items: center; justify-content: space-between; gap: 24px;
+      margin-top: 94px; padding-top: 24px; border-top: 1px solid var(--line);
+    }
+    .hero-foot-label { color: var(--quiet); font: 10px var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+    .hero-tags { display: flex; flex-wrap: wrap; gap: 9px; }
+    .tag {
+      padding: 7px 10px; border: 1px solid var(--line); border-radius: 4px;
+      color: #b5c2b8; font: 10px var(--mono); letter-spacing: .035em;
+    }
+
+    section { position: relative; }
+    .section { padding: 112px 0; border-top: 1px solid var(--line); }
+    .section-head { max-width: 700px; margin-bottom: 48px; }
+    .section-kicker { color: var(--mint); font: 10px var(--mono); letter-spacing: .15em; text-transform: uppercase; }
+    h2 { margin: 17px 0 15px; font-size: clamp(36px, 4vw, 54px); line-height: 1.06; letter-spacing: -.06em; font-weight: 640; }
+    .section-intro { max-width: 640px; margin: 0; color: var(--muted); font-size: 15px; line-height: 1.8; }
+
+    .principle {
+      display: grid; grid-template-columns: .8fr 1.2fr; gap: 76px; align-items: start;
+    }
+    .principle-aside { position: sticky; top: 112px; }
+    .principle-aside .big-quote { margin: 0; color: #e7eee8; font-size: clamp(29px, 3.4vw, 43px); line-height: 1.13; letter-spacing: -.055em; }
+    .principle-aside .big-quote span { color: var(--acid); }
+    .principle-aside .aside-note { max-width: 270px; margin-top: 22px; color: var(--quiet); font-size: 12px; line-height: 1.7; }
+    .pipeline { border-top: 1px solid var(--line-strong); }
+    .pipe-row {
+      display: grid; grid-template-columns: 46px minmax(0, 1fr) auto; align-items: center; gap: 18px;
+      min-height: 82px; border-bottom: 1px solid var(--line);
+    }
+    .pipe-no { color: var(--quiet); font: 11px var(--mono); }
+    .pipe-name { font-size: 19px; font-weight: 560; letter-spacing: -.035em; }
+    .pipe-desc { color: var(--quiet); font: 10px var(--mono); text-align: right; }
+
+    .layers-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .layer-card {
+      min-height: 222px; padding: 25px; border: 1px solid var(--line); border-radius: 9px;
+      background: linear-gradient(145deg, rgba(255,255,255,.035), rgba(255,255,255,.008));
+      transition: border-color .2s, transform .2s, background .2s;
+    }
+    .layer-card:hover { transform: translateY(-4px); border-color: rgba(199,250,101,.32); background: linear-gradient(145deg, rgba(199,250,101,.06), rgba(255,255,255,.008)); }
+    .layer-icon { width: 36px; height: 36px; display: grid; place-items: center; margin-bottom: 24px; border: 1px solid rgba(199,250,101,.25); border-radius: 8px; color: var(--acid); background: rgba(199,250,101,.06); }
+    .layer-icon svg { width: 18px; height: 18px; }
+    .layer-card h3 { margin: 0 0 10px; font-size: 17px; font-weight: 590; letter-spacing: -.035em; }
+    .layer-card p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.7; }
+    .layer-crate { display: inline-block; margin-top: 22px; color: #829287; font: 10px var(--mono); }
+
+    .manifesto {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 60px; align-items: center;
+      padding: 42px; border: 1px solid rgba(199,250,101,.18); border-radius: 10px;
+      background: radial-gradient(ellipse at 0% 0%, rgba(199,250,101,.075), transparent 55%), #101612;
+    }
+    .manifesto h2 { margin: 14px 0 0; font-size: clamp(32px, 3.5vw, 46px); }
+    .manifesto-copy { color: #a9b7ac; font-size: 14px; line-height: 1.8; }
+    .manifesto-copy strong { color: #e7eee8; font-weight: 590; }
+    .manifesto-rule { display: flex; align-items: center; gap: 12px; margin-top: 22px; color: var(--acid); font: 10px var(--mono); letter-spacing: .06em; }
+    .manifesto-rule::before { width: 24px; height: 1px; background: var(--acid); content: ""; }
+
+    .progress-section { background: linear-gradient(180deg, transparent, rgba(21,30,25,.45), transparent); }
+    .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .stat {
+      padding: 25px; border: 1px solid var(--line); border-radius: 9px; background: rgba(14,20,16,.8);
+    }
+    .stat-label { color: var(--mint); font: 10px var(--mono); letter-spacing: .11em; text-transform: uppercase; }
+    .stat-number { margin: 23px 0 8px; font-size: clamp(35px, 4vw, 48px); line-height: 1; letter-spacing: -.065em; font-weight: 650; }
+    .stat-number span { color: var(--acid); }
+    .stat-detail { color: #c1cdc4; font-size: 12px; line-height: 1.55; }
+    .stat-date { margin-top: 20px; color: var(--quiet); font: 9px var(--mono); }
+    .progress-note {
+      display: flex; align-items: flex-start; gap: 14px; margin-top: 18px; padding: 17px 19px;
+      border: 1px solid var(--line); border-radius: 7px; color: var(--muted);
+      background: rgba(255,255,255,.018); font-size: 12px; line-height: 1.7;
+    }
+    .progress-note svg { flex: none; width: 16px; height: 16px; margin-top: 1px; color: var(--acid); }
+    .progress-note strong { color: #e7eee8; font-weight: 580; }
+
+    .start-grid { display: grid; grid-template-columns: .92fr 1.08fr; gap: 70px; align-items: start; }
+    .start-copy p { max-width: 440px; color: var(--muted); font-size: 14px; line-height: 1.8; }
+    .start-copy .license { margin-top: 25px; padding-top: 21px; border-top: 1px solid var(--line); color: var(--quiet); font-size: 11px; }
+    .terminal {
+      overflow: hidden; border: 1px solid var(--line-strong); border-radius: 9px; background: #0d120f;
+      box-shadow: 0 24px 70px rgba(0,0,0,.2);
+    }
+    .terminal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 16px; border-bottom: 1px solid var(--line); color: #7f9184; font: 10px var(--mono); }
+    .terminal-dots { display: flex; gap: 5px; }
+    .terminal-dots i { width: 7px; height: 7px; border-radius: 50%; background: #46544a; }
+    .terminal-body { padding: 22px 20px 25px; }
+    .terminal-label { margin-bottom: 12px; color: #748579; font: 10px var(--mono); }
+    .command {
+      display: flex; align-items: center; justify-content: space-between; gap: 14px;
+      padding: 16px; border: 1px solid rgba(199,250,101,.14); border-radius: 6px; background: rgba(199,250,101,.035);
+    }
+    .command code { color: #e2ede4; font: 12px/1.65 var(--mono); overflow-wrap: anywhere; }
+    .command code b { color: var(--acid); font-weight: 500; }
+    .copy {
+      flex: none; width: 34px; height: 34px; display: grid; place-items: center;
+      border: 1px solid var(--line-strong); border-radius: 5px; color: #aebdb1; background: transparent; cursor: pointer;
+      transition: color .2s, border-color .2s;
+    }
+    .copy:hover { color: var(--acid); border-color: rgba(199,250,101,.45); }
+    .copy svg { width: 15px; height: 15px; }
+    .terminal-hint { margin: 15px 0 0; color: var(--quiet); font: 10px/1.7 var(--mono); }
+
+    .footer { padding: 30px 0 36px; border-top: 1px solid var(--line); }
+    .footer-inner { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+    .footer-left { display: flex; align-items: center; gap: 18px; }
+    .footer-copy { color: var(--quiet); font: 10px var(--mono); }
+    .footer-links { display: flex; gap: 22px; color: #9baa9f; font: 11px var(--mono); }
+    .footer-links a:hover { color: var(--acid); }
+
+    @media (max-width: 900px) {
+      .hero-grid { grid-template-columns: 1fr; gap: 64px; }
+      .hero-copy { max-width: 720px; }
+      .visual { width: min(100%, 690px); margin-inline: auto; }
+      .principle { grid-template-columns: 1fr; gap: 36px; }
+      .principle-aside { position: static; }
+      .principle-aside .aside-note { max-width: 510px; }
+      .start-grid { grid-template-columns: 1fr; gap: 38px; }
+    }
+    @media (max-width: 680px) {
+      .wrap { width: min(var(--max), calc(100% - 36px)); }
+      .nav { min-height: 66px; }
+      .nav-links { display: none; }
+      .nav-cta { padding: 9px 11px; font-size: 10px; }
+      .hero { padding: 76px 0 58px; }
+      .hero-grid { gap: 45px; }
+      .hero h1 { font-size: clamp(50px, 13vw, 70px); }
+      .hero-lede { font-size: 15px; }
+      .hero-foot { align-items: flex-start; flex-direction: column; margin-top: 75px; }
+      .mini-window { right: -8px; bottom: -33px; }
+      .visual-index { left: -16px; }
+      .section { padding: 82px 0; }
+      .section-head { margin-bottom: 34px; }
+      .layers-grid { grid-template-columns: 1fr; }
+      .layer-card { min-height: 0; }
+      .manifesto { grid-template-columns: 1fr; gap: 23px; padding: 27px 23px; }
+      .stats { grid-template-columns: 1fr; }
+      .stat { padding: 22px; }
+      .stat-number { margin-top: 16px; }
+      .footer-inner, .footer-left { align-items: flex-start; flex-direction: column; }
+      .footer-inner { gap: 18px; }
+      .footer-left { gap: 9px; }
+      .footer-links { flex-wrap: wrap; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap nav">
+      <a class="brand" href="#" aria-label="rENDER home">
+        <span class="brand-mark">r</span><span><b>r</b>ENDER</span>
+      </a>
+      <nav class="nav-links" aria-label="Main navigation">
+        <a href="#architecture">Architecture</a>
+        <a href="#progress">Progress</a>
+        <a href="#start">Build it</a>
+      </nav>
+      <a class="nav-cta" href="https://github.com/elyar-adil/rENDER" target="_blank" rel="noreferrer">
+        View source
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M7 17 17 7M7 7h10v10"/></svg>
+      </a>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="wrap">
+        <div class="hero-grid">
+          <div class="hero-copy">
+            <div class="eyebrow">An independent browser engine · Rust</div>
+            <h1>A browser engine.<br><span class="accent">Built,</span> not borrowed.</h1>
+            <p class="hero-lede">
+              <strong>rENDER is a native desktop browser built around its own engine.</strong>
+              HTML, CSS, JavaScript, layout and painting are implemented here—not delegated to Chromium or a system WebView.
+            </p>
+            <div class="hero-actions">
+              <a class="button button-primary" href="#start">
+                Build from source
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6"/></svg>
+              </a>
+              <a class="button button-secondary" href="https://github.com/elyar-adil/rENDER" target="_blank" rel="noreferrer">
+                Explore the code
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M7 17 17 7M7 7h10v10"/></svg>
+              </a>
+            </div>
+            <p class="hero-note">NOT A CHROMIUM FORK &nbsp;·&nbsp; NOT A WEBVIEW WRAPPER &nbsp;·&nbsp; STILL EXPERIMENTAL</p>
+          </div>
+
+          <div class="visual" aria-label="Screenshots of the rENDER browser">
+            <div class="visual-glow"></div>
+            <div class="browser-window">
+              <div class="browser-bar">
+                <span class="traffic" aria-hidden="true"><i></i><i></i><i></i></span>
+                <span class="tab-pill">rENDER&nbsp; / &nbsp;New tab</span>
+                <span class="address">render://home</span>
+              </div>
+              <div class="browser-screen">
+                <img src="screenshot_index.png" alt="The rENDER browser's built-in start page" fetchpriority="high">
+              </div>
+              <div class="screen-caption"><span>Native browser window</span><span>Real project screenshot ↗</span></div>
+            </div>
+            <div class="mini-window">
+              <img src="screenshot_hao123.png" alt="A real webpage rendered by the rENDER engine" loading="lazy">
+              <div class="mini-label">REAL-WORLD PAGE · ENGINE RENDER</div>
+            </div>
+            <div class="visual-index">FIG. 01 — THE ENGINE IN MOTION</div>
+          </div>
+        </div>
+
+        <div class="hero-foot">
+          <span class="hero-foot-label">One repository. The whole path to pixels.</span>
+          <div class="hero-tags">
+            <span class="tag">RUST</span><span class="tag">NATIVE DESKTOP</span><span class="tag">OWN RENDERING STACK</span><span class="tag">NO SITE-SPECIFIC HACKS</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="architecture">
+      <div class="wrap">
+        <div class="section-head">
+          <div class="section-kicker">01 / Architecture</div>
+          <h2>From a response<br>to a frame. <span style="color:var(--acid)">All yours.</span></h2>
+          <p class="section-intro">A web page does not arrive as pixels. rENDER works through the layers that turn a document into something you can see and interact with.</p>
+        </div>
+
+        <div class="principle">
+          <div class="principle-aside">
+            <p class="big-quote">No borrowed engine hiding underneath. <span>Every layer has a place.</span></p>
+            <p class="aside-note">The crates are separated by responsibility. The browser shell is the edge of the system; the document engine lives inside the repository.</p>
+          </div>
+          <div class="pipeline" aria-label="Rendering pipeline">
+            <div class="pipe-row"><span class="pipe-no">01</span><span class="pipe-name">Fetch</span><span class="pipe-desc">HTTP · TLS · RESOURCES</span></div>
+            <div class="pipe-row"><span class="pipe-no">02</span><span class="pipe-name">Parse</span><span class="pipe-desc">HTML · DOM · ENCODING</span></div>
+            <div class="pipe-row"><span class="pipe-no">03</span><span class="pipe-name">Style</span><span class="pipe-desc">CSS · SELECTORS · CASCADE</span></div>
+            <div class="pipe-row"><span class="pipe-no">04</span><span class="pipe-name">Execute &amp; lay out</span><span class="pipe-desc">JAVASCRIPT · FRAGMENTS</span></div>
+            <div class="pipe-row"><span class="pipe-no">05</span><span class="pipe-name">Paint</span><span class="pipe-desc">DISPLAY LIST · RASTER · COMPOSITE</span></div>
+            <div class="pipe-row"><span class="pipe-no">06</span><span class="pipe-name">Present</span><span class="pipe-desc">NATIVE WINDOW · INPUT</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="wrap">
+        <div class="section-head">
+          <div class="section-kicker">02 / Under the hood</div>
+          <h2>Small pieces.<br>One rendering system.</h2>
+          <p class="section-intro">The engine is split into focused Rust crates. Each layer can be tested and improved without hiding missing work behind a different browser.</p>
+        </div>
+
+        <div class="layers-grid">
+          <article class="layer-card">
+            <div class="layer-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 5h16v14H4zM8 9h8M8 13h5"/></svg></div>
+            <h3>Documents &amp; structure</h3>
+            <p>HTML5 tokenization and tree construction, DOM mutation, namespaces, events and forms.</p>
+            <span class="layer-crate">render-html · render-dom</span>
+          </article>
+          <article class="layer-card">
+            <div class="layer-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 5h16M4 12h11M4 19h7"/><circle cx="18" cy="12" r="2"/><circle cx="14" cy="19" r="2"/></svg></div>
+            <h3>Style &amp; layout</h3>
+            <p>Selectors, cascade, computed values and layout contexts including block, flex, grid and table.</p>
+            <span class="layer-crate">render-css · render-layout</span>
+          </article>
+          <article class="layer-card">
+            <div class="layer-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 17 9 7l3 6 2-4 6 8H4Z"/><path d="M4 20h16"/></svg></div>
+            <h3>Pixels &amp; presentation</h3>
+            <p>JavaScript execution, display lists, image decoding, rasterization and retained compositing.</p>
+            <span class="layer-crate">render-js · render-core</span>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="wrap">
+        <div class="manifesto">
+          <div>
+            <div class="section-kicker">03 / Engineering principle</div>
+            <h2>Standards over shortcuts.</h2>
+          </div>
+          <div>
+            <p class="manifesto-copy">A page that fails is evidence of a missing capability—not a reason to add a rule for that website. rENDER is developed against <strong>web standards, conformance suites and real-page diagnostics</strong>, with the engine itself responsible for getting better.</p>
+            <div class="manifesto-rule">NO PER-SITE BRANCHES · NO EXTERNAL BROWSER FALLBACK</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section progress-section" id="progress">
+      <div class="wrap">
+        <div class="section-head">
+          <div class="section-kicker">04 / Measured progress</div>
+          <h2>Show the work.<br>Including the gaps.</h2>
+          <p class="section-intro">These are results from specific, pinned test suites—not a single browser-compatibility score. They make progress inspectable and limitations visible.</p>
+        </div>
+
+        <div class="stats">
+          <article class="stat">
+            <div class="stat-label">JavaScript · test262</div>
+            <div class="stat-number">88<span>.15%</span></div>
+            <div class="stat-detail">90,965 of 103,199 test variants passed.</div>
+            <div class="stat-date">MEASURED · 01 NOV 2026</div>
+          </article>
+          <article class="stat">
+            <div class="stat-label">HTML · html5lib</div>
+            <div class="stat-number">97<span>.55%</span></div>
+            <div class="stat-detail">7,196 of 7,377 tree-construction pairs matched.</div>
+            <div class="stat-date">MEASURED · 02 NOV 2026</div>
+          </article>
+          <article class="stat">
+            <div class="stat-label">Web Platform Tests</div>
+            <div class="stat-number">7<span>.0%</span></div>
+            <div class="stat-detail">197 of 2,817 executable DOM and HTML tests passed in the recorded run.</div>
+            <div class="stat-date">DOM + HTML · LATEST RECORDED BASELINE</div>
+          </article>
+        </div>
+
+        <div class="progress-note">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8h.01"/></svg>
+          <span><strong>Read the scope, not just the percentages.</strong> These suites test different parts of the platform and are not directly comparable. The current WPT figure covers the recorded DOM + HTML subset; the CSS WPT runner is not yet operational. rENDER remains experimental and is not a general-purpose, secure daily-driver browser.</span>
+        </div>
+        <p style="margin:18px 0 0;color:var(--quiet);font:10px/1.7 var(--mono)">Detailed measurements and known boundaries live in <a href="capability_matrix.md" style="color:var(--mint);text-decoration:underline;text-underline-offset:3px">the capability matrix ↗</a>.</p>
+      </div>
+    </section>
+
+    <section class="section" id="start">
+      <div class="wrap">
+        <div class="start-grid">
+          <div class="start-copy">
+            <div class="section-kicker">05 / Get your hands on it</div>
+            <h2>Run the engine.<br>Read the source.</h2>
+            <p>rENDER is developed in the open repository. Build the native browser locally, inspect the rendering pipeline, or help close one of the documented gaps.</p>
+            <a class="button button-primary" href="https://github.com/elyar-adil/rENDER" target="_blank" rel="noreferrer">
+              Open GitHub repository
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M7 17 17 7M7 7h10v10"/></svg>
+            </a>
+            <p class="license">rENDER Non-Commercial License 1.0. Personal, educational, research and other non-commercial use are permitted. Commercial use requires separate written permission.</p>
+          </div>
+
+          <div class="terminal">
+            <div class="terminal-head">
+              <span class="terminal-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+              <span>TERMINAL · LOCAL BUILD</span>
+              <span>RUST / CARGO</span>
+            </div>
+            <div class="terminal-body">
+              <div class="terminal-label"># Launch the native browser</div>
+              <div class="command">
+                <code><b>$</b> cargo run --release -p render-browser</code>
+                <button class="copy" type="button" aria-label="Copy build command" title="Copy command" data-copy="cargo run --release -p render-browser">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="8" y="8" width="11" height="12" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg>
+                </button>
+              </div>
+              <div class="terminal-label" style="margin-top:21px"># Open a page directly</div>
+              <div class="command">
+                <code><b>$</b> cargo run --release -p render-browser -- https://example.com/</code>
+                <button class="copy" type="button" aria-label="Copy URL launch command" title="Copy command" data-copy="cargo run --release -p render-browser -- https://example.com/">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="8" y="8" width="11" height="12" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg>
+                </button>
+              </div>
+              <p class="terminal-hint">Build prerequisites and platform notes are documented in the README. A system dav1d / pkg-config setup may be required for native AVIF decoding.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="wrap footer-inner">
+      <div class="footer-left">
+        <a class="brand" href="#" aria-label="rENDER home"><span class="brand-mark">r</span><span><b>r</b>ENDER</span></a>
+        <span class="footer-copy">A browser engine, built not borrowed.</span>
+      </div>
+      <div class="footer-links">
+        <a href="https://github.com/elyar-adil/rENDER" target="_blank" rel="noreferrer">GITHUB ↗</a>
+        <a href="../README.md">README</a>
+        <a href="capability_matrix.md">CAPABILITIES</a>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    document.querySelectorAll("[data-copy]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const command = button.getAttribute("data-copy");
+        const original = button.innerHTML;
+        try {
+          await navigator.clipboard.writeText(command);
+          button.setAttribute("aria-label", "Copied");
+          button.title = "Copied";
+          button.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>';
+          window.setTimeout(() => {
+            button.innerHTML = original;
+            button.title = "Copy command";
+            button.setAttribute("aria-label", "Copy command");
+          }, 1400);
+        } catch {
+          button.title = "Clipboard unavailable";
+        }
+      });
+    });
+  </script>
+</body>
+</html>
