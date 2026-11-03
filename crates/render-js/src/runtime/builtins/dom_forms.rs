@@ -54,6 +54,33 @@ fn is_radio(dom: &Dom, node: NodeId) -> bool {
         .is_some_and(|kind| kind.eq_ignore_ascii_case("radio"))
 }
 
+/// Whether `node` is a submit button (HTML §4.10.21.2): a `button` whose type
+/// is `submit` (the default), or an `input` in the Submit Button or Image
+/// Button state.
+fn is_submit_button(dom: &Dom, node: NodeId) -> bool {
+    let Some(NodeKind::Element(element)) = dom.node(node).map(render_dom::Node::kind) else {
+        return false;
+    };
+    if element.namespace != render_dom::Namespace::Html {
+        return false;
+    }
+    match element.local_name.as_str() {
+        "button" => dom
+            .attribute(node, "type")
+            .ok()
+            .flatten()
+            .is_none_or(|kind| kind.eq_ignore_ascii_case("submit")),
+        "input" => dom
+            .attribute(node, "type")
+            .ok()
+            .flatten()
+            .is_some_and(|kind| {
+                kind.eq_ignore_ascii_case("submit") || kind.eq_ignore_ascii_case("image")
+            }),
+        _ => false,
+    }
+}
+
 /// The `value` of a radio button: its `value` content attribute, or `on` when it
 /// has none (HTML §4.10.5.4).
 fn radio_value(dom: &Dom, node: NodeId) -> String {
@@ -184,6 +211,53 @@ impl JsRuntime {
             Some(ObjectHost::Node(node)) if accept(dom, *node) => Ok(*node),
             _ => Err(JsError::type_error("Illegal invocation")),
         }
+    }
+
+    /// `HTMLFormElement.prototype.submit` and `requestSubmit` (HTML §4.10.21.2,
+    /// §4.10.21.3).
+    ///
+    /// `submit()` skips validation and the `submit` event. `requestSubmit()`
+    /// dispatches a cancelable bubbling `submit` event first and only queues
+    /// the submission when script did not prevent its default action. URL
+    /// resolution and the successful-control set belong to the embedding's
+    /// existing form-submission implementation.
+    pub(crate) fn form_submit_native(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+        request_submit: bool,
+    ) -> Result<JsValue, JsError> {
+        let form = self.node_receiver(dom, receiver, Dom::is_form_element)?;
+        let submitter = if request_submit {
+            match arguments.first() {
+                None | Some(JsValue::Undefined | JsValue::Null) => None,
+                Some(value) => {
+                    let JsValue::Object(object) = value else {
+                        return Err(JsError::type_error(
+                            "requestSubmit: submitter is not an element",
+                        ));
+                    };
+                    let node = self.require_node(*object)?;
+                    if !is_submit_button(dom, node) || dom.form_owner(node) != Some(form) {
+                        return Err(JsError::type_error(
+                            "requestSubmit: submitter is not a submit button of this form",
+                        ));
+                    }
+                    Some(node)
+                }
+            }
+        } else {
+            None
+        };
+        if request_submit
+            && !self.dispatch_dom_event(dom, form, "submit", true, true, false, &[])?
+        {
+            return Ok(JsValue::Undefined);
+        }
+        self.pending_form_submissions
+            .push(crate::FormSubmissionRequest { form, submitter });
+        Ok(JsValue::Undefined)
     }
 
     /// `HTMLFormElement.prototype.elements` (HTML §4.10.3).

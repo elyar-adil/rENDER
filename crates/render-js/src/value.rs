@@ -1124,6 +1124,12 @@ pub(crate) enum NativeFunction {
     QueueMicrotask,
     /// `Window.prototype.postMessage`, bound to the window it is installed on.
     WindowPostMessage,
+    /// `window.open`: a same-tab target navigates the embedding's one document.
+    WindowOpen,
+    /// `HTMLFormElement.prototype.submit` / `requestSubmit` (HTML §4.10.21.2,
+    /// §4.10.21.3): the embedding resolves and sends the submission.
+    FormSubmit,
+    FormRequestSubmit,
     /// Dedicated Web Worker operations. The object-side methods act on a
     /// `Worker` instance; the scope-side globals run in the worker's realm.
     WorkerPostMessage,
@@ -4199,6 +4205,7 @@ impl Realm {
             "getComputedStyle",
             NativeFunction::GetComputedStyle,
         );
+        Self::define_global_function(objects, global, "open", NativeFunction::WindowOpen);
         Self::define_global_function(
             objects,
             global,
@@ -5661,6 +5668,15 @@ impl Realm {
             "length",
             NativeFunction::FormLength,
             None,
+        );
+        Self::install_methods(
+            objects,
+            prototypes["HTMLFormElement"],
+            function_prototype,
+            [
+                ("submit", NativeFunction::FormSubmit),
+                ("requestSubmit", NativeFunction::FormRequestSubmit),
+            ],
         );
         Self::install_attribute(
             objects,

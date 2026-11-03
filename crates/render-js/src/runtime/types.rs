@@ -640,6 +640,20 @@ pub struct NavigationRequest {
     pub replace: bool,
 }
 
+/// A form submission a script requested through `form.submit()` or
+/// `form.requestSubmit()`.
+///
+/// The runtime records the form and optional submitter; URL resolution, field
+/// collection and encoding stay in the embedding, which already owns those
+/// rules for user-initiated submissions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormSubmissionRequest {
+    pub form: NodeId,
+    /// The submit button named by `requestSubmit()`, or `None` for
+    /// `form.submit()` and an omitted argument.
+    pub submitter: Option<NodeId>,
+}
+
 /// A session-history change a script requested through the `History` interface.
 /// The runtime records these and never applies them: the embedding updates its
 /// session history, and performs any traversal itself.

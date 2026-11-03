@@ -455,6 +455,7 @@ impl JsRuntime {
             )),
             NativeFunction::StrIterator => self.string_iterator(dom, receiver),
             NativeFunction::WindowPostMessage => self.window_post_message(receiver, arguments),
+            NativeFunction::WindowOpen => self.window_open(arguments, receiver),
             NativeFunction::QueueMicrotask => {
                 let callback = Self::require_callable_object(
                     required_argument(arguments, 0, "queueMicrotask")?,
@@ -933,6 +934,8 @@ impl JsRuntime {
             | NativeFunction::TextSplitText
             | NativeFunction::FormElements
             | NativeFunction::FormLength
+            | NativeFunction::FormSubmit
+            | NativeFunction::FormRequestSubmit
             | NativeFunction::FieldsetElements
             | NativeFunction::ControlForm
             | NativeFunction::DocumentForms

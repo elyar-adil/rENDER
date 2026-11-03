@@ -117,8 +117,8 @@ mod worker_tests;
 
 pub use types::{
     ConsoleLevel, ConsoleMessage, DocumentReadyState, ElementRect, FetchCredentials, FetchOutcome,
-    HistoryRequest, JsMicrotask, NavigationRequest, PendingFetch, TimerEntry, TimerHandler,
-    TimerKind, TimerRequest,
+    FormSubmissionRequest, HistoryRequest, JsMicrotask, NavigationRequest, PendingFetch,
+    TimerEntry, TimerHandler, TimerKind, TimerRequest,
 };
 
 /// Whether a history change may point `new` at the document URL `current`.
@@ -247,6 +247,7 @@ pub struct JsRuntime {
     ready_state: DocumentReadyState,
     pending_history_requests: Vec<HistoryRequest>,
     pending_navigations: Vec<NavigationRequest>,
+    pending_form_submissions: Vec<FormSubmissionRequest>,
     /// Network transfers queued by `fetch()`/`XMLHttpRequest`, drained by the
     /// embedding through [`Self::take_pending_fetch_requests`].
     pending_fetch_requests: Vec<PendingFetch>,
@@ -513,6 +514,7 @@ impl JsRuntime {
             ready_state: DocumentReadyState::Loading,
             pending_history_requests: Vec::new(),
             pending_navigations: Vec::new(),
+            pending_form_submissions: Vec::new(),
             pending_fetch_requests: Vec::new(),
             pending_fetch_promises: BTreeMap::new(),
             pending_fetch_targets: BTreeMap::new(),
@@ -954,6 +956,13 @@ impl JsRuntime {
     /// `href` writes) since the last call. The embedding performs the load.
     pub fn take_pending_navigations(&mut self) -> Vec<NavigationRequest> {
         std::mem::take(&mut self.pending_navigations)
+    }
+
+    /// Drain form submissions requested by `form.submit()` or
+    /// `form.requestSubmit()` since the last call. The embedding resolves the
+    /// action URL and collects the successful controls.
+    pub fn take_pending_form_submissions(&mut self) -> Vec<FormSubmissionRequest> {
+        std::mem::take(&mut self.pending_form_submissions)
     }
 
     /// Drain network transfers queued by `fetch()`/`XMLHttpRequest` since the

@@ -361,6 +361,94 @@ fn location_href_writes_and_assign_replace_queue_navigations() {
 }
 
 #[test]
+fn form_submit_and_request_submit_queue_form_submissions() {
+    let mut parsed = parse_document(
+        "<!doctype html><form id=f action=/send><input name=q value=rust>\
+         <button id=b type=submit>go</button></form>",
+    );
+    let url = Url::parse("https://example.test/current").expect("test URL");
+    let mut runtime = JsRuntime::with_url(&parsed.dom, &url);
+    let mut form = None;
+    let mut button = None;
+    let mut pending = vec![parsed.dom.document()];
+    while let Some(node) = pending.pop() {
+        if let Some(render_dom::NodeKind::Element(element)) =
+            parsed.dom.node(node).map(render_dom::Node::kind)
+        {
+            if element.local_name == "form" {
+                form = Some(node);
+            }
+            if element.local_name == "button" {
+                button = Some(node);
+            }
+        }
+        pending.extend(parsed.dom.children(node).unwrap_or_default().iter().rev());
+    }
+    let form = form.expect("fixture form");
+    let button = button.expect("fixture button");
+
+    runtime
+        .execute(&mut parsed.dom, "document.getElementById('f').submit();")
+        .expect("form.submit executes");
+    assert_eq!(
+        runtime.take_pending_form_submissions(),
+        vec![crate::FormSubmissionRequest {
+            form,
+            submitter: None
+        }]
+    );
+
+    runtime
+        .execute(
+            &mut parsed.dom,
+            "document.getElementById('f').requestSubmit(document.getElementById('b'));",
+        )
+        .expect("form.requestSubmit executes");
+    assert_eq!(
+        runtime.take_pending_form_submissions(),
+        vec![crate::FormSubmissionRequest {
+            form,
+            submitter: Some(button)
+        }]
+    );
+
+    runtime
+        .execute(
+            &mut parsed.dom,
+            "document.getElementById('f').addEventListener('submit', function (event) { \
+                 event.preventDefault(); \
+             }); \
+             document.getElementById('f').requestSubmit();",
+        )
+        .expect("a prevented requestSubmit executes");
+    assert!(runtime.take_pending_form_submissions().is_empty());
+}
+
+#[test]
+fn window_open_navigates_only_a_same_tab_target() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let url = Url::parse("https://example.test/current").expect("test URL");
+    let mut runtime = JsRuntime::with_url(&parsed.dom, &url);
+    let same_tab = runtime
+        .execute(&mut parsed.dom, "window.open('/next', '_self') === window;")
+        .expect("same-tab window.open executes");
+    assert_eq!(same_tab.value, JsValue::Boolean(true));
+    assert_eq!(
+        runtime.take_pending_navigations(),
+        vec![crate::NavigationRequest {
+            url: "https://example.test/next".to_owned(),
+            replace: false
+        }]
+    );
+
+    let new_tab = runtime
+        .execute(&mut parsed.dom, "window.open('/popup', '_blank') === null;")
+        .expect("blank-target window.open executes");
+    assert_eq!(new_tab.value, JsValue::Boolean(true));
+    assert!(runtime.take_pending_navigations().is_empty());
+}
+
+#[test]
 fn location_non_href_writes_still_fail_instead_of_faking_navigation() {
     let mut parsed = parse_document("<!doctype html><p></p>");
     let url = Url::parse("https://example.test/current").expect("test URL");

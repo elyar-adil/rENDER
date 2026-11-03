@@ -1,3 +1,28 @@
+# 交接文档 (2026-11-03, 续十一) — headless 脚本导航与最终资源补齐
+
+headless 之前只渲染首个文档。Google 的 enable-JavaScript 过渡页要等 meta refresh + 定时器才揭示结果，真实站点也常用 `location` 赋值或表单提交换页；停在首文档会截到过渡页。
+
+## 修复
+
+- `render-browser/src/headless.rs`：settle 循环接住脚本导航（`location` 赋值/`assign`/`replace`）、同标签页表单提交和到期的 meta refresh；用同一 transport/cookie jar 加载下一文档，重置每文档缓存与生命周期标志，保留总审计 deadline 和聚合计数。新文档的 runtime 重新安装 viewport/DPR。
+- settle 循环拆出 `finish_rendering`；最终帧发现的新图片/字体/导航会再走一轮有界渲染，不再丢最后一帧资源。
+- 定时器等待受 `--wait-ms` 约束，不再用固定 1s horizon；`--wait-ms` 仍是软预算，单个解释器 turn 不可抢占。
+- 新增 `headless_runner` 集成测试：DOMContentLoaded 定时器导航、等待窗口内到期定时器、GET 表单提交、meta refresh。
+- `render-js` 补 `form.submit()` 请求入队、`location` 导航 API 与嵌套文档同步。
+
+## 验证
+
+```text
+cargo test -p render-browser --test headless_runner    9 passed
+cargo test -p render-browser --lib                   249 passed
+cargo test -p render-js --lib                       1295 passed
+cargo clippy -p render-browser -p render-js --all-targets -- -D warnings
+```
+
+剩余：跨标签页/`window.open` 导航、POST multipart、iframe 内导航编排仍未接管。
+
+---
+
 # 交接文档 (2026-11-03, 续十) — 脚本可见的视口、DPR 与 UA
 
 Apple 首页在 headless 中被判定为 tablet / no-retina，根因不在布局，而在脚本看到的环境与真实渲染环境不一致，且媒体查询缺少分辨率支持。

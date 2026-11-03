@@ -1500,6 +1500,20 @@ impl Page {
         self.event_loop.next_timer_deadline()
     }
 
+    /// Advance the page's virtual clock to `now` without running a turn.
+    ///
+    /// Embeddings that sleep between pumps must move the clock themselves;
+    /// otherwise scheduled timers never become due.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PageError::Clock`] when `now` is earlier than the current
+    /// virtual instant.
+    pub fn advance_time_to(&mut self, now: Duration) -> Result<(), PageError> {
+        self.event_loop.advance_time_to(now)?;
+        Ok(())
+    }
+
     /// Border-box geometry for a DOM node from the latest completed layout,
     /// in CSS pixels relative to the page origin.
     #[must_use]

@@ -28,7 +28,7 @@ use url::Url;
 
 use super::builtins::dom_exception::DomExceptionName;
 use super::{INTRINSICS_PRELUDE_SOURCE, JsRuntime, PRELUDE_SOURCE};
-use crate::{JsError, JsValue, ObjectId, RealmId, TimerRequest};
+use crate::{JsError, JsValue, NavigationRequest, ObjectId, RealmId, TimerRequest};
 
 /// The host's source of the documents and scripts that nested browsing
 /// contexts load by URL.
@@ -554,10 +554,55 @@ impl JsRuntime {
     fn origin_of(&self, realm: RealmId) -> String {
         self.contexts[realm.0].origin.clone()
     }
+
+    /// `window.open(url, target, features)` (HTML §7.2.2). This runtime has one
+    /// browsing context and no popup UI, so only a same-tab target navigates
+    /// the document that called it. `_blank` and named targets return `null`.
+    pub(super) fn window_open(
+        &mut self,
+        arguments: &[JsValue],
+        receiver: ObjectId,
+    ) -> Result<JsValue, JsError> {
+        let requested = match arguments.first() {
+            None | Some(JsValue::Undefined | JsValue::Null) => "about:blank".to_owned(),
+            Some(value) => value.to_js_string().to_lossy(),
+        };
+        let target = arguments
+            .get(1)
+            .map_or_else(String::new, |value| value.to_js_string().to_lossy());
+        if !window_target_is_same_tab(&target) {
+            return Ok(JsValue::Null);
+        }
+        let base = self.document_base_url().ok_or_else(|| {
+            JsError::dom("window.open: the window has no document URL to resolve against")
+        })?;
+        let resolved = base.join(&requested).map_err(|error| {
+            self.dom_exception(
+                DomExceptionName::Syntax,
+                format!("window.open: {requested:?} is not a valid URL: {error}"),
+            )
+        })?;
+        self.pending_navigations.push(NavigationRequest {
+            url: resolved.to_string(),
+            replace: false,
+        });
+        // The same browsing context is the WindowProxy the caller already holds.
+        Ok(JsValue::Object(receiver))
+    }
 }
 
 fn blank_url() -> Url {
     Url::parse(ABOUT_BLANK).expect("constant URL")
+}
+
+/// Whether a `window.open` target names the browsing context that is already
+/// displayed. This runtime has no second window, so only the explicit same-tab
+/// keywords resolve to it.
+fn window_target_is_same_tab(target: &str) -> bool {
+    matches!(
+        target.to_ascii_lowercase().as_str(),
+        "_self" | "_top" | "_parent"
+    )
 }
 
 /// Whether a document at `url` takes its origin and base URL from the document

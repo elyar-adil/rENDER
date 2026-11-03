@@ -174,6 +174,13 @@ impl JsRuntime {
             }
             NativeFunction::FormElements => self.form_elements_native(dom, receiver),
             NativeFunction::FormLength => self.form_length_native(dom, receiver),
+            NativeFunction::FormSubmit | NativeFunction::FormRequestSubmit => self
+                .form_submit_native(
+                    dom,
+                    receiver,
+                    arguments,
+                    function == NativeFunction::FormRequestSubmit,
+                ),
             NativeFunction::FieldsetElements => self.fieldset_elements_native(dom, receiver),
             NativeFunction::ControlForm => self.control_form_native(dom, receiver),
             NativeFunction::DocumentForms => self.document_forms_native(dom, receiver),

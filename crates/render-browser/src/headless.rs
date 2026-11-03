@@ -43,8 +43,10 @@ use render_core::image::{
     ImageLimits, ImageResourceKey, ImageResources, ImageSelectionContext, ImageSource,
 };
 use render_core::import_map::ImportMap;
+use render_core::interaction::{FormEnctype, FormMethod, plan_form_submission};
 use render_core::js::{
     DocumentReadyState, DynamicModuleUnit, ElementRect, FetchCredentials, FetchOutcome,
+    FormSubmissionRequest,
 };
 use render_core::layout::{LayoutOptions, PhysicalSize};
 use render_core::module_graph::{ModuleGraph, module_key};
@@ -81,12 +83,17 @@ const PAGE_TURN_BUDGET: usize = 64;
 const SCRIPT_BATCH_TURN_BUDGET: usize = 1_024;
 /// Wall-clock slice for draining one prepared classic-script batch.
 const SCRIPT_BATCH_TIME_BUDGET: Duration = Duration::from_millis(500);
-/// A pending timer within this horizon is allowed to fire before the final
-/// frame. Longer timers do not keep a settled page alive: the screenshot is a
-/// snapshot, not a recording session.
-const TIMER_HORIZON: Duration = Duration::from_secs(1);
+/// A page timer may keep the runner alive up to the `--wait-ms` deadline; one
+/// sleep is capped so a new earlier wake-up (a meta refresh) is noticed.
+const MAX_TIMER_SLEEP: Duration = Duration::from_secs(5);
 /// Upper bound on source bytes accepted for one page transfer.
 const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
+/// Same-tab navigations a script or a `<meta http-equiv="refresh">` may cause
+/// before the runner stops following redirects.
+const MAX_NAVIGATIONS: usize = 10;
+/// Render/apply rounds after the settle loop, so resources discovered by the
+/// final frame still reach that frame.
+const MAX_FINAL_RENDER_PASSES: usize = 4;
 
 /// Inputs for one offscreen page load.
 #[derive(Clone, Debug)]
@@ -160,6 +167,8 @@ pub struct HeadlessHealth {
     pub fonts_loaded: usize,
     pub font_failures: usize,
     pub page_fetches: usize,
+    /// Same-tab navigations followed beyond the initial document.
+    pub navigations: usize,
     pub elapsed_ms: u64,
     pub timed_out: bool,
 }
@@ -191,7 +200,7 @@ impl HeadlessReport {
              \"scripts_queued\":{},\"scripts_executed\":{},\"scripts_failed\":{},\"scripts_threw\":{},\
              \"images_loaded\":{},\"images_failed\":{},\
              \"fonts_loaded\":{},\"font_failures\":{},\"page_fetches\":{},\
-             \"elapsed_ms\":{},\"timed_out\":{},\"geometry\":[",
+             \"navigations\":{},\"elapsed_ms\":{},\"timed_out\":{},\"geometry\":[",
             json_string(health.url.as_str()),
             json_string(health.final_url.as_str()),
             json_string(&health.ready_state),
@@ -215,6 +224,7 @@ impl HeadlessReport {
             health.fonts_loaded,
             health.font_failures,
             health.page_fetches,
+            health.navigations,
             health.elapsed_ms,
             health.timed_out,
         );
@@ -279,6 +289,7 @@ pub fn write_surface_png(surface: &Surface, path: &Path) -> io::Result<()> {
 struct HeadlessSession {
     options: HeadlessOptions,
     page: Page,
+    page_options: PageOptions,
     base_url: Url,
     transport: HttpTransport,
     cookies: CookieJar,
@@ -316,7 +327,11 @@ struct HeadlessSession {
     fonts_loaded: usize,
     font_failures: usize,
     page_fetches: usize,
+    navigations: usize,
+    navigation_limit_reached: bool,
+    fired_meta_refresh: Option<(NodeId, String)>,
     created_at: Instant,
+    document_started_at: Instant,
     deadline: Instant,
 }
 
@@ -346,15 +361,12 @@ impl HeadlessSession {
             device_scale: options.device_scale,
             ..DocumentRenderOptions::default()
         };
-        let mut page = Page::with_options_and_url_unrendered(
-            &html,
-            PageOptions {
-                runtime_limits: runtime_limits(),
-                render: render_options,
-                ..PageOptions::default()
-            },
-            &final_url,
-        );
+        let page_options = PageOptions {
+            runtime_limits: runtime_limits(),
+            render: render_options,
+            ..PageOptions::default()
+        };
+        let mut page = Page::with_options_and_url_unrendered(&html, page_options, &final_url);
         // Scripts must see the same geometry the renderer uses. Without this
         // the runtime defaults to 1024x768/DPR 1, so responsive pages sniff a
         // tablet viewport and choose the wrong markup and image variants.
@@ -371,6 +383,7 @@ impl HeadlessSession {
         Ok(Self {
             options,
             page,
+            page_options,
             base_url: final_url,
             transport,
             cookies,
@@ -408,7 +421,11 @@ impl HeadlessSession {
             fonts_loaded: 0,
             font_failures: 0,
             page_fetches: 0,
+            navigations: 0,
+            navigation_limit_reached: false,
+            fired_meta_refresh: None,
             created_at: now,
+            document_started_at: now,
             deadline: now + wait,
         })
     }
@@ -427,15 +444,21 @@ impl HeadlessSession {
                 break;
             }
             activity |= self.apply_scripts()?;
-            if self.expired() {
-                timed_out = true;
-                break;
-            }
+            self.sync_cookies();
             activity |= self.service_page_fetches();
             activity |= self.service_dynamic_imports();
             activity |= self.run_page_turns(PAGE_TURN_BUDGET);
+            self.sync_cookies();
             // A fetch resolved by `settle_fetch` can itself queue another one.
             activity |= self.service_page_fetches();
+            if let Some(load) = self.take_requested_navigation() {
+                if self.expired() {
+                    timed_out = true;
+                    break;
+                }
+                self.navigate(&load)?;
+                continue;
+            }
             if self.expired() {
                 timed_out = true;
                 break;
@@ -461,48 +484,30 @@ impl HeadlessSession {
                 timed_out = true;
                 break;
             }
-            // A timer due shortly is part of the page's settle path (a
-            // deferred bootstrap, an image swap). A timer beyond the horizon
-            // belongs to a recording, not to this snapshot.
+            let remaining = self.deadline.saturating_duration_since(now);
             let elapsed = self.created_at.elapsed();
+            let mut wake: Option<Duration> = None;
             if let Some(next) = self.page.next_wake_deadline()
                 && next >= elapsed
             {
                 let delay = next.saturating_sub(elapsed);
-                let remaining = self.deadline.saturating_duration_since(now);
-                if delay <= TIMER_HORIZON.min(remaining) {
-                    std::thread::sleep(delay);
-                    continue;
+                if delay <= remaining {
+                    wake = Some(delay);
                 }
+            }
+            if let Some(delay) = self.meta_refresh_wait()
+                && delay <= remaining
+            {
+                wake = Some(wake.map_or(delay, |current| current.min(delay)));
+            }
+            if let Some(delay) = wake {
+                std::thread::sleep(delay.min(MAX_TIMER_SLEEP));
+                continue;
             }
             break;
         }
 
-        // Drain work the final render itself queued (geometry-driven
-        // microtasks, image load events) without starting a new page timer.
-        if !timed_out {
-            for _ in 0..8 {
-                if !self.run_page_turns(8) {
-                    break;
-                }
-            }
-        }
-        let current_revision = self.page.document().dom().revision().as_u64();
-        if self.needs_render || self.rendered_revision != Some(current_revision) {
-            self.render()?;
-        }
-        self.advance_ready_state();
-        if !timed_out {
-            for _ in 0..4 {
-                if !self.run_page_turns(8) {
-                    break;
-                }
-            }
-        }
-        if self.rendered_revision != Some(self.page.document().dom().revision().as_u64()) {
-            self.render()?;
-        }
-
+        self.finish_rendering(timed_out)?;
         let output = self
             .last_render
             .take()
@@ -519,6 +524,262 @@ impl HeadlessSession {
             geometry: self.geometry_json(),
             dom_html,
         })
+    }
+
+    /// Apply the resources the last frame discovered and re-render until a
+    /// pass produces neither new resources nor page activity.
+    ///
+    /// A render can reveal work that only exists in the resulting tree: an
+    /// image referenced by a style set the cascade just activated, a font
+    /// family a late script introduced, or a navigation queued while the
+    /// frame was produced. Running a bounded second phase after the settle
+    /// loop keeps those from being dropped from the final frame.
+    fn finish_rendering(&mut self, timed_out: bool) -> Result<(), String> {
+        for _ in 0..MAX_FINAL_RENDER_PASSES {
+            let revision = self.page.document().dom().revision().as_u64();
+            if self.needs_render
+                || self.last_render.is_none()
+                || self.rendered_revision != Some(revision)
+            {
+                self.render()?;
+            }
+            let output = self.last_render.take();
+            let mut applied = false;
+            if let Some(output) = output.as_ref() {
+                applied |= self.apply_fonts(output);
+                applied |= self.apply_images(Some(output));
+            }
+            self.last_render = output;
+            let mut page_activity = false;
+            if !timed_out {
+                page_activity |= self.advance_ready_state();
+                page_activity |= self.run_page_turns(8);
+                self.sync_cookies();
+                if let Some(load) = self.take_requested_navigation()
+                    && !self.expired()
+                {
+                    self.navigate(&load)?;
+                    continue;
+                }
+            }
+            if !applied && !page_activity {
+                break;
+            }
+        }
+        let revision = self.page.document().dom().revision().as_u64();
+        if self.needs_render
+            || self.last_render.is_none()
+            || self.rendered_revision != Some(revision)
+        {
+            self.render()?;
+        }
+        Ok(())
+    }
+
+    /// Moves `document.cookie` writes into the HTTP jar and seeds the JS jar
+    /// with the cookies that apply to the current document. The jar itself is
+    /// never replaced by a navigation, so both first-party and script cookies
+    /// survive to the next document.
+    fn sync_cookies(&mut self) {
+        let writes = self.page.runtime_mut().take_pending_cookie_writes();
+        for write in writes {
+            if let Err(issue) = self.cookies.set_cookie(&self.base_url, &write) {
+                eprintln!("render-headless: cookie rejected: {}", issue.message);
+            }
+        }
+        let header = self
+            .cookies
+            .cookie_header(&self.base_url)
+            .unwrap_or_default();
+        self.page.runtime_mut().set_document_cookies(&header);
+    }
+
+    /// The newest navigation requested by page script or a due meta refresh.
+    fn take_requested_navigation(&mut self) -> Option<DocumentLoad> {
+        if self.navigation_limit_reached {
+            let _ = self.page.runtime_mut().take_pending_navigations();
+            let _ = self.page.runtime_mut().take_pending_form_submissions();
+            return None;
+        }
+        let navigations = self.page.runtime_mut().take_pending_navigations();
+        if let Some(request) = navigations.into_iter().next_back() {
+            match Url::parse(&request.url) {
+                Ok(url) => return Some(DocumentLoad::get(url)),
+                Err(error) => {
+                    eprintln!(
+                        "render-headless: ignoring invalid script navigation URL {:?}: {error}",
+                        request.url
+                    );
+                }
+            }
+        }
+        let submissions = self.page.runtime_mut().take_pending_form_submissions();
+        if let Some(request) = submissions.into_iter().next_back()
+            && let Some(load) = self.form_navigation(&request)
+        {
+            return Some(load);
+        }
+        self.meta_refresh_request()
+    }
+
+    fn form_navigation(&self, request: &FormSubmissionRequest) -> Option<DocumentLoad> {
+        let dom = self.page.document().dom();
+        if !form_submission_is_same_tab(dom, request.form, request.submitter) {
+            return None;
+        }
+        let submitter = request.submitter.unwrap_or(request.form);
+        let plan = match plan_form_submission(dom, submitter, &self.base_url) {
+            Ok(plan) => plan,
+            Err(error) => {
+                eprintln!("render-headless: form submission ignored: {error}");
+                return None;
+            }
+        };
+        match (plan.method, plan.enctype) {
+            (FormMethod::Get, _) => Some(DocumentLoad::get(plan.target)),
+            (FormMethod::Post, FormEnctype::UrlEncoded) => {
+                let body = plan.urlencoded_body().into_bytes();
+                Some(DocumentLoad::post(plan.target, body))
+            }
+            (FormMethod::Post, enctype) => {
+                eprintln!(
+                    "render-headless: form submission ignored: enctype {enctype:?} is not supported"
+                );
+                None
+            }
+        }
+    }
+
+    fn navigate(&mut self, load: &DocumentLoad) -> Result<(), String> {
+        if self.navigations >= MAX_NAVIGATIONS {
+            if !self.navigation_limit_reached {
+                eprintln!("render-headless: navigation limit {MAX_NAVIGATIONS} reached");
+            }
+            self.navigation_limit_reached = true;
+            return Ok(());
+        }
+        if !matches!(load.url.scheme(), "http" | "https" | "file") {
+            eprintln!(
+                "render-headless: ignoring navigation to unsupported URL scheme {:?}",
+                load.url.scheme()
+            );
+            return Ok(());
+        }
+        let (html, final_url) = load_document(&self.transport, &mut self.cookies, load)?;
+        self.navigations = self.navigations.saturating_add(1);
+        self.reset_document(&html, final_url);
+        Ok(())
+    }
+
+    /// Replace the displayed document while keeping the transport, cookie jar,
+    /// font backend and the overall audit deadline. Every per-document cache
+    /// and lifecycle flag starts over; counters aggregate over the audit.
+    fn reset_document(&mut self, html: &str, final_url: Url) {
+        let page_options = self.page_options;
+        self.page = Page::with_options_and_url_unrendered(html, page_options, &final_url);
+        self.page.runtime_mut().install_viewport(
+            self.options.viewport_width as f32,
+            self.options.viewport_height as f32,
+            0.0,
+            0.0,
+        );
+        self.page
+            .runtime_mut()
+            .install_device_pixel_ratio(f64::from(self.options.device_scale));
+        self.base_url = final_url;
+        self.style_sheets = ExternalStyleSheets::default();
+        self.attempted_styles.clear();
+        self.images = ImageResources::default();
+        self.attempted_images.clear();
+        self.started_scripts.clear();
+        self.import_map = ImportMap::default();
+        self.font_loader = DocumentFontLoader::new();
+        self.attempted_fonts.clear();
+        self.transitions = TransitionState::default();
+        self.last_render = None;
+        self.computed_styles.clear();
+        self.last_geometry.clear();
+        self.rendered_revision = None;
+        self.needs_render = true;
+        self.initial_script_scan_done = false;
+        self.dom_content_loaded = false;
+        self.load_fired = false;
+        self.styles_pending = true;
+        self.scripts_pending = true;
+        self.images_pending = true;
+        self.fonts_pending = true;
+        self.fired_meta_refresh = None;
+        self.document_started_at = Instant::now();
+        self.sync_cookies();
+    }
+
+    /// The first `<meta http-equiv="refresh">` in tree order, resolved against
+    /// the current document URL.
+    fn meta_refresh(&self) -> Option<MetaRefresh> {
+        let dom = self.page.document().dom();
+        let mut stack = vec![dom.document()];
+        while let Some(node) = stack.pop() {
+            if let Some(NodeKind::Element(element)) =
+                dom.node(node).map(render_core::dom::Node::kind)
+            {
+                let refresh = element.namespace == render_core::dom::Namespace::Html
+                    && element.local_name == "meta"
+                    && dom
+                        .attribute(node, "http-equiv")
+                        .ok()
+                        .flatten()
+                        .is_some_and(|value| value.eq_ignore_ascii_case("refresh"));
+                if refresh
+                    && let Some(content) = dom.attribute(node, "content").ok().flatten()
+                    && let Some((delay, target)) = parse_meta_refresh(content)
+                {
+                    let url = if target.is_empty() {
+                        self.base_url.clone()
+                    } else {
+                        self.base_url.join(&target).ok()?
+                    };
+                    return Some(MetaRefresh {
+                        node,
+                        content: content.to_owned(),
+                        url,
+                        delay,
+                    });
+                }
+            }
+            if let Some(children) = dom.children(node) {
+                stack.extend(children.iter().rev().copied());
+            }
+        }
+        None
+    }
+
+    fn meta_refresh_request(&mut self) -> Option<DocumentLoad> {
+        let refresh = self.meta_refresh()?;
+        let key = (refresh.node, refresh.content.clone());
+        if self.fired_meta_refresh.as_ref() == Some(&key) {
+            return None;
+        }
+        if self.document_started_at.elapsed() < refresh.delay {
+            return None;
+        }
+        self.fired_meta_refresh = Some(key);
+        Some(DocumentLoad::get(refresh.url))
+    }
+
+    fn meta_refresh_wait(&self) -> Option<Duration> {
+        if self.navigation_limit_reached {
+            return None;
+        }
+        let refresh = self.meta_refresh()?;
+        let key = (refresh.node, refresh.content.clone());
+        if self.fired_meta_refresh.as_ref() == Some(&key) {
+            return None;
+        }
+        Some(
+            refresh
+                .delay
+                .saturating_sub(self.document_started_at.elapsed()),
+        )
     }
 
     fn expired(&self) -> bool {
@@ -1117,6 +1378,10 @@ impl HeadlessSession {
 
     fn run_page_turns(&mut self, budget: usize) -> bool {
         let mut activity = false;
+        let now = self.document_started_at.elapsed();
+        if let Err(error) = self.page.advance_time_to(now) {
+            eprintln!("render-headless: could not advance the page clock: {error}");
+        }
         for _ in 0..budget {
             if self.expired() {
                 break;
@@ -1262,6 +1527,7 @@ impl HeadlessSession {
             fonts_loaded: self.fonts_loaded,
             font_failures: self.font_failures,
             page_fetches: self.page_fetches,
+            navigations: self.navigations,
             elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
             timed_out,
         }
@@ -1385,17 +1651,66 @@ fn build_transport(proxy: Option<&str>) -> Result<HttpTransport, String> {
     }
 }
 
+/// One document load, whether it is the first navigation or a same-tab
+/// navigation requested later by page script or a meta refresh.
+#[derive(Clone, Debug)]
+struct DocumentLoad {
+    url: Url,
+    method: HttpMethod,
+    body: Option<Vec<u8>>,
+}
+
+impl DocumentLoad {
+    fn get(url: Url) -> Self {
+        Self {
+            url,
+            method: HttpMethod::Get,
+            body: None,
+        }
+    }
+
+    fn post(url: Url, body: Vec<u8>) -> Self {
+        Self {
+            url,
+            method: HttpMethod::Post,
+            body: Some(body),
+        }
+    }
+}
+
+/// A due-or-upcoming `<meta http-equiv="refresh">` navigation.
+#[derive(Clone, Debug)]
+struct MetaRefresh {
+    node: NodeId,
+    content: String,
+    url: Url,
+    delay: Duration,
+}
+
 fn load_initial_document(
     transport: &HttpTransport,
     cookies: &mut CookieJar,
     url: &Url,
 ) -> Result<(String, Url), String> {
+    load_document(transport, cookies, &DocumentLoad::get(url.clone()))
+}
+
+fn load_document(
+    transport: &HttpTransport,
+    cookies: &mut CookieJar,
+    load: &DocumentLoad,
+) -> Result<(String, Url), String> {
+    let url = &load.url;
     match url.scheme() {
         "http" | "https" => {
-            let request = cookies.decorate_request(
-                FetchRequest::get(url.clone())
-                    .with_accept("text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1"),
-            );
+            let mut request = FetchRequest::new(load.method, url.clone())
+                .with_accept("text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1");
+            if let Some(body) = &load.body {
+                request = request
+                    .with_header("Content-Type", "application/x-www-form-urlencoded")
+                    .with_body(body.clone());
+            }
+            let request = cookies.decorate_request(request);
             let response = transport
                 .fetch(&request, &CancelToken::default())
                 .map_err(|error| format!("navigation to {url} failed: {error}"))?;
@@ -1463,6 +1778,58 @@ fn load_initial_document(
             "unsupported URL scheme {scheme:?}; use http, https or file"
         )),
     }
+}
+
+/// Whether a form's target names the context already displayed. A blank or
+/// `_self`/`_top`/`_parent` target stays here; `_blank` is the only target
+/// this single-context runner refuses to follow.
+fn form_submission_is_same_tab(
+    dom: &render_core::dom::Dom,
+    form: NodeId,
+    submitter: Option<NodeId>,
+) -> bool {
+    let target = submitter
+        .and_then(|node| dom.attribute(node, "formtarget").ok().flatten())
+        .or_else(|| dom.attribute(form, "target").ok().flatten())
+        .unwrap_or_default();
+    !target.eq_ignore_ascii_case("_blank")
+}
+
+/// Parse the `content` of `<meta http-equiv="refresh">` into (delay, URL text).
+/// The URL is empty for a plain timed reload. Invalid directives are ignored.
+fn parse_meta_refresh(content: &str) -> Option<(Duration, String)> {
+    let content = content.trim_start();
+    let (seconds, rest) = content
+        .split_once(';')
+        .map_or((content, None), |(seconds, rest)| (seconds, Some(rest)));
+    let seconds: f64 = seconds.trim().parse().ok()?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    // Meta refresh delays beyond a day belong to a recording, not an audit.
+    let delay = Duration::from_secs_f64(seconds.min(86_400.0));
+    let Some(rest) = rest else {
+        return Some((delay, String::new()));
+    };
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return Some((delay, String::new()));
+    }
+    let (keyword, value) = rest.split_once('=')?;
+    if !keyword.trim().eq_ignore_ascii_case("url") {
+        return None;
+    }
+    let value = value.trim();
+    let value = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .or_else(|| {
+            value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+        })
+        .unwrap_or(value);
+    Some((delay, value.trim().to_owned()))
 }
 
 fn module_outcome(result: FetchResult) -> Result<(Url, String), String> {
