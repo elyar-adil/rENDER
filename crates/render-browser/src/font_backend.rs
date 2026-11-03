@@ -1481,6 +1481,18 @@ fn line_metrics(font: &Font, font_size: f32) -> (f32, f32) {
 }
 
 impl TextMeasurer for SystemFontBackend {
+    fn normal_line_height(&self, font_size: f32, font: &FontRequest<'_>) -> f32 {
+        let instance = self.resolve(font);
+        // CSS 2.1 §10.8.1's "reasonable for the font": the same face that
+        // spaces the line supplies ascent - descent + line gap. fontdue scales
+        // these to the requested pixel size.
+        self.face_for(&instance, ' ')
+            .and_then(|(face, _, _)| face.horizontal_line_metrics(font_size))
+            .map_or(font_size * 1.2, |metrics| {
+                metrics.new_line_size.max(font_size * 0.5)
+            })
+    }
+
     fn measure(&self, text: &str, style: TextStyle<'_>) -> TextMeasure {
         let instance = self.resolve(&style.font);
         let mut advance = 0.0_f32;
@@ -1970,6 +1982,27 @@ mod tests {
     /// The total coverage of a mask, for the assertions below.
     fn ink(coverage: &[u8]) -> u32 {
         coverage.iter().map(|value| u32::from(*value)).sum()
+    }
+
+    #[test]
+    fn normal_line_height_follows_the_selected_face() {
+        let backend = SystemFontBackend::load().expect("system fonts load");
+        let arial = FontRequest::of_family("Arial");
+        let pingfang = FontRequest::of_family("PingFang SC");
+        let arial_height = backend.normal_line_height(16.0, &arial);
+        let pingfang_height = backend.normal_line_height(16.0, &pingfang);
+        assert!(
+            (16.0..24.0).contains(&arial_height),
+            "Arial 16px normal line height is {arial_height}"
+        );
+        assert!(
+            (16.0..28.0).contains(&pingfang_height),
+            "PingFang 16px normal line height is {pingfang_height}"
+        );
+        assert!(
+            pingfang_height > arial_height,
+            "a CJK face's larger ascent/descent must not collapse to the Arial line box"
+        );
     }
 
     #[test]

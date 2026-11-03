@@ -1445,18 +1445,24 @@ impl<'a> Solver<'a> {
             .and_then(|value| parse_font_size(value.css_text(), self.options.root_font_size))
             .unwrap_or(self.options.root_font_size)
             .clamp(1.0, 512.0);
-        let line_height = computed
-            .and_then(|style| style.get("line-height"))
-            .and_then(|value| parse_line_height(value.css_text(), font_size))
-            .unwrap_or(font_size * 1.2)
-            .clamp(font_size, 1_024.0);
+        let font = self.font_request(computed, source);
+        let line_height = match computed.and_then(|style| style.get("line-height")) {
+            Some(value) if value.css_text().trim().eq_ignore_ascii_case("normal") => {
+                self.text_measurer.normal_line_height(font_size, &font)
+            }
+            Some(value) => {
+                parse_line_height(value.css_text(), font_size).unwrap_or(font_size * 1.2)
+            }
+            None => self.text_measurer.normal_line_height(font_size, &font),
+        }
+        .clamp(font_size, 1_024.0);
         let (spacing, diagnostics) = self.text_spacing(computed, source, font_size);
         (
             InlineTextStyle {
                 style: TextStyle {
                     font_size,
                     line_height,
-                    font: self.font_request(computed, source),
+                    font,
                 },
                 spacing,
             },

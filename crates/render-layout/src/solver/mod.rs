@@ -183,6 +183,17 @@ pub trait TextMeasurer: Sync {
     /// [`crate::font::nominal_face`].
     fn measure(&self, text: &str, style: TextStyle<'_>) -> TextMeasure;
 
+    /// The used value of `line-height: normal` for one face, in CSS pixels.
+    ///
+    /// CSS 2.1 §10.8.1 leaves this to the user agent and recommends a value
+    /// "reasonable for the font"; browsers use the face's ascent, descent and
+    /// line gap. The default keeps font-free test measurers deterministic at
+    /// 1.2em, while a real backend overrides it with the selected face's
+    /// metrics so Arial and PingFang do not share one line height.
+    fn normal_line_height(&self, font_size: f32, _font: &FontRequest<'_>) -> f32 {
+        font_size * 1.2
+    }
+
     /// Measure `text` with the CSS Text 3 §7 spacing that applies to it.
     ///
     /// The default body keeps this trait source-compatible for existing
