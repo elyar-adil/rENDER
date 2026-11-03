@@ -189,7 +189,7 @@ pub trait TextMeasurer: Sync {
     /// "reasonable for the font"; browsers use the face's ascent, descent and
     /// line gap. The default keeps font-free test measurers deterministic at
     /// 1.2em, while a real backend overrides it with the selected face's
-    /// metrics so Arial and PingFang do not share one line height.
+    /// metrics so Arial and `PingFang` do not share one line height.
     fn normal_line_height(&self, font_size: f32, _font: &FontRequest<'_>) -> f32 {
         font_size * 1.2
     }
