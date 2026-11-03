@@ -1316,10 +1316,85 @@ pub enum GridTemplate {
     },
 }
 
+/// The track list of `grid-auto-columns`. The grammar is `<track-size>+`
+/// (CSS Grid §7.7), so it always has at least one track and never accepts
+/// `none` or `repeat()`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GridAutoTracks(pub Vec<GridTrack>);
+
+impl GridAutoTracks {
+    fn to_css(&self) -> String {
+        serialize_grid_tracks(&self.0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GridAutoRepeat {
     Fill,
     Fit,
+}
+
+/// `grid-auto-flow` (CSS Grid §8.5): the placement axis and whether packing is
+/// dense. The two values are orthogonal in the grammar (`[ row | column ] ||
+/// dense`), so they are stored as one enum rather than a pair that could hold
+/// an impossible state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GridAutoFlow {
+    Row,
+    Column,
+    RowDense,
+    ColumnDense,
+}
+
+impl GridAutoFlow {
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        let mut column = None;
+        let mut dense = false;
+        let mut tokens = value.split_ascii_whitespace().peekable();
+        tokens.peek()?;
+        for token in tokens {
+            if token.eq_ignore_ascii_case("dense") {
+                if dense {
+                    return None;
+                }
+                dense = true;
+            } else if token.eq_ignore_ascii_case("row") || token.eq_ignore_ascii_case("column") {
+                if column.is_some() {
+                    return None;
+                }
+                column = Some(token.eq_ignore_ascii_case("column"));
+            } else {
+                return None;
+            }
+        }
+        Some(match (column.unwrap_or(false), dense) {
+            (false, false) => Self::Row,
+            (true, false) => Self::Column,
+            (false, true) => Self::RowDense,
+            (true, true) => Self::ColumnDense,
+        })
+    }
+
+    #[must_use]
+    pub const fn is_column(self) -> bool {
+        matches!(self, Self::Column | Self::ColumnDense)
+    }
+
+    #[must_use]
+    pub const fn is_dense(self) -> bool {
+        matches!(self, Self::RowDense | Self::ColumnDense)
+    }
+
+    #[must_use]
+    pub const fn to_css(self) -> &'static str {
+        match self {
+            Self::Row => "row",
+            Self::Column => "column",
+            Self::RowDense => "row dense",
+            Self::ColumnDense => "column dense",
+        }
+    }
 }
 
 /// One `<grid-line>` component of a `grid-*-start`/`grid-*-end` placement
@@ -1344,6 +1419,7 @@ pub enum GridTrack {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum GridTrackBreadth {
+    Auto,
     LengthPercentage(LengthPercentage),
     Fraction(f32),
 }
@@ -1535,6 +1611,8 @@ pub enum TypedPropertyValue {
     ColumnSpan(ColumnSpan),
     GridTemplate(GridTemplate),
     GridLine(GridLine),
+    GridAutoFlow(GridAutoFlow),
+    GridAutoTracks(GridAutoTracks),
     AspectRatio(AspectRatio),
     Transform(TransformList),
     TransformOrigin(TransformOrigin),
@@ -1598,6 +1676,8 @@ impl TypedPropertyValue {
             Self::ColumnSpan(_) => "column-span",
             Self::GridTemplate(_) => "grid-template",
             Self::GridLine(_) => "grid-line",
+            Self::GridAutoFlow(_) => "grid-auto-flow",
+            Self::GridAutoTracks(_) => "grid-auto-tracks",
             Self::AspectRatio(_) => "aspect-ratio",
             Self::Transform(_) => "transform",
             Self::TransformOrigin(_) => "transform-origin",
@@ -1660,6 +1740,8 @@ impl TypedPropertyValue {
             Self::ColumnSpan(value) => value.as_str().to_owned(),
             Self::GridTemplate(value) => value.to_css(),
             Self::GridLine(value) => value.to_css(),
+            Self::GridAutoFlow(value) => value.to_css().to_owned(),
+            Self::GridAutoTracks(value) => value.to_css(),
             Self::AspectRatio(value) => value.to_css(),
             Self::Transform(value) => value.to_css(),
             Self::TransformOrigin(value) => value.to_css(),
@@ -1877,6 +1959,7 @@ impl GridTrack {
 impl GridTrackBreadth {
     fn to_css(&self) -> String {
         match self {
+            Self::Auto => "auto".to_owned(),
             Self::LengthPercentage(value) => value.to_css(),
             Self::Fraction(value) => format_number_unit(*value, "fr"),
         }
@@ -2016,6 +2099,8 @@ pub const DECLARED_GRAMMARS: &[&str] = &[
     "column-span",
     "grid-template-columns",
     "grid-template-rows",
+    "grid-auto-flow",
+    "grid-auto-columns",
     "grid-column-start",
     "grid-column-end",
     "grid-row-start",
@@ -2223,6 +2308,10 @@ fn parse_property<'i>(
         }
         "grid-template-columns" | "grid-template-rows" => {
             parse_grid_template(input).map(TypedPropertyValue::GridTemplate)
+        }
+        "grid-auto-flow" => parse_grid_auto_flow(input).map(TypedPropertyValue::GridAutoFlow),
+        "grid-auto-columns" => {
+            parse_grid_auto_tracks(input).map(TypedPropertyValue::GridAutoTracks)
         }
         "grid-column-start" | "grid-column-end" | "grid-row-start" | "grid-row-end" => {
             parse_grid_line(input).map(TypedPropertyValue::GridLine)
@@ -4610,10 +4699,44 @@ fn parse_grid_track<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, GridTrack> 
 }
 
 fn parse_grid_track_breadth<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, GridTrackBreadth> {
-    if let Ok(fraction) = input.try_parse(parse_grid_fraction) {
+    if input
+        .try_parse(|candidate| candidate.expect_ident_matching("auto"))
+        .is_ok()
+    {
+        Ok(GridTrackBreadth::Auto)
+    } else if let Ok(fraction) = input.try_parse(parse_grid_fraction) {
         Ok(GridTrackBreadth::Fraction(fraction))
     } else {
         parse_length_percentage(input, true).map(GridTrackBreadth::LengthPercentage)
+    }
+}
+
+fn parse_grid_auto_flow<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, GridAutoFlow> {
+    let location = input.current_source_location();
+    let mut value = String::new();
+    while !input.is_exhausted() {
+        let ident = input.expect_ident_cloned()?;
+        if !value.is_empty() {
+            value.push(' ');
+        }
+        value.push_str(&ident);
+    }
+    GridAutoFlow::parse(&value).ok_or_else(|| location.new_custom_error(()))
+}
+
+fn parse_grid_auto_tracks<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, GridAutoTracks> {
+    let location = input.current_source_location();
+    let mut tracks = Vec::new();
+    while !input.is_exhausted() {
+        if tracks.len() >= MAX_PARSED_GRID_TRACKS {
+            return Err(location.new_custom_error(()));
+        }
+        tracks.push(parse_grid_track(input)?);
+    }
+    if tracks.is_empty() {
+        Err(location.new_custom_error(()))
+    } else {
+        Ok(GridAutoTracks(tracks))
     }
 }
 
@@ -5616,6 +5739,47 @@ mod tests {
         ] {
             assert!(
                 parse_typed_property("grid-template-columns", invalid)
+                    .expect("supported")
+                    .is_err(),
+                "unexpectedly accepted {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_grid_auto_flow_and_implicit_column_tracks() {
+        for (css, expected) in [
+            ("row", "row"),
+            ("column", "column"),
+            ("row dense", "row dense"),
+            ("dense row", "row dense"),
+            ("column dense", "column dense"),
+            ("dense column", "column dense"),
+            ("dense", "row dense"),
+        ] {
+            assert_eq!(parse("grid-auto-flow", css).to_css(), expected, "{css}");
+        }
+        for invalid in ["row column", "dense dense", "none", "column column"] {
+            assert!(
+                parse_typed_property("grid-auto-flow", invalid)
+                    .expect("supported")
+                    .is_err(),
+                "unexpectedly accepted {invalid}"
+            );
+        }
+
+        assert_eq!(parse("grid-auto-columns", "auto").to_css(), "auto");
+        assert_eq!(
+            parse("grid-auto-columns", "50px auto 2fr").to_css(),
+            "50px auto 2fr"
+        );
+        assert_eq!(
+            parse("grid-auto-columns", "minmax(20px, auto)").to_css(),
+            "minmax(20px, auto)"
+        );
+        for invalid in ["none", "repeat(2, 1fr)", ""] {
+            assert!(
+                parse_typed_property("grid-auto-columns", invalid)
                     .expect("supported")
                     .is_err(),
                 "unexpectedly accepted {invalid}"

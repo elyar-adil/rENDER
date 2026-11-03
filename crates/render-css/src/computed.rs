@@ -230,6 +230,8 @@ impl PropertyRegistry {
             ("column-span", "none"),
             ("grid-template-columns", "none"),
             ("grid-template-rows", "none"),
+            ("grid-auto-flow", "row"),
+            ("grid-auto-columns", "auto"),
             ("grid-column-start", "auto"),
             ("grid-column-end", "auto"),
             ("grid-row-start", "auto"),

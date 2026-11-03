@@ -18,6 +18,7 @@ use crate::solver::resolve::length_depends_on_percentage;
 use crate::tree::FormattingNodeId;
 use crate::tree::FormattingNodeKind;
 use render_css::computed::ComputedStyle;
+use render_css::properties::GridAutoFlow;
 use render_css::properties::GridAutoRepeat;
 use render_css::properties::GridLine;
 use render_css::properties::GridTemplate;
@@ -30,6 +31,17 @@ use render_css::properties::TypedPropertyValue;
 use render_dom::NodeId;
 use std::collections::HashSet;
 
+/// One child's declared placement before the auto-placement pass resolves the
+/// automatic axes. Spans are already normalized to at least one track.
+#[derive(Clone, Copy)]
+struct GridItemSpec {
+    node: FormattingNodeId,
+    explicit_row: Option<usize>,
+    row_span: usize,
+    explicit_column: Option<usize>,
+    column_span: usize,
+}
+
 pub(super) fn grid_template(style: Option<&ComputedStyle>, property: &str) -> GridTemplate {
     match style.and_then(|style| style.typed(property)) {
         Some(TypedPropertyValue::GridTemplate(template)) => template.clone(),
@@ -37,7 +49,7 @@ pub(super) fn grid_template(style: Option<&ComputedStyle>, property: &str) -> Gr
     }
 }
 
-impl Solver<'_> {
+impl<'a> Solver<'a> {
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) fn layout_grid_children(
         &mut self,
@@ -65,6 +77,26 @@ impl Solver<'_> {
         );
         let column_template = grid_template(container_style, "grid-template-columns");
         let row_template = grid_template(container_style, "grid-template-rows");
+        let flow = match container_style.and_then(|style| style.typed("grid-auto-flow")) {
+            Some(TypedPropertyValue::GridAutoFlow(flow)) => *flow,
+            _ => GridAutoFlow::Row,
+        };
+        let auto_columns = match container_style.and_then(|style| style.typed("grid-auto-columns"))
+        {
+            Some(TypedPropertyValue::GridAutoTracks(tracks)) => tracks
+                .0
+                .iter()
+                .map(|track| {
+                    self.resolve_grid_track(
+                        track,
+                        Some(containing.size.width),
+                        "grid-auto-columns",
+                        container_source,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
         let Ok(mut columns) = self.expand_grid_template(
             &column_template,
             Some(containing.size.width),
@@ -75,57 +107,171 @@ impl Solver<'_> {
         ) else {
             return (Vec::new(), 0.0);
         };
-        if columns.is_empty() {
+        // The number of explicit tracks before any implicit column is added.
+        // `grid-auto-columns` cycles over the implicit tracks after this point.
+        let template_column_count = columns.len();
+        // Positive grid-line starts may create implicit columns beyond the
+        // explicit template. Account for those before sizing the column axis.
+        let mut required_columns = columns.len();
+        for node in children.iter().copied() {
+            let style = self.grid_item_style(node);
+            let (start, span) = grid_axis_placement(
+                style,
+                "grid-column-start",
+                "grid-column-end",
+                template_column_count,
+            );
+            if let Some(start) = start {
+                required_columns = required_columns.max(start.saturating_add(span));
+            }
+        }
+        if required_columns > self.options.limits.max_grid_tracks {
+            self.report_grid_track_limit(container_source);
+            return (Vec::new(), 0.0);
+        }
+        grow_grid_columns(
+            &mut columns,
+            required_columns,
+            template_column_count,
+            &auto_columns,
+        );
+        // A row-flow grid with no explicit columns still has one implicit
+        // column. Keeping it flexible preserves the stretch-to-container
+        // behaviour the row-major path has always had.
+        if columns.is_empty() && !flow.is_column() {
             columns.push(TrackSizing::Flexible {
                 minimum: 0.0,
                 factor: 1.0,
             });
         }
-        // Positive grid-line starts may create implicit columns beyond the
-        // explicit template. Account for those before sizing the column axis.
-        let explicit_columns = children
-            .iter()
-            .filter_map(|node| {
-                let style = self
-                    .formatting
-                    .get(*node)
-                    .and_then(|node| node.style_source)
-                    .and_then(|source| self.styles.get(&source));
-                let (start, span) = grid_axis_placement(
-                    style,
-                    "grid-column-start",
-                    "grid-column-end",
-                    columns.len(),
-                );
-                start.unwrap_or(0).checked_add(span)
-            })
-            .max()
-            .map_or(columns.len(), |count| count.max(columns.len()));
-        if explicit_columns > self.options.limits.max_grid_tracks {
-            self.report_grid_track_limit(container_source);
-            return (Vec::new(), 0.0);
-        }
-        columns.resize(explicit_columns, TrackSizing::Intrinsic { minimum: 0.0 });
 
-        let required_row_count = required_rows(children.len(), columns.len());
+        let row_item_count = if flow.is_column() {
+            children.len()
+        } else {
+            required_rows(children.len(), columns.len())
+        };
         let Ok(mut rows) = self.expand_grid_template(
             &row_template,
             specified_height,
             row_gap,
-            required_row_count,
+            row_item_count,
             "grid-template-rows",
             container_source,
         ) else {
             return (Vec::new(), 0.0);
         };
-        let row_count = rows.len().max(required_row_count);
+        let template_row_count = rows.len();
+
+        let mut specs = Vec::with_capacity(children.len());
+        for node in children.iter().copied() {
+            let style = self.grid_item_style(node);
+            let (explicit_column, column_span) = grid_axis_placement(
+                style,
+                "grid-column-start",
+                "grid-column-end",
+                template_column_count,
+            );
+            let (explicit_row, row_span) =
+                grid_axis_placement(style, "grid-row-start", "grid-row-end", template_row_count);
+            if row_span
+                .checked_mul(column_span)
+                .is_none_or(|area| area > self.options.limits.max_grid_tracks)
+            {
+                self.report_grid_track_limit(container_source);
+                return (Vec::new(), 0.0);
+            }
+            specs.push(GridItemSpec {
+                node,
+                explicit_row,
+                row_span,
+                explicit_column,
+                column_span,
+            });
+        }
+
+        let mut row_count = rows.len();
+        for spec in &specs {
+            if let Some(row) = spec.explicit_row {
+                row_count = row_count.max(row.saturating_add(spec.row_span));
+            }
+        }
+        if !specs.is_empty() {
+            row_count = row_count.max(if flow.is_column() {
+                1
+            } else {
+                required_rows(children.len(), columns.len())
+            });
+        }
         if columns.len().saturating_add(row_count) > self.options.limits.max_grid_tracks {
             self.report_grid_track_limit(container_source);
             return (Vec::new(), 0.0);
         }
         rows.resize(row_count, TrackSizing::Intrinsic { minimum: 0.0 });
 
-        let column_axis = size_axis(&columns, Some(containing.size.width), column_gap, &[]);
+        let Some(placements) = self.auto_place_grid_items(
+            &specs,
+            &mut columns,
+            template_column_count,
+            &auto_columns,
+            rows.len(),
+            flow,
+            container_source,
+        ) else {
+            return (Vec::new(), 0.0);
+        };
+        // Placement can create tracks in either axis (an auto item may land
+        // past the rows sized for the explicit tracks, and a column-flow item
+        // may need another implicit column).
+        let mut final_columns = columns.len();
+        let mut final_rows = rows.len();
+        for (spec, placement) in specs.iter().zip(&placements) {
+            let Some((row, column)) = placement else {
+                continue;
+            };
+            final_columns = final_columns.max(column.saturating_add(spec.column_span));
+            final_rows = final_rows.max(row.saturating_add(spec.row_span));
+        }
+        if final_columns > self.options.limits.max_grid_tracks
+            || final_columns.saturating_add(final_rows) > self.options.limits.max_grid_tracks
+        {
+            self.report_grid_track_limit(container_source);
+            return (Vec::new(), 0.0);
+        }
+        grow_grid_columns(
+            &mut columns,
+            final_columns,
+            template_column_count,
+            &auto_columns,
+        );
+        rows.resize(final_rows, TrackSizing::Intrinsic { minimum: 0.0 });
+
+        // Auto-sized implicit columns take their width from the largest item
+        // in the column, exactly as the row axis takes its height from the
+        // row's tallest item.
+        let mut column_contributions = vec![0.0_f32; columns.len()];
+        for (spec, placement) in specs.iter().zip(&placements) {
+            let Some((_, column)) = *placement else {
+                continue;
+            };
+            let contribution =
+                self.grid_item_max_content_outer_width(spec.node, containing.size.width);
+            let column_end = column.saturating_add(spec.column_span);
+            let current = column_contributions[column..column_end].iter().sum::<f32>()
+                + column_gap * count_as_f32(spec.column_span.saturating_sub(1));
+            if contribution > current {
+                let additional = (contribution - current) / count_as_f32(spec.column_span);
+                for track in &mut column_contributions[column..column_end] {
+                    *track += additional;
+                }
+            }
+        }
+
+        let column_axis = size_axis(
+            &columns,
+            Some(containing.size.width),
+            column_gap,
+            &column_contributions,
+        );
         // CSS Grid §12.2: `justify-content` aligns the grid inside the grid
         // container along the inline axis. `start`/`end` name writing-mode
         // edges, so the free space moves to the other side under RTL.
@@ -155,89 +301,15 @@ impl Solver<'_> {
         };
         let mut row_contributions = vec![0.0_f32; rows.len()];
         let mut items = Vec::with_capacity(children.len());
-        let mut occupied = HashSet::new();
-        let mut auto_cursor = 0usize;
-        for node in children.iter().copied() {
-            let item_style = self
-                .formatting
-                .get(node)
-                .and_then(|node| node.style_source)
-                .and_then(|source| self.styles.get(&source));
-            let (explicit_column, column_span) = grid_axis_placement(
-                item_style,
-                "grid-column-start",
-                "grid-column-end",
-                columns.len(),
-            );
-            let (explicit_row, row_span) =
-                grid_axis_placement(item_style, "grid-row-start", "grid-row-end", rows.len());
-            if row_span
-                .checked_mul(column_span)
-                .is_none_or(|area| area > self.options.limits.max_grid_tracks)
-            {
-                self.report_grid_track_limit(container_source);
-                return (Vec::new(), 0.0);
-            }
-            let available_columns = columns.len().saturating_sub(column_span);
-            let fits = |row: usize, column: usize, occupied: &HashSet<(usize, usize)>| {
-                column <= available_columns
-                    && (row..row.saturating_add(row_span)).all(|r| {
-                        (column..column.saturating_add(column_span))
-                            .all(|c| !occupied.contains(&(r, c)))
-                    })
+        for (spec, placement) in specs.iter().zip(&placements) {
+            let Some((row, column)) = *placement else {
+                continue;
             };
-            let (row, column) = match (explicit_row, explicit_column) {
-                (Some(row), Some(column)) => (row, column),
-                (Some(row), None) => {
-                    let column = (0..=available_columns)
-                        .find(|column| fits(row, *column, &occupied))
-                        .unwrap_or(0);
-                    (row, column)
-                }
-                (None, Some(column)) => {
-                    let start_row = auto_cursor / columns.len();
-                    let row = (start_row..self.options.limits.max_grid_tracks)
-                        .find(|row| fits(*row, column, &occupied))
-                        .unwrap_or(start_row);
-                    (row, column)
-                }
-                (None, None) => {
-                    let limit = self
-                        .options
-                        .limits
-                        .max_grid_tracks
-                        .saturating_sub(columns.len())
-                        .saturating_mul(columns.len());
-                    while auto_cursor < limit {
-                        let (row, column) = automatic_position(auto_cursor, columns.len());
-                        if fits(row, column, &occupied) {
-                            break;
-                        }
-                        auto_cursor = auto_cursor.saturating_add(1);
-                    }
-                    if auto_cursor >= limit {
-                        self.report_grid_track_limit(container_source);
-                        return (Vec::new(), 0.0);
-                    }
-                    let (row, column) = automatic_position(auto_cursor, columns.len());
-                    auto_cursor = auto_cursor.saturating_add(column_span);
-                    (row, column)
-                }
-            };
-            for r in row..row.saturating_add(row_span) {
-                for c in column..column.saturating_add(column_span) {
-                    occupied.insert((r, c));
-                }
-            }
+            let node = spec.node;
+            let row_span = spec.row_span;
+            let column_span = spec.column_span;
+            let item_style = self.grid_item_style(node);
             let row_end = row.saturating_add(row_span);
-            if row_end > rows.len() {
-                if columns.len().saturating_add(row_end) > self.options.limits.max_grid_tracks {
-                    self.report_grid_track_limit(container_source);
-                    return (Vec::new(), 0.0);
-                }
-                rows.resize(row_end, TrackSizing::Intrinsic { minimum: 0.0 });
-                row_contributions.resize(rows.len(), 0.0);
-            }
             let track_width = column_width(column, column_span);
             let track_x = column_origin(column, column_span);
             let item_source = self.formatting.get(node).and_then(|node| node.source);
@@ -394,6 +466,7 @@ impl Solver<'_> {
                 minimum: 0.0,
                 factor: *factor,
             },
+            GridTrack::Breadth(GridTrackBreadth::Auto) => TrackSizing::Intrinsic { minimum: 0.0 },
             GridTrack::Breadth(GridTrackBreadth::LengthPercentage(value)) => self
                 .resolve_grid_length(value, available, property, source)
                 .map_or(TrackSizing::Intrinsic { minimum: 0.0 }, TrackSizing::Fixed),
@@ -406,6 +479,7 @@ impl Solver<'_> {
                         minimum,
                         factor: *factor,
                     },
+                    GridTrackBreadth::Auto => TrackSizing::Intrinsic { minimum },
                     GridTrackBreadth::LengthPercentage(maximum) => self
                         .resolve_grid_length(maximum, available, property, source)
                         .map_or(TrackSizing::Intrinsic { minimum }, |maximum| {
@@ -434,15 +508,239 @@ impl Solver<'_> {
     }
 
     pub(super) fn grid_item_axis_is_auto(&self, node: FormattingNodeId, property: &str) -> bool {
-        let style = self
-            .formatting
-            .get(node)
-            .and_then(|node| node.style_source)
-            .and_then(|source| self.styles.get(&source));
+        let style = self.grid_item_style(node);
         matches!(
             style.and_then(|style| style.typed(property)),
             Some(TypedPropertyValue::Size(Size::Auto)) | None
         )
+    }
+
+    /// The computed style of a grid item. The returned reference borrows the
+    /// document's style map, not `self`, so callers may measure or lay out the
+    /// item while holding it.
+    pub(super) fn grid_item_style(&self, node: FormattingNodeId) -> Option<&'a ComputedStyle> {
+        self.formatting
+            .get(node)
+            .and_then(|node| node.style_source)
+            .and_then(|source| self.styles.get(&source))
+    }
+
+    /// The margin-box max-content width of a grid item, used as an auto
+    /// track's intrinsic contribution. A specified border-box width already
+    /// contains its padding and border, so only a content-box or an auto width
+    /// adds those edges again.
+    pub(super) fn grid_item_max_content_outer_width(
+        &mut self,
+        node: FormattingNodeId,
+        available: f32,
+    ) -> f32 {
+        let source = self.formatting.get(node).and_then(|node| node.source);
+        let style = self.grid_item_style(node).cloned();
+        let content = self.max_content_width(node);
+        let margin = self.resolve_edge(style.as_ref(), "margin-left", available, source)
+            + self.resolve_edge(style.as_ref(), "margin-right", available, source);
+        let padding = self.resolve_edge(style.as_ref(), "padding-left", available, source)
+            + self.resolve_edge(style.as_ref(), "padding-right", available, source);
+        let border = self.resolve_border(style.as_ref(), "border-left-width", available, source)
+            + self.resolve_border(style.as_ref(), "border-right-width", available, source);
+        let width_is_auto = matches!(
+            style.as_ref().and_then(|style| style.typed("width")),
+            Some(TypedPropertyValue::Size(Size::Auto)) | None
+        );
+        let border_box = matches!(
+            style.as_ref().and_then(|style| style.typed("box-sizing")),
+            Some(TypedPropertyValue::BoxSizing(
+                render_css::properties::BoxSizing::BorderBox
+            ))
+        );
+        let extras = margin
+            + if width_is_auto || !border_box {
+                padding + border
+            } else {
+                0.0
+            };
+        (content + extras).max(0.0)
+    }
+
+    /// CSS Grid §8.5 auto-placement. Items with a definite placement are fixed
+    /// first, then items locked to one axis fill the other, then the remaining
+    /// items walk a sparse cursor (or restart at the grid origin for `dense`).
+    /// The returned position is the zero-based (row, column) of each item's
+    /// start cell.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn auto_place_grid_items(
+        &mut self,
+        specs: &[GridItemSpec],
+        columns: &mut Vec<TrackSizing>,
+        template_column_count: usize,
+        auto_columns: &[TrackSizing],
+        row_count: usize,
+        flow: GridAutoFlow,
+        container_source: Option<NodeId>,
+    ) -> Option<Vec<Option<(usize, usize)>>> {
+        let max_tracks = self.options.limits.max_grid_tracks;
+        let mut occupied = HashSet::new();
+        let mut placements = vec![None; specs.len()];
+
+        // 1. Definite row and column.
+        for (index, spec) in specs.iter().enumerate() {
+            if let (Some(row), Some(column)) = (spec.explicit_row, spec.explicit_column) {
+                placements[index] = Some((row, column));
+                occupy_grid_area(row, column, spec.row_span, spec.column_span, &mut occupied);
+            }
+        }
+
+        // 2. Definite row, automatic column: the first free column in that row.
+        for (index, spec) in specs.iter().enumerate() {
+            let Some(row) = spec.explicit_row else {
+                continue;
+            };
+            if spec.explicit_column.is_some() {
+                continue;
+            }
+            let mut column = 0usize;
+            loop {
+                if column.saturating_add(spec.column_span) > max_tracks {
+                    self.report_grid_track_limit(container_source);
+                    return None;
+                }
+                grow_grid_columns(
+                    columns,
+                    column.saturating_add(spec.column_span),
+                    template_column_count,
+                    auto_columns,
+                );
+                if grid_area_is_free(row, column, spec.row_span, spec.column_span, &occupied) {
+                    break;
+                }
+                column = column.saturating_add(1);
+            }
+            placements[index] = Some((row, column));
+            occupy_grid_area(row, column, spec.row_span, spec.column_span, &mut occupied);
+        }
+
+        // 3. Definite column, automatic row: the first free row in that column.
+        for (index, spec) in specs.iter().enumerate() {
+            let Some(column) = spec.explicit_column else {
+                continue;
+            };
+            if spec.explicit_row.is_some() {
+                continue;
+            }
+            let mut row = 0usize;
+            loop {
+                if row.saturating_add(spec.row_span) > max_tracks {
+                    self.report_grid_track_limit(container_source);
+                    return None;
+                }
+                if grid_area_is_free(row, column, spec.row_span, spec.column_span, &occupied) {
+                    break;
+                }
+                row = row.saturating_add(1);
+            }
+            placements[index] = Some((row, column));
+            occupy_grid_area(row, column, spec.row_span, spec.column_span, &mut occupied);
+        }
+
+        let automatic = specs.iter().enumerate().filter_map(|(index, spec)| {
+            (spec.explicit_row.is_none() && spec.explicit_column.is_none()).then_some(index)
+        });
+
+        if flow.is_column() {
+            // In column flow the explicit rows define one column's height. An
+            // item spanning more rows than the template gets a taller flow
+            // cell, matching the implicit-row growth the row axis would do.
+            let flow_rows = row_count
+                .max(
+                    automatic
+                        .clone()
+                        .map(|index| specs[index].row_span)
+                        .max()
+                        .unwrap_or(1),
+                )
+                .max(1);
+            let mut cursor = 0usize;
+            for index in automatic {
+                let spec = specs[index];
+                let mut scan = if flow.is_dense() { 0 } else { cursor };
+                loop {
+                    let row = scan % flow_rows;
+                    let column = scan / flow_rows;
+                    if column.saturating_add(spec.column_span) > max_tracks {
+                        self.report_grid_track_limit(container_source);
+                        return None;
+                    }
+                    grow_grid_columns(
+                        columns,
+                        column.saturating_add(spec.column_span),
+                        template_column_count,
+                        auto_columns,
+                    );
+                    if row.saturating_add(spec.row_span) <= flow_rows
+                        && grid_area_is_free(
+                            row,
+                            column,
+                            spec.row_span,
+                            spec.column_span,
+                            &occupied,
+                        )
+                    {
+                        break;
+                    }
+                    scan = scan.saturating_add(1);
+                    if scan > flow_rows.saturating_mul(max_tracks) {
+                        self.report_grid_track_limit(container_source);
+                        return None;
+                    }
+                }
+                let row = scan % flow_rows;
+                let column = scan / flow_rows;
+                placements[index] = Some((row, column));
+                occupy_grid_area(row, column, spec.row_span, spec.column_span, &mut occupied);
+                if !flow.is_dense() {
+                    cursor = scan.saturating_add(spec.row_span);
+                }
+            }
+        } else {
+            let column_count = columns.len().max(1);
+            let mut cursor = 0usize;
+            for index in automatic {
+                let spec = specs[index];
+                let mut scan = if flow.is_dense() { 0 } else { cursor };
+                loop {
+                    let (row, column) = automatic_position(scan, column_count);
+                    if row.saturating_add(spec.row_span) > max_tracks {
+                        self.report_grid_track_limit(container_source);
+                        return None;
+                    }
+                    if column.saturating_add(spec.column_span) <= column_count
+                        && grid_area_is_free(
+                            row,
+                            column,
+                            spec.row_span,
+                            spec.column_span,
+                            &occupied,
+                        )
+                    {
+                        break;
+                    }
+                    scan = scan.saturating_add(1);
+                    if scan > max_tracks.saturating_mul(column_count) {
+                        self.report_grid_track_limit(container_source);
+                        return None;
+                    }
+                }
+                let row = scan / column_count;
+                let column = scan % column_count;
+                placements[index] = Some((row, column));
+                occupy_grid_area(row, column, spec.row_span, spec.column_span, &mut occupied);
+                if !flow.is_dense() {
+                    cursor = scan.saturating_add(spec.column_span);
+                }
+            }
+        }
+
+        Some(placements)
     }
 
     pub(super) fn report_grid_track_limit(&mut self, source: Option<NodeId>) {
@@ -451,6 +749,53 @@ impl Solver<'_> {
             code: LayoutDiagnosticCode::GridTrackLimit,
             message: "grid track limit exceeded".to_owned(),
         });
+    }
+}
+
+/// Append implicit columns until the axis has `target` tracks. Each new track
+/// cycles through `grid-auto-columns`; an absent list means the initial `auto`,
+/// which is an intrinsic track with no fixed minimum.
+fn grow_grid_columns(
+    columns: &mut Vec<TrackSizing>,
+    target: usize,
+    template_column_count: usize,
+    auto_columns: &[TrackSizing],
+) {
+    while columns.len() < target {
+        let implicit_index = columns.len().saturating_sub(template_column_count);
+        let track = if auto_columns.is_empty() {
+            TrackSizing::Intrinsic { minimum: 0.0 }
+        } else {
+            auto_columns[implicit_index % auto_columns.len()]
+        };
+        columns.push(track);
+    }
+}
+
+fn grid_area_is_free(
+    row: usize,
+    column: usize,
+    row_span: usize,
+    column_span: usize,
+    occupied: &HashSet<(usize, usize)>,
+) -> bool {
+    (row..row.saturating_add(row_span)).all(|row| {
+        (column..column.saturating_add(column_span))
+            .all(|column| !occupied.contains(&(row, column)))
+    })
+}
+
+fn occupy_grid_area(
+    row: usize,
+    column: usize,
+    row_span: usize,
+    column_span: usize,
+    occupied: &mut HashSet<(usize, usize)>,
+) {
+    for row in row..row.saturating_add(row_span) {
+        for column in column..column.saturating_add(column_span) {
+            occupied.insert((row, column));
+        }
     }
 }
 

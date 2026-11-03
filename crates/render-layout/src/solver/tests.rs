@@ -2365,6 +2365,192 @@ fn aspect_ratio_supplies_auto_block_height_from_used_width() {
 }
 
 #[test]
+fn column_flow_places_six_items_in_three_columns_and_two_rows() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='grid'>\
+           <div id='a'></div><div id='b'></div><div id='c'></div>\
+           <div id='d'></div><div id='e'></div><div id='f'></div>\
+         </div></body>",
+        "html, body, #grid, #grid > div { display:block; margin:0 } \
+         #grid { display:grid; width:300px; grid-template-rows:50px 50px; \
+                 grid-auto-flow:column; grid-auto-columns:50px; \
+                 column-gap:4px; row-gap:10px }",
+        300.0,
+    );
+    let rect = |selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .unwrap()
+            .rect
+    };
+    // The explicit two rows are the column height: six items make three
+    // columns of two, not six rows of one.
+    assert_eq!(rect("#a"), PhysicalRect::new(0.0, 0.0, 50.0, 50.0));
+    assert_eq!(rect("#b"), PhysicalRect::new(0.0, 60.0, 50.0, 50.0));
+    assert_eq!(rect("#c"), PhysicalRect::new(54.0, 0.0, 50.0, 50.0));
+    assert_eq!(rect("#d"), PhysicalRect::new(54.0, 60.0, 50.0, 50.0));
+    assert_eq!(rect("#e"), PhysicalRect::new(108.0, 0.0, 50.0, 50.0));
+    assert_eq!(rect("#f"), PhysicalRect::new(108.0, 60.0, 50.0, 50.0));
+    assert_eq!(rect("#grid").size.height, 110.0);
+}
+
+#[test]
+fn row_flow_is_the_unchanged_default_and_can_be_written_explicitly() {
+    let html = "<!doctype html><body><div id='grid'>\
+                  <div id='a'></div><div id='b'></div><div id='c'></div>\
+                  <div id='d'></div><div id='e'></div><div id='f'></div>\
+                </div></body>";
+    let css = "html, body, #grid, #grid > div { display:block; margin:0 } \
+               #grid { display:grid; width:300px; grid-template-columns:100px 100px; \
+                       grid-template-rows:30px 30px 30px; grid-auto-columns:50px }";
+    let layout_for = |extra: &str| {
+        let (output, _, layout) = pipeline(html, &format!("{css} {extra}"), 300.0);
+        ["#a", "#b", "#c", "#d", "#e", "#f"]
+            .into_iter()
+            .map(|selector| {
+                layout
+                    .fragments
+                    .iter()
+                    .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+                    .unwrap()
+                    .rect
+            })
+            .collect::<Vec<_>>()
+    };
+    let default = layout_for("");
+    assert_eq!(default, layout_for("#grid { grid-auto-flow:row }"));
+    assert_eq!(default[0], PhysicalRect::new(0.0, 0.0, 100.0, 30.0));
+    assert_eq!(default[1], PhysicalRect::new(100.0, 0.0, 100.0, 30.0));
+    assert_eq!(default[2], PhysicalRect::new(0.0, 30.0, 100.0, 30.0));
+    assert_eq!(default[5], PhysicalRect::new(100.0, 60.0, 100.0, 30.0));
+}
+
+#[test]
+fn column_dense_backfills_a_hole_left_by_a_sparse_explicit_item() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='grid'>\
+           <div id='explicit'></div><div id='a'></div><div id='b'></div><div id='c'></div>\
+         </div></body>",
+        "html, body, #grid, #grid > div { display:block; margin:0 } \
+         #grid { display:grid; width:300px; grid-template-rows:30px 30px 30px; \
+                 grid-auto-flow:column dense; grid-auto-columns:50px } \
+         #explicit { grid-column:2; grid-row:3 } \
+         #a, #b { grid-row:span 2 }",
+        300.0,
+    );
+    let rect = |selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .unwrap()
+            .rect
+    };
+    // `a` and `b` span both rows of columns 1 and 2; the explicit item leaves
+    // row 3 of column 1 empty. Dense packing restarts at the grid origin for
+    // `c`, so it backfills that hole instead of starting column 3.
+    assert_eq!(rect("#explicit"), PhysicalRect::new(50.0, 60.0, 50.0, 30.0));
+    assert_eq!(rect("#a"), PhysicalRect::new(0.0, 0.0, 50.0, 60.0));
+    assert_eq!(rect("#b"), PhysicalRect::new(50.0, 0.0, 50.0, 60.0));
+    assert_eq!(rect("#c"), PhysicalRect::new(0.0, 60.0, 50.0, 30.0));
+}
+
+#[test]
+fn auto_columns_size_to_their_column_max_content_contribution() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='grid'>\
+           <div id='a'></div><div id='b'></div><div id='c'></div>\
+           <div id='d'></div><div id='e'></div><div id='f'></div>\
+         </div></body>",
+        "html, body, #grid, #grid > div { display:block; margin:0 } \
+         #grid { display:grid; width:300px; grid-template-rows:20px 20px; \
+                 grid-auto-flow:column; grid-auto-columns:auto; \
+                 column-gap:4px; row-gap:10px } \
+         #a, #b { width:40px; height:20px } \
+         #c, #d { width:60px; height:20px } \
+         #e, #f { width:45px; height:20px }",
+        300.0,
+    );
+    let rect = |selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .unwrap()
+            .rect
+    };
+    assert_eq!(rect("#a"), PhysicalRect::new(0.0, 0.0, 40.0, 20.0));
+    assert_eq!(rect("#c"), PhysicalRect::new(44.0, 0.0, 60.0, 20.0));
+    assert_eq!(rect("#e"), PhysicalRect::new(108.0, 0.0, 45.0, 20.0));
+    assert_eq!(rect("#d"), PhysicalRect::new(44.0, 30.0, 60.0, 20.0));
+    assert_eq!(rect("#grid").size.height, 50.0);
+}
+
+#[test]
+fn channel_sidebar_reduced_fixture_keeps_three_columns_inside_230px() {
+    let links = [
+        ("col", "专栏"),
+        ("live", "直播"),
+        ("activity", "活动"),
+        ("classroom", "课堂"),
+        ("community", "社区中心"),
+        ("music", "新歌热榜"),
+    ];
+    let mut links_html = String::new();
+    for (id, text) in links {
+        std::fmt::write(
+            &mut links_html,
+            format_args!(
+                "<a id='{id}' class='channel-link__right' href='#'>\
+                   <span class='side-text'>{text}</span></a>"
+            ),
+        )
+        .unwrap();
+    }
+    let html = format!(
+        "<!doctype html><body><div id='right' class='channel-items__right'>{links_html}</div></body>"
+    );
+    let (output, _, layout) = pipeline(
+        &html,
+        "html, body, .channel-items__right, .channel-link__right { display:block; margin:0 } \
+         .channel-items__right { display:grid; width:230px; grid-auto-flow:column; \
+                                 grid-row-gap:10px; grid-column-gap:4px; grid-column:span 1; \
+                                 grid-template-rows:repeat(2,1fr) } \
+         .channel-link__right { width:74px; height:32px; font-size:13px; line-height:32px } \
+         .side-text { display:block }",
+        1180.0,
+    );
+    let right = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(find(&output.dom, "#right")))
+        .unwrap()
+        .rect;
+    assert_eq!(right.size.width, 230.0);
+    assert!((right.size.height - 74.0).abs() < 0.01, "{right:?}");
+
+    let mut rows = std::collections::BTreeSet::new();
+    let expected_x = [0.0, 0.0, 78.0, 78.0, 156.0, 156.0];
+    for (index, (id, _)) in links.iter().enumerate() {
+        let rect = layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, &format!("#{id}"))))
+            .unwrap()
+            .rect;
+        assert!((rect.origin.x - expected_x[index]).abs() < 0.01);
+        assert!(
+            rect.origin.x + rect.size.width <= 230.0 + 0.01,
+            "{id}: {rect:?}"
+        );
+        rows.insert(rect.origin.y.to_bits());
+    }
+    assert_eq!(rows.len(), 2, "six links must occupy exactly two rows");
+}
+
+#[test]
 fn explicit_grid_column_and_row_lines_place_cards_in_requested_tracks() {
     let (output, _, layout) = pipeline(
         "<!doctype html><body><div id=grid><div id=card></div></div></body>",

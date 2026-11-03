@@ -634,10 +634,11 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
         status: SupportStatus::Partial,
         notes: "Explicit track lists including `fr`, `repeat()` with fixed and \
                 `auto-fill` / `auto-fit` repetition, line names, `auto-placement` by \
-                sparse packing, and the row and column gaps are implemented. The \
-                implicit grid algorithm of 7.2, `grid-auto-flow: dense`, named line \
-                placement from `grid-column` / `grid-row` shorthand, and alignment of \
-                the grid container are not.",
+                sparse packing, the row and column gaps, `grid-auto-flow: row | \
+                column | row dense | column dense`, and implicit column sizing from \
+                `grid-auto-columns` are implemented. The implicit grid algorithm of \
+                7.2, named line placement from `grid-column` / `grid-row` shorthand, \
+                and alignment of the grid container are not.",
         dependencies: &[CSS_TYPED_VALUES],
         tests: GRID_TESTS,
     },

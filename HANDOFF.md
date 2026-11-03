@@ -19,6 +19,52 @@ cargo clippy -p render-js -p render-css -p render-core -p render-browser --all-t
 ```
 
 剩余：`-webkit-device-pixel-ratio` 作为离散特性（不带 min/max）仍按 `Equal` 比较；`resolution` 单位只支持 dppx/dpi/dpcm 的常规写法。
+# 交接文档 (2026-11-03, 续三) — CSS Grid `grid-auto-flow` 与隐式列
+
+`display:grid` 的自动放置此前一律按行优先游标计算（`automatic_position(cursor, columns.len())`），`grid-auto-flow` 既没有解析也没有消费者。真实 1180px 页面的右频道栏因此把 6 个链接排成 6 行，容器高度 218px，越过 y=255 的视频卡起点。
+
+## 根因与修复
+
+- `crates/render-css/src/properties.rs`：新增 `grid-auto-flow: row | column | row dense | column dense` 与 `grid-auto-columns: <track-size>+`，`grid-template-*` / `grid-auto-columns` 的 track breadth 接受 `auto`。两者进入 `DECLARED_GRAMMARS`，`computed.rs` 注册初始值 `row` / `auto`。
+- `crates/render-layout/src/solver/grid.rs`：把“边布局边决定位置”改成两阶段。先收集每个子项的定义轴位置，执行 CSS Grid §8.5 的分组放置（双轴确定 → 行锁定 → 列锁定 → 自动），再按最终轨道尺寸布局。
+  - 行流保持原有稀疏游标；列流用显式行数做列内游标，必要时追加隐式列。
+  - `dense` 对每个自动项从网格原点重新扫描；这是 §8.5 的等价实现，未做 `order`/`grid-auto-rows` 的额外扩展。
+  - 隐式列按 `grid-auto-columns` 循环取尺寸；`auto` 列取该列子项的最大外廓 max-content 贡献。
+- `crates/render-core/src/spec/registry.rs`：能力声明同步，不再把 `grid-auto-flow: dense` 列为未实现。
+
+## 真实页面几何（`render-headless`，1180×780，DPR 1，代理）
+
+| 元素 | 修复前 | 修复后 |
+| --- | ---: | ---: |
+| `.channel-items__right` | 6 行，高 218 | **3 列 × 2 行，高 66** |
+| 链接 y | 96,134,172,210,248,286 | **172,210（两个值）** |
+| 链接 x | 同一列 | **934.97, 990.97, 1046.97** |
+| 最右链接右边缘 | — | **1122.97 ≤ 容器右边缘 1141.97** |
+| `.bili-video-card` top | 255 | **255（频道栏底部 238）** |
+
+## 测试
+
+- `render-layout`：2 显式行 + `column` + 6 项 → 3×2、容器高 110；默认/显式 `row` 几何一致；`column dense` 回填稀疏显式项留下的洞；`grid-auto-columns:auto` 按列 max-content 得 40/60/45；230px 频道栏 reduced fixture 为 3 列 × 2 行、高 74、右边缘不越界。
+- `render-css`：合法/非法 `grid-auto-flow` 组合、`dense` 单独值归一化为 `row dense`、`grid-auto-columns` 的 `50px auto 2fr` 与 `minmax(20px, auto)`。
+
+```text
+cargo fmt --all --check                                             clean
+cargo clippy -p render-layout -p render-css -p render-core --all-targets -- -D warnings
+                                                                    clean
+cargo test -p render-layout --lib                                   419 passed, 1 ignored
+cargo test -p render-css --lib                                      337 passed
+cargo test -p render-core --lib                                     568 passed, 1 ignored
+cargo test -p render-core --test layout_positioning --test layout_paint_regressions
+                                                                    9 passed
+python3 tools/check_site_neutrality.py                              0 blocking
+```
+
+## 剩余缺口
+
+- `grid-auto-rows` 仍未消费，隐式行只按内容贡献定高。
+- `grid-auto-flow: dense` 未与 `order` 组合；`order` 本身也尚未参与网格排序。
+- 显式列/行仍只支持数字与 `span`，命名网格线未实现。
+- 受“不触碰桌面”约束，本轮没有窗口/截图/GUI 自动化；真实页面验证全部走 `render-headless` 与 JSON 几何。
 
 ---
 
