@@ -589,6 +589,10 @@ impl Builder<'_> {
                 // `append_table_children` applies the CSS 2.1 §17.2.1 anonymous
                 // table boxes while they are appended.
                 let table_parent = table_level(&display);
+                let out_of_flow = matches!(
+                    crate::solver::resolve::position(Some(style)),
+                    Position::Absolute | Position::Fixed
+                );
                 if inline_level && float(style) != Float::None {
                     kind = match kind {
                         FormattingNodeKind::Inline => FormattingNodeKind::BlockContainer {
@@ -600,6 +604,25 @@ impl Builder<'_> {
                         other => other,
                     };
                     inline_level = false;
+                }
+                // CSS Display 3 §2.7: absolute and fixed positioning blockify
+                // the box, so an absolutely positioned `display:inline` element
+                // lays its contents out as a block. CSS Position 3 §3.5.3 still
+                // gives it the static position of the inline box it would have
+                // generated if it were static, so it keeps its place in the
+                // inline sequence: turning it into a block-level sibling here
+                // would break that sequence into anonymous blocks and make a
+                // shrink-to-fit ancestor measure only the widest fragment.
+                // `AtomicInline` is this tree's blockified inline-level box; the
+                // solver takes it out of the line box and measures it as
+                // out-of-flow, which is what `is_out_of_flow` already answers.
+                if inline_level && out_of_flow {
+                    kind = match kind {
+                        FormattingNodeKind::Inline => FormattingNodeKind::AtomicInline {
+                            context: FormattingContextKind::Block,
+                        },
+                        other => other,
+                    };
                 }
                 if independent_children {
                     // Flex and grid items are blockified for layout, while
@@ -619,10 +642,11 @@ impl Builder<'_> {
                 // line, so neither continues the previous `capitalize` word.
                 // Without this, the second paragraph inside a container would
                 // inherit the first one's open word and stay lowercase.
-                let forced_line_start = matches!(
-                    node.kind(),
-                    NodeKind::Element(element) if element.local_name == "br"
-                );
+                let forced_line_start = !out_of_flow
+                    && matches!(
+                        node.kind(),
+                        NodeKind::Element(element) if element.local_name == "br"
+                    );
                 if !inline_level || forced_line_start {
                     self.capitalize_word_start = true;
                 }
@@ -1937,6 +1961,41 @@ mod tests {
             tree.get(body.children[0]).unwrap().children,
             vec![inline.id]
         );
+    }
+
+    #[test]
+    fn absolutely_positioned_inline_is_blockified_in_place() {
+        // CSS Display 3 §2.7 blockifies an absolutely positioned box, but it
+        // stays in the inline sequence so the boxes around it keep sharing one
+        // anonymous block (and therefore one shrink-to-fit measurement).
+        let output = parse_document(
+            "<!doctype html><body><div id='box'><span>a</span><span id='abs'>b</span><span>c</span></div></body>",
+        );
+        let styles = styles(
+            &output.dom,
+            "html, body, div { display:block } span { display:inline } #abs { position:absolute }",
+        );
+        let tree = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let box_node = find(&output.dom, "#box");
+        let boxed = tree
+            .iter()
+            .find(|node| node.source == Some(box_node))
+            .expect("box formatting node");
+        assert_eq!(boxed.children.len(), 1, "the inline run was split");
+        let anonymous = tree.get(boxed.children[0]).expect("anonymous block");
+        assert!(matches!(anonymous.kind, FormattingNodeKind::AnonymousBlock));
+        assert_eq!(anonymous.children.len(), 3);
+
+        let absolute = tree
+            .iter()
+            .find(|node| node.source == Some(find(&output.dom, "#abs")))
+            .expect("absolute formatting node");
+        assert!(matches!(
+            absolute.kind,
+            FormattingNodeKind::AtomicInline {
+                context: FormattingContextKind::Block
+            }
+        ));
     }
 
     #[test]

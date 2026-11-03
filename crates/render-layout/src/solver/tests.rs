@@ -3020,6 +3020,196 @@ fn layout_containment_makes_a_static_box_the_containing_block_for_fixed_children
 }
 
 #[test]
+fn absolutely_positioned_inline_link_does_not_add_a_phantom_header_line() {
+    // A right-aligned absolute link inside an inline run: CSS Display 3 §2.7
+    // blockifies it, and CSS Position 3 §3.5.3 keeps the static position of the
+    // inline box it would have generated. It must not consume inline width or
+    // add a second line to the header.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><header id='head'><span id='brand'>Brand</span>\
+         <a id='link'><span id='badge'></span></a><span id='tail'>Tail</span></header></body>",
+        "html, body, header, span, a { display:block; margin:0 } \
+         header { position:relative; width:400px; line-height:20px } \
+         #brand, #tail { display:inline } \
+         #link { display:inline; position:absolute; right:10px; top:4px } \
+         #badge { display:inline-block; width:30px; height:20px }",
+        400.0,
+    );
+    let head = fragment(&layout, find(&output.dom, "#head")).rect;
+    assert_eq!(head.size.height, 20.0, "the absolute link added a line box");
+
+    let link = fragment(&layout, find(&output.dom, "#link")).rect;
+    assert_eq!(link.origin.x, 400.0 - 10.0 - 30.0);
+    assert_eq!(link.origin.y, 4.0);
+    assert_eq!(link.size.width, 30.0);
+    assert_eq!(link.size.height, 20.0);
+
+    let tail = layout
+        .fragments
+        .iter()
+        .find(|fragment| matches!(&fragment.kind, FragmentKind::Text(data) if data.text == "Tail"))
+        .expect("tail text fragment");
+    assert_eq!(
+        tail.rect.origin.x, 40.0,
+        "the absolute link consumed inline space before the tail"
+    );
+}
+
+#[test]
+fn fixed_inline_does_not_add_a_phantom_header_line() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><header id='head'><span id='brand'>Brand</span>\
+         <a id='link'><span id='badge'></span></a><span id='tail'>Tail</span></header></body>",
+        "html, body, header, span, a { display:block; margin:0 } \
+         header { position:relative; width:400px; line-height:20px } \
+         #brand, #tail { display:inline } \
+         #link { display:inline; position:fixed; right:10px; top:4px } \
+         #badge { display:inline-block; width:30px; height:20px }",
+        800.0,
+    );
+    let head = fragment(&layout, find(&output.dom, "#head")).rect;
+    assert_eq!(head.size.height, 20.0, "the fixed link added a line box");
+
+    let link = fragment(&layout, find(&output.dom, "#link")).rect;
+    assert_eq!(link.origin.x, 800.0 - 10.0 - 30.0);
+    assert_eq!(link.origin.y, 4.0);
+    let tail = layout
+        .fragments
+        .iter()
+        .find(|fragment| matches!(&fragment.kind, FragmentKind::Text(data) if data.text == "Tail"))
+        .expect("tail text fragment");
+    assert_eq!(tail.rect.origin.x, 40.0);
+}
+
+#[test]
+fn an_out_of_flow_inline_uses_its_inline_static_position_when_insets_are_auto() {
+    // CSS Position 3 §3.5.3: both-auto insets align the box to the line its
+    // hypothetical inline box would have occupied, without adding to the line.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><header id='head'><span id='brand'>Brand</span>\
+         <a id='link'><span id='badge'></span></a><span id='tail'>Tail</span></header></body>",
+        "html, body, header, span, a { display:block; margin:0 } \
+         header { position:relative; width:400px; line-height:20px } \
+         #brand, #tail { display:inline } \
+         #link { display:inline; position:absolute } \
+         #badge { display:inline-block; width:30px; height:20px }",
+        400.0,
+    );
+    let link = fragment(&layout, find(&output.dom, "#link")).rect;
+    assert_eq!(link, PhysicalRect::new(40.0, 0.0, 30.0, 20.0));
+    let tail = layout
+        .fragments
+        .iter()
+        .find(|fragment| matches!(&fragment.kind, FragmentKind::Text(data) if data.text == "Tail"))
+        .expect("tail text fragment");
+    assert_eq!(tail.rect.origin.x, 40.0);
+    assert_eq!(
+        fragment(&layout, find(&output.dom, "#head"))
+            .rect
+            .size
+            .height,
+        20.0
+    );
+}
+
+#[test]
+fn an_out_of_flow_inline_with_opposing_insets_stretches_to_the_inset_modified_block() {
+    // CSS Position 3 §3.5: an absolute box sizes against its inset-modified
+    // containing block; the inline solver must not force shrink-to-fit.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><header id='head'><span id='brand'>Brand</span>\
+         <a id='link'></a></header></body>",
+        "html, body, header, span, a { display:block; margin:0 } \
+         header { position:relative; width:400px; line-height:20px } \
+         #brand { display:inline } \
+         #link { display:inline; position:absolute; left:20px; right:10px; top:0; height:20px }",
+        400.0,
+    );
+    let link = fragment(&layout, find(&output.dom, "#link")).rect;
+    assert_eq!(link, PhysicalRect::new(20.0, 0.0, 370.0, 20.0));
+    assert_eq!(
+        fragment(&layout, find(&output.dom, "#head"))
+            .rect
+            .size
+            .height,
+        20.0
+    );
+}
+
+#[test]
+fn an_out_of_flow_inline_does_not_size_its_shrink_to_fit_parent() {
+    // The only child is an absolutely positioned inline: it generates a box,
+    // but no line box and no intrinsic contribution.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='chip'><a id='link'><span id='badge'></span></a></div></body>",
+        "html, body, div, a, span { display:block; margin:0 } \
+         #chip { display:inline-block; position:relative; line-height:20px } \
+         #link { display:inline; position:absolute; left:0; top:0; width:30px } \
+         #badge { display:inline-block; width:30px; height:20px }",
+        800.0,
+    );
+    let chip = fragment(&layout, find(&output.dom, "#chip")).rect;
+    assert_eq!(chip.size.width, 0.0);
+    assert_eq!(chip.size.height, 0.0);
+
+    let link = fragment(&layout, find(&output.dom, "#link")).rect;
+    assert_eq!(link, PhysicalRect::new(0.0, 0.0, 30.0, 20.0));
+}
+
+#[test]
+fn an_out_of_flow_inline_between_inline_blocks_keeps_the_inline_run_together() {
+    // The same sequence as
+    // `absolutely_positioned_inline_child_does_not_contribute_to_shrink_to_fit_width`,
+    // but with `display:inline` instead of `display:inline-block`: blockifying
+    // the absolute box must not split the logo/form run into separate anonymous
+    // blocks, so the shrink-to-fit width stays 100 + 10 + 50.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='search'><div id='logo'></div><div id='toggle'></div><div id='form'></div></div></body>",
+        "html, body { display:block; margin:0 } \
+         #search { display:block; position:absolute; left:0; top:0; line-height:20px } \
+         #logo { display:inline-block; width:100px; height:20px; margin-right:10px } \
+         #toggle { position:absolute; display:inline; left:0; width:30px; height:20px } \
+         #form { display:inline-block; width:50px; height:20px }",
+        800.0,
+    );
+    let search = fragment(&layout, find(&output.dom, "#search")).rect;
+    assert_eq!(search.size.width, 160.0);
+    assert_eq!(search.size.height, 20.0);
+
+    let form = fragment(&layout, find(&output.dom, "#form")).rect;
+    assert_eq!(form.origin.x, 110.0, "the inline run was split");
+    let toggle = fragment(&layout, find(&output.dom, "#toggle")).rect;
+    assert_eq!(toggle, PhysicalRect::new(0.0, 0.0, 30.0, 20.0));
+}
+
+#[test]
+fn a_static_inline_between_two_inline_blocks_still_participates_in_the_line() {
+    // The in-flow control for the two tests above: `position:static` keeps the
+    // inline in the sequence, between the brand and the tail.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><header id='head'><span id='brand'>Brand</span>\
+         <a id='link'><span id='badge'></span></a><span id='tail'>Tail</span></header></body>",
+        "html, body, header, span, a { display:block; margin:0 } \
+         header { position:relative; width:400px; line-height:20px } \
+         #brand, #tail { display:inline } \
+         #link { display:inline } \
+         #badge { display:inline-block; width:30px; height:20px }",
+        400.0,
+    );
+    let head = fragment(&layout, find(&output.dom, "#head")).rect;
+    assert_eq!(head.size.height, 20.0);
+
+    let badge = fragment(&layout, find(&output.dom, "#badge")).rect;
+    assert_eq!(badge.origin.x, 40.0);
+    let tail = layout
+        .fragments
+        .iter()
+        .find(|fragment| matches!(&fragment.kind, FragmentKind::Text(data) if data.text == "Tail"))
+        .expect("tail text fragment");
+    assert_eq!(tail.rect.origin.x, 70.0);
+}
+
+#[test]
 fn layout_containment_contains_floats_like_a_flow_root() {
     let (output, _, layout) = pipeline(
         "<!doctype html><body><div id='container'><div id='float'></div></div></body>",

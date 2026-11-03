@@ -600,9 +600,20 @@ impl<'a> Solver<'a> {
             atom.break_before = break_before;
         }
         let atoms = atoms;
+        // CSS 2.1 §9.4.2: a line box exists only for in-flow inline content.
+        // An out-of-flow box keeps an atom so it can be laid out at its static
+        // position, but by itself it must not create the line box whose height
+        // an auto-height ancestor would otherwise absorb.
+        let has_in_flow_line_content = atoms.iter().any(|atom| match atom.atomic {
+            Some(node) => !self.is_out_of_flow(node),
+            None => atom.forced_break || !atom.character.is_whitespace(),
+        });
         let ends_with_forced_break = atoms
             .iter()
             .rev()
+            // An out-of-flow placeholder after the break is not line content,
+            // so it must not hide the forced break that ended the last line.
+            .filter(|atom| !atom.atomic.is_some_and(|node| self.is_out_of_flow(node)))
             .find(|atom| atom.forced_break || !atom.character.is_whitespace())
             .is_some_and(|atom| atom.forced_break);
 
@@ -1034,7 +1045,7 @@ impl<'a> Solver<'a> {
             }
         }
         self.flush_text_run(&mut current_run, &mut fragments);
-        let trailing_line_height = if ends_with_forced_break {
+        let trailing_line_height = if ends_with_forced_break || !has_in_flow_line_content {
             0.0
         } else {
             current_line_height
@@ -1640,6 +1651,27 @@ impl<'a> Solver<'a> {
         }
         let typography = self.inline_text_style(node.style_source);
         let line_breaking = self.line_break_options(node.style_source);
+        // CSS Position 3 §2: an absolutely or fixed positioned box "does not
+        // participate in its parent's formatting context". A block-level one
+        // can be a child of an inline box instead of a sibling of the
+        // anonymous block, so it still reaches this walk; it keeps a
+        // placeholder for its static position but none of its content may
+        // become a line atom.
+        if self.is_out_of_flow(node_id) {
+            atoms.push(InlineAtom {
+                formatting_node: node_id,
+                source: node.source,
+                character: '\0',
+                forced_break: false,
+                break_before: true,
+                atomic: Some(node_id),
+                line_breaking,
+                style: typography.style,
+                spacing: typography.spacing,
+                bidi_level: 0,
+            });
+            return;
+        }
         if node.source.is_some_and(|source| {
             matches!(
                 self.dom.node(source).map(Node::kind),
@@ -1695,7 +1727,16 @@ impl<'a> Solver<'a> {
         y: f32,
         depth: usize,
     ) -> Option<(FragmentId, PhysicalRect)> {
-        let content_width = self.atomic_inline_content_width(node_id, containing.size.width);
+        let out_of_flow = self.is_out_of_flow(node_id);
+        // CSS Position 3 §3.5 and §4 size an absolutely positioned box from its
+        // inset-modified containing block, not from the line it would have
+        // occupied. Passing the atomic inline's shrink-to-fit width here would
+        // override that algorithm, so only in-flow atomic boxes get one.
+        let content_width = if out_of_flow {
+            None
+        } else {
+            Some(self.atomic_inline_content_width(node_id, containing.size.width))
+        };
         let result = self.layout_block(
             node_id,
             PhysicalRect::new(
@@ -1709,9 +1750,63 @@ impl<'a> Solver<'a> {
             positioning_containing_rtl,
             y,
             depth,
-            Some(content_width),
+            content_width,
         )?;
-        let outer = self.fragment_outer_rect(result.fragment)?;
+        let mut outer = self.fragment_outer_rect(result.fragment)?;
+        if out_of_flow {
+            // CSS Position 3 §3.5.3 "Inline Layout": when both insets in an
+            // axis are `auto`, the box is aligned into a static-position
+            // rectangle taken from the line box its hypothetical inline box
+            // would have occupied. The block layout above resolves a definite
+            // inset itself, so only the both-auto axes are moved to the inline
+            // cursor; this engine approximates the hypothetical line box with
+            // the current line and its top edge.
+            let node = self.formatting.get(node_id).cloned();
+            let source = node.as_ref().and_then(|node| node.source);
+            let style = node
+                .as_ref()
+                .and_then(|node| node.style_source)
+                .and_then(|source| self.styles.get(&source))
+                .cloned();
+            let left = self.resolve_inset(
+                style.as_ref(),
+                "left",
+                positioning_containing.size.width,
+                source,
+            );
+            let right = self.resolve_inset(
+                style.as_ref(),
+                "right",
+                positioning_containing.size.width,
+                source,
+            );
+            let top = self.resolve_inset(
+                style.as_ref(),
+                "top",
+                positioning_containing.size.height,
+                source,
+            );
+            let bottom = self.resolve_inset(
+                style.as_ref(),
+                "bottom",
+                positioning_containing.size.height,
+                source,
+            );
+            let dx = if left.is_none() && right.is_none() {
+                x - outer.origin.x
+            } else {
+                0.0
+            };
+            let dy = if top.is_none() && bottom.is_none() {
+                y - outer.origin.y
+            } else {
+                0.0
+            };
+            if dx != 0.0 || dy != 0.0 {
+                self.translate_fragment_subtree(result.fragment, dx, dy);
+                outer = self.fragment_outer_rect(result.fragment)?;
+            }
+        }
         Some((result.fragment, outer))
     }
 
