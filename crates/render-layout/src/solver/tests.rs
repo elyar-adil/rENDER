@@ -3144,7 +3144,7 @@ fn an_out_of_flow_inline_does_not_size_its_shrink_to_fit_parent() {
         "<!doctype html><body><div id='chip'><a id='link'><span id='badge'></span></a></div></body>",
         "html, body, div, a, span { display:block; margin:0 } \
          #chip { display:inline-block; position:relative; line-height:20px } \
-         #link { display:inline; position:absolute; left:0; top:0; width:30px } \
+         #link { display:inline; position:absolute; left:0; top:0 } \
          #badge { display:inline-block; width:30px; height:20px }",
         800.0,
     );

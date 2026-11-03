@@ -496,19 +496,22 @@ impl Solver<'_> {
         // left is the static position and the width is shrink-to-fit. Requiring
         // a definite inset here stretched such a box to its containing block
         // (Bing's 国内版/国际版 switch became 955px wide instead of 160px).
-        let shrink_to_fit_width = if out_of_flow
-            && specified_width.is_none()
-            && positioned_content_width.is_none()
-        {
-            Some(
-                self.max_content_width(node_id).min(
+        // §10.3.5's shrink-to-fit is
+        // `min(max(preferred minimum width, available width), preferred width)`,
+        // so the min-content floor keeps the box as wide as its longest
+        // unbreakable content even when the static position leaves no room
+        // (an out-of-flow inline inside a zero-width shrink-to-fit parent).
+        let shrink_to_fit_width =
+            if out_of_flow && specified_width.is_none() && positioned_content_width.is_none() {
+                let available =
                     (containing.size.width - non_content - margin_left.value - margin_right.value)
-                        .max(0.0),
-                ),
-            )
-        } else {
-            None
-        };
+                        .max(0.0);
+                let preferred = self.max_content_width(node_id);
+                let preferred_minimum = self.min_content_width(node_id);
+                Some(preferred.min(preferred_minimum.max(available)))
+            } else {
+                None
+            };
         let forced_content_width = forced_content_width.or(positioned_content_width);
         let mut content_width = forced_content_width.unwrap_or_else(|| {
             specified_width.map_or_else(
