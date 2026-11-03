@@ -70,6 +70,26 @@ The release binary loads `dav1d.dll` at startup. Keeping a copy next to
 `target\release\render-browser.exe` (or `<prefix>\bin` on `PATH`) makes a
 direct launch independent of the current shell.
 
+## Headless page screenshots
+
+`render-headless` loads a page through the same network, style, script, image
+and font resource loaders as the native shell, but never creates a window or a
+graphics surface. It writes the final composited frame as a PNG at
+`width * dpr` by `height * dpr` device pixels:
+
+```bash
+cargo run --release -p render-browser --bin render-headless -- \
+  --url https://www.example.com/ --out /tmp/page.png \
+  --width 1180 --height 780 --dpr 2 --wait-ms 10000 --print-health
+```
+
+Optional flags are `--proxy ADDR` (or `direct`), `--dump-dom PATH`, and
+`--print-health`, which emits JSON with readiness, resource counters, surface
+dimensions and element border boxes. `--wait-ms` is the maximum settle budget;
+a single JavaScript turn is not interruptible, so a page whose script reaches
+the interpreter step limit can overrun it. Network, file I/O and the PNG write
+are the only side effects.
+
 ## Performance Measurements
 
 Use the headless, deterministic `render-perf` binary to measure the stable

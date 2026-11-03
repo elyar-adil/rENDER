@@ -1,3 +1,41 @@
+# 交接文档 (2026-11-03, 续) — 无窗口 headless 页面运行器
+
+新增 `render-browser` 的 `render-headless` bin 和库里 `render_browser::headless` 模块。它只做网络/文件 I/O 与离屏 CPU 光栅化，不创建 winit/AppKit/NSWindow、不启动 softbuffer/gpu、不拉起外部浏览器；窗口焦点不受影响。
+
+## 用法
+
+```bash
+cargo run --release -p render-browser --bin render-headless -- \
+  --url https://www.example.com/ --out /tmp/page.png \
+  --width 1180 --height 780 --dpr 2 --wait-ms 10000 --print-health
+```
+
+可选 `--proxy ADDR|direct`、`--dump-dom PATH`、`--print-health`（JSON：readyState、资源计数、surface 尺寸、元素 border box）。PNG 尺寸为 `width*dpr × height*dpr`。
+
+## 已实现
+
+- 导航经 `render_net::HttpTransport`（TLS 验证保留；显式代理与 `NO_PROXY` 语义沿用 transport）。
+- HTML 编码嗅探复用 `decode_html_bytes`/`Content-Type` charset；`<base>`/相对 URL 由现有 Discover 路径处理。
+- 外部 CSS 经 `resources.rs`，经典/模块脚本经 `scripts.rs`（含依赖图、import map、动态 `import()`），图片经 `images.rs`（含 CSS background、srcset 选择上下文），webfont 经 `font_faces.rs` 的 `DocumentFontLoader`。
+- `Page` 只跑 DOM/JS/事件循环（`run_one_turn_without_render`），每次需要时把 DOM 快照交给 `Document::render_with_interaction_and_transitions_and_frames`；`device_scale` 只缩放 paint，layout/脚本几何保持 CSS px。几何与 computed style 通过 `publish_render_geometry`/`publish_computed_styles` 回灌脚本。
+- `fetch()`/XHR 同步执行，cookie jar 复用 `render_net::CookieJar`；跨域响应做 ACAO 检查。`DOMContentLoaded`/`load` 在资源与立即任务静默后派发。
+- 本地 HTTP fixture 测试（CSS + 外链 JS + JS `fetch` + SVG 图片 + 失败 webfont）验证 DOM 更新、PNG 800×600（400×300 CSS @ DPR 2）、健康计数与元素几何。
+
+## 实测
+
+- `example.com`（release，1180×780 CSS，DPR 2）：2360×1560 PNG，614 ms，`ready_state=complete`；截图 `/tmp/headless-example-release.png`。
+- `rust-lang.org`（release，同视口）：2360×1560，7.2 s，4 个外部样式表、9 张图片、3 个脚本执行，`css_errors=0`、`images_failed=0`；截图 `/tmp/headless-rust-lang.png`。
+- `baidu.com/s?wd=abc` 被服务端重定向到 `wappass.baidu.com` 验证码页，脚本两次触发解释器 step limit；截图是真实返回的验证码页，不是伪造搜索结果。10 s 预算下 release 实际 18.4 s，因为单个 JS turn 不可抢占（已在 README 说明）。
+
+## 剩余缺口
+
+- 无 GPU、无窗口、无输入/滚动/动画播放；截图是静止视口首屏。
+- 没有导航接管（脚本 `location`/表单提交中途导航不会换页）、无 iframe 导航编排、无 CORS preflight、无 service worker/SharedWorker。
+- `wait-ms` 是软预算：单个解释器 turn 不能中断；超时会体现在 `timed_out`。
+- 本地 `file:` 页面的外部子资源仍走 `render-net`，因此不会读取同目录文件；HTTP(S) 页面没有这个限制。
+
+---
+
 # 交接文档 (2026-11-03) — 通用 Web Worker API
 
 本轮补上 Dedicated Web Worker，让把压缩/遥测/captcha 工作放到 worker 的页面不再因 `ReferenceError: Worker is not defined` 进入全局错误页。实现完全走通用 HTML/JS 路径，没有站点特判。
