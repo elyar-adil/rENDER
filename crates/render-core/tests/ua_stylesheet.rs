@@ -251,23 +251,267 @@ fn list_items_paint_their_markers() {
 }
 
 #[test]
-fn form_controls_use_a_smaller_face_and_a_box_border() {
-    // HTML §15.3.10 defers the widget look to §15.5; the smaller UI font and
-    // border-box sizing are the parts a document can observe.
+fn form_controls_use_the_chromium_auto_appearance_box() {
+    // HTML §15.3.10 and Chromium's html.css: an unstyled control has
+    // `appearance: auto`, so text inputs and textareas are content-box, while
+    // search, buttons and selects are border-box. The UI face is 13.3333px
+    // Arial with a normal line height.
     let document = Document::parse(
-        "<!doctype html><body><input id=i type=text><button id=b>go</button>\
-         <textarea id=ta></textarea><select id=sel><option>x</option></select></body>",
+        "<!doctype html><body><input id=i type=text><input id=s type=search>\
+         <button id=b>go</button><textarea id=ta></textarea>\
+         <select id=sel><option>x</option></select></body>",
     );
-    for id in ["i", "b", "ta", "sel"] {
+    for id in ["i", "s", "b", "ta", "sel"] {
         assert_eq!(
             computed(&document, id, "font-size"),
             "13.3333px",
             "{id} control font"
         );
-        assert_eq!(computed(&document, id, "box-sizing"), "border-box", "{id}");
+        assert_eq!(
+            computed(&document, id, "line-height"),
+            "normal",
+            "{id} line height"
+        );
     }
+    for id in ["i", "s", "b", "sel"] {
+        assert_eq!(
+            computed(&document, id, "font-family"),
+            "Arial",
+            "{id} family"
+        );
+    }
+    assert_eq!(computed(&document, "ta", "font-family"), "monospace");
+    assert_eq!(computed(&document, "i", "box-sizing"), "content-box");
+    assert_eq!(computed(&document, "ta", "box-sizing"), "content-box");
+    assert_eq!(computed(&document, "s", "box-sizing"), "border-box");
+    assert_eq!(computed(&document, "b", "box-sizing"), "border-box");
+    assert_eq!(computed(&document, "sel", "box-sizing"), "border-box");
+
+    // Chromium's native field border, padding and fill, and its button rule.
+    assert_eq!(computed(&document, "i", "padding-top"), "1px");
+    assert_eq!(computed(&document, "i", "padding-left"), "2px");
+    assert_eq!(computed(&document, "i", "border-top-width"), "2px");
+    assert_eq!(computed(&document, "i", "border-top-color"), "#767676");
+    assert_eq!(computed(&document, "i", "background-color"), "#ffffff");
+    assert_eq!(computed(&document, "b", "padding-left"), "6px");
+    assert_eq!(computed(&document, "b", "border-top-width"), "2px");
+    assert_eq!(computed(&document, "b", "background-color"), "#efefef");
+    assert_eq!(computed(&document, "ta", "padding-top"), "2px");
+    assert_eq!(computed(&document, "ta", "border-top-width"), "1px");
+    assert_eq!(computed(&document, "sel", "padding-left"), "4px");
+    assert_eq!(computed(&document, "sel", "border-top-width"), "1px");
+
     assert_eq!(computed(&document, "ta", "white-space"), "pre-wrap");
     assert_eq!(computed(&document, "b", "text-align"), "center");
+    assert_eq!(computed(&document, "i", "text-align"), "start");
+    assert_eq!(computed(&document, "i", "text-transform"), "none");
+    assert_eq!(computed(&document, "i", "text-indent"), "0");
+    assert_eq!(computed(&document, "i", "text-shadow"), "none");
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one listing of the used box for each kind of control"
+)]
+fn unstyled_form_controls_have_chromium_used_boxes() {
+    // Exact used geometry through the document pipeline. Chromium's text field
+    // is 177.33px wide by 21.33px high on desktop; the reference measurer's
+    // nominal Arial line height is 1.2em, so the height here is 22px. Widths
+    // are not affected by that difference.
+    let document = Document::parse(
+        "<!doctype html><body style='margin:0'><form>\
+         <input id=i type=text value=go>\
+         <input id=s type=search>\
+         <input id=su type=submit value=go>\
+         <button id=b>go</button>\
+         <textarea id=ta></textarea>\
+         <textarea id=ta2 rows=3 cols=40></textarea>\
+         <select id=sel><option>x</option></select>\
+         </form></body>",
+    );
+    let render = document.render_reference(DocumentRenderOptions::default());
+    let close = |actual: f32, expected: f32, label: &str| {
+        assert!(
+            (actual - expected).abs() < 0.01,
+            "{label}: expected {expected}, got {actual}"
+        );
+    };
+    let geometry = |id: &str| {
+        let node = find_by_id(&document, id);
+        render
+            .layout
+            .fragments
+            .iter()
+            .find_map(|fragment| match (&fragment.kind, fragment.source) {
+                (render_core::layout::FragmentKind::Box(geometry), Some(source))
+                    if source == node =>
+                {
+                    Some(geometry.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing box fragment for #{id}"))
+    };
+    let used = |id: &str| {
+        let geometry = geometry(id);
+        (
+            geometry.border_rect(),
+            geometry.content_rect,
+            geometry.padding,
+            geometry.border,
+        )
+    };
+
+    let (border, content, padding, edge) = used("i");
+    close(border.size.width, 177.33, "text input border width");
+    close(border.size.height, 22.0, "text input border height");
+    close(content.size.width, 169.33, "text input content width");
+    close(content.size.height, 16.0, "text input content height");
+    close(padding.left, 2.0, "text input left padding");
+    close(padding.top, 1.0, "text input top padding");
+    close(edge.left, 2.0, "text input left border");
+
+    // `box-sizing: border-box` on search turns the same outer width into
+    // 8px less content than the text field.
+    let (border, content, _, _) = used("s");
+    close(border.size.width, 177.33, "search border width");
+    close(border.size.height, 22.0, "search border height");
+    close(content.size.width, 169.33, "search content width");
+    close(content.size.height, 16.0, "search content height");
+
+    // The button is shrink-to-fit: the reference face advances `go` by
+    // 13.3333px and Chromium's padding/border add 16px.
+    for id in ["su", "b"] {
+        let (border, content, padding, edge) = used(id);
+        close(content.size.width, 13.3333, &format!("{id} content width"));
+        close(content.size.height, 16.0, &format!("{id} content height"));
+        close(border.size.width, 29.3333, &format!("{id} border width"));
+        close(border.size.height, 22.0, &format!("{id} border height"));
+        close(padding.left, 6.0, &format!("{id} left padding"));
+        close(edge.left, 2.0, &format!("{id} left border"));
+    }
+
+    // 20 columns of the monospace 0.6em advance, and 2 rows of the 1.2em
+    // reference line height, both content-box.
+    let (border, content, _, _) = used("ta");
+    close(border.size.width, 166.0, "textarea border width");
+    close(border.size.height, 38.0, "textarea border height");
+    close(content.size.width, 160.0, "textarea content width");
+    close(content.size.height, 32.0, "textarea content height");
+
+    let (border, content, _, _) = used("ta2");
+    close(border.size.width, 326.0, "rows/cols textarea border width");
+    close(border.size.height, 54.0, "rows/cols textarea border height");
+    close(
+        content.size.width,
+        320.0,
+        "rows/cols textarea content width",
+    );
+    close(
+        content.size.height,
+        48.0,
+        "rows/cols textarea content height",
+    );
+
+    let (border, content, padding, edge) = used("sel");
+    close(border.size.width, 16.6667, "select border width");
+    close(border.size.height, 20.0, "select border height");
+    close(content.size.width, 6.6667, "select content width");
+    close(content.size.height, 16.0, "select content height");
+    close(padding.left, 4.0, "select left padding");
+    close(edge.left, 1.0, "select left border");
+
+    // The form-control type styles reach the text runs, not just the box.
+    let input = find_by_id(&document, "i");
+    let text = render
+        .layout
+        .fragments
+        .iter()
+        .find_map(|fragment| match (&fragment.kind, fragment.source) {
+            (render_core::layout::FragmentKind::Text(data), Some(source)) if source == input => {
+                Some((data, fragment.rect))
+            }
+            _ => None,
+        })
+        .expect("input value text fragment");
+    close(text.0.font_size, 13.3333, "input text font size");
+    close(text.1.size.height, 16.0, "input text line height");
+}
+
+#[test]
+#[allow(
+    clippy::float_cmp,
+    reason = "40px and 46px are exact in binary and come from exact arithmetic"
+)]
+fn text_input_height_follows_an_author_line_height() {
+    // The UA height is `1lh`, not a fixed pixel height: a page that only sets
+    // `line-height` must get a field tall enough for that line, exactly as
+    // Chromium's native inner editor does.
+    let document = Document::parse(
+        "<!doctype html><body><input id=i type=text style='line-height:40px'></body>",
+    );
+    let render = document.render_reference(DocumentRenderOptions::default());
+    let node = find_by_id(&document, "i");
+    let geometry = render
+        .layout
+        .fragments
+        .iter()
+        .find_map(|fragment| match (&fragment.kind, fragment.source) {
+            (render_core::layout::FragmentKind::Box(geometry), Some(source)) if source == node => {
+                Some(geometry)
+            }
+            _ => None,
+        })
+        .expect("input box");
+    assert_eq!(geometry.content_rect.size.height, 40.0);
+    assert_eq!(geometry.border_rect().size.height, 46.0);
+}
+
+#[test]
+#[allow(
+    clippy::float_cmp,
+    reason = "the author's pixel widths are exact binary-fraction arithmetic"
+)]
+fn author_form_control_rules_override_the_ua_box() {
+    // UA declarations are only defaults. A control that sets its own width,
+    // sizing, padding, border, face and fill must lose none of them.
+    let document = Document::parse(
+        "<!doctype html><body><input id=i type=text style='box-sizing:border-box;\
+         width:300px; height:60px; padding:10px; border:8px solid #123456;\
+         font-family:Georgia; font-size:20px; line-height:24px;\
+         background-color:#abcdef; color:#111111'></body>",
+    );
+    let render = document.render_reference(DocumentRenderOptions::default());
+    for (property, expected) in [
+        ("box-sizing", "border-box"),
+        ("font-family", "Georgia"),
+        ("font-size", "20px"),
+        ("line-height", "24px"),
+        ("background-color", "#abcdef"),
+        ("border-top-color", "#123456"),
+    ] {
+        assert_eq!(
+            computed(&document, "i", property),
+            expected,
+            "author {property}"
+        );
+    }
+    let node = find_by_id(&document, "i");
+    let geometry = render
+        .layout
+        .fragments
+        .iter()
+        .find_map(|fragment| match (&fragment.kind, fragment.source) {
+            (render_core::layout::FragmentKind::Box(geometry), Some(source)) if source == node => {
+                Some(geometry)
+            }
+            _ => None,
+        })
+        .expect("input box");
+    assert_eq!(geometry.border_rect().size.width, 300.0);
+    assert_eq!(geometry.content_rect.size.width, 264.0);
+    assert_eq!(geometry.content_rect.size.height, 24.0);
 }
 
 #[test]

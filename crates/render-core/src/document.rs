@@ -218,25 +218,145 @@ caption { text-align: center; }
    wins on order. */
 :where(td[nowrap], th[nowrap]) { white-space: nowrap; }
 
-/* §15.3.10 Form controls. The spec defers the widget look to §15.5 and no
-   longer states a control font; engines ship a smaller UI face than the
-   document face, and `font-size` is the half of that this engine renders. */
-button, input, select, textarea { font-size: 13.3333px; }
-button, input, select, textarea { display: inline-block; }
+/* §15.3.10 Form controls.
+
+   Chromium's html.css carries two rendering branches around
+   `@supports blink-feature(AppearanceBase)`. Inside the modern branch,
+   `-internal-auto-base(A, B)` selects the native `appearance: auto` arm
+   (A) or the opt-in `appearance: base` arm (B). An unstyled control has
+   `appearance: auto`, so the used boxes below are Chromium's A arm and
+   HTML's current §15.3.10 rules: a 13.3333px Arial UI face with normal line
+   height, content-box for text inputs and textareas, border-box for search
+   inputs, buttons and selects, and the native field/button borders and
+   padding. The B arm (transparent background, 0 padding, 1px currentColor
+   border, border-box everywhere) belongs to authors who write
+   `appearance: base`; this engine has no `appearance` property and no base
+   widget painting, so it does not mix those values into the UA defaults.
+
+   Chromium paints `2px inset` on text fields and `2px outset` on buttons.
+   The rasterizer paints solid borders only, so the same width and colour are
+   declared solid rather than leaving UA controls with no border. `Field`,
+   `FieldText`, `ButtonFace` and `ButtonText` are likewise spelled as their
+   light-theme sRGB values because those system-colour keywords are not
+   defined here. */
+button, input, select, textarea {
+  margin: 0;
+  font-family: Arial;
+  font-size: 13.3333px;
+  font-weight: normal;
+  font-style: normal;
+  line-height: normal;
+  letter-spacing: normal;
+  word-spacing: normal;
+  text-transform: none;
+  text-indent: 0;
+  text-shadow: none;
+  color: #000000;
+  display: inline-block;
+  text-align: start;
+}
 /* A single-line input and a button centre their text vertically in the box
    (HTML §15.5). The value is the input's only child, so a centred flex box
    places it without changing any other content. */
 input:not([type="hidden" i]) { display: inline-flex; align-items: center; }
-button, input:is([type="reset" i], [type="button" i], [type="submit" i]) {
-  text-align: center;
-  justify-content: center;
+/* Chromium's native text-field box: 1px 2px padding and a 2px border around
+   a content-box width. The 169.33px content width is the 20-character default
+   of Chromium/desktop (177.33px border box); without a width an empty field
+   would collapse to its padding because this engine has no native editor.
+   The height is one normal line box, which is what that editor contributes
+   to an empty field. */
+input {
+  padding: 1px 2px;
+  border: 2px solid #767676;
+  background-color: #ffffff;
+  box-sizing: content-box;
 }
-button, input, select, textarea { box-sizing: border-box; }
-textarea { white-space: pre-wrap; }
-input:not([type="hidden" i]) {
-  width: 180px; min-height: 22px;
-  padding-left: 4px; padding-right: 4px;
-  border: 1px solid #888;
+input:not([type="hidden" i], [type="submit" i], [type="reset" i],
+         [type="button" i], [type="image" i], [type="file" i],
+         [type="checkbox" i], [type="radio" i], [type="range" i],
+         [type="color" i], [type="search" i]) {
+  width: 169.33px;
+  height: 1lh;
+}
+/* HTML §15.3.10 lists search, the button-ish inputs, color, checkbox and
+   radio as border-box controls; the text field stays content-box. */
+input:is([type="search" i], [type="submit" i], [type="reset" i],
+         [type="button" i], [type="color" i], [type="checkbox" i],
+         [type="radio" i]) {
+  box-sizing: border-box;
+}
+/* Search is the one text-entry box Chromium sizes with border-box, so its
+   content width is 8px smaller than the text field's at the same outer size. */
+input[type="search" i] {
+  width: 177.33px;
+  height: calc(1lh + 6px);
+}
+/* File, image and range controls clear the text-field border and padding, as
+   Chromium's `appearance: none` reset does. */
+input[type="file" i], input[type="image" i], input[type="range" i] {
+  padding: 0;
+  border: 0;
+  background-color: transparent;
+}
+/* The controls outside the text/button/textarea/select group get platform
+   intrinsic sizes Chromium models in its theme, not in html.css. These are the
+   desktop values for range and color; the file control keeps the engine's
+   previous field width so it stays visible without a native file-chooser
+   widget. */
+input[type="range" i] { width: 129px; height: 16px; }
+input[type="color" i] { width: 44px; height: 23px; }
+input[type="file" i] { width: 180px; height: 1lh; }
+/* Native checkbox and radio: a small bordered control, not a text field. */
+input[type="checkbox" i], input[type="radio" i] {
+  padding: 0;
+  margin: 3px 3px 3px 4px;
+  border: 1px solid #767676;
+  background-color: #ffffff;
+  width: 13px;
+  height: 13px;
+}
+input[type="radio" i] { border-radius: 50%; }
+/* Chromium's `input[type=button|submit|reset]` and `button` rule: border-box,
+   1px 6px padding, a 2px ButtonBorder ring and ButtonFace fill. The flex
+   display stands in for the native button's `-internal-align-content-block:
+   center`, which this engine does not have. */
+button, input:is([type="reset" i], [type="button" i], [type="submit" i]) {
+  box-sizing: border-box;
+  padding: 1px 6px;
+  border: 2px solid #767676;
+  background-color: #efefef;
+  color: #000000;
+  text-align: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: default;
+}
+/* Native textarea: content-box, 2px padding, 1px border, monospace face and
+   pre-wrap. The intrinsic size comes from `rows`/`cols`, whose defaults are
+   2 and 20; `1ch` is the monospace advance the effective-width algorithm
+   calls the average character width, and `1lh` is the used line height. */
+textarea {
+  box-sizing: content-box;
+  padding: 2px;
+  border: 1px solid #767676;
+  background-color: #ffffff;
+  font-family: monospace;
+  white-space: pre-wrap;
+}
+:where(textarea) {
+  width: calc(20 * 1ch);
+  height: calc(2 * 1lh);
+}
+/* Native drop-down select: border-box with a 1px border and the theme's
+   internal 1px/4px text inset. */
+select {
+  box-sizing: border-box;
+  padding: 1px 4px;
+  border: 1px solid #767676;
+  background-color: #ffffff;
+  white-space: pre;
+  border-radius: 0;
 }
 
 /* A frame's viewport clips its document: the nested document paints into the
@@ -483,6 +603,24 @@ fn presentational_hint_declarations(
     ) && let Some(height) = attribute("height")
     {
         hints.push(declaration("height", px_or_percent(height)));
+    }
+    // HTML §15.5.17: `cols` and `rows` give a textarea's effective width and
+    // height in character cells. They are not pixel dimensions, so they map to
+    // `ch` (the zero advance the effective-width algorithm calls the average
+    // character width) and `lh` (the used line height) instead of the pixel
+    // path above.
+    if tag == "textarea" {
+        let positive_integer = |name: &str| {
+            attribute(name)
+                .and_then(|raw| raw.parse::<u32>().ok())
+                .filter(|value| *value > 0)
+        };
+        if let Some(cols) = positive_integer("cols") {
+            hints.push(declaration("width", format!("calc({cols} * 1ch)")));
+        }
+        if let Some(rows) = positive_integer("rows") {
+            hints.push(declaration("height", format!("calc({rows} * 1lh)")));
+        }
     }
 
     // align: text alignment for cell/block content, geometry for

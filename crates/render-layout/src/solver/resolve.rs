@@ -524,17 +524,32 @@ impl Solver<'_> {
         // CSS 2.1 §4.3.2: `em` refers to the computed font size of the
         // element on which the property is set, not the root font. The
         // computed-value stage stores an absolute font size, so this stays a
-        // cheap parse of the stored pixel value.
-        let font_size = node
-            .and_then(|node| self.styles.get(&node))
-            .and_then(|style| style.get("font-size"))
-            .and_then(|value| parse_font_size(value.css_text(), self.options.root_font_size))
-            .unwrap_or(self.options.root_font_size);
+        // cheap parse of the stored pixel value. `ch` and `lh` additionally
+        // need the selected face's zero advance and the element's used line
+        // height, which only the shared text-style resolution knows.
+        let text_style = node.map(|node| self.inline_text_style(Some(node)));
+        let font_size = text_style.map_or_else(
+            || {
+                node.and_then(|node| self.styles.get(&node))
+                    .and_then(|style| style.get("font-size"))
+                    .and_then(|value| {
+                        parse_font_size(value.css_text(), self.options.root_font_size)
+                    })
+                    .unwrap_or(self.options.root_font_size)
+            },
+            |style| style.style.font_size,
+        );
+        let line_height = text_style.map_or(self.options.default_line_height, |style| {
+            style.style.line_height
+        });
+        let zero_advance =
+            text_style.map(|style| self.text_measurer.measure("0", style.style).advance);
         let mut context = LengthResolutionContext {
             percentage_basis: Some(basis),
             font_size,
             root_font_size: self.options.root_font_size,
-            line_height: self.options.default_line_height,
+            zero_advance,
+            line_height,
             root_line_height: self.options.default_line_height,
             viewport_width: self.options.viewport.width,
             viewport_height: self.options.viewport.height,
