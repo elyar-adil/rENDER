@@ -1493,6 +1493,19 @@ impl TextMeasurer for SystemFontBackend {
             })
     }
 
+    fn x_height(&self, font_size: f32, font: &FontRequest<'_>) -> f32 {
+        // CSS 2.1 §10.8.1's `middle` keyword is defined against the parent's
+        // x-height. fontdue exposes glyph outlines rather than the OpenType
+        // `sxHeight` metric, so the ink height of a lowercase x is the closest
+        // measurement a real face gives; a face with no Latin x falls back to
+        // the reference path's half-em.
+        let instance = self.resolve(font);
+        self.face_for(&instance, 'x')
+            .map(|(face, _, _)| face.metrics('x', font_size).bounds.height)
+            .filter(|height| height.is_finite() && *height > 0.0 && *height <= font_size)
+            .unwrap_or(font_size * 0.5)
+    }
+
     fn measure(&self, text: &str, style: TextStyle<'_>) -> TextMeasure {
         let instance = self.resolve(&style.font);
         let mut advance = 0.0_f32;

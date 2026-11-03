@@ -59,6 +59,8 @@ mod tests;
 mod text_tests;
 #[cfg(test)]
 mod vanish_tests;
+#[cfg(test)]
+mod vertical_align_tests;
 
 /// The typographic inputs one text run is measured with.
 ///
@@ -192,6 +194,17 @@ pub trait TextMeasurer: Sync {
     /// metrics so Arial and `PingFang` do not share one line height.
     fn normal_line_height(&self, font_size: f32, _font: &FontRequest<'_>) -> f32 {
         font_size * 1.2
+    }
+
+    /// The face's x-height in CSS pixels, used by `vertical-align: middle`
+    /// (CSS 2.1 §10.8.1) to place a box's midpoint half an x-height above the
+    /// parent's baseline.
+    ///
+    /// The reference path has no glyph table, so it falls back to half an em,
+    /// which is the usual x-height of the nominal faces. A backend with a real
+    /// face overrides this with the metrics the face reports.
+    fn x_height(&self, font_size: f32, _font: &FontRequest<'_>) -> f32 {
+        font_size * 0.5
     }
 
     /// Measure `text` with the CSS Text 3 §7 spacing that applies to it.
@@ -751,6 +764,9 @@ pub(super) struct InlineAtom<'a> {
     line_breaking: LineBreakOptions,
     style: TextStyle<'a>,
     spacing: TextSpacing,
+    /// The CSS 2.1 §10.8.1 alignment this inline-level box asks for, together
+    /// with the parent metrics the keywords need.
+    vertical_align: inline::VerticalAlignContext,
     /// The resolved UAX #9 embedding level of this atom.
     bidi_level: u8,
 }
@@ -763,6 +779,8 @@ struct TextRun<'a> {
     y: f32,
     width: f32,
     typography: inline::InlineTextStyle<'a>,
+    /// The §10.8.1 alignment of the inline box this run belongs to.
+    vertical_align: inline::VerticalAlignContext,
     /// CSS Text 3 §7 spacing before the run's first unit, recorded when the
     /// run is opened. Interior spacing is derived from `typography.spacing`
     /// when the run is painted, because it is the same for every character.

@@ -26,6 +26,7 @@ use crate::solver::TextStyle;
 use crate::solver::block::content_visibility_hidden;
 use crate::solver::block::has_inline_size_containment;
 use crate::solver::block::inline_float_band;
+use crate::solver::block::overflow_axes;
 use crate::solver::is_word_separator;
 use crate::solver::resolve::count_as_f32;
 use crate::tree::FormattingContextKind;
@@ -37,12 +38,15 @@ use render_css::length::{LengthContext, resolve_length_expr};
 use render_css::properties::AlignItems;
 use render_css::properties::BoxSizing;
 use render_css::properties::Direction;
+use render_css::properties::Display;
+use render_css::properties::DisplayOutside;
 use render_css::properties::Float;
 use render_css::properties::JustifyContent;
 use render_css::properties::LineBreak;
 use render_css::properties::Overflow;
 use render_css::properties::TextAlign;
 use render_css::properties::TypedPropertyValue;
+use render_css::properties::VerticalAlign;
 use render_css::properties::WordBreak as WordBreakProperty;
 use render_dom::Namespace;
 use render_dom::Node;
@@ -262,6 +266,63 @@ pub(super) struct InlineTextStyle<'a> {
 pub(super) struct InlineTextContextSource {
     pub style_source: Option<NodeId>,
     pub is_first_child: bool,
+}
+
+/// The used value of CSS 2.1 §10.8.1 `vertical-align` for an inline-level box.
+///
+/// §10.8.1 has two families of values. `baseline`, `middle`, `text-top`,
+/// `text-bottom` and a `<length>`/`<percentage>` shift all position the box by
+/// its own baseline and therefore contribute an ascent and a descent to the
+/// line box. `top` and `bottom` pin the box to the line box itself, so they
+/// contribute their height instead. Resolving the `<length>`/`<percentage>`
+/// form at collection time turns every value into one of a few primitive
+/// shifts the alignment pass can apply without re-reading the cascade.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) enum InlineVerticalAlign {
+    #[default]
+    Baseline,
+    Middle,
+    Top,
+    Bottom,
+    TextTop,
+    TextBottom,
+    /// Raise the box's baseline by this many pixels. Negative values lower
+    /// it. The `sub` and `super` keywords are UA-defined shifts; they resolve
+    /// to this form so the line pass has one representation.
+    Offset(f32),
+}
+
+/// The alignment requested by an inline-level box and the parent metrics its
+/// keyword needs: the parent's content-area ascent/descent for `text-top` and
+/// `text-bottom`, and the parent's x-height for `middle`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct VerticalAlignContext {
+    pub align: InlineVerticalAlign,
+    pub parent_ascent: f32,
+    pub parent_descent: f32,
+    pub parent_x_height: f32,
+}
+
+/// One inline-level box on a line, captured before §10.8.1 alignment moves
+/// it. `baseline` is measured from `top`, the box's current top edge, and
+/// `height` is the box's inline-level height: its `line-height` for a text run
+/// or its margin box for an atomic inline.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct InlineLineItem {
+    fragment: FragmentId,
+    top: f32,
+    baseline: f32,
+    height: f32,
+    /// Whether this item is a text run rather than an atomic inline box.
+    text: bool,
+    vertical_align: VerticalAlignContext,
+}
+
+/// The ascent and descent of a line's strut, relative to its baseline.
+#[derive(Clone, Copy, Debug)]
+struct LineStrut {
+    ascent: f32,
+    descent: f32,
 }
 
 /// The block container's own text properties that shape its inline content.
@@ -627,7 +688,9 @@ impl<'a> Solver<'a> {
             spacing: TextSpacing::default(),
         };
         let first_style = atoms.first().map_or(default_style, inline_typography);
+        let strut = self.line_strut(source.style_source);
         let mut fragments = Vec::new();
+        let mut line_items: Vec<InlineLineItem> = Vec::new();
         let mut line_y = containing.origin.y;
         // CSS Text 3 §8.1: the indent is a margin on the start edge of the
         // first formatted line, so it moves where the line may start and the
@@ -651,6 +714,7 @@ impl<'a> Solver<'a> {
         // narrow it and `text-indent` moves one of its edges, so alignment
         // must use the band the line was actually filled into.
         let mut line_bands = vec![(line_left, line_right)];
+        let mut line_top = line_y;
         // CSS Overflow 3 §3.1: an ellipsis marks overflow, so it is drawn only
         // when the content does not fit the line box. Without this test every
         // character is checked against the room reserved for the ellipsis, and
@@ -675,8 +739,9 @@ impl<'a> Solver<'a> {
         while cursor < atoms.len() {
             let atom = atoms[cursor];
             if atom.forced_break {
-                self.flush_text_run(&mut current_run, &mut fragments);
-                line_y += current_line_height;
+                self.flush_text_run(&mut current_run, &mut fragments, &mut line_items);
+                line_y += self.align_inline_line(&line_items, line_top, strut, current_line_height);
+                line_items.clear();
                 line_index += 1;
                 after_forced_break = true;
                 current_line_height = atom.style.line_height;
@@ -690,6 +755,7 @@ impl<'a> Solver<'a> {
                     line_indent,
                     rtl,
                 );
+                line_top = line_y;
                 line_bands.push((line_left, line_right));
                 line_x = line_left;
                 pending_space = None;
@@ -698,7 +764,7 @@ impl<'a> Solver<'a> {
                 continue;
             }
             if let Some(atomic) = atom.atomic {
-                self.flush_text_run(&mut current_run, &mut fragments);
+                self.flush_text_run(&mut current_run, &mut fragments, &mut line_items);
                 if let Some(space) = pending_space.take()
                     && line_x > line_left
                 {
@@ -711,6 +777,7 @@ impl<'a> Solver<'a> {
                     self.push_character(
                         &mut current_run,
                         &mut fragments,
+                        &mut line_items,
                         space,
                         ' ',
                         line_x,
@@ -719,7 +786,7 @@ impl<'a> Solver<'a> {
                         spacing,
                         line_index,
                     );
-                    self.flush_text_run(&mut current_run, &mut fragments);
+                    self.flush_text_run(&mut current_run, &mut fragments, &mut line_items);
                     line_x += width;
                     previous_unit = Some(PreviousUnit {
                         typography: inline_typography(&space),
@@ -757,6 +824,7 @@ impl<'a> Solver<'a> {
                             line_indent,
                             rtl,
                         );
+                        line_top = line_y;
                         line_x = line_left;
                         self.translate_fragment_subtree(
                             fragment,
@@ -765,7 +833,14 @@ impl<'a> Solver<'a> {
                         );
                     }
                     if line_x > line_left && line_x + outer.size.width > line_right {
-                        line_y += current_line_height;
+                        self.flush_text_run(&mut current_run, &mut fragments, &mut line_items);
+                        line_y += self.align_inline_line(
+                            &line_items,
+                            line_top,
+                            strut,
+                            current_line_height,
+                        );
+                        line_items.clear();
                         line_index += 1;
                         after_forced_break = false;
                         current_line_height = atom.style.line_height;
@@ -779,6 +854,7 @@ impl<'a> Solver<'a> {
                             line_indent,
                             rtl,
                         );
+                        line_top = line_y;
                         line_bands.push((line_left, line_right));
                         line_x = line_left;
                         self.translate_fragment_subtree(
@@ -787,6 +863,35 @@ impl<'a> Solver<'a> {
                             line_y - outer.origin.y,
                         );
                     }
+                    let baseline = self.atomic_inline_baseline(
+                        fragment,
+                        atom.source,
+                        line_y,
+                        outer.size.height,
+                    );
+                    // An inline-block with no in-flow line box has no text
+                    // baseline to align. The engine keeps such a box (an empty
+                    // spacer, an image-only card) at the line top, as it did
+                    // before §10.8.1 alignment existed; only a box with a real
+                    // baseline takes part in baseline alignment.
+                    let vertical_align = if baseline.is_none()
+                        && atom.vertical_align.align == InlineVerticalAlign::Baseline
+                    {
+                        VerticalAlignContext {
+                            align: InlineVerticalAlign::Top,
+                            ..atom.vertical_align
+                        }
+                    } else {
+                        atom.vertical_align
+                    };
+                    line_items.push(InlineLineItem {
+                        fragment,
+                        top: line_y,
+                        baseline: baseline.unwrap_or(0.0),
+                        height: outer.size.height,
+                        text: false,
+                        vertical_align,
+                    });
                     line_x += outer.size.width;
                     current_line_height = current_line_height.max(outer.size.height);
                     // §7.2: a consecutive run of atomic inlines is a single
@@ -827,6 +932,7 @@ impl<'a> Solver<'a> {
                     line_indent,
                     rtl,
                 );
+                line_top = line_y;
                 line_x = line_left;
             }
             let space_width = pending_space
@@ -862,8 +968,9 @@ impl<'a> Solver<'a> {
                 && line_x > line_left
                 && line_x + space_width + segment_width > line_right
             {
-                self.flush_text_run(&mut current_run, &mut fragments);
-                line_y += current_line_height;
+                self.flush_text_run(&mut current_run, &mut fragments, &mut line_items);
+                line_y += self.align_inline_line(&line_items, line_top, strut, current_line_height);
+                line_items.clear();
                 line_index += 1;
                 after_forced_break = false;
                 current_line_height = segment[0].style.line_height;
@@ -877,6 +984,7 @@ impl<'a> Solver<'a> {
                     line_indent,
                     rtl,
                 );
+                line_top = line_y;
                 line_bands.push((line_left, line_right));
                 line_x = line_left;
                 pending_space = None;
@@ -895,6 +1003,7 @@ impl<'a> Solver<'a> {
                 self.push_character(
                     &mut current_run,
                     &mut fragments,
+                    &mut line_items,
                     space,
                     ' ',
                     line_x,
@@ -946,8 +1055,10 @@ impl<'a> Solver<'a> {
                 let width;
                 let leading_spacing;
                 if wraps {
-                    self.flush_text_run(&mut current_run, &mut fragments);
-                    line_y += current_line_height;
+                    self.flush_text_run(&mut current_run, &mut fragments, &mut line_items);
+                    line_y +=
+                        self.align_inline_line(&line_items, line_top, strut, current_line_height);
+                    line_items.clear();
                     line_index += 1;
                     after_forced_break = false;
                     current_line_height = atom.style.line_height;
@@ -961,6 +1072,7 @@ impl<'a> Solver<'a> {
                         line_indent,
                         rtl,
                     );
+                    line_top = line_y;
                     line_bands.push((line_left, line_right));
                     line_x = line_left;
                     width = bare.max(0.0);
@@ -976,10 +1088,11 @@ impl<'a> Solver<'a> {
                         // the ellipsis takes the place of the clipped text. It
                         // reuses the measurement that reserved its room, so it
                         // ends exactly where the text it replaced would have.
-                        self.flush_text_run(&mut current_run, &mut fragments);
+                        self.flush_text_run(&mut current_run, &mut fragments, &mut line_items);
                         self.push_character(
                             &mut current_run,
                             &mut fragments,
+                            &mut line_items,
                             *atom,
                             ELLIPSIS,
                             line_x,
@@ -988,8 +1101,14 @@ impl<'a> Solver<'a> {
                             ellipsis_spacing,
                             line_index,
                         );
-                        self.flush_text_run(&mut current_run, &mut fragments);
-                        line_y += current_line_height;
+                        self.flush_text_run(&mut current_run, &mut fragments, &mut line_items);
+                        line_y += self.align_inline_line(
+                            &line_items,
+                            line_top,
+                            strut,
+                            current_line_height,
+                        );
+                        line_items.clear();
                         line_index += 1;
                         after_forced_break = false;
                         current_line_height = atom.style.line_height;
@@ -1003,6 +1122,7 @@ impl<'a> Solver<'a> {
                             line_indent,
                             rtl,
                         );
+                        line_top = line_y;
                         line_bands.push((line_left, line_right));
                         line_x = line_left;
                         previous_unit = None;
@@ -1016,6 +1136,7 @@ impl<'a> Solver<'a> {
                 self.push_character(
                     &mut current_run,
                     &mut fragments,
+                    &mut line_items,
                     *atom,
                     atom.character,
                     line_x,
@@ -1044,11 +1165,11 @@ impl<'a> Solver<'a> {
                 cursor = segment_end;
             }
         }
-        self.flush_text_run(&mut current_run, &mut fragments);
+        self.flush_text_run(&mut current_run, &mut fragments, &mut line_items);
         let trailing_line_height = if ends_with_forced_break || !has_in_flow_line_content {
             0.0
         } else {
-            current_line_height
+            self.align_inline_line(&line_items, line_top, strut, current_line_height)
         };
         let height = line_y - containing.origin.y + trailing_line_height;
         let text_align = match (self.text_align(source.style_source), rtl) {
@@ -1061,66 +1182,140 @@ impl<'a> Solver<'a> {
             (TextAlign::End, true) => TextAlign::Left,
             (value, _) => value,
         };
-        self.align_atomic_inline_baselines(&fragments);
         self.finish_inline_lines(&fragments, containing, text_align, &line_bands);
         (fragments, height)
     }
 
-    /// CSS 2.1 §10.8.1: inline-level boxes on one line share a baseline.
-    /// Atomic inline boxes (an `inline-block` badge with its own text) are
-    /// placed with their top edge at the line top; that lifts them relative to
-    /// the surrounding text and can make a following row's badge peek through
-    /// an ancestor's `overflow:hidden` edge. Re-home each atomic box's own
-    /// text baseline on the line's baseline.
-    ///
-    /// A line can be made of atomics alone: the hot-search row is a sequence of
-    /// inline-flex links whose text lives inside those atomic boxes, so there
-    /// is no direct text run to read the row baseline from. In that case the
-    /// highest atomic text baseline becomes the line baseline.
-    fn align_atomic_inline_baselines(&mut self, fragments: &[FragmentId]) {
-        let mut line_baselines: BTreeMap<usize, f32> = BTreeMap::new();
-        let mut atomic_baselines: BTreeMap<FragmentId, (usize, f32)> = BTreeMap::new();
-        for fragment in fragments {
-            let Some(placement) = self.inline_bidi.get(fragment).copied() else {
-                continue;
-            };
-            let Some(entry) = self.fragments.get(fragment.as_u32() as usize) else {
-                continue;
-            };
-            match &entry.kind {
-                FragmentKind::Text(text) => {
-                    line_baselines
-                        .entry(placement.line)
-                        .and_modify(|baseline| *baseline = baseline.max(text.baseline))
-                        .or_insert(text.baseline);
-                }
-                FragmentKind::Box(_) => {
-                    if let Some(baseline) = self.fragment_last_text_baseline(*fragment) {
-                        atomic_baselines.insert(*fragment, (placement.line, baseline));
-                        line_baselines
-                            .entry(placement.line)
-                            .and_modify(|line| *line = line.max(baseline))
-                            .or_insert(baseline);
-                    }
-                }
-            }
-        }
-        let mut shifts = Vec::new();
-        for (fragment, (line, atomic_baseline)) in atomic_baselines {
-            let Some(line_baseline) = line_baselines.get(&line).copied() else {
-                continue;
-            };
-            let shift = line_baseline - atomic_baseline;
-            if shift.abs() > 0.01 {
-                shifts.push((fragment, shift));
-            }
-        }
-        for (fragment, shift) in shifts {
-            self.translate_fragment_subtree(fragment, 0.0, shift);
+    /// The metrics every line box starts with: a zero-width inline box with
+    /// the block container's font and `line-height`, CSS 2.1 §10.8's "strut".
+    fn line_strut(&mut self, source: Option<NodeId>) -> LineStrut {
+        let style = self.inline_text_style(source);
+        let metrics = self.text_measurer.measure("", style.style);
+        let half_leading = (style.style.line_height - (metrics.ascent + metrics.descent)) / 2.0;
+        LineStrut {
+            ascent: half_leading + metrics.ascent,
+            descent: half_leading + metrics.descent,
         }
     }
 
-    /// The bottom-most text baseline inside `root`, in document coordinates.
+    /// CSS 2.1 §10.8.1: align every inline-level box on one line and return
+    /// the line box height.
+    ///
+    /// The whole line shares one baseline. Baseline-relative values contribute
+    /// an ascent and a descent around it; `top` and `bottom` are pinned to the
+    /// line box edges and only contribute their height. The line box is the
+    /// union of those extents, so a box taller than the line grows it (and
+    /// `top`/`bottom` boxes follow the final edges). `line_top` is the first
+    /// line box position in document space and is the top of the finished line
+    /// box, which is what makes a line of stacked blocks start at its
+    /// containing block's content edge.
+    fn align_inline_line(
+        &mut self,
+        items: &[InlineLineItem],
+        line_top: f32,
+        strut: LineStrut,
+        minimum_height: f32,
+    ) -> f32 {
+        // A line box starts with the container's strut. The engine has always
+        // let a line made only of atomic inline boxes be sized by those boxes
+        // themselves (their own text baselines or their bottom edges), which is
+        // also what keeps an empty inline-block from growing a line by the
+        // container's descender. Keep that behaviour: the strut's ascent and
+        // descent join the line when a direct text run is present, and an
+        // otherwise empty line still needs its line-height.
+        let (mut ascent, mut descent) = if items.is_empty() || items.iter().any(|item| item.text) {
+            (strut.ascent, strut.descent)
+        } else {
+            (0.0, 0.0)
+        };
+        let mut tallest_top = 0.0_f32;
+        let mut tallest_bottom = 0.0_f32;
+        for item in items {
+            match item.vertical_align.align {
+                InlineVerticalAlign::Baseline => {
+                    ascent = ascent.max(item.baseline);
+                    descent = descent.max(item.height - item.baseline);
+                }
+                InlineVerticalAlign::Middle => {
+                    let half_x = item.vertical_align.parent_x_height / 2.0;
+                    ascent = ascent.max(item.height / 2.0 - half_x);
+                    descent = descent.max(item.height / 2.0 + half_x);
+                }
+                InlineVerticalAlign::TextTop => {
+                    let parent_ascent = item.vertical_align.parent_ascent;
+                    ascent = ascent.max(parent_ascent);
+                    descent = descent.max(item.height - parent_ascent);
+                }
+                InlineVerticalAlign::TextBottom => {
+                    let parent_descent = item.vertical_align.parent_descent;
+                    descent = descent.max(parent_descent);
+                    ascent = ascent.max(item.height - parent_descent);
+                }
+                InlineVerticalAlign::Offset(offset) => {
+                    ascent = ascent.max(offset + item.baseline);
+                    descent = descent.max(item.height - item.baseline - offset);
+                }
+                InlineVerticalAlign::Top => {
+                    tallest_top = tallest_top.max(item.height);
+                }
+                InlineVerticalAlign::Bottom => {
+                    tallest_bottom = tallest_bottom.max(item.height);
+                }
+            }
+        }
+        let line_height = (ascent + descent)
+            .max(tallest_top)
+            .max(tallest_bottom)
+            .max(minimum_height);
+        let baseline = line_top + ascent;
+        for item in items {
+            let desired_top = match item.vertical_align.align {
+                InlineVerticalAlign::Baseline => baseline - item.baseline,
+                InlineVerticalAlign::Middle => {
+                    baseline + item.vertical_align.parent_x_height / 2.0 - item.height / 2.0
+                }
+                InlineVerticalAlign::Top => line_top,
+                InlineVerticalAlign::Bottom => line_top + line_height - item.height,
+                InlineVerticalAlign::TextTop => baseline - item.vertical_align.parent_ascent,
+                InlineVerticalAlign::TextBottom => {
+                    baseline + item.vertical_align.parent_descent - item.height
+                }
+                InlineVerticalAlign::Offset(offset) => baseline - offset - item.baseline,
+            };
+            let dy = desired_top - item.top;
+            if dy.abs() > 0.01 {
+                self.translate_fragment_subtree(item.fragment, 0.0, dy);
+            }
+        }
+        line_height
+    }
+
+    /// The baseline of an atomic inline box, measured from its margin box top.
+    ///
+    /// CSS 2.1 §10.8.1: this is the baseline of its last line box in the
+    /// normal flow, or its bottom margin edge when it has no in-flow line boxes
+    /// or its `overflow` is not `visible`. Floats and absolutely positioned
+    /// descendants do not generate line boxes in the normal flow, so text
+    /// inside them must not become the box's baseline: a positioned badge in
+    /// an inline-block used to drag the whole box down by the badge's offset.
+    fn atomic_inline_baseline(
+        &self,
+        fragment: FragmentId,
+        source: Option<NodeId>,
+        top: f32,
+        height: f32,
+    ) -> Option<f32> {
+        let style = source.and_then(|source| self.styles.get(&source));
+        let (overflow_x, overflow_y) = overflow_axes(style);
+        if overflow_x != Overflow::Visible || overflow_y != Overflow::Visible {
+            return Some(height);
+        }
+        self.fragment_last_text_baseline(fragment)
+            .map(|baseline| (baseline - top).max(0.0))
+    }
+
+    /// The bottom-most text baseline inside `root`'s normal flow, in document
+    /// coordinates.
     fn fragment_last_text_baseline(&self, root: FragmentId) -> Option<f32> {
         let mut pending = vec![root];
         let mut baseline: Option<f32> = None;
@@ -1128,6 +1323,13 @@ impl<'a> Solver<'a> {
             let Some(fragment) = self.fragments.get(id.as_u32() as usize) else {
                 continue;
             };
+            if id != root
+                && matches!(fragment.kind, FragmentKind::Box(_))
+                && (self.source_is_out_of_flow(fragment.source)
+                    || self.float_side(fragment.formatting_node) != Float::None)
+            {
+                continue;
+            }
             if let FragmentKind::Text(text) = &fragment.kind {
                 baseline =
                     Some(baseline.map_or(text.baseline, |current| current.max(text.baseline)));
@@ -1553,6 +1755,108 @@ impl<'a> Solver<'a> {
         )
     }
 
+    /// The used `vertical-align` of an inline-level box and the parent metrics
+    /// the baseline-relative keywords need.
+    ///
+    /// CSS 2.1 §10.8.1 resolves the `<length>`/`<percentage>` form against the
+    /// element's own `line-height`, and `sub`/`super` are UA-defined baseline
+    /// shifts (§10.8.1 says only that they are "the proper position" for
+    /// subscripts and superscripts). The two here follow the long-standing
+    /// browser convention of 0.2em down and 0.33em up. `middle`, `text-top`
+    /// and `text-bottom` read the parent inline box's font metrics, not the
+    /// line-height, because §10.8.1 names the parent's content area and
+    /// x-height.
+    /// Whether `source` generates an inline-level box, which is the only kind
+    /// of box CSS 2.1 §10.8.1 lets `vertical-align` move.
+    ///
+    /// Text directly inside a block container lives in an anonymous inline
+    /// box. §9.2.2.1 gives anonymous boxes the initial value of every
+    /// non-inherited property, so a `vertical-align` declared on the block -
+    /// including a table cell's, which §17.5.3 consumes for cell alignment -
+    /// must not leak into the text's line box. Text inside a `<span>` has the
+    /// span as its style source and does inherit the declaration through the
+    /// span's inline box.
+    fn inline_level_style(&self, source: Option<NodeId>) -> bool {
+        matches!(
+            source
+                .and_then(|source| self.styles.get(&source))
+                .and_then(|style| style.typed("display")),
+            Some(TypedPropertyValue::Display(Display::Normal {
+                outside: DisplayOutside::Inline,
+                ..
+            }))
+        )
+    }
+
+    fn vertical_align_context(
+        &mut self,
+        source: Option<NodeId>,
+        typography: InlineTextStyle<'a>,
+    ) -> VerticalAlignContext {
+        let vertical_align = source
+            .and_then(|source| self.styles.get(&source))
+            .and_then(|style| style.typed("vertical-align"))
+            .cloned();
+        let align = match vertical_align {
+            Some(TypedPropertyValue::VerticalAlign(VerticalAlign::Middle)) => {
+                InlineVerticalAlign::Middle
+            }
+            Some(TypedPropertyValue::VerticalAlign(VerticalAlign::Top)) => InlineVerticalAlign::Top,
+            Some(TypedPropertyValue::VerticalAlign(VerticalAlign::Bottom)) => {
+                InlineVerticalAlign::Bottom
+            }
+            Some(TypedPropertyValue::VerticalAlign(VerticalAlign::TextTop)) => {
+                InlineVerticalAlign::TextTop
+            }
+            Some(TypedPropertyValue::VerticalAlign(VerticalAlign::TextBottom)) => {
+                InlineVerticalAlign::TextBottom
+            }
+            Some(TypedPropertyValue::VerticalAlign(VerticalAlign::Sub)) => {
+                InlineVerticalAlign::Offset(-0.2 * typography.style.font_size)
+            }
+            Some(TypedPropertyValue::VerticalAlign(VerticalAlign::Super)) => {
+                InlineVerticalAlign::Offset(0.33 * typography.style.font_size)
+            }
+            Some(TypedPropertyValue::VerticalAlign(VerticalAlign::Offset(value))) => {
+                InlineVerticalAlign::Offset(self.resolve_length(
+                    &value,
+                    typography.style.line_height,
+                    source,
+                    "vertical-align",
+                ))
+            }
+            Some(TypedPropertyValue::VerticalAlign(VerticalAlign::Baseline)) | None => {
+                InlineVerticalAlign::Baseline
+            }
+            Some(_) => InlineVerticalAlign::Baseline,
+        };
+        let parent_style = self.inline_text_style(self.parent_style_source(source));
+        let metrics = self.text_measurer.measure("", parent_style.style);
+        let parent_x_height = self
+            .text_measurer
+            .x_height(parent_style.style.font_size, &parent_style.style.font);
+        VerticalAlignContext {
+            align,
+            parent_ascent: metrics.ascent,
+            parent_descent: metrics.descent,
+            parent_x_height,
+        }
+    }
+
+    /// The nearest ancestor element whose computed style the solver has. This
+    /// is an inline-level box's parent for the §10.8.1 keywords that read the
+    /// parent's content area or x-height.
+    fn parent_style_source(&self, source: Option<NodeId>) -> Option<NodeId> {
+        let mut current = source.and_then(|source| self.dom.parent(source));
+        while let Some(node) = current {
+            if self.styles.contains_key(&node) {
+                return Some(node);
+            }
+            current = self.dom.parent(node);
+        }
+        None
+    }
+
     /// The CSS Fonts 4 font request for `source`.
     ///
     /// §2.1.1 makes `font-family`, §2.2 `font-weight`, §2.4 `font-style` and
@@ -1667,6 +1971,50 @@ impl<'a> Solver<'a> {
         (spacing, diagnostics)
     }
 
+    /// Append one atom per character of a text node. Split out of
+    /// [`Self::collect_inline_atoms`] so the walker stays under the line
+    /// budget after `vertical-align` added per-run alignment context.
+    fn collect_text_atoms(
+        &mut self,
+        node_id: FormattingNodeId,
+        source: Option<NodeId>,
+        text: &str,
+        style_source: Option<NodeId>,
+        atoms: &mut Vec<InlineAtom<'a>>,
+    ) {
+        let typography = self.inline_text_style(style_source);
+        let line_breaking = self.line_break_options(style_source);
+        let vertical_align = if self.inline_level_style(style_source) {
+            self.vertical_align_context(style_source, typography)
+        } else {
+            VerticalAlignContext::default()
+        };
+        for character in text.chars() {
+            if self.inline_characters >= self.options.limits.max_inline_characters {
+                self.diagnostics.push(LayoutDiagnostic {
+                    node: source,
+                    code: LayoutDiagnosticCode::InlineTextLimit,
+                    message: "inline character limit exceeded".to_owned(),
+                });
+                return;
+            }
+            self.inline_characters += 1;
+            atoms.push(InlineAtom {
+                formatting_node: node_id,
+                source,
+                character,
+                forced_break: false,
+                break_before: false,
+                atomic: None,
+                line_breaking,
+                style: typography.style,
+                spacing: typography.spacing,
+                vertical_align,
+                bidi_level: 0,
+            });
+        }
+    }
+
     pub(super) fn collect_inline_atoms(
         &mut self,
         node_id: FormattingNodeId,
@@ -1694,35 +2042,12 @@ impl<'a> Solver<'a> {
             return;
         }
         if let FormattingNodeKind::Text(text) = node.kind {
-            let typography = self.inline_text_style(node.style_source);
-            let line_breaking = self.line_break_options(node.style_source);
-            for character in text.chars() {
-                if self.inline_characters >= self.options.limits.max_inline_characters {
-                    self.diagnostics.push(LayoutDiagnostic {
-                        node: node.source,
-                        code: LayoutDiagnosticCode::InlineTextLimit,
-                        message: "inline character limit exceeded".to_owned(),
-                    });
-                    return;
-                }
-                self.inline_characters += 1;
-                atoms.push(InlineAtom {
-                    formatting_node: node_id,
-                    source: node.source,
-                    character,
-                    forced_break: false,
-                    break_before: false,
-                    atomic: None,
-                    line_breaking,
-                    style: typography.style,
-                    spacing: typography.spacing,
-                    bidi_level: 0,
-                });
-            }
+            self.collect_text_atoms(node_id, node.source, &text, node.style_source, atoms);
             return;
         }
         let typography = self.inline_text_style(node.style_source);
         let line_breaking = self.line_break_options(node.style_source);
+        let vertical_align = self.vertical_align_context(node.style_source, typography);
         // CSS Position 3 §2: an absolutely or fixed positioned box "does not
         // participate in its parent's formatting context". A block-level one
         // can be a child of an inline box instead of a sibling of the
@@ -1740,6 +2065,7 @@ impl<'a> Solver<'a> {
                 line_breaking,
                 style: typography.style,
                 spacing: typography.spacing,
+                vertical_align,
                 bidi_level: 0,
             });
             return;
@@ -1760,6 +2086,7 @@ impl<'a> Solver<'a> {
                 line_breaking,
                 style: typography.style,
                 spacing: typography.spacing,
+                vertical_align,
                 bidi_level: 0,
             });
             return;
@@ -1775,6 +2102,7 @@ impl<'a> Solver<'a> {
                 line_breaking,
                 style: typography.style,
                 spacing: typography.spacing,
+                vertical_align,
                 bidi_level: 0,
             });
             return;
@@ -2409,6 +2737,7 @@ impl<'a> Solver<'a> {
                     line_breaking,
                     style: typography.style,
                     spacing: typography.spacing,
+                    vertical_align: VerticalAlignContext::default(),
                     bidi_level: 0,
                 });
             }
@@ -2425,6 +2754,7 @@ impl<'a> Solver<'a> {
                 line_breaking,
                 style: typography.style,
                 spacing: typography.spacing,
+                vertical_align: VerticalAlignContext::default(),
                 bidi_level: 0,
             });
             return;
@@ -2443,6 +2773,7 @@ impl<'a> Solver<'a> {
                 line_breaking,
                 style: typography.style,
                 spacing: typography.spacing,
+                vertical_align: VerticalAlignContext::default(),
                 bidi_level: 0,
             });
             return;
@@ -2723,6 +3054,7 @@ impl<'a> Solver<'a> {
         &mut self,
         run: &mut Option<TextRun<'a>>,
         fragments: &mut Vec<FragmentId>,
+        line_items: &mut Vec<InlineLineItem>,
         atom: InlineAtom<'a>,
         character: char,
         x: f32,
@@ -2736,10 +3068,11 @@ impl<'a> Solver<'a> {
             run.formatting_node != atom.formatting_node
                 || (run.y - y).abs() > f32::EPSILON
                 || run.typography != typography
+                || run.vertical_align != atom.vertical_align
                 || run.bidi_level != atom.bidi_level
                 || run.line != line
         }) {
-            self.flush_text_run(run, fragments);
+            self.flush_text_run(run, fragments, line_items);
         }
         let level = atom.bidi_level;
         let run = run.get_or_insert_with(|| TextRun {
@@ -2750,6 +3083,7 @@ impl<'a> Solver<'a> {
             y,
             width: 0.0,
             typography,
+            vertical_align: atom.vertical_align,
             leading_spacing,
             bidi_level: level,
             line,
@@ -2762,6 +3096,7 @@ impl<'a> Solver<'a> {
         &mut self,
         run: &mut Option<TextRun<'a>>,
         fragments: &mut Vec<FragmentId>,
+        line_items: &mut Vec<InlineLineItem>,
     ) {
         let Some(run) = run.take() else {
             return;
@@ -2781,13 +3116,14 @@ impl<'a> Solver<'a> {
         // 13px font).
         let half_leading =
             (run.typography.style.line_height - (metrics.ascent + metrics.descent)) / 2.0;
+        let baseline_offset = half_leading + metrics.ascent;
         if let Some(fragment) = self.allocate_fragment(
             run.formatting_node,
             run.source,
             rect,
             FragmentKind::Text(TextFragmentData {
                 text: run.text,
-                baseline: run.y + half_leading + metrics.ascent,
+                baseline: run.y + baseline_offset,
                 font_size: run.typography.style.font_size,
                 font: StoredFontRequest::new(run.typography.style.font),
                 spacing: run.typography.spacing,
@@ -2795,6 +3131,14 @@ impl<'a> Solver<'a> {
                 trailing_spacing: 0.0,
             }),
         ) {
+            line_items.push(InlineLineItem {
+                fragment,
+                top: run.y,
+                baseline: baseline_offset,
+                height: run.typography.style.line_height,
+                text: true,
+                vertical_align: run.vertical_align,
+            });
             self.inline_bidi.insert(
                 fragment,
                 InlineBidiPlacement {
