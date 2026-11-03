@@ -1870,6 +1870,16 @@ impl<'a> Builder<'a> {
                 _ => None,
             })
             .unwrap_or("0% 0%");
+        let position_x = style
+            .get("background-position-x")
+            .map(ComputedValue::css_text)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let position_y = style
+            .get("background-position-y")
+            .map(ComputedValue::css_text)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
         let repeat = style
             .typed("background-repeat")
             .and_then(|value| match value {
@@ -1879,22 +1889,33 @@ impl<'a> Builder<'a> {
             .unwrap_or("repeat");
         let intrinsic_width = image_dimension_to_f32(width);
         let intrinsic_height = image_dimension_to_f32(height);
-        let (paint_width, paint_height, source) = match size {
-            "cover" => {
+        let font_size = style_font_size(style);
+        let (paint_width, paint_height, source) =
+            if first_background_layer(size).eq_ignore_ascii_case("cover") {
                 let scale = (positioning_area.size.width / intrinsic_width)
                     .max(positioning_area.size.height / intrinsic_height);
                 let source_width = positioning_area.size.width / scale;
                 let source_height = positioning_area.size.height / scale;
-                let (position_x, position_y) = background_position(position);
-                let source_x = (intrinsic_width - source_width) * position_x;
-                let source_y = (intrinsic_height - source_height) * position_y;
+                let (fraction_x, fraction_y) = background_position(
+                    position,
+                    position_x,
+                    position_y,
+                    positioning_area.size,
+                    PhysicalSize {
+                        width: source_width,
+                        height: source_height,
+                    },
+                    font_size,
+                    self.fragments.viewport,
+                );
+                let source_x = (intrinsic_width - source_width) * fraction_x;
+                let source_y = (intrinsic_height - source_height) * fraction_y;
                 (
                     positioning_area.size.width,
                     positioning_area.size.height,
                     PhysicalRect::new(source_x, source_y, source_width, source_height),
                 )
-            }
-            "contain" => {
+            } else if first_background_layer(size).eq_ignore_ascii_case("contain") {
                 let scale = (positioning_area.size.width / intrinsic_width)
                     .min(positioning_area.size.height / intrinsic_height);
                 (
@@ -1902,18 +1923,38 @@ impl<'a> Builder<'a> {
                     intrinsic_height * scale,
                     PhysicalRect::new(0.0, 0.0, intrinsic_width, intrinsic_height),
                 )
-            }
-            _ => (
-                intrinsic_width,
-                intrinsic_height,
-                PhysicalRect::new(0.0, 0.0, intrinsic_width, intrinsic_height),
-            ),
-        };
-        let (position_x, position_y) = background_position(position);
-        let origin_x =
-            positioning_area.origin.x + (positioning_area.size.width - paint_width) * position_x;
-        let origin_y =
-            positioning_area.origin.y + (positioning_area.size.height - paint_height) * position_y;
+            } else {
+                let (paint_width, paint_height) = explicit_background_size(
+                    size,
+                    intrinsic_width,
+                    intrinsic_height,
+                    positioning_area.size,
+                    font_size,
+                    self.fragments.viewport,
+                );
+                (
+                    paint_width,
+                    paint_height,
+                    PhysicalRect::new(0.0, 0.0, intrinsic_width, intrinsic_height),
+                )
+            };
+        if paint_width <= 0.0 || paint_height <= 0.0 {
+            return;
+        }
+        let (offset_x, offset_y) = background_position(
+            position,
+            position_x,
+            position_y,
+            positioning_area.size,
+            PhysicalSize {
+                width: paint_width,
+                height: paint_height,
+            },
+            font_size,
+            self.fragments.viewport,
+        );
+        let origin_x = positioning_area.origin.x + offset_x;
+        let origin_y = positioning_area.origin.y + offset_y;
         self.push(
             fragment,
             PaintPhase::Background,
@@ -4398,33 +4439,144 @@ fn image_dimension_to_f32(value: u32) -> f32 {
     value as f32
 }
 
-fn background_position(value: &str) -> (f32, f32) {
-    let lower = value.to_ascii_lowercase();
-    let horizontal = if lower.split_ascii_whitespace().any(|part| part == "right") {
-        1.0
-    } else if lower.split_ascii_whitespace().any(|part| part == "center") {
-        0.5
+fn first_background_layer(value: &str) -> &str {
+    split_gradient_arguments(value)
+        .first()
+        .copied()
+        .unwrap_or("")
+        .trim()
+}
+
+/// Resolve `<bg-size>` (CSS Backgrounds 3 §3.9) to the size the bitmap is
+/// painted at. Percentages use the corresponding positioning-area dimension;
+/// an `auto` axis keeps the image's intrinsic aspect ratio.
+fn explicit_background_size(
+    value: &str,
+    intrinsic_width: f32,
+    intrinsic_height: f32,
+    area: PhysicalSize,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> (f32, f32) {
+    let tokens = clip_components(first_background_layer(value));
+    let width = tokens
+        .first()
+        .and_then(|token| background_size_component(token, area.width, font_size, viewport));
+    let height = tokens
+        .get(1)
+        .and_then(|token| background_size_component(token, area.height, font_size, viewport));
+    match (width, height) {
+        (Some(width), Some(height)) => (width, height),
+        (Some(width), None) if intrinsic_width > 0.0 => {
+            (width, width * intrinsic_height / intrinsic_width)
+        }
+        (None, Some(height)) if intrinsic_height > 0.0 => {
+            (height * intrinsic_width / intrinsic_height, height)
+        }
+        (None, Some(height)) => (intrinsic_width, height),
+        _ => (intrinsic_width, intrinsic_height),
+    }
+}
+
+fn background_size_component(
+    token: &str,
+    basis: f32,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> Option<f32> {
+    if token.trim().eq_ignore_ascii_case("auto") {
+        None
     } else {
-        lower
-            .split_ascii_whitespace()
-            .next()
-            .and_then(|part| part.strip_suffix('%'))
-            .and_then(|number| number.parse::<f32>().ok())
-            .map_or(0.0, |number| (number / 100.0).clamp(0.0, 1.0))
+        resolve_clip_length(token, basis, font_size, viewport)
+    }
+}
+
+/// Resolve `background-position` (CSS Backgrounds 3 §3.6) to offsets from the
+/// positioning area's origin. Percentages and keyword alignment resolve
+/// against the free space left by the painted image size; `<length>` values
+/// are absolute. The non-standard `background-position-x`/`-y` longhands are
+/// widely used to override one axis and take precedence when present.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "position, both longhand overrides, area, image size, font and viewport"
+)]
+fn background_position(
+    value: &str,
+    x_override: Option<&str>,
+    y_override: Option<&str>,
+    area: PhysicalSize,
+    image: PhysicalSize,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> (f32, f32) {
+    let tokens = clip_components(first_background_layer(value));
+    let free_x = area.width - image.width;
+    let free_y = area.height - image.height;
+    let (mut x, mut y) = match tokens.as_slice() {
+        [] => (0.0, 0.0),
+        [single] => {
+            if let Some(x) = background_position_axis(single, true, free_x, font_size, viewport) {
+                (x, free_y / 2.0)
+            } else if let Some(y) =
+                background_position_axis(single, false, free_y, font_size, viewport)
+            {
+                (free_x / 2.0, y)
+            } else {
+                (0.0, 0.0)
+            }
+        }
+        [first, second, ..] if is_vertical_position_keyword(first) => (
+            background_position_axis(second, true, free_x, font_size, viewport)
+                .unwrap_or(free_x / 2.0),
+            background_position_axis(first, false, free_y, font_size, viewport).unwrap_or(0.0),
+        ),
+        [first, second, ..] => (
+            background_position_axis(first, true, free_x, font_size, viewport).unwrap_or(0.0),
+            background_position_axis(second, false, free_y, font_size, viewport)
+                .unwrap_or(free_y / 2.0),
+        ),
     };
-    let vertical = if lower.split_ascii_whitespace().any(|part| part == "bottom") {
-        1.0
-    } else if lower.split_ascii_whitespace().any(|part| part == "center") {
-        0.5
-    } else {
-        lower
-            .split_ascii_whitespace()
-            .nth(1)
-            .and_then(|part| part.strip_suffix('%'))
-            .and_then(|number| number.parse::<f32>().ok())
-            .map_or(0.0, |number| (number / 100.0).clamp(0.0, 1.0))
-    };
-    (horizontal, vertical)
+    if let Some(token) = x_override
+        && let Some(offset) = background_position_axis(token, true, free_x, font_size, viewport)
+    {
+        x = offset;
+    }
+    if let Some(token) = y_override
+        && let Some(offset) = background_position_axis(token, false, free_y, font_size, viewport)
+    {
+        y = offset;
+    }
+    (x, y)
+}
+
+fn is_vertical_position_keyword(token: &str) -> bool {
+    token.eq_ignore_ascii_case("top") || token.eq_ignore_ascii_case("bottom")
+}
+
+fn background_position_axis(
+    token: &str,
+    horizontal: bool,
+    free_space: f32,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> Option<f32> {
+    let token = token.trim();
+    if token.eq_ignore_ascii_case("left") {
+        return horizontal.then_some(0.0);
+    }
+    if token.eq_ignore_ascii_case("right") {
+        return horizontal.then_some(free_space);
+    }
+    if token.eq_ignore_ascii_case("top") {
+        return (!horizontal).then_some(0.0);
+    }
+    if token.eq_ignore_ascii_case("bottom") {
+        return (!horizontal).then_some(free_space);
+    }
+    if token.eq_ignore_ascii_case("center") {
+        return Some(free_space / 2.0);
+    }
+    resolve_clip_length(token, free_space, font_size, viewport)
 }
 
 fn fragment_coordinate_space(

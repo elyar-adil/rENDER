@@ -23,6 +23,160 @@ fn target_id(document: &Document, id: &str) -> render_core::dom::NodeId {
 }
 
 #[test]
+fn explicit_background_size_scales_the_bitmap_inside_the_padding_box() {
+    // The common shortcut-link pattern: a 96x96 brand PNG on an 18px high
+    // inline-block with `background-size:18px 18px` and the common
+    // `background-position-y` longhand. Before background-size was consumed,
+    // the bitmap painted at its intrinsic 96x96 size, so only the top-left
+    // corner of each logo filled the tile (red JD, black QQ/12306 blocks).
+    let document = Document::parse(
+        "<!doctype html><style>\
+         html, body { display:block; margin:0; background:#fff }\
+         .icon-site { display:inline-block; height:18px; padding-left:25px;\
+                      overflow:hidden; white-space:nowrap; font-size:12px;\
+                      background-image:url(jd.png);\
+                      background-size:18px 18px; background-repeat:no-repeat;\
+                      background-position-y:2px }\
+         </style>\
+         <a id='tile' class='icon-site' href='#'>京东热卖</a>",
+    );
+    let url = Url::parse("https://example.test/page.html").unwrap();
+    let initial = document.render_reference(DocumentRenderOptions::default());
+    let discovery = discover_images_with_styles(
+        document.dom(),
+        &initial.styles,
+        &url,
+        ImageLimits::default(),
+    );
+    let key = discovery
+        .resources
+        .iter()
+        .find(|resource| resource.key.requested_url.as_str().ends_with("jd.png"))
+        .expect("inline background image should be discovered")
+        .key
+        .clone();
+    let image = DecodedImage::from_pixels(96, 96, vec![Color::rgb(255, 0, 0); 96 * 96]).unwrap();
+    let mut images = ImageResources::default();
+    images.insert(key, image, ImageLimits::default()).unwrap();
+
+    let render = document.render_with_images(
+        DocumentRenderOptions::default(),
+        DocumentBackends {
+            text_measurer: &SimpleTextMeasurer,
+            text_shaper: &ReferenceTextShaper,
+            glyph_masks: &NoGlyphMasks,
+            font_face_installer: None,
+        },
+        &images,
+    );
+    let tile = target_id(&document, "tile");
+    let item = render
+        .display
+        .list
+        .items()
+        .iter()
+        .find(|item| {
+            item.source == Some(tile)
+                && matches!(item.command, render_core::paint::DisplayCommand::Image(_))
+        })
+        .expect("background image should paint");
+    #[allow(
+        clippy::float_cmp,
+        reason = "the geometry is derived from exact integral pixel values"
+    )]
+    {
+        assert_eq!(item.bounds.origin.x, 0.0);
+        assert_eq!(item.bounds.origin.y, 2.0);
+        assert_eq!(item.bounds.size.width, 18.0);
+        assert_eq!(item.bounds.size.height, 18.0);
+    }
+
+    // The image starts at y=2, so the anchor's first row stays white; the
+    // bitmap is 18px wide and does not spill into the text at 19px.
+    assert_eq!(
+        render.raster.surface.pixel(0, 0),
+        Some(Color::rgb(255, 255, 255))
+    );
+    assert_eq!(
+        render.raster.surface.pixel(1, 3),
+        Some(Color::rgb(255, 0, 0))
+    );
+    assert_eq!(
+        render.raster.surface.pixel(19, 3),
+        Some(Color::rgb(255, 255, 255))
+    );
+}
+
+#[test]
+fn explicit_background_size_scales_a_96px_source_into_a_32px_tile() {
+    // A 32px square tile (e.g. a shortcut icon at 2x density) must scale the
+    // 96x96 source to 32x32. The old painter used the intrinsic 96x96 size,
+    // leaving only the source's top-left corner visible as a coloured/black
+    // rectangle.
+    let document = Document::parse(
+        "<!doctype html><style>\
+         html, body { display:block; margin:0; background:#fff }\
+         #tile32 { position:absolute; left:100px; top:10px; width:32px; height:32px;\
+                   background-image:url(jd.png); background-size:32px 32px;\
+                   background-position:center; background-repeat:no-repeat }\
+         </style><div id='tile32'></div>",
+    );
+    let url = Url::parse("https://example.test/page.html").unwrap();
+    let initial = document.render_reference(DocumentRenderOptions::default());
+    let discovery = discover_images_with_styles(
+        document.dom(),
+        &initial.styles,
+        &url,
+        ImageLimits::default(),
+    );
+    let key = discovery
+        .resources
+        .first()
+        .expect("background image should be discovered")
+        .key
+        .clone();
+    let image = DecodedImage::from_pixels(96, 96, vec![Color::rgb(255, 0, 0); 96 * 96]).unwrap();
+    let mut images = ImageResources::default();
+    images.insert(key, image, ImageLimits::default()).unwrap();
+
+    let render = document.render_with_images(
+        DocumentRenderOptions::default(),
+        DocumentBackends {
+            text_measurer: &SimpleTextMeasurer,
+            text_shaper: &ReferenceTextShaper,
+            glyph_masks: &NoGlyphMasks,
+            font_face_installer: None,
+        },
+        &images,
+    );
+    let tile = target_id(&document, "tile32");
+    let item = render
+        .display
+        .list
+        .items()
+        .iter()
+        .find(|item| {
+            item.source == Some(tile)
+                && matches!(item.command, render_core::paint::DisplayCommand::Image(_))
+        })
+        .expect("background image should paint");
+    #[allow(
+        clippy::float_cmp,
+        reason = "the geometry is derived from exact integral pixel values"
+    )]
+    {
+        assert_eq!(item.bounds.origin.x, 100.0);
+        assert_eq!(item.bounds.origin.y, 10.0);
+        assert_eq!(item.bounds.size.width, 32.0);
+        assert_eq!(item.bounds.size.height, 32.0);
+    }
+    assert_eq!(
+        render.raster.surface.pixel(101, 11),
+        Some(Color::rgb(255, 0, 0))
+    );
+}
+
+#[test]
 fn background_image_uses_border_box_as_the_default_painting_area() {
     let document = Document::parse(
         "<!doctype html><style>\

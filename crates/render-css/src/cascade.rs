@@ -2228,17 +2228,28 @@ fn expand_background_shorthand(value: &str) -> Vec<(String, String)> {
         .find(|keyword| lower.split_ascii_whitespace().any(|part| part == *keyword))
         .unwrap_or("repeat")
         .to_owned();
-    let size = value
-        .split_once('/')
-        .map(|(_, tail)| tail.split_ascii_whitespace().next().unwrap_or("auto"))
-        .filter(|part| {
-            matches!(
-                part.to_ascii_lowercase().as_str(),
-                "cover" | "contain" | "auto"
-            )
+    let size = top_level_slash(value)
+        .map(|slash| {
+            let mut parts = Vec::new();
+            for component in split_css_components(&value[slash + 1..]) {
+                let lower = component.to_ascii_lowercase();
+                if matches!(lower.as_str(), "cover" | "contain") && parts.is_empty() {
+                    parts.push(component);
+                    break;
+                }
+                if parts.len() < 2
+                    && parse_typed_property("background-size", component)
+                        .is_some_and(|result| result.is_ok())
+                {
+                    parts.push(component);
+                } else {
+                    break;
+                }
+            }
+            parts.join(" ")
         })
-        .unwrap_or("auto")
-        .to_owned();
+        .filter(|size| !size.is_empty())
+        .unwrap_or_else(|| "auto".to_owned());
     let positions: Vec<_> = split_css_components(value)
         .into_iter()
         .filter(|component| {
@@ -2265,6 +2276,26 @@ fn expand_background_shorthand(value: &str) -> Vec<(String, String)> {
         ("background-position".to_owned(), position),
         ("background-size".to_owned(), size),
     ]
+}
+
+/// Position of the background-size `/` separator at the top level. A URL such
+/// as `https://host/a.png` also contains slashes, so splitting on the first
+/// `/` would pick the scheme instead of the grammar separator.
+fn top_level_slash(value: &str) -> Option<usize> {
+    let mut depth = 0_i32;
+    let mut quote = None;
+    for (index, character) in value.char_indices() {
+        match (quote, character) {
+            (Some(expected), character) if character == expected => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(character),
+            (None, '(') => depth += 1,
+            (None, ')') => depth = (depth - 1).max(0),
+            (None, '/') if depth == 0 => return Some(index),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Expand the `animation` shorthand into its eight longhands.
@@ -4109,6 +4140,35 @@ mod tests {
                 .get("background-position")
                 .map(|value| value.value.as_str()),
             Some("50% 50%")
+        );
+    }
+
+    #[test]
+    fn background_shorthand_keeps_explicit_size_after_a_url() {
+        let (dom, target) = document_and_target();
+        let sheet = parse_stylesheet(
+            "#target { background: url(https://cdn.example/a.png) no-repeat 0 0 / 18px 18px }",
+        );
+        let style = cascade_element(
+            &dom,
+            target,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+        assert_eq!(
+            style
+                .get("background-size")
+                .map(|value| value.value.as_str()),
+            Some("18px 18px")
+        );
+        assert_eq!(
+            style
+                .get("background-image")
+                .map(|value| value.value.as_str()),
+            Some("url(https://cdn.example/a.png)")
         );
     }
 

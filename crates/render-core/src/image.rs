@@ -371,11 +371,109 @@ pub fn discover_images_with_styles_and_context(
     discovery
 }
 
+/// The first fetchable URL in a `background-image` or `mask-image` value.
+///
+/// CSS Backgrounds 3 §3.2 makes the value a comma-separated layer list, and
+/// `image-set()` nests another candidate list inside one layer. Only the first
+/// referenced image is returned because paint currently selects one bitmap per
+/// element; callers still need discovery to understand the surrounding syntax
+/// rather than rejecting the whole declaration.
 #[must_use]
 pub fn background_url(value: &str) -> Option<&str> {
-    let value = value.trim();
-    let inner = value.strip_prefix("url(")?.strip_suffix(')')?.trim();
-    Some(inner.trim_matches(['\'', '"']))
+    split_top_level(value, ',')
+        .into_iter()
+        .find_map(background_layer_url)
+}
+
+fn background_layer_url(layer: &str) -> Option<&str> {
+    image_token_url(first_css_token(layer.trim())?)
+}
+
+fn image_token_url(token: &str) -> Option<&str> {
+    let token = token.trim();
+    let lower = token.to_ascii_lowercase();
+    if lower.starts_with("url(") && token.ends_with(')') {
+        return Some(unquote(token.get(4..token.len() - 1)?.trim()));
+    }
+    if (lower.starts_with("image-set(") || lower.starts_with("-webkit-image-set("))
+        && token.ends_with(')')
+    {
+        let open = token.find('(')? + 1;
+        let candidates = token.get(open..token.len() - 1)?;
+        return split_top_level(candidates, ',')
+            .into_iter()
+            .find_map(background_layer_url);
+    }
+    if let Some(inner) = token
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            token
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+    {
+        return Some(inner);
+    }
+    None
+}
+
+fn unquote(value: &str) -> &str {
+    value.trim_matches(['\'', '"'])
+}
+
+/// The first component of a CSS function argument, stopping at top-level
+/// whitespace while preserving nested functions and quoted strings.
+fn first_css_token(value: &str) -> Option<&str> {
+    let mut depth = 0_i32;
+    let mut quote = None;
+    let mut start = None;
+    for (index, character) in value.char_indices() {
+        match (quote, character) {
+            (Some(expected), character) if character == expected => quote = None,
+            (None, '\'' | '"') => {
+                quote = Some(character);
+                start.get_or_insert(index);
+            }
+            (None, '(') => {
+                depth += 1;
+                start.get_or_insert(index);
+            }
+            (None, ')') => depth = (depth - 1).max(0),
+            (None, character) if character.is_whitespace() && depth == 0 => {
+                if let Some(start) = start {
+                    return Some(&value[start..index]);
+                }
+            }
+            (None, _) => {
+                start.get_or_insert(index);
+            }
+            _ => {}
+        }
+    }
+    start.map(|start| &value[start..])
+}
+
+fn split_top_level(value: &str, separator: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_i32;
+    let mut quote = None;
+    for (index, character) in value.char_indices() {
+        match (quote, character) {
+            (Some(expected), character) if character == expected => quote = None,
+            (None, '\'' | '"') => quote = Some(character),
+            (None, '(') => depth += 1,
+            (None, ')') => depth = (depth - 1).max(0),
+            (None, character) if character == separator && depth == 0 => {
+                parts.push(&value[start..index]);
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&value[start..]);
+    parts
 }
 
 /// Whether a completed request still represents the element's current image
@@ -1554,8 +1652,8 @@ mod tests {
 
     use super::{
         DecodedImage, ImageDecodeError, ImageFormat, ImageLimits, ImageResources,
-        ImageSelectionContext, decode_image, discover_images, discover_images_with_context,
-        image_key_is_current, sniff_image_format,
+        ImageSelectionContext, background_url, decode_image, discover_images,
+        discover_images_with_context, image_key_is_current, sniff_image_format,
     };
     use crate::dom::{ShadowRootMode, SlotAssignmentMode};
     use crate::paint::Color;
@@ -1584,6 +1682,47 @@ mod tests {
             pending.extend(dom.children(node).unwrap_or_default().iter().rev());
         }
         panic!("missing test element #{id}");
+    }
+
+    #[test]
+    fn background_image_layers_and_image_set_discover_the_first_url() {
+        for (value, expected) in [
+            ("url(a.png)", Some("a.png")),
+            ("url('a.png')", Some("a.png")),
+            ("url(a.png), url(b.png)", Some("a.png")),
+            ("none, url(b.png)", Some("b.png")),
+            ("linear-gradient(red, blue), url(c.png)", Some("c.png")),
+            ("image-set(url(a.png) 1x, url(b.png) 2x)", Some("a.png")),
+            ("image-set('a.png' 1x, 'b.png' 2x)", Some("a.png")),
+            ("-webkit-image-set(url(a.png) 1x)", Some("a.png")),
+            ("none", None),
+        ] {
+            assert_eq!(background_url(value), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn discovery_accepts_a_multi_layer_background_image() {
+        let document = crate::document::Document::parse(
+            "<!doctype html><style>\
+             html, body { display:block; margin:0 }\
+             #box { display:block; width:20px; height:20px;\
+                    background-image:url(a.png),url(b.png);\
+                    background-repeat:no-repeat }\
+             </style><div id=box></div>",
+        );
+        let initial = document.render_reference(crate::document::DocumentRenderOptions::default());
+        let discovery = super::discover_images_with_styles(
+            document.dom(),
+            &initial.styles,
+            &Url::parse("https://example.test/page.html").unwrap(),
+            ImageLimits::default(),
+        );
+        assert_eq!(discovery.resources.len(), 1);
+        assert_eq!(
+            discovery.resources[0].key.requested_url.as_str(),
+            "https://example.test/a.png"
+        );
     }
 
     #[test]
