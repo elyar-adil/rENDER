@@ -36,6 +36,44 @@ cargo run --release -p render-browser --bin render-headless -- \
 
 ---
 
+# 交接文档 (2026-11-03, 续二) — CSS 背景图尺寸、位置与图层发现
+
+本轮修复快捷方式图标被画成整块红/黑矩形的问题，全部走通用 CSS 背景绘制路径，没有站点特判。
+
+## 根因
+
+`paint_background_image` 只识别 `background-size: cover|contain`，其余值一律按图片 intrinsic 尺寸绘制。真实页面把 96×96 / 256×256 品牌 PNG 放进 18px 高的 `inline-block`，并声明 `background-size:18px 18px`；旧代码把整张图从左上角开始画，只被 18px 高的盒子裁掉，于是整块红色（京东）、黑色（QQ/12306）或青色（WorkBuddy）覆盖到文字上。第二个问题是非标准的 `background-position-y:2px` 只存在 token map，绘制层完全不读；`background-position` 也只支持关键字/百分比，不支持长度。
+
+## 修复
+
+- `render-core/src/paint/display_list.rs`：按 CSS Backgrounds 3 §3.9 解析 `<bg-size>`（`auto`、长度、百分比、单值保持宽高比、双值、`cover`/`contain`）；按 §3.6 解析位置到 positioning area 的像素偏移（关键字、百分比按 free space、长度绝对），并让 `background-position-x`/`-y` 覆盖对应轴。
+- `render-css/src/cascade.rs`：`background` 简写只在顶层 `/` 处拆分尺寸，不再把 `https://` 的斜杠当分隔符；`/` 后保留显式长度/百分比/双值，而不是只接受 `auto`/`cover`/`contain`。
+- `render-core/src/image.rs`：`background_url` 支持逗号分隔的多图层和 `image-set()`/`-webkit-image-set()`，取第一个可下载 URL；`mask-image` 同样受益。
+- 新增 paint 集成测试覆盖 18px 真实快捷方式规则（含 `background-position-y`）和 96×96 → 32×32 缩放；新增图层/image-set 发现测试与 `background` 简写尺寸测试。
+
+## 验证
+
+```text
+cargo test -p render-core --lib                              567 passed, 1 ignored
+cargo test -p render-core --test paint_images                   5 passed
+cargo test -p render-css --lib                                335 passed
+cargo test -p render-browser --lib                            249 passed
+cargo clippy -p render-core -p render-css -p render-browser --all-targets -- -D warnings  clean
+cargo fmt --all --check                                       clean
+python tools/check_site_neutrality.py                         0 blocking, 31 advisory
+```
+
+额外用 `/tmp` 中 curl 下载的真实资源做离屏检查（无窗口）：96×96 PNG 在 18×18 目标上采样为 `(227,34,29)` 红色；256×256 WebP 与 64×64 PNG 同样缩放到 18×18；图像命令 bounds 为 `(x, y+2, 18, 18)`。
+
+## 剩余缺口
+
+- 一次只绘制背景图层的第一个 URL；多 URL 图层的堆叠、每个图层独立的 size/position/repeat 列表尚未实现。
+- `image-set()` 只取第一个候选，不按 DPR/分辨率选择。
+- `background-position` 的 3/4 值边缘偏移语法（`right 10px bottom 20px`）仍是近似。
+- `background-repeat` 的多图层循环、以及 `background` 简写的逗号多图层展开仍缺。
+
+---
+
 # 交接文档 (2026-11-03) — 通用 Web Worker API
 
 本轮补上 Dedicated Web Worker，让把压缩/遥测/captcha 工作放到 worker 的页面不再因 `ReferenceError: Worker is not defined` 进入全局错误页。实现完全走通用 HTML/JS 路径，没有站点特判。
