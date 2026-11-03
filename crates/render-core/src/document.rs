@@ -2080,6 +2080,7 @@ fn render_dom(
     let mut match_context = MatchContext {
         viewport_width: Some(options.layout.viewport.width),
         viewport_height: Some(options.layout.viewport.height),
+        resolution: Some(options.device_scale),
         quirks_mode: is_quirks_mode(quirks_mode),
         prefers_color_scheme: options.color_scheme,
         focused: environment.interaction.focused,

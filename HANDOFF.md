@@ -1,3 +1,27 @@
+# 交接文档 (2026-11-03, 续十) — 脚本可见的视口、DPR 与 UA
+
+Apple 首页在 headless 中被判定为 tablet / no-retina，根因不在布局，而在脚本看到的环境与真实渲染环境不一致，且媒体查询缺少分辨率支持。
+
+## 修复
+
+- `render-browser/src/headless.rs`：`HeadlessSession::new` 在页面创建后立即把 `--width/--height/--dpr` 安装到 JS runtime（`install_viewport`、`install_device_pixel_ratio`）。此前脚本始终看到 runtime 默认的 1024×768 / DPR 1，响应式页面因此选择平板标记和图片变体。
+- `render-js/src/value.rs`：`navigator.userAgent` 与 HTTP 请求头使用同一串 Chrome/120 Windows UA（仍保留 `rENDER/<version>` 标识），并补上 `appVersion`、`vendor`。站点特性检测读的是 JS 属性，旧的 `Mozilla/5.0 rENDER/0.1` 会让它们走降级分支。
+- `render-css/src/cascade.rs`：媒体查询支持 `resolution`、`device-pixel-ratio`、`-webkit-device-pixel-ratio`、`-moz-device-pixel-ratio`；支持 WebKit 的 `-webkit-min-device-pixel-ratio` / `-webkit-max-device-pixel-ratio` 中缀写法。`prefers-reduced-motion`、`prefers-contrast`、`scripting`、`display-mode`、`color-gamut`、`dynamic-range` 等离散特性改为按 `MatchContext` 实际值判断，不再一律 `true`。
+- 分辨率上下文贯通三处：`render-core/src/document.rs` 的样式匹配、`render-core/src/image.rs` 的图片候选选择（`image-set()`/`x` 描述符）、`render-js` 的 `matchMedia`。
+- 新增 `render-js` 测试断言 UA 组成；`file:///tmp/dpr.html` 实测脚本读到 `1440x900 dpr=2 mq=true`。
+
+## 验证
+
+```text
+cargo test -p render-js --lib          1293 passed
+cargo test -p render-css -p render-core --lib  336 + 568 passed
+cargo clippy -p render-js -p render-css -p render-core -p render-browser --all-targets -- -D warnings
+```
+
+剩余：`-webkit-device-pixel-ratio` 作为离散特性（不带 min/max）仍按 `Equal` 比较；`resolution` 单位只支持 dppx/dpi/dpcm 的常规写法。
+
+---
+
 # 交接文档 (2026-11-03, 续) — 无窗口 headless 页面运行器
 
 新增 `render-browser` 的 `render-headless` bin 和库里 `render_browser::headless` 模块。它只做网络/文件 I/O 与离屏 CPU 光栅化，不创建 winit/AppKit/NSWindow、不启动 softbuffer/gpu、不拉起外部浏览器；窗口焦点不受影响。

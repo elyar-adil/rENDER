@@ -380,7 +380,9 @@ fn navigator_exposes_browser_bootstrap_properties() {
         .execute(
             &mut parsed.dom,
             r#"navigator.appName === "Netscape" &&
-                    navigator.userAgent === "Mozilla/5.0 rENDER/0.1" &&
+                    navigator.userAgent.indexOf("Mozilla/5.0") === 0 &&
+                    navigator.userAgent.indexOf("Chrome/120.0.0.0") > 0 &&
+                    navigator.userAgent.indexOf("rENDER/") > 0 &&
                     navigator.language === "zh-CN" &&
                     navigator.mimeTypes.length === 0 &&
                     navigator.plugins.length === 0 &&

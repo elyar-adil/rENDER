@@ -1441,6 +1441,7 @@ fn selection_match_context(context: ImageSelectionContext) -> MatchContext {
     MatchContext {
         viewport_width: Some(context.viewport_width as f32),
         viewport_height: Some(context.viewport_height as f32),
+        resolution: Some(context.device_pixel_ratio_milli as f32 / 1_000.0),
         ..MatchContext::default()
     }
 }

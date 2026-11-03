@@ -1513,7 +1513,10 @@ fn continuous_feature(name: &str) -> Option<ContinuousFeature> {
         "width" => ContinuousFeature::Width,
         "height" => ContinuousFeature::Height,
         "aspect-ratio" => ContinuousFeature::AspectRatio,
-        "resolution" | "-webkit-device-pixel-ratio" => ContinuousFeature::Resolution,
+        "resolution"
+        | "device-pixel-ratio"
+        | "-webkit-device-pixel-ratio"
+        | "-moz-device-pixel-ratio" => ContinuousFeature::Resolution,
         "color" => ContinuousFeature::Color,
         "monochrome" => ContinuousFeature::Monochrome,
         "color-index" => ContinuousFeature::ColorIndex,
@@ -1559,17 +1562,33 @@ fn evaluate_legacy_media_feature(
     value: &str,
     context: &MatchContext,
 ) -> ConditionResult {
-    for (prefix, comparison) in [
-        ("min-", Comparison::GreaterOrEqual),
-        ("max-", Comparison::LessOrEqual),
-    ] {
-        if let Some(base) = name.strip_prefix(prefix)
-            && continuous_feature(base).is_some()
-        {
-            return evaluate_media_feature_value(base, value, comparison, context);
+    // WebKit's legacy resolution spelling puts the `min-`/`max-` marker in
+    // the middle of the name. Apple's feature detection asks
+    // `matchMedia("(-webkit-min-device-pixel-ratio: 2)")`; without this
+    // normalization it reads as an unknown feature and reports a non-retina
+    // display even at DPR 2.
+    let (name, comparison) = match name {
+        "-webkit-min-device-pixel-ratio" | "min--webkit-device-pixel-ratio" => {
+            ("-webkit-device-pixel-ratio", Comparison::GreaterOrEqual)
+        }
+        "-webkit-max-device-pixel-ratio" | "max--webkit-device-pixel-ratio" => {
+            ("-webkit-device-pixel-ratio", Comparison::LessOrEqual)
+        }
+        _ => (name, Comparison::Equal),
+    };
+    if comparison == Comparison::Equal {
+        for (prefix, comparison) in [
+            ("min-", Comparison::GreaterOrEqual),
+            ("max-", Comparison::LessOrEqual),
+        ] {
+            if let Some(base) = name.strip_prefix(prefix)
+                && continuous_feature(base).is_some()
+            {
+                return evaluate_media_feature_value(base, value, comparison, context);
+            }
         }
     }
-    evaluate_media_feature_value(name, value, Comparison::Equal, context)
+    evaluate_media_feature_value(name, value, comparison, context)
 }
 
 fn evaluate_media_feature_value(
@@ -1624,17 +1643,25 @@ fn evaluate_boolean_media_feature(name: &str, context: &MatchContext) -> Conditi
         "overflow-inline" => {
             ConditionResult::evaluated(context.overflow_inline != OverflowInline::None)
         }
-        "orientation"
-        | "prefers-color-scheme"
-        | "prefers-reduced-motion"
-        | "prefers-reduced-transparency"
-        | "prefers-reduced-data"
-        | "prefers-contrast"
-        | "scripting"
-        | "display-mode"
-        | "color-gamut"
-        | "dynamic-range"
-        | "video-dynamic-range" => ConditionResult::evaluated(true),
+        "prefers-reduced-motion" => ConditionResult::evaluated(
+            context.prefers_reduced_motion != ReducedPreference::NoPreference,
+        ),
+        "prefers-reduced-transparency" => ConditionResult::evaluated(
+            context.prefers_reduced_transparency != ReducedPreference::NoPreference,
+        ),
+        "prefers-reduced-data" => ConditionResult::evaluated(
+            context.prefers_reduced_data != ReducedPreference::NoPreference,
+        ),
+        "prefers-contrast" => {
+            ConditionResult::evaluated(context.prefers_contrast != ContrastPreference::NoPreference)
+        }
+        "scripting" => ConditionResult::evaluated(context.scripting != Scripting::None),
+        "display-mode" => ConditionResult::evaluated(context.display_mode != DisplayMode::Browser),
+        "color-gamut" => ConditionResult::evaluated(context.color_gamut != ColorGamut::Srgb),
+        "dynamic-range" | "video-dynamic-range" => {
+            ConditionResult::evaluated(context.dynamic_range != DynamicRange::Standard)
+        }
+        "orientation" | "prefers-color-scheme" => ConditionResult::evaluated(true),
         _ => ConditionResult::unsupported(),
     }
 }

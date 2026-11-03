@@ -8163,11 +8163,27 @@ impl Realm {
             prototype: Some(object_prototype),
             ..JsObject::default()
         });
+        // Site feature detection reads `navigator.userAgent`, not the HTTP
+        // User-Agent header. Keeping the two in sync matters: Apple, banks and
+        // many legacy sites branch their markup on a Chrome/Windows UA, and a
+        // distinctive token like `rENDER/0.1` makes them serve a tablet or
+        // fallback layout. The HTTP transport uses this same string.
+        let user_agent = concat!(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ",
+            "AppleWebKit/537.36 (KHTML, like Gecko) ",
+            "Chrome/120.0.0.0 Safari/537.36 rENDER/",
+            env!("CARGO_PKG_VERSION")
+        );
         for (name, value) in [
-            ("userAgent", "Mozilla/5.0 rENDER/0.1"),
+            ("userAgent", user_agent),
             ("appName", "Netscape"),
-            ("appVersion", "5.0 (rENDER)"),
+            (
+                "appVersion",
+                "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            ),
             ("platform", "Win32"),
+            ("vendor", "Google Inc."),
             ("language", "zh-CN"),
         ] {
             objects[navigator.0].properties.insert(

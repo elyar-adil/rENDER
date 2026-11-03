@@ -346,7 +346,7 @@ impl HeadlessSession {
             device_scale: options.device_scale,
             ..DocumentRenderOptions::default()
         };
-        let page = Page::with_options_and_url_unrendered(
+        let mut page = Page::with_options_and_url_unrendered(
             &html,
             PageOptions {
                 runtime_limits: runtime_limits(),
@@ -355,6 +355,17 @@ impl HeadlessSession {
             },
             &final_url,
         );
+        // Scripts must see the same geometry the renderer uses. Without this
+        // the runtime defaults to 1024x768/DPR 1, so responsive pages sniff a
+        // tablet viewport and choose the wrong markup and image variants.
+        page.runtime_mut().install_viewport(
+            options.viewport_width as f32,
+            options.viewport_height as f32,
+            0.0,
+            0.0,
+        );
+        page.runtime_mut()
+            .install_device_pixel_ratio(f64::from(options.device_scale));
         let now = Instant::now();
         let wait = options.wait;
         Ok(Self {

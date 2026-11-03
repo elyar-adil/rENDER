@@ -866,6 +866,7 @@ impl JsRuntime {
             &MatchContext {
                 viewport_width: Some(self.viewport.width),
                 viewport_height: Some(self.viewport.height),
+                resolution: Some(self.device_pixel_ratio as f32),
                 ..MatchContext::default()
             },
         )
