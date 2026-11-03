@@ -688,7 +688,7 @@ impl<'a> Solver<'a> {
             spacing: TextSpacing::default(),
         };
         let first_style = atoms.first().map_or(default_style, inline_typography);
-        let strut = self.line_strut(source.style_source);
+        let strut = self.line_strut(source.style_source, first_style.style);
         let mut fragments = Vec::new();
         let mut line_items: Vec<InlineLineItem> = Vec::new();
         let mut line_y = containing.origin.y;
@@ -1188,8 +1188,21 @@ impl<'a> Solver<'a> {
 
     /// The metrics every line box starts with: a zero-width inline box with
     /// the block container's font and `line-height`, CSS 2.1 §10.8's "strut".
-    fn line_strut(&mut self, source: Option<NodeId>) -> LineStrut {
-        let style = self.inline_text_style(source);
+    fn line_strut(&mut self, source: Option<NodeId>, inherited: TextStyle<'a>) -> LineStrut {
+        // An anonymous block has no computed style of its own; its inline
+        // content inherits the first run's typography. Falling back to the
+        // initial font there grew an unstyled 13.33px button from a 16px line
+        // to the root 19.2px one. A named block keeps using its own style, so
+        // a child `span` with a different line-height still does not move the
+        // strut.
+        let style = if source.is_some() {
+            self.inline_text_style(source)
+        } else {
+            InlineTextStyle {
+                style: inherited,
+                spacing: TextSpacing::default(),
+            }
+        };
         let metrics = self.text_measurer.measure("", style.style);
         let half_leading = (style.style.line_height - (metrics.ascent + metrics.descent)) / 2.0;
         LineStrut {
