@@ -1461,6 +1461,31 @@ fn wrapped_flex_align_content_and_reverse_control_line_positions() {
     assert_eq!((a.rect.origin.y, c.rect.origin.y), (80.0, 0.0));
 }
 
+// A flex item's specified width is an outer size under `box-sizing:
+// border-box`. The intrinsic-size path used to treat it as a content size and
+// then add padding and border again, so a 100px item with 10px padding and a
+// 5px border was 130px wide and pushed its next sibling 130px along the line.
+#[test]
+fn border_box_width_is_the_outer_width_of_a_flex_item() {
+    let html =
+        "<!doctype html><body><div id='row'><div id='a'></div><div id='b'></div></div></body>";
+    let css = "html, body, #row, #a, #b { display:block; margin:0 } \
+               #row { display:flex; width:400px; height:40px } \
+               #a, #b { width:100px; height:30px; box-sizing:border-box; \
+                        padding:10px; border:5px solid }";
+    let (output, _, layout) = pipeline(html, css, 400.0);
+    let a = fragment(&layout, find(&output.dom, "#a"));
+    let b = fragment(&layout, find(&output.dom, "#b"));
+    let FragmentKind::Box(a_geometry) = &a.kind else {
+        panic!("expected a box fragment");
+    };
+    assert_eq!(a.rect.size.width, 100.0);
+    assert_eq!(a_geometry.content_rect.size.width, 70.0);
+    assert_eq!(a_geometry.padding.left, 10.0);
+    assert_eq!(a_geometry.border.left, 5.0);
+    assert_eq!(b.rect.origin.x, 100.0);
+}
+
 #[test]
 fn definite_height_wrapped_columns_place_items_across_cross_axis() {
     let html = "<!doctype html><body><div id='menu'><div id='a'></div><div id='b'></div><div id='c'></div></div></body>";

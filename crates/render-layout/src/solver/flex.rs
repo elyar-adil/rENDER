@@ -1126,13 +1126,27 @@ impl Solver<'_> {
             };
             let child_size = if is_flex {
                 let child_node = self.formatting.get(child);
-                let child_source = child_node.and_then(|node| node.source);
-                let child_style = child_node
-                    .and_then(|node| node.style_source)
-                    .and_then(|source| self.styles.get(&source))
-                    .cloned();
-                child_size
-                    + self.flex_outer_extras(child_style.as_ref(), horizontal, basis, child_source)
+                // A direct text child has no box of its own even though its
+                // style source is the flex container; adding the container's
+                // padding and border here counted them twice and made an
+                // auto-width `<input type=submit>` 16px wider than the same
+                // text in a `<button>`.
+                if child_node.is_some_and(|node| matches!(node.kind, FormattingNodeKind::Text(_))) {
+                    child_size
+                } else {
+                    let child_source = child_node.and_then(|node| node.source);
+                    let child_style = child_node
+                        .and_then(|node| node.style_source)
+                        .and_then(|source| self.styles.get(&source))
+                        .cloned();
+                    child_size
+                        + self.flex_outer_extras(
+                            child_style.as_ref(),
+                            horizontal,
+                            basis,
+                            child_source,
+                        )
+                }
             } else if !horizontal {
                 // A block container's intrinsic height is the sum of its
                 // children's *outer* heights. A padded title line inside a
@@ -1245,8 +1259,21 @@ impl Solver<'_> {
         // suggestion" for the min-content measurement and the max-content
         // counterpart for the other: the intrinsic size of a box with a
         // definite size is that size, however wide its contents are.
-        self.resolve_size_against(style.as_ref(), property, None, entry.source)
-            .unwrap_or(content)
+        match self.resolve_size_against(style.as_ref(), property, None, entry.source) {
+            // The specified size suggestion is an outer size under
+            // `box-sizing: border-box`; this function returns a content size,
+            // and the caller adds the padding and border back. Returning the
+            // border-box width here made the automatic minimum 30px too large
+            // (and a definite-size flex item 30px too wide).
+            Some(specified) => self.flex_basis_content_box(
+                style.as_ref(),
+                specified,
+                horizontal,
+                basis,
+                entry.source,
+            ),
+            None => content,
+        }
     }
 
     pub(super) fn flex_outer_extras(
