@@ -11,6 +11,7 @@ use std::error::Error;
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use render_css::computed::ComputedStyle;
 use url::Url;
 
 use crate::document::{Document, DocumentBackends, DocumentRenderOptions, DocumentRenderOutput};
@@ -764,6 +765,26 @@ impl Page {
         self.geometry_index = geometry.clone();
         self.runtime.install_element_geometry(geometry);
         self.queue_pending_runtime_microtasks();
+        true
+    }
+
+    /// Install computed styles produced by an external renderer when their DOM
+    /// revision is still current. Returns whether the snapshot was installed.
+    ///
+    /// This is the computed-style counterpart of
+    /// [`Self::publish_render_geometry`]: an embedding that renders documents
+    /// on a worker publishes both artifacts through these seams, and script
+    /// reading `getComputedStyle` sees the same values the frame painted.
+    pub fn publish_computed_styles(
+        &mut self,
+        revision: u64,
+        styles: &BTreeMap<NodeId, ComputedStyle>,
+    ) -> bool {
+        if self.document.dom().revision().as_u64() != revision {
+            return false;
+        }
+        self.runtime
+            .install_computed_styles(self.document.dom().revision(), styles);
         true
     }
 
@@ -1911,6 +1932,7 @@ impl Page {
         let Some(snapshot) = self.snapshot.as_ref() else {
             self.geometry_index.clear();
             self.runtime.install_element_geometry(BTreeMap::new());
+            self.runtime.clear_computed_styles();
             return;
         };
         let mut index = BTreeMap::new();
@@ -1931,6 +1953,8 @@ impl Page {
         }
         self.geometry_index = index.clone();
         self.runtime.install_element_geometry(index);
+        self.runtime
+            .install_computed_styles(snapshot.revision, &snapshot.styles);
     }
 }
 

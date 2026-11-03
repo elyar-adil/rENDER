@@ -20,13 +20,20 @@ use crate::runtime::JsRuntime;
 use crate::runtime::builtins::dom::is_valid_property_name;
 use crate::runtime::builtins::dom_exception::DomExceptionName;
 use crate::runtime::convert::required_argument;
+use crate::value::ComputedPseudo;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use render_css::cascade::expand_shorthand;
+use render_css::computed::ComputedStyle;
+use render_css::computed::PropertyRegistry;
 use render_css::cssom::split_rule_list;
+use render_css::pseudo::PseudoElement;
+use render_css::pseudo::style_source;
 use render_css::stylesheet::parse_declaration_list;
 use render_dom::Dom;
 use render_dom::DomError;
 use render_dom::NodeId;
+use std::sync::OnceLock;
 
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_style_native(
@@ -107,6 +114,149 @@ fn is_complete_rule(rule: &str) -> bool {
 pub(in crate::runtime) const STYLE_METHOD_PROPERTIES: [&str; 4] =
     ["getPropertyValue", "setProperty", "removeProperty", "item"];
 
+/// Parse the second argument of `getComputedStyle`. The legacy single-colon
+/// spellings are accepted for compatibility; every other selector is a
+/// pseudo-element this engine does not generate, and gets an empty
+/// declaration rather than the element's values.
+pub(in crate::runtime) fn computed_pseudo_from_text(text: &str) -> ComputedPseudo {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "" => ComputedPseudo::Element,
+        "::before" | ":before" => ComputedPseudo::Before,
+        "::after" | ":after" => ComputedPseudo::After,
+        _ => ComputedPseudo::Unsupported,
+    }
+}
+
+/// The longhands a computed shorthand is serialized from. A shorthand the
+/// cascade expanded has no stored value of its own, so CSSOM's getter has to
+/// put the parts back together. Shorthands whose serialization is not a plain
+/// joining of longhands (`border`, `background`, `font`, ...) are deliberately
+/// absent and return the inline declaration, or the empty string.
+fn shorthand_longhands(property: &str) -> Option<&'static [&'static str]> {
+    match property {
+        "margin" => Some(&["margin-top", "margin-right", "margin-bottom", "margin-left"]),
+        "padding" => Some(&[
+            "padding-top",
+            "padding-right",
+            "padding-bottom",
+            "padding-left",
+        ]),
+        "border-width" => Some(&[
+            "border-top-width",
+            "border-right-width",
+            "border-bottom-width",
+            "border-left-width",
+        ]),
+        "border-style" => Some(&[
+            "border-top-style",
+            "border-right-style",
+            "border-bottom-style",
+            "border-left-style",
+        ]),
+        "border-color" => Some(&[
+            "border-top-color",
+            "border-right-color",
+            "border-bottom-color",
+            "border-left-color",
+        ]),
+        "inset" => Some(&["top", "right", "bottom", "left"]),
+        "overflow" => Some(&["overflow-x", "overflow-y"]),
+        "gap" => Some(&["row-gap", "column-gap"]),
+        "grid-gap" => Some(&["row-gap", "column-gap"]),
+        "flex-flow" => Some(&["flex-direction", "flex-wrap"]),
+        "flex" => Some(&["flex-grow", "flex-shrink", "flex-basis"]),
+        "grid-column" => Some(&["grid-column-start", "grid-column-end"]),
+        "grid-row" => Some(&["grid-row-start", "grid-row-end"]),
+        "columns" => Some(&["column-width", "column-count"]),
+        _ => None,
+    }
+}
+
+/// Serialize longhand values as a CSS shorthand. `values` is in the order
+/// [`shorthand_longhands`] returns; only properties that function names reach
+/// here.
+fn serialize_shorthand(property: &str, values: &[String]) -> Option<String> {
+    if values.iter().any(String::is_empty) {
+        return None;
+    }
+    match property {
+        "overflow" | "gap" | "grid-gap" | "flex-flow" => {
+            let [first, second] = values else {
+                return None;
+            };
+            Some(if first == second {
+                first.clone()
+            } else {
+                format!("{first} {second}")
+            })
+        }
+        "flex" => Some(values.join(" ")),
+        "grid-column" | "grid-row" => {
+            let [start, end] = values else {
+                return None;
+            };
+            let start = start.trim();
+            let end = end.trim();
+            Some(if end.eq_ignore_ascii_case("auto") {
+                start.to_owned()
+            } else {
+                format!("{start} / {end}")
+            })
+        }
+        "columns" => {
+            let [width, count] = values else {
+                return None;
+            };
+            if width.eq_ignore_ascii_case("auto") && count.eq_ignore_ascii_case("auto") {
+                Some("auto".to_owned())
+            } else if width.eq_ignore_ascii_case("auto") {
+                Some(count.clone())
+            } else if count.eq_ignore_ascii_case("auto") {
+                Some(width.clone())
+            } else {
+                Some(format!("{width} {count}"))
+            }
+        }
+        _ => {
+            let [top, right, bottom, left] = values else {
+                return None;
+            };
+            Some(if top == right && right == bottom && bottom == left {
+                top.clone()
+            } else if top == bottom && right == left {
+                format!("{top} {right}")
+            } else {
+                format!("{top} {right} {bottom} {left}")
+            })
+        }
+    }
+}
+
+/// The property registry's initial values, keyed by name. These are the values
+/// `getComputedStyle` answers before a page has rendered, and for a property
+/// the computed snapshot does not contain. Built once: the registry is
+/// immutable and the map is the same for every realm.
+fn property_initial_values() -> &'static std::collections::BTreeMap<String, String> {
+    static INITIAL: OnceLock<std::collections::BTreeMap<String, String>> = OnceLock::new();
+    INITIAL.get_or_init(|| {
+        PropertyRegistry::standard_baseline()
+            .iter()
+            .map(|(name, definition)| {
+                // `font-size: medium` is the user's default font size. The
+                // engine's root default is 16px (`root_font_size`), and a
+                // browser's computed style reports an absolute length, so the
+                // pre-render fallback does too.
+                let value = if name == "font-size" && definition.initial_value == "medium" {
+                    "16px".to_owned()
+                } else {
+                    definition.initial_value.clone()
+                };
+                (name.clone(), value)
+            })
+            .collect()
+    })
+}
+
 impl JsRuntime {
     /// Declarations of the element's inline `style` attribute, in source order.
     pub(in crate::runtime) fn inline_declarations(
@@ -147,22 +297,175 @@ impl JsRuntime {
         }
     }
 
+    /// The computed style of `node` or one of its generated pseudo-elements,
+    /// or `None` when the last committed render produced no entry.
+    pub(in crate::runtime) fn computed_style_for(
+        &self,
+        node: NodeId,
+        pseudo: ComputedPseudo,
+    ) -> Option<&ComputedStyle> {
+        match pseudo {
+            ComputedPseudo::Element => self.computed_styles.get(&node),
+            ComputedPseudo::Before => self
+                .computed_styles
+                .get(&style_source(node, PseudoElement::Before)),
+            ComputedPseudo::After => self
+                .computed_styles
+                .get(&style_source(node, PseudoElement::After)),
+            ComputedPseudo::Unsupported => None,
+        }
+    }
+
+    /// The property names a computed declaration enumerates, in the order
+    /// `length`/`item` expose them.
+    ///
+    /// A rendered element answers every property the registry defines (the
+    /// computed style's own map already includes the shared initial values),
+    /// plus any custom or unregistered property the document wrote inline. A
+    /// generated pseudo-element enumerates only the style the cascade actually
+    /// produced. Before the first render the element's inline names and the
+    /// registry's names are the whole answer.
+    pub(in crate::runtime) fn computed_style_property_names(
+        &self,
+        dom: &Dom,
+        node: NodeId,
+        pseudo: ComputedPseudo,
+    ) -> Vec<String> {
+        if pseudo == ComputedPseudo::Unsupported {
+            return Vec::new();
+        }
+        let style = self.computed_style_for(node, pseudo);
+        if pseudo != ComputedPseudo::Element && style.is_none() {
+            return Vec::new();
+        }
+        let mut names = match style {
+            Some(style) => style
+                .property_names()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>(),
+            None => property_initial_values()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+        };
+        if pseudo == ComputedPseudo::Element {
+            for (name, _, _) in Self::inline_declarations(dom, node) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        names
+    }
+
+    /// The value `getComputedStyle(...).getPropertyValue(property)` returns.
+    ///
+    /// The order is the CSSOM one: the committed cascade's computed value,
+    /// then a serialization synthesized from longhands for a shorthand the
+    /// cascade expanded, then the element's current inline declaration, then
+    /// the registry's initial value. Percentages and `auto` stay computed
+    /// values; this method never substitutes a layout used value.
+    pub(in crate::runtime) fn computed_property_value(
+        &self,
+        dom: &Dom,
+        node: NodeId,
+        pseudo: ComputedPseudo,
+        property: &str,
+    ) -> String {
+        let property = property.trim().to_ascii_lowercase();
+        if property.is_empty() {
+            return String::new();
+        }
+        let style = self.computed_style_for(node, pseudo);
+        // CSSOM has no useful computed style for a pseudo-element the engine
+        // did not generate: the declaration is empty rather than the element's
+        // inherited values. `::before`/`::after` styles exist in the snapshot
+        // exactly when the cascade produced a box for them.
+        if pseudo == ComputedPseudo::Unsupported
+            || (pseudo != ComputedPseudo::Element && style.is_none())
+        {
+            return String::new();
+        }
+        Self::lookup_computed_property(dom, node, pseudo, style, &property)
+            .or_else(|| property_initial_values().get(&property).cloned())
+            .unwrap_or_default()
+    }
+
+    fn lookup_computed_property(
+        dom: &Dom,
+        node: NodeId,
+        pseudo: ComputedPseudo,
+        style: Option<&ComputedStyle>,
+        property: &str,
+    ) -> Option<String> {
+        if let Some(value) = style.and_then(|style| style.get(property)) {
+            let text = value.css_text().trim();
+            if !text.is_empty() {
+                return Some(text.to_owned());
+            }
+        }
+        if let Some(longhands) = shorthand_longhands(property) {
+            let values = longhands
+                .iter()
+                .map(|longhand| {
+                    Self::lookup_computed_property(dom, node, pseudo, style, longhand)
+                        .or_else(|| property_initial_values().get(*longhand).cloned())
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if let Some(serialized) = serialize_shorthand(property, &values) {
+                return Some(serialized);
+            }
+        }
+        if pseudo == ComputedPseudo::Element {
+            return Self::inline_property_value(dom, node, property);
+        }
+        None
+    }
+
+    /// The current inline declaration of `property`, expanding a shorthand
+    /// (`margin: 8px` answers `margin-top`) and honouring `!important` within
+    /// the inline block itself.
+    fn inline_property_value(dom: &Dom, node: NodeId, property: &str) -> Option<String> {
+        let mut selected: Option<(String, bool)> = None;
+        for (name, value, important) in Self::inline_declarations(dom, node) {
+            for (longhand, longhand_value) in expand_shorthand(&name, &value) {
+                if longhand != property {
+                    continue;
+                }
+                let wins = selected
+                    .as_ref()
+                    .is_none_or(|(_, current_important)| important || !*current_important);
+                if wins {
+                    selected = Some((longhand_value, important));
+                }
+            }
+        }
+        selected.map(|(value, _)| value)
+    }
+
     pub(in crate::runtime) fn style_get_property(
         &mut self,
         dom: &Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let node = self.require_style_declaration(receiver)?;
         let requested = required_argument(arguments, 0, "getPropertyValue")?.to_js_string();
         let requested = requested.to_lossy().trim().to_ascii_lowercase();
-        Ok(JsValue::String(
-            (Self::inline_declarations(dom, node)
-                .into_iter()
-                .find(|(name, _, _)| *name == requested)
-                .map_or_else(String::new, |(_, value, _)| value))
-            .into(),
-        ))
+        match self.realm.host(receiver) {
+            Some(ObjectHost::CssStyleDeclaration(node)) => Ok(JsValue::String(
+                (Self::inline_declarations(dom, node)
+                    .into_iter()
+                    .find(|(name, _, _)| *name == requested)
+                    .map_or_else(String::new, |(_, value, _)| value))
+                .into(),
+            )),
+            Some(ObjectHost::ComputedStyleDeclaration { node, pseudo }) => Ok(JsValue::String(
+                (self.computed_property_value(dom, node, pseudo, &requested)).into(),
+            )),
+            _ => Err(JsError::type_error(
+                "incompatible CSSStyleDeclaration method receiver",
+            )),
+        }
     }
 
     pub(in crate::runtime) fn style_set_property(
@@ -171,6 +474,14 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
+        // CSSOM exposes computed declarations as read-only: a write is a
+        // silent no-op, not an error, exactly as it is in browsers.
+        if matches!(
+            self.realm.host(receiver),
+            Some(ObjectHost::ComputedStyleDeclaration { .. })
+        ) {
+            return Ok(JsValue::Undefined);
+        }
         let node = self.require_style_declaration(receiver)?;
         let name = required_argument(arguments, 0, "setProperty")?
             .to_js_string()
@@ -206,6 +517,12 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
+        if matches!(
+            self.realm.host(receiver),
+            Some(ObjectHost::ComputedStyleDeclaration { .. })
+        ) {
+            return Ok(JsValue::String((String::new()).into()));
+        }
         let node = self.require_style_declaration(receiver)?;
         let name = required_argument(arguments, 0, "removeProperty")?
             .to_js_string()
@@ -230,12 +547,25 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let node = self.require_style_declaration(receiver)?;
         let index = match arguments.first() {
             Some(value) => self.to_number_value(dom, value)?,
             None => return Ok(JsValue::String((String::new()).into())),
         };
-        let declarations = Self::inline_declarations(dom, node);
+        let computed = match self.realm.host(receiver) {
+            Some(ObjectHost::ComputedStyleDeclaration { node, pseudo }) => {
+                Some(self.computed_style_property_names(dom, node, pseudo))
+            }
+            _ => None,
+        };
+        let declarations = if let Some(names) = &computed {
+            names.clone()
+        } else {
+            let node = self.require_style_declaration(receiver)?;
+            Self::inline_declarations(dom, node)
+                .into_iter()
+                .map(|(name, _, _)| name)
+                .collect()
+        };
         #[allow(
             clippy::cast_precision_loss,
             clippy::cast_possible_truncation,
@@ -244,7 +574,7 @@ impl JsRuntime {
         )]
         let position = index as usize;
         Ok(match declarations.get(position) {
-            Some((name, _, _)) => JsValue::String((name.clone()).into()),
+            Some(name) => JsValue::String((name.clone()).into()),
             None => JsValue::String((String::new()).into()),
         })
     }

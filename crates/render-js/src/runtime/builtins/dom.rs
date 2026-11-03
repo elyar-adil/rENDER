@@ -20,10 +20,12 @@ use crate::ObjectId;
 use crate::runtime::JsRuntime;
 use crate::runtime::builtins::dom_collections::unsigned_long;
 use crate::runtime::builtins::dom_exception::DomExceptionName;
+use crate::runtime::builtins::style::computed_pseudo_from_text;
 use crate::runtime::convert::required_argument;
 use crate::runtime::types::ElementRect;
 use crate::utf16::JsString;
 use crate::value::CollectionFilter;
+use crate::value::ComputedPseudo;
 use crate::value::DomNodeKind;
 use crate::value::HTML_ELEMENT_INTERFACES;
 use crate::value::NativeFunction;
@@ -425,9 +427,16 @@ impl JsRuntime {
             NativeFunction::GetComputedStyle => {
                 let argument = required_argument(arguments, 0, "getComputedStyle")?;
                 let element = self.value_as_node(argument)?;
+                let pseudo = arguments
+                    .get(1)
+                    .filter(|value| !matches!(value, JsValue::Undefined | JsValue::Null))
+                    .map_or(ComputedPseudo::Element, |value| {
+                        computed_pseudo_from_text(&value.to_js_string().to_lossy())
+                    });
                 self.ensure_heap_capacity(1)?;
                 Ok(JsValue::Object(
-                    self.realm.style_declaration_wrapper(element),
+                    self.realm
+                        .computed_style_declaration_wrapper(element, pseudo),
                 ))
             }
             NativeFunction::CompareDocumentPosition => {
@@ -735,6 +744,11 @@ pub(in crate::runtime) fn is_valid_property_name(name: &str) -> bool {
 
 /// Map a camelCase style member (`backgroundColor`) to its CSS property name.
 pub(in crate::runtime) fn css_prop_from_member(property: &str) -> String {
+    // CSSOM's legacy `cssFloat` member is the one camelCase name that does not
+    // map by inserting hyphens: it is `float`.
+    if property == "cssFloat" {
+        return "float".to_owned();
+    }
     let mut mapped = String::with_capacity(property.len() + 4);
     for character in property.chars() {
         if character.is_ascii_uppercase() {

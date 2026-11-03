@@ -5836,6 +5836,47 @@ impl JsRuntime {
                     }
                 }
             }
+            Some(ObjectHost::ComputedStyleDeclaration { node, pseudo }) => {
+                // CSSOM's computed declaration is read-only. `cssText` is the
+                // empty string rather than a serialization of every property.
+                if property == "cssText" {
+                    return Ok(JsValue::String((String::new()).into()));
+                }
+                if property == "parentRule" {
+                    return Ok(JsValue::Null);
+                }
+                let names = if property == "length" || property.parse::<usize>().is_ok() {
+                    Some(self.computed_style_property_names(dom, node, pseudo))
+                } else {
+                    None
+                };
+                if property == "length" {
+                    let names = names.unwrap_or_default();
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "declaration counts are far below any precision boundary"
+                    )]
+                    let length = names.len() as f64;
+                    return Ok(JsValue::Number(length));
+                }
+                if let Ok(index) = property.parse::<usize>() {
+                    let names = names.unwrap_or_default();
+                    return Ok(match names.get(index) {
+                        Some(name) => JsValue::String((name.clone()).into()),
+                        None => JsValue::Undefined,
+                    });
+                }
+                // camelCase member access maps to kebab-case properties, but
+                // the interface's methods always take precedence.
+                if !STYLE_METHOD_PROPERTIES.contains(&property) {
+                    let css_name = css_prop_from_member(property);
+                    if is_valid_property_name(&css_name) {
+                        return Ok(JsValue::String(
+                            (self.computed_property_value(dom, node, pseudo, &css_name)).into(),
+                        ));
+                    }
+                }
+            }
             // CSSOM §6.4: the members of a style sheet. `cssRules` is the
             // live rule list; `ownerNode`, `href`, `type` and `title` come
             // from the element that owns the sheet.
@@ -6114,6 +6155,18 @@ impl JsRuntime {
                 Some(NativeFunction::StyleRemoveProperty)
             }
             (Some(ObjectHost::CssStyleDeclaration(_)), "item") => Some(NativeFunction::StyleItem),
+            (Some(ObjectHost::ComputedStyleDeclaration { .. }), "getPropertyValue") => {
+                Some(NativeFunction::StyleGetProperty)
+            }
+            (Some(ObjectHost::ComputedStyleDeclaration { .. }), "setProperty") => {
+                Some(NativeFunction::StyleSetProperty)
+            }
+            (Some(ObjectHost::ComputedStyleDeclaration { .. }), "removeProperty") => {
+                Some(NativeFunction::StyleRemoveProperty)
+            }
+            (Some(ObjectHost::ComputedStyleDeclaration { .. }), "item") => {
+                Some(NativeFunction::StyleItem)
+            }
             (Some(ObjectHost::CssStyleSheet(_)), "insertRule") => {
                 Some(NativeFunction::StyleSheetInsertRule)
             }
@@ -6318,6 +6371,14 @@ impl JsRuntime {
                 return self.set_inner_html(dom, node, &source);
             }
             return self.set_outer_html(dom, node, &source);
+        }
+        if matches!(
+            self.realm.host(object),
+            Some(ObjectHost::ComputedStyleDeclaration { .. })
+        ) {
+            // CSSOM computed declarations are read-only: assignment is a
+            // silent no-op, whether it names `cssText` or a camelCase member.
+            return Ok(());
         }
         if let Some(ObjectHost::CssStyleDeclaration(node)) = self.realm.host(object) {
             if property == "cssText" {

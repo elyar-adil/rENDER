@@ -2448,6 +2448,19 @@ pub(crate) enum CollectionFilter {
     FormControlName(String),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum ComputedPseudo {
+    /// The element itself.
+    #[default]
+    Element,
+    Before,
+    After,
+    /// A pseudo-element this engine has no generated-content style for. The
+    /// declaration is empty, as CSSOM requires for a pseudo that does not
+    /// generate a box the engine models.
+    Unsupported,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) enum ObjectHost {
     #[default]
@@ -2468,6 +2481,15 @@ pub(crate) enum ObjectHost {
     /// members to `data-*` attributes on the owning element.
     DataSet(NodeId),
     CssStyleDeclaration(NodeId),
+    /// The read-only `CSSStyleDeclaration` `getComputedStyle` returns for an
+    /// element or one of its generated-content pseudo-elements. Values come
+    /// from the last computed-style snapshot installed by the embedding, with
+    /// inline declarations and initial values as the pre-render fallback.
+    /// `element.style` remains [`ObjectHost::CssStyleDeclaration`].
+    ComputedStyleDeclaration {
+        node: NodeId,
+        pseudo: ComputedPseudo,
+    },
     /// A `CSSStyleSheet` whose rules are the text of the `<style>` element
     /// `NodeId` (CSSOM §6.4). A `<link rel=stylesheet>` sheet has the element
     /// as its owner but no text child, so its CSSOM rule list starts empty.
@@ -3256,6 +3278,8 @@ pub struct RealmRecord {
     range_wrappers: BTreeMap<RangeId, ObjectId>,
     class_list_wrappers: BTreeMap<NodeId, ObjectId>,
     style_declaration_wrappers: BTreeMap<NodeId, ObjectId>,
+    /// One read-only computed declaration per `(element, pseudo-element)`.
+    computed_style_declaration_wrappers: BTreeMap<(NodeId, ComputedPseudo), ObjectId>,
     /// One `CSSStyleSheet` per `<style>`/`<link>` owner (CSSOM §6.4).
     style_sheet_wrappers: BTreeMap<NodeId, ObjectId>,
     /// One `CSSRuleList` per style element, so repeated reads return the same
@@ -3803,6 +3827,7 @@ impl Realm {
             range_wrappers: BTreeMap::new(),
             class_list_wrappers: BTreeMap::new(),
             style_declaration_wrappers: BTreeMap::new(),
+            computed_style_declaration_wrappers: BTreeMap::new(),
             style_sheet_wrappers: BTreeMap::new(),
             css_rule_list_wrappers: BTreeMap::new(),
             css_rule_wrappers: BTreeMap::new(),
@@ -11908,6 +11933,7 @@ impl RealmRecord {
                 + self.range_wrappers.len()
                 + self.class_list_wrappers.len()
                 + self.style_declaration_wrappers.len()
+                + self.computed_style_declaration_wrappers.len()
                 + self.style_sheet_wrappers.len()
                 + self.css_rule_list_wrappers.len()
                 + self.css_rule_wrappers.len()
@@ -11952,6 +11978,7 @@ impl RealmRecord {
         roots.extend(self.implementation_wrappers.values().copied());
         roots.extend(self.class_list_wrappers.values().copied());
         roots.extend(self.style_declaration_wrappers.values().copied());
+        roots.extend(self.computed_style_declaration_wrappers.values().copied());
         roots.extend(self.style_sheet_wrappers.values().copied());
         roots.extend(self.css_rule_list_wrappers.values().copied());
         roots.extend(self.css_rule_wrappers.values().copied());
@@ -12978,6 +13005,30 @@ impl Realm {
             ..JsObject::default()
         });
         self.style_declaration_wrappers.insert(node, wrapper);
+        wrapper
+    }
+
+    /// The read-only computed declaration of `node` (or one of its generated
+    /// pseudo-elements). Repeated calls return the same object, which reads
+    /// the runtime's current computed-style snapshot on every access.
+    pub(crate) fn computed_style_declaration_wrapper(
+        &mut self,
+        node: NodeId,
+        pseudo: ComputedPseudo,
+    ) -> ObjectId {
+        if let Some(wrapper) = self
+            .computed_style_declaration_wrappers
+            .get(&(node, pseudo))
+        {
+            return *wrapper;
+        }
+        let wrapper = self.allocate(JsObject {
+            prototype: Some(self.object_prototype),
+            host: ObjectHost::ComputedStyleDeclaration { node, pseudo },
+            ..JsObject::default()
+        });
+        self.computed_style_declaration_wrappers
+            .insert((node, pseudo), wrapper);
         wrapper
     }
 

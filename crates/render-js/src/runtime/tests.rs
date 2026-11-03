@@ -8979,3 +8979,41 @@ fn class_list_item_converts_its_index_with_to_number() {
         JsValue::Boolean(true)
     );
 }
+
+#[test]
+fn get_computed_style_reads_the_installed_cascade_snapshot() {
+    use render_css::cascade::{CascadeInput, CascadeOrigin};
+    use render_css::computed::{ComputationLimits, PropertyRegistry, compute_document_styles};
+    use render_css::selector::MatchContext;
+    use render_css::stylesheet::parse_stylesheet;
+
+    let mut parsed = parse_document(
+        "<!doctype html><div id=x style='color:red'>text</div><div id=plain>plain</div>",
+    );
+    let sheet =
+        parse_stylesheet("#x { display:flex; padding-left:12px; font-size:20px; margin-top:3px }");
+    let styles = compute_document_styles(
+        &parsed.dom,
+        &[CascadeInput {
+            sheet: &sheet,
+            origin: CascadeOrigin::Author,
+        }],
+        &PropertyRegistry::standard_baseline(),
+        &ComputationLimits::default(),
+        &MatchContext::default(),
+    );
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime.install_computed_styles(parsed.dom.revision(), &styles);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            "var s = getComputedStyle(document.getElementById('x')); \
+             [s.display, s.paddingLeft, s.fontSize, s.marginTop, s.getPropertyValue('padding-left'), s.color].join('|')",
+        )
+        .expect("getComputedStyle executes");
+    assert_eq!(
+        outcome.value.to_js_string().to_lossy(),
+        "flex|12px|20px|3px|12px|red",
+        "the committed cascade snapshot is visible to script"
+    );
+}

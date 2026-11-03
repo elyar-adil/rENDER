@@ -35,6 +35,7 @@ use crate::utf16::JsString;
 use crate::value::ErrorKind;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use render_css::computed::ComputedStyle;
 use render_dom::Dom;
 use render_dom::DomError;
 use render_dom::DomRevision;
@@ -343,6 +344,18 @@ pub struct JsRuntime {
     dialog_return_values: BTreeMap<NodeId, String>,
     random_state: u64,
     element_geometry: BTreeMap<u64, ElementRect>,
+    /// Computed styles from the latest render the embedding committed, keyed
+    /// by DOM node. `getComputedStyle` serves these values; an element that is
+    /// absent (created since the render, or in a page before its first render)
+    /// falls back to its inline declarations and the registry's initial
+    /// values.
+    computed_styles: BTreeMap<NodeId, ComputedStyle>,
+    /// DOM revision the installed computed snapshot was computed from. It is
+    /// informational: a later mutation does not invalidate the snapshot,
+    /// because node ids are stable and the next render replaces it. Scripts
+    /// therefore see at most one committed turn of staleness, which is the
+    /// same boundary `getBoundingClientRect` geometry has.
+    computed_styles_revision: DomRevision,
     viewport: ElementRect,
     /// Device pixel ratio exposed as `window.devicePixelRatio` (CSSOM View
     /// §4.2). Viewport and element geometry stay in CSS pixels; only this ratio
@@ -549,6 +562,8 @@ impl JsRuntime {
                 nanos | 1
             },
             element_geometry: BTreeMap::new(),
+            computed_styles: BTreeMap::new(),
+            computed_styles_revision: dom.revision(),
             viewport: ElementRect {
                 x: 0.0,
                 y: 0.0,
@@ -1070,6 +1085,40 @@ impl JsRuntime {
         self.element_geometry = geometry;
         self.queue_intersection_observers();
         self.queue_resize_observers();
+    }
+
+    /// Install the computed styles of the document as of `revision`.
+    ///
+    /// `Window.getComputedStyle` reads this map. The entries are the cascade's
+    /// computed values (what CSSOM calls computed values, not layout's used
+    /// values), including generated `::before`/`::after` styles keyed by
+    /// [`render_css::pseudo::style_source`]. Replacing the map is how a
+    /// committed render makes its new values visible to later script turns.
+    ///
+    /// A page that has not rendered yet, and an element created after the
+    /// snapshot, have no entry and fall back to inline declarations and the
+    /// property registry's initial values.
+    pub fn install_computed_styles(
+        &mut self,
+        revision: DomRevision,
+        styles: &BTreeMap<NodeId, ComputedStyle>,
+    ) {
+        self.computed_styles.clone_from(styles);
+        self.computed_styles_revision = revision;
+    }
+
+    /// Drop the computed-style snapshot, restoring the inline/initial fallback
+    /// used before a document's first render.
+    pub fn clear_computed_styles(&mut self) {
+        self.computed_styles.clear();
+        self.computed_styles_revision = DomRevision::default();
+    }
+
+    /// The DOM revision the installed computed-style snapshot was computed
+    /// from. Useful to an embedding that wants to report staleness.
+    #[must_use]
+    pub const fn computed_styles_revision(&self) -> DomRevision {
+        self.computed_styles_revision
     }
 
     /// Publish the current CSS viewport and document scroll position.

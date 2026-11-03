@@ -208,6 +208,7 @@ pub(super) fn mark_host(
         | ObjectHost::ClassList(_)
         | ObjectHost::DataSet(_)
         | ObjectHost::CssStyleDeclaration(_)
+        | ObjectHost::ComputedStyleDeclaration { .. }
         | ObjectHost::CssStyleSheet(_)
         | ObjectHost::CssRuleList(_)
         | ObjectHost::CssRule { .. }

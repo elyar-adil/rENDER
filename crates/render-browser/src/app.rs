@@ -1013,6 +1013,9 @@ impl BrowserApp {
             }
             page.raster_background = frame.raster_background;
             if let Some(styles) = frame.computed_styles {
+                let _published = page
+                    .page
+                    .publish_computed_styles(frame.document_revision, &styles);
                 page.computed_styles = styles;
             }
             if let Some(transition_state) = frame.transition_state {
