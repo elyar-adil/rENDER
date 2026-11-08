@@ -1570,10 +1570,17 @@ impl<'a> Solver<'a> {
     }
 
     pub(super) fn measure_inline_character(&self, character: char, style: TextStyle<'_>) -> f32 {
+        let key = super::InlineAdvanceKey::new(character, style);
+        if let Some(advance) = self.inline_advances.borrow().get(&key) {
+            return *advance;
+        }
         let mut encoded = [0_u8; 4];
-        self.text_measurer
+        let advance = self
+            .text_measurer
             .measure(character.encode_utf8(&mut encoded), style)
-            .advance
+            .advance;
+        self.inline_advances.borrow_mut().insert(key, advance);
+        advance
     }
 
     /// The advance of one typographic character unit, including the CSS Text

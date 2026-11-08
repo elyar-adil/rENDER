@@ -3179,9 +3179,11 @@ mod tests {
         let layout = ChromeLayout::new(2_360, 1_560, 2.0, tabs.tabs());
         let editor = AddressEditor::new("render://home");
         let close = layout.tabs[0].close;
+        // The hover feedback is a circle inscribed in the close box, so sample
+        // its centre: a corner sample can legitimately fall outside the circle.
         let sample = Point {
-            x: close.x + 3.0 * layout.scale,
-            y: close.y + 3.0 * layout.scale,
+            x: close.x + close.width * 0.5,
+            y: close.y + close.height * 0.25,
         };
         let index = sample.y as usize * layout.content.width as usize + sample.x as usize;
         let tab_hot = paint_test_frame(&layout, &tabs, &editor, HitTarget::Tab(active), None);

@@ -93,6 +93,7 @@ use render_html::serialize_html_node;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::hash_map::Entry;
 
 /// Logs a native DOM/builtin dispatch that took long enough to explain a
 /// stalled script turn. The interpreter step counter does not see time spent
@@ -461,7 +462,7 @@ impl JsRuntime {
         function: &UserFunction,
         parameters: &Environment,
     ) -> Result<(), JsError> {
-        if !function.defaults.iter().any(Option::is_some) {
+        if !function.has_defaults {
             return self.instantiate_function_plan(function);
         }
         self.environment
@@ -932,18 +933,31 @@ impl JsRuntime {
         self.ensure_heap_capacity(if arrow { 1 } else { 2 })?;
         let function_index = self.functions.len();
         let uses_arguments = !arrow && body_observes_arguments(body);
-        let (body, defaults, patterns) = Self::extract_parameter_markers(body);
+        let (body, mut default_map, mut pattern_map) = Self::extract_parameter_markers(body);
         // The body's hoisting data is a pure function of the immutable AST, so
         // compute it once. Each call then creates the same bindings without
         // re-scanning the body or rebuilding declaration maps.
         let activation = Self::activation_plan(&body);
         let (parameters, length, rest) = Self::binding_parameters(parameters);
-        let defaults = (0..parameters.len())
-            .map(|index| defaults.get(&index).cloned())
-            .collect();
-        let patterns = (0..parameters.len())
-            .map(|index| patterns.get(&index).cloned())
-            .collect();
+        let has_defaults = !default_map.is_empty();
+        let has_patterns = !pattern_map.is_empty();
+        // An ordinary parameter list needs no per-position table at all; only
+        // the exceptional function pays for the two vectors.
+        let (defaults, patterns) = if has_defaults || has_patterns {
+            let defaults: Vec<Option<Expr>> = (0..parameters.len())
+                .map(|index| default_map.remove(&index))
+                .collect();
+            let patterns: Vec<Option<Statement>> = (0..parameters.len())
+                .map(|index| pattern_map.remove(&index))
+                .collect();
+            (defaults, patterns)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let simple_parameters = !rest && !has_defaults && !has_patterns;
+        let has_disposables = activation
+            .as_ref()
+            .is_none_or(|plan| plan.lexical.iter().any(|(_, kind)| kind.is_disposable()));
         let private_scope = self
             .class_frames
             .last()
@@ -964,12 +978,15 @@ impl JsRuntime {
             defaults,
             patterns,
             body,
-            captured_environment: Rc::from(self.environment.clone()),
+            captured_environment: Rc::from(self.environment.as_slice()),
             arrow,
             strict,
             class,
             private_scope,
             rest,
+            simple_parameters,
+            has_defaults,
+            has_disposables,
             kind,
             uses_arguments,
             this_context,
@@ -3161,7 +3178,7 @@ impl JsRuntime {
                     None => Self::failed_set(strict, key),
                 };
             }
-            if !self.realm.set_property(object, key.to_owned(), value) {
+            if !self.realm.set_property_str(object, key, value) {
                 return Self::failed_set(strict, key);
             }
             return Ok(());
@@ -3201,6 +3218,13 @@ impl JsRuntime {
         dom: &mut Dom,
         value: &JsValue,
     ) -> Result<JsValue, JsError> {
+        // A primitive needs no `ToPrimitive`; numbers and BigInts are already
+        // the `ToNumeric` result, which is the common case in numeric loops.
+        match value {
+            JsValue::Number(_) | JsValue::BigInt(_) => return Ok(value.clone()),
+            JsValue::Object(_) => {}
+            primitive => return Ok(JsValue::Number(to_number(primitive)?)),
+        }
         match self.to_primitive_with_hint(dom, value.clone(), PrimitiveHint::Number)? {
             primitive @ JsValue::BigInt(_) => Ok(primitive),
             primitive => Ok(JsValue::Number(to_number(&primitive)?)),
@@ -3312,7 +3336,14 @@ impl JsRuntime {
         dom: &mut Dom,
         value: &JsValue,
     ) -> Result<JsString, JsError> {
-        let primitive = self.to_primitive_with_hint(dom, value.clone(), PrimitiveHint::String)?;
+        // A primitive needs no `ToPrimitive`; this avoids the generic call in
+        // every string conversion of a number or boolean.
+        let primitive = match value {
+            JsValue::Object(_) => {
+                self.to_primitive_with_hint(dom, value.clone(), PrimitiveHint::String)?
+            }
+            primitive => primitive.clone(),
+        };
         // ECMA-262 7.1.17 ToString: a Symbol has no string conversion.
         if matches!(primitive, JsValue::Symbol(_)) {
             return Err(JsError::type_error(
@@ -3793,14 +3824,15 @@ impl JsRuntime {
                 (callee, receiver)
             }
             Expr::Identifier(name) => {
-                let scope = self.resolve_name(dom, name)?;
-                // A function found on a `with` object is called with that
-                // object as `this` (ECMA-262 9.1.1.2.7, WithBaseObject).
+                // One pass resolves the binding and the record it lives in, so
+                // a call does not walk the scope chain twice (the receiver
+                // matters only for a `with` record, ECMA-262 9.1.1.2.7).
+                let (value, scope) = self.lookup_binding_reference(dom, name)?;
                 let receiver = match scope.and_then(|depth| self.with_object_at(depth)) {
                     Some(object) => JsValue::Object(object),
                     None => JsValue::Undefined,
                 };
-                (self.read_resolved_binding(dom, scope, name)?, receiver)
+                (value, receiver)
             }
             _ => (self.evaluate(dom, callee)?, JsValue::Undefined),
         };
@@ -4254,11 +4286,10 @@ impl JsRuntime {
         }
         let length = u32::try_from(slots.len())
             .map_err(|_| JsError::resource("array literal exceeds the supported u32 range"))?;
-        if !self.realm.set_property(
-            object,
-            "length".to_owned(),
-            JsValue::Number(f64::from(length)),
-        ) {
+        if !self
+            .realm
+            .set_property_str(object, "length", JsValue::Number(f64::from(length)))
+        {
             return Err(JsError::type_error("could not define array length"));
         }
         Ok(JsValue::Object(object))
@@ -4368,6 +4399,34 @@ impl JsRuntime {
         left: JsValue,
         right: JsValue,
     ) -> Result<JsValue, JsError> {
+        // Numbers are already primitive and already the `ToNumeric` result, so
+        // no conversion can run. Numeric loops are the interpreter's hottest
+        // arithmetic case, and this skips the generic conversion calls.
+        if matches!((&left, &right), (JsValue::Number(_), JsValue::Number(_))) {
+            match operator {
+                BinaryOp::Add
+                | BinaryOp::Subtract
+                | BinaryOp::Multiply
+                | BinaryOp::Divide
+                | BinaryOp::Remainder
+                | BinaryOp::Exponentiate
+                | BinaryOp::BitwiseAnd
+                | BinaryOp::BitwiseXor
+                | BinaryOp::BitwiseOr
+                | BinaryOp::LeftShift
+                | BinaryOp::RightShift
+                | BinaryOp::UnsignedRightShift => {
+                    return self.numeric_operation(operator, &left, &right);
+                }
+                BinaryOp::Less
+                | BinaryOp::LessEqual
+                | BinaryOp::Greater
+                | BinaryOp::GreaterEqual => {
+                    return relational_compare(operator, &left, &right).map(JsValue::Boolean);
+                }
+                _ => {}
+            }
+        }
         match operator {
             BinaryOp::StrictEqual => return Ok(JsValue::Boolean(strict_equal(&left, &right))),
             BinaryOp::StrictNotEqual => {
@@ -4389,15 +4448,30 @@ impl JsRuntime {
                 return Ok(JsValue::String(utf16::JsString::from_units(&units)));
             }
             BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
-                let left = self.to_primitive_with_hint(dom, left, PrimitiveHint::Number)?;
-                let right = self.to_primitive_with_hint(dom, right, PrimitiveHint::Number)?;
+                // Only an object operand needs `ToPrimitive`; on primitives it
+                // is the identity, and comparisons in loops are usually numeric.
+                let (left, right) = if matches!(left, JsValue::Object(_))
+                    || matches!(right, JsValue::Object(_))
+                {
+                    let left = self.to_primitive_with_hint(dom, left, PrimitiveHint::Number)?;
+                    let right = self.to_primitive_with_hint(dom, right, PrimitiveHint::Number)?;
+                    (left, right)
+                } else {
+                    (left, right)
+                };
                 return relational_compare(operator, &left, &right).map(JsValue::Boolean);
             }
             _ => {}
         }
         let (left, right) = if operator == BinaryOp::Add {
-            let left = self.to_primitive_with_hint(dom, left, PrimitiveHint::Default)?;
-            let right = self.to_primitive_with_hint(dom, right, PrimitiveHint::Default)?;
+            let (left, right) =
+                if matches!(left, JsValue::Object(_)) || matches!(right, JsValue::Object(_)) {
+                    let left = self.to_primitive_with_hint(dom, left, PrimitiveHint::Default)?;
+                    let right = self.to_primitive_with_hint(dom, right, PrimitiveHint::Default)?;
+                    (left, right)
+                } else {
+                    (left, right)
+                };
             if matches!(left, JsValue::String(_)) || matches!(right, JsValue::String(_)) {
                 // StringAdd converts both operands with ToString, which throws
                 // for a Symbol.
@@ -4633,7 +4707,7 @@ impl JsRuntime {
                         "global property {name:?} cannot be defined"
                     )));
                 }
-            } else if !self.realm.set_global(name.to_owned(), value) {
+            } else if !self.realm.set_global(name, value) {
                 return Err(JsError::type_error(format!(
                     "global property {name:?} is not writable"
                 )));
@@ -4649,10 +4723,22 @@ impl JsRuntime {
             return Ok(());
         }
         let target_index = if kind == VariableKind::Var {
-            self.environment
-                .iter()
-                .rposition(|scope| scope.borrow().function_scope)
-                .unwrap_or_else(|| self.environment.len().saturating_sub(1))
+            // The call environment is the innermost one for an ordinary call;
+            // only a block scope or a `with`/catch record makes the search go
+            // further out.
+            let last = self.environment.len().saturating_sub(1);
+            if self
+                .environment
+                .get(last)
+                .is_some_and(|scope| scope.borrow().function_scope)
+            {
+                last
+            } else {
+                self.environment
+                    .iter()
+                    .rposition(|scope| scope.borrow().function_scope)
+                    .unwrap_or(last)
+            }
         } else {
             self.environment.len().saturating_sub(1)
         };
@@ -4661,24 +4747,25 @@ impl JsRuntime {
             .get(target_index)
             .expect("non-empty environment chain has a declaration target");
         let mut target = target.borrow_mut();
-        if let Some(existing) = target.bindings.get(name) {
-            if kind == VariableKind::Var && existing.kind == VariableKind::Var {
-                return Ok(());
+        match target.bindings.entry(name.to_owned()) {
+            Entry::Occupied(existing) => {
+                if kind == VariableKind::Var && existing.get().kind == VariableKind::Var {
+                    return Ok(());
+                }
+                return Err(JsError::syntax(
+                    format!("binding {name:?} is already declared in this scope"),
+                    0,
+                ));
             }
-            return Err(JsError::syntax(
-                format!("binding {name:?} is already declared in this scope"),
-                0,
-            ));
+            Entry::Vacant(slot) => {
+                slot.insert(Binding {
+                    value,
+                    mutable,
+                    initialized,
+                    kind,
+                });
+            }
         }
-        target.bindings.insert(
-            name.to_owned(),
-            Binding {
-                value,
-                mutable,
-                initialized,
-                kind,
-            },
-        );
         if Self::binding_trace_enabled() && name == "document" {
             eprintln!(
                 "[bind create document depth={} scopes={} initialized={initialized} | stack {:?}]",
@@ -4699,7 +4786,9 @@ impl JsRuntime {
     ) -> Result<(), JsError> {
         // `var x = v` is a PutValue on the resolved reference (ECMA-262
         // 14.3.2.1), so inside a `with` body it writes the binding object.
+        // The chain scan runs only when a `with` record is actually present.
         if kind == VariableKind::Var
+            && self.environment_has_with_scope()
             && let Some(depth) = self.resolve_name(dom, name)?
             && let Some(object) = self.with_object_at(depth)
         {
@@ -4757,7 +4846,7 @@ impl JsRuntime {
                 ));
             }
             binding.initialized = true;
-            if self.realm.set_global(name.to_owned(), value) {
+            if self.realm.set_global(name, value) {
                 return Ok(());
             }
             if kind == VariableKind::Var {
@@ -4827,6 +4916,15 @@ impl JsRuntime {
         self.environment
             .get(depth)
             .and_then(|scope| scope.borrow().with_object)
+    }
+
+    /// Whether any record of the current chain is a `with` object environment.
+    /// A captured chain can contain one after its `with` body has finished, so
+    /// this inspects the records instead of counting active statements.
+    fn environment_has_with_scope(&self) -> bool {
+        self.environment
+            .iter()
+            .any(|scope| scope.borrow().with_object.is_some())
     }
 
     /// `HasBinding` of an object environment record with `withEnvironment`
@@ -4912,12 +5010,24 @@ impl JsRuntime {
     }
 
     fn read_global_binding(&mut self, dom: &mut Dom, name: &str) -> Result<JsValue, JsError> {
-        if let Some(binding) = self.global_bindings().get(name)
-            && !binding.initialized
-        {
-            return Err(JsError::reference(format!(
-                "cannot access {name} before initialization"
-            )));
+        if let Some(binding) = self.global_bindings().get(name) {
+            if !binding.initialized {
+                return Err(JsError::reference(format!(
+                    "cannot access {name} before initialization"
+                )));
+            }
+            // A `var` lives as an ordinary data property of the global object.
+            // Reading the property map directly avoids the generic [[Get]]
+            // machinery (namespace, string and proxy checks) for every global
+            // identifier in a loop.
+            if binding.kind == VariableKind::Var
+                && let Some(descriptor) = self
+                    .realm
+                    .own_property_map(self.realm.global_object(), name)
+                && !descriptor.is_accessor()
+            {
+                return Ok(descriptor.value);
+            }
         }
         if name == "devicePixelRatio" {
             return Ok(JsValue::Number(self.device_pixel_ratio));
@@ -4953,6 +5063,7 @@ impl JsRuntime {
         let mut depth = self.environment.len();
         while depth > 0 {
             depth -= 1;
+            let with_object;
             {
                 let scope = self.environment[depth].borrow();
                 if let Some(binding) = scope.bindings.get(name) {
@@ -4968,14 +5079,55 @@ impl JsRuntime {
                     drop(scope);
                     return self.read_import(&import);
                 }
+                with_object = scope.with_object;
             }
-            if let Some(object) = self.with_object_at(depth)
+            if let Some(object) = with_object
                 && self.with_object_has_binding(dom, object, name)?
             {
                 return self.read_resolved_binding(dom, Some(depth), name);
             }
         }
         self.read_global_binding(dom, name)
+    }
+
+    /// `GetValue` of an identifier together with the index of the record that
+    /// bound it, in one scope-chain pass. A call target needs the record to get
+    /// a `with` object's receiver, and must not walk the chain a second time.
+    pub(super) fn lookup_binding_reference(
+        &mut self,
+        dom: &mut Dom,
+        name: &str,
+    ) -> Result<(JsValue, Option<usize>), JsError> {
+        let mut depth = self.environment.len();
+        while depth > 0 {
+            depth -= 1;
+            let with_object;
+            {
+                let scope = self.environment[depth].borrow();
+                if let Some(binding) = scope.bindings.get(name) {
+                    if !binding.initialized {
+                        return Err(JsError::reference(format!(
+                            "cannot access {name} before initialization"
+                        )));
+                    }
+                    return Ok((binding.value.clone(), Some(depth)));
+                }
+                if let Some(import) = scope.imports.get(name) {
+                    let import = import.clone();
+                    drop(scope);
+                    return Ok((self.read_import(&import)?, Some(depth)));
+                }
+                with_object = scope.with_object;
+            }
+            if let Some(object) = with_object
+                && self.with_object_has_binding(dom, object, name)?
+            {
+                let value = self.read_resolved_binding(dom, Some(depth), name)?;
+                return Ok((value, Some(depth)));
+            }
+        }
+        let value = self.read_global_binding(dom, name)?;
+        Ok((value, None))
     }
 
     /// `PutValue` of an identifier reference resolved by [`Self::resolve_name`];
@@ -5048,7 +5200,7 @@ impl JsRuntime {
             return Err(JsError::reference(format!("{name} is not defined")));
         }
         // A failed [[Set]] throws only in strict code (PutValue, ECMA-262 6.2.5.6).
-        if self.realm.set_global(name.to_owned(), value) || !self.code_is_strict() {
+        if self.realm.set_global(name, value) || !self.code_is_strict() {
             Ok(())
         } else {
             Err(JsError::type_error(format!(
@@ -5153,6 +5305,20 @@ impl JsRuntime {
         property: &str,
     ) -> Result<JsValue, JsError> {
         self.consume_step()?;
+        // Plain object properties are by far the common read. An own data
+        // property in the object's property map answers before every exotic
+        // check (a String wrapper's characters, a typed array's elements and a
+        // namespace's exports are not stored in that map, so they fall through).
+        if !matches!(
+            self.realm.host_ref(object),
+            Some(ObjectHost::Proxy { .. } | ObjectHost::ModuleNamespace(_))
+        ) && let Some(descriptor) = self.realm.own_property_map(object, property)
+        {
+            if descriptor.is_accessor() {
+                return self.get_value(dom, object, property);
+            }
+            return Ok(descriptor.value);
+        }
         // Import-defer namespaces are rare; skip the realm and namespace
         // lookups entirely on pages that have none. This is the common
         // property-read path for every bundle.
@@ -5198,10 +5364,14 @@ impl JsRuntime {
             return Ok(member.value);
         }
         // A proxy on the prototype chain answers before any later holder.
-        if let Some(value) = self.proxy_inherited_get(dom, object, property)? {
+        if self.realm.has_proxy_objects()
+            && let Some(value) = self.proxy_inherited_get(dom, object, property)?
+        {
             return Ok(value);
         }
-        let inherited_origin = self.realm.get_property_with_origin(object, property);
+        let inherited = self
+            .realm
+            .get_property_descriptor_with_origin(object, property);
         if object == self.realm.global_object() {
             let value = match property {
                 "innerWidth" | "outerWidth" => Some(f64::from(self.viewport.width)),
@@ -6040,11 +6210,15 @@ impl JsRuntime {
         // `Function.prototype.call`, and friends. Only when the chain holds
         // nothing but `Object.prototype`'s generic members do the synthesized
         // host methods apply; the final read goes through [[Get]].
-        if inherited_origin
-            .as_ref()
-            .is_some_and(|(_, holder)| *holder != self.realm.object_prototype_id())
+        if let Some((descriptor, holder)) = &inherited
+            && *holder != self.realm.object_prototype_id()
         {
-            return self.get_value(dom, object, property);
+            // The chain walk already found the data value; only an accessor
+            // has to run through [[Get]] again.
+            if descriptor.is_accessor() {
+                return self.get_value(dom, object, property);
+            }
+            return Ok(descriptor.value.clone());
         }
         let function = match (self.realm.host(object), property) {
             (Some(ObjectHost::Promise(_)), "then") => Some(NativeFunction::PromiseThen),
@@ -6228,7 +6402,7 @@ impl JsRuntime {
         }
         // Named properties (HTML §7.4.4, §3.1.5) sit below every property of the
         // chain, so they answer only when the chain holds no property of this name.
-        if inherited_origin.is_none()
+        if inherited.is_none()
             && let Some(value) = self.named_access_value(dom, object, property)?
         {
             return Ok(value);
@@ -6443,7 +6617,7 @@ impl JsRuntime {
                         }
                         return self.set_value(dom, object, property, value);
                     }
-                    if !self.realm.set_property(object, property.to_owned(), value) {
+                    if !self.realm.set_property_str(object, property, value) {
                         return Err(JsError::type_error(format!(
                             "property {property:?} is not writable"
                         )));
@@ -6500,8 +6674,7 @@ impl JsRuntime {
                         }
                     };
                     let window = self.realm.global_object();
-                    self.realm
-                        .set_property(window, property.to_owned(), handler);
+                    self.realm.set_property_str(window, property, handler);
                     return Ok(());
                 }
                 if property.starts_with("on") && property.len() > 2 {
@@ -6567,9 +6740,9 @@ impl JsRuntime {
                     return Ok(());
                 }
                 if property.parse::<usize>().is_ok() {
-                    return if self.realm.set_property(
+                    return if self.realm.set_property_str(
                         object,
-                        property.to_owned(),
+                        property,
                         JsValue::String(value.to_js_string()),
                     ) {
                         Ok(())
@@ -7790,7 +7963,7 @@ impl JsRuntime {
         // spec: every parameter binding is created uninitialized first so a
         // default that reads a later (or its own) parameter observes the
         // temporal dead zone instead of an outer binding.
-        if function.defaults.iter().any(Option::is_some) {
+        if function.has_defaults {
             for parameter in &function.parameters {
                 call_environment.bindings.insert(
                     parameter.clone(),
@@ -7840,7 +8013,9 @@ impl JsRuntime {
                 },
             );
         }
-        let mut call_chain = function.captured_environment.to_vec();
+        let mut call_chain = self.environment_pool.pop().unwrap_or_default();
+        call_chain.clear();
+        call_chain.extend_from_slice(&function.captured_environment);
         call_chain.push(call_environment.clone());
         let previous_environment = std::mem::replace(&mut self.environment, call_chain);
         // The caller's chain is still reachable only from this Rust frame, so
@@ -7892,7 +8067,7 @@ impl JsRuntime {
             Ok(()) if function.kind.is_coroutine() => self
                 .start_coroutine(dom, callee, index, &function, &call_environment)
                 .map(Completion::Return),
-            Ok(()) => {
+            Ok(()) if function.has_disposables => {
                 // The body's own scope is the innermost one now, and its `using`
                 // resources are disposed when the body is left.
                 let scope = self.environment.last().cloned();
@@ -7902,6 +8077,7 @@ impl JsRuntime {
                     None => result,
                 }
             }
+            Ok(()) => self.evaluate_statements(dom, &function.body),
             // An async function reports a failing parameter list through its
             // promise rather than by throwing (ECMA-262 §10.2.1.1).
             Err(error) if function.kind == FunctionKind::Async => {
@@ -7929,7 +8105,12 @@ impl JsRuntime {
         } else {
             (None, false)
         };
-        self.environment = self.suspended_environments.pop().unwrap_or_default();
+        let previous_environment = self.suspended_environments.pop().unwrap_or_default();
+        let mut finished_chain = std::mem::replace(&mut self.environment, previous_environment);
+        if self.environment_pool.len() < 32 {
+            finished_chain.clear();
+            self.environment_pool.push(finished_chain);
+        }
         match result? {
             Completion::Normal(_) if constructor => Ok(final_this.unwrap_or(JsValue::Undefined)),
             Completion::Normal(_) => Ok(JsValue::Undefined),
@@ -7963,9 +8144,7 @@ impl JsRuntime {
         // A parameter list is simple (IsSimpleParameterList) when it has no
         // defaults, no rest element and no destructuring; only a sloppy function
         // with a simple list gets a mapped object.
-        let simple = !function.rest
-            && function.defaults.iter().all(Option::is_none)
-            && function.patterns.iter().all(Option::is_none);
+        let simple = function.simple_parameters;
         let map = (simple && !function.strict).then(|| {
             // CreateMappedArgumentsObject: a repeated parameter name maps only at its
             // last position, and an index maps only when an argument was passed for it.
@@ -8039,10 +8218,7 @@ impl JsRuntime {
         // A simple parameter list binds positional values with no initializer
         // or pattern to run in between. All ordinary calls take this path, so
         // it binds the whole list under one record borrow.
-        if !function.rest
-            && function.defaults.iter().all(Option::is_none)
-            && function.patterns.iter().all(Option::is_none)
-        {
+        if function.simple_parameters {
             let mut environment = call_environment.borrow_mut();
             for (index, parameter) in function.parameters.iter().enumerate() {
                 let value = arguments.get(index).cloned().unwrap_or(JsValue::Undefined);

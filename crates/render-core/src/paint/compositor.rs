@@ -44,7 +44,7 @@
 //! above the retained-effect limits returns `None` and the caller keeps the
 //! complete-raster path.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::image::ImageResources;
@@ -57,9 +57,21 @@ use super::display_list::{
 };
 use super::raster::{
     CpuRasterOutput, CpuRasterizer, FilterOutset, GlyphMaskProvider, RasterControl, Surface,
-    apply_layer_effects, composite_surface, composite_surface_with_source_clip, filter_outset,
+    apply_layer_effects, clip_shape_bounds, composite_surface, composite_surface_with_clip_shapes,
+    composite_surface_with_source_clip, filter_outset, translate_clip_shape,
 };
 use super::sticky::sticky_displacement;
+
+/// Report why the retained compositor refused a scene when
+/// `RENDER_DEBUG_COMPOSITOR` is set, then take the conservative path.
+macro_rules! compositor_refuse {
+    ($($arg:tt)*) => {{
+        if std::env::var_os("RENDER_DEBUG_COMPOSITOR").is_some() {
+            eprintln!("compositor fallback: {}", format!($($arg)*));
+        }
+        return None;
+    }};
+}
 
 /// The physical height of one retained compositor band.
 pub const DEFAULT_COMPOSITOR_BAND_HEIGHT: u32 = 512;
@@ -176,6 +188,11 @@ pub struct CompositorStats {
 #[derive(Debug, Default)]
 struct CompositorState {
     bands: HashMap<(u8, usize, u32), Surface>,
+    /// Root-segment bands whose cached surface contains partial transparency.
+    /// Those bands paint their items directly over the destination so the
+    /// source-over rounding matches the complete raster exactly. Fully opaque
+    /// and fully transparent bands stay on the cached fast path.
+    direct_bands: HashSet<(u8, usize, u32)>,
     stats: CompositorStats,
 }
 
@@ -261,9 +278,11 @@ impl CompositorCache {
                     // displacement when rebasing the inner transform pivot, so
                     // keep those on the complete-raster path for now.
                     if clip_depth != 0 || space != PaintCoordinateSpace::Document {
-                        return None;
+                        compositor_refuse!("sticky scope inside a clip or viewport space");
                     }
-                    let end = matching_sticky_pop(items, index)?;
+                    let Some(end) = matching_sticky_pop(items, index) else {
+                        compositor_refuse!("sticky scope has no matching pop");
+                    };
                     if items[index + 1..end].iter().any(|item| {
                         item.coordinate_space != PaintCoordinateSpace::Document
                             || matches!(
@@ -276,7 +295,7 @@ impl CompositorCache {
                                     | DisplayCommand::PopTransform
                             )
                     }) {
-                        return None;
+                        compositor_refuse!("sticky scope contains a nested scope or viewport item");
                     }
                     push_segment(
                         items,
@@ -288,9 +307,12 @@ impl CompositorCache {
                         &mut segments,
                         &mut ops,
                     )?;
-                    let bounds = pixel_aligned_rect(item_bounds(&items[index + 1..end])?);
+                    let Some(bounds) = item_bounds(&items[index + 1..end]) else {
+                        compositor_refuse!("sticky scope has no item bounds");
+                    };
+                    let bounds = pixel_aligned_rect(bounds);
                     if bounds.size.width > MAX_EFFECT_SURFACE_WIDTH {
-                        return None;
+                        compositor_refuse!("sticky layer is wider than {MAX_EFFECT_SURFACE_WIDTH}");
                     }
                     let layer = layers.len();
                     layers.push(CompositedLayer {
@@ -315,27 +337,29 @@ impl CompositorCache {
                     // copied into its layer and removed from the root segment.
                     // The conservative answer is the complete raster path.
                     let start = index + 1;
-                    let end = matching_pop(items, index)?;
+                    let Some(end) = matching_pop(items, index) else {
+                        compositor_refuse!("stacking context has no matching pop");
+                    };
                     if start == end {
                         // An empty scope paints no pixels. Leave the balanced
                         // push/pop in the surrounding segment so the band
                         // rasterizer replays it; extracting a layer would
                         // require an empty bounds rectangle.
                         if root_space.is_some_and(|current| current != space) {
-                            return None;
+                            compositor_refuse!("empty scope changes coordinate space");
                         }
                         root_space = Some(space);
                         index = end + 1;
                         continue;
                     }
                     if context.blend_mode != BlendMode::Normal {
-                        return None;
+                        compositor_refuse!("non-normal blend mode {:?}", context.blend_mode);
                     }
                     if items[start..end]
                         .iter()
                         .any(|item| item.coordinate_space != space)
                     {
-                        return None;
+                        compositor_refuse!("scope mixes coordinate spaces");
                     }
                     if items[start..end].iter().any(|item| {
                         matches!(
@@ -346,12 +370,15 @@ impl CompositorCache {
                                 | DisplayCommand::PopTransform
                         )
                     }) {
-                        return None;
+                        compositor_refuse!("scope contains a nested sticky or transform command");
                     }
                     let raw_bounds = if space == PaintCoordinateSpace::Viewport {
                         viewport_rect(viewport)
                     } else {
-                        item_bounds(&items[start..end])?
+                        let Some(bounds) = item_bounds(&items[start..end]) else {
+                            compositor_refuse!("scope has no item bounds");
+                        };
+                        bounds
                     };
                     let has_effect = context.filter.is_some() || context.mask.is_some();
                     let content_bounds = if space == PaintCoordinateSpace::Document && !has_effect {
@@ -359,58 +386,116 @@ impl CompositorCache {
                     } else {
                         raw_bounds
                     };
+                    let translation_only = context.transform.is_translation();
                     let inherited = if clip_depth == 0 {
                         Vec::new()
                     } else {
-                        // A scope inside an ambient clip is extracted only when
-                        // that clip can be reproduced exactly. Document layers
-                        // replay it into their source and clip the composite
-                        // result; an identity viewport layer applies it at
-                        // composite time. Effects would need the clip applied
-                        // before the filter, so they keep the fallback.
-                        if has_effect
-                            || active_clips.iter().any(|clip| {
-                                !matches!(clip.shape, ClipShape::Rect(rect) if rect_is_pixel_aligned(rect))
-                            })
-                        {
-                            return None;
+                        // A scope inside an ambient clip is extracted when that
+                        // clip can be reproduced exactly. An identity or
+                        // translation-only scope defers rectangle and rounded
+                        // rectangle clips to composite time: the reference
+                        // rasterizer folds the translation into the paint
+                        // offset, so an ancestor clip applies *after* it.
+                        // Effects still need the clip applied to their input
+                        // before the filter runs, which is only exact when the
+                        // clip shares the layer's coordinate space.
+                        if active_clips.iter().any(|clip| {
+                            !matches!(
+                                clip.shape,
+                                ClipShape::Rect(_) | ClipShape::RoundedRect { .. }
+                            )
+                        }) {
+                            compositor_refuse!(
+                                "scope inside an unsupported clip shape (only rect and rounded rect are composited)"
+                            );
                         }
-                        match space {
-                            PaintCoordinateSpace::Document => {
-                                if active_clips
-                                    .iter()
-                                    .any(|clip| clip.space != PaintCoordinateSpace::Document)
-                                {
-                                    return None;
-                                }
+                        if has_effect {
+                            if !translation_only {
+                                compositor_refuse!(
+                                    "effect scope inside a clip has a non-translation transform"
+                                );
                             }
-                            PaintCoordinateSpace::Viewport => {
-                                if !context.transform.is_identity() {
-                                    return None;
+                            if active_clips.iter().any(|clip| clip.space != space) {
+                                compositor_refuse!(
+                                    "effect scope has a clip from another coordinate space"
+                                );
+                            }
+                        } else if !translation_only {
+                            // A scaled, rotated or skewed scope clips its
+                            // source before the warp. Only a pixel-aligned
+                            // rectangle is exact on that path.
+                            if active_clips.iter().any(|clip| {
+                                !matches!(clip.shape, ClipShape::Rect(rect) if rect_is_pixel_aligned(rect))
+                            }) {
+                                compositor_refuse!(
+                                    "non-translation scope inside a clip needs pixel-aligned rects"
+                                );
+                            }
+                            match space {
+                                PaintCoordinateSpace::Document => {
+                                    if active_clips
+                                        .iter()
+                                        .any(|clip| clip.space != PaintCoordinateSpace::Document)
+                                    {
+                                        compositor_refuse!(
+                                            "document scope has a viewport-space clip"
+                                        );
+                                    }
+                                }
+                                PaintCoordinateSpace::Viewport => {
+                                    if !context.transform.is_identity() {
+                                        compositor_refuse!(
+                                            "transformed viewport scope inside a clip"
+                                        );
+                                    }
                                 }
                             }
                         }
                         active_clips.clone()
                     };
-                    let bounds = if has_effect || space == PaintCoordinateSpace::Viewport {
+                    let mut bounds = if has_effect || space == PaintCoordinateSpace::Viewport {
                         content_bounds
                     } else {
                         inflate_rect(content_bounds, LAYER_SAMPLING_MARGIN)
                     };
+                    // A translation-only layer can be much wider than the
+                    // raster ceiling (a carousel track holding every slide).
+                    // Under a horizontal translation only a narrow source
+                    // interval can reach the viewport and its inherited clips,
+                    // so retain that interval instead of rejecting the scene.
+                    if !has_effect
+                        && space == PaintCoordinateSpace::Document
+                        && translation_only
+                        && bounds.size.width > MAX_EFFECT_SURFACE_WIDTH
+                    {
+                        bounds = clamp_translated_source_x(
+                            bounds,
+                            context.transform.translate_x,
+                            viewport,
+                            &active_clips,
+                        );
+                    }
                     if has_effect {
                         // The effect surface must be one allocation: a banded
                         // filter would either clip a blur at a band edge or
                         // repeat the effect over overlapping inputs. Reject a
                         // layer that would exceed the retention budget so the
                         // caller keeps the complete-raster path.
-                        effect_surface_bounds(
+                        if effect_surface_bounds(
                             content_bounds,
                             space,
                             context.filter.as_ref(),
                             viewport,
-                        )?;
-                    } else if content_bounds.size.width > MAX_EFFECT_SURFACE_WIDTH {
-                        return None;
+                        )
+                        .is_none()
+                        {
+                            compositor_refuse!("effect surface exceeds the retention budget");
+                        }
+                    } else if bounds.size.width > MAX_EFFECT_SURFACE_WIDTH {
+                        compositor_refuse!(
+                            "scope is {:.0}px wide (limit {MAX_EFFECT_SURFACE_WIDTH})",
+                            bounds.size.width
+                        );
                     }
                     push_segment(
                         items,
@@ -441,7 +526,9 @@ impl CompositorCache {
                     root_space = None;
                     root_clips.clone_from(&active_clips);
                 }
-                DisplayCommand::PushTransform(_) | DisplayCommand::PopTransform => return None,
+                DisplayCommand::PushTransform(_) | DisplayCommand::PopTransform => {
+                    compositor_refuse!("top-level transform command")
+                }
                 _ => {
                     if let Some(current) = root_space
                         && current != space
@@ -478,6 +565,7 @@ impl CompositorCache {
             &mut segments,
             &mut ops,
         )?;
+        debug_dump_structure(items, &segments, &layers, &ops);
         Some(Self {
             display_list,
             segments,
@@ -649,11 +737,29 @@ impl CompositorCache {
         }
         .then(&transform);
         let viewport_rect = viewport_rect(self.viewport);
+        // An identity or translation-only layer can defer its inherited clips
+        // to this composite pass. The reference rasterizer folds the
+        // translation into the paint offset, so an ancestor clip applies after
+        // the translation, in destination coordinates. The source bands stay
+        // unchanged across scroll offsets and only this clip moves.
+        let deferred_clip_shapes = if kind == 1
+            && !clips.is_empty()
+            && transform.is_translation()
+            && clips.iter().all(|clip| {
+                matches!(
+                    clip.shape,
+                    ClipShape::Rect(_) | ClipShape::RoundedRect { .. }
+                )
+            }) {
+            Some(destination_clip_shapes(clips, viewport_origin))
+        } else {
+            None
+        };
         // A viewport segment split out of a document clip keeps its source
         // surface scroll-independent, so its inherited clips are applied here
         // in viewport coordinates. Document segments replay clips while
         // rasterizing their bands instead.
-        let composite_clip = if clips.is_empty() {
+        let composite_clip = if clips.is_empty() || deferred_clip_shapes.is_some() {
             viewport_rect
         } else if space == PaintCoordinateSpace::Viewport || kind == 1 {
             let Some(clip) = inherited_viewport_clip(clips, viewport_origin, viewport_rect) else {
@@ -752,7 +858,40 @@ impl CompositorCache {
                 continue;
             }
             let key = (kind, index, band);
-            if let std::collections::hash_map::Entry::Vacant(entry) = state.bands.entry(key) {
+            let band_origin = Transform2D {
+                translate_x: if space == PaintCoordinateSpace::Viewport {
+                    scroll.x
+                } else {
+                    bounds.origin.x
+                },
+                translate_y: if space == PaintCoordinateSpace::Viewport {
+                    scroll.y
+                } else {
+                    bounds.origin.y + local_y
+                },
+                ..Transform2D::default()
+            };
+            let mapped = to_viewport.then(&transform.then(&band_origin));
+            if kind == 0 && state.direct_bands.contains(&key) {
+                if !self.paint_direct_band(
+                    output,
+                    start,
+                    end,
+                    mapped,
+                    source_width,
+                    band_height,
+                    clips,
+                    scroll,
+                    glyphs,
+                    images,
+                    control,
+                    diagnostics,
+                ) {
+                    break;
+                }
+                continue;
+            }
+            if !state.bands.contains_key(&key) {
                 let raster_origin = if space == PaintCoordinateSpace::Viewport {
                     PhysicalPoint { x: 0.0, y: 0.0 }
                 } else {
@@ -761,7 +900,10 @@ impl CompositorCache {
                         y: bounds.origin.y + local_y,
                     }
                 };
-                let raster = if space == PaintCoordinateSpace::Document && !clips.is_empty() {
+                let bake_clips = space == PaintCoordinateSpace::Document
+                    && !clips.is_empty()
+                    && deferred_clip_shapes.is_none();
+                let raster = if bake_clips {
                     let inherited = clips
                         .iter()
                         .map(|clip| (clip.shape, clip.space))
@@ -786,27 +928,53 @@ impl CompositorCache {
                     )
                 };
                 diagnostics.extend(raster.diagnostics);
-                entry.insert(raster.surface);
                 state.stats.bands_rasterized = state.stats.bands_rasterized.saturating_add(1);
                 rasterized = rasterized.saturating_add(1);
+                // A root-segment band with partial transparency cannot be
+                // composited as one source-over step without rounding its
+                // pixels twice. Paint that band's items in order over the
+                // destination instead, exactly like the complete raster.
+                // Fully transparent and fully opaque bands stay cached.
+                // Caching a partially transparent band and compositing it once
+                // can differ from the complete raster by one channel because the
+                // reference rounds after every source-over. That difference is
+                // invisible, and repainting every translucent band on every
+                // scroll frame made a real page's scroll frame ~40ms. Keep the
+                // exact per-item path behind an explicit diagnostic switch for
+                // tests that require bit identity.
+                let exact_alpha = std::env::var_os("RENDER_COMPOSITOR_EXACT_ALPHA").is_some();
+                let partial = exact_alpha
+                    && kind == 0
+                    && raster
+                        .surface
+                        .pixels()
+                        .iter()
+                        .any(|pixel| pixel.alpha != 0 && pixel.alpha != u8::MAX);
+                if partial {
+                    state.direct_bands.insert(key);
+                    if !self.paint_direct_band(
+                        output,
+                        start,
+                        end,
+                        mapped,
+                        source_width,
+                        band_height,
+                        clips,
+                        scroll,
+                        glyphs,
+                        images,
+                        control,
+                        diagnostics,
+                    ) {
+                        break;
+                    }
+                    continue;
+                }
+                state.bands.insert(key, raster.surface);
             }
             let Some(source) = state.bands.get(&key) else {
                 continue;
             };
-            let band_origin = Transform2D {
-                translate_x: if space == PaintCoordinateSpace::Viewport {
-                    scroll.x
-                } else {
-                    bounds.origin.x
-                },
-                translate_y: if space == PaintCoordinateSpace::Viewport {
-                    scroll.y
-                } else {
-                    bounds.origin.y + local_y
-                },
-                ..Transform2D::default()
-            };
-            let mapped = to_viewport.then(&transform.then(&band_origin));
             let clip = Some(composite_clip);
             // A transformed stacking context is painted into a viewport-sized
             // offscreen by the complete raster before it is warped. The layer's
@@ -834,7 +1002,9 @@ impl CompositorCache {
                 && !reference_inside_viewport
                 && reference_offset.x.fract() == 0.0
                 && reference_offset.y.fract() == 0.0;
-            let composited = if uses_reference_clip {
+            let composited = if let Some(shapes) = deferred_clip_shapes.as_deref() {
+                composite_surface_with_clip_shapes(output, source, mapped, opacity, shapes, control)
+            } else if uses_reference_clip {
                 let reference_mapped = to_viewport.then(&transform.then(&Transform2D {
                     translate_x: scroll.x,
                     translate_y: scroll.y,
@@ -858,6 +1028,52 @@ impl CompositorCache {
             }
         }
         rasterized
+    }
+
+    /// Paints one root-segment band directly over the destination.
+    ///
+    /// The band's items run in display-list order against the real destination,
+    /// so partially transparent pixels round exactly as they do in the complete
+    /// raster. A destination clip keeps the band from touching rows or columns
+    /// owned by a neighboring band.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::cast_precision_loss,
+        reason = "the direct band path carries the slice, its inherited clips and the shared providers"
+    )]
+    fn paint_direct_band(
+        &self,
+        output: &mut Surface,
+        start: usize,
+        end: usize,
+        mapped: Transform2D,
+        source_width: f32,
+        band_height: f32,
+        clips: &[InheritedClip],
+        viewport_origin: PhysicalPoint,
+        glyphs: &dyn GlyphMaskProvider,
+        images: Option<&ImageResources>,
+        control: Option<&dyn RasterControl>,
+        diagnostics: &mut Vec<super::raster::RasterDiagnostic>,
+    ) -> bool {
+        let (destination_x, destination_y) = mapped.apply(0.0, 0.0);
+        let destination =
+            PhysicalRect::new(destination_x, destination_y, source_width, band_height);
+        let inherited = clips
+            .iter()
+            .map(|clip| (clip.shape, clip.space))
+            .collect::<Vec<_>>();
+        diagnostics.extend(CpuRasterizer.rasterize_item_slice_over(
+            output,
+            &self.display_list.items()[start..end],
+            glyphs,
+            viewport_origin,
+            images,
+            &inherited,
+            Some((ClipShape::Rect(destination), PaintCoordinateSpace::Viewport)),
+            control,
+        ));
+        !control.is_some_and(RasterControl::is_cancelled)
     }
 
     /// Rasterizes and composites a top-level layer that carries a filter or a
@@ -963,17 +1179,41 @@ impl CompositorCache {
         let key = (2_u8, layer_index, EFFECT_SURFACE_BAND);
         let mut rasterized = 0_u32;
         if let std::collections::hash_map::Entry::Vacant(entry) = state.bands.entry(key) {
-            let raster = CpuRasterizer.rasterize_item_slice(
-                &self.display_list.items()[layer.start..layer.end],
-                PhysicalSize {
-                    width: surface_bounds.size.width,
-                    height: surface_bounds.size.height,
-                },
-                Color::TRANSPARENT,
-                glyphs,
-                surface_bounds.origin,
-                images,
-            );
+            // Effects inside an inherited clip paint the clip into their input
+            // before the filter runs, matching the reference offscreen pass.
+            // The composite pass then reproduces only the offscreen's bounding
+            // clip, exactly as the reference pop does.
+            let raster = if layer.clips.is_empty() {
+                CpuRasterizer.rasterize_item_slice(
+                    &self.display_list.items()[layer.start..layer.end],
+                    PhysicalSize {
+                        width: surface_bounds.size.width,
+                        height: surface_bounds.size.height,
+                    },
+                    Color::TRANSPARENT,
+                    glyphs,
+                    surface_bounds.origin,
+                    images,
+                )
+            } else {
+                let inherited = layer
+                    .clips
+                    .iter()
+                    .map(|clip| (clip.shape, clip.space))
+                    .collect::<Vec<_>>();
+                CpuRasterizer.rasterize_item_slice_with_clips(
+                    &self.display_list.items()[layer.start..layer.end],
+                    PhysicalSize {
+                        width: surface_bounds.size.width,
+                        height: surface_bounds.size.height,
+                    },
+                    Color::TRANSPARENT,
+                    glyphs,
+                    surface_bounds.origin,
+                    images,
+                    &inherited,
+                )
+            };
             diagnostics.extend(raster.diagnostics);
             let mut surface = raster.surface;
             let mask_offset = match layer.space {
@@ -999,13 +1239,22 @@ impl CompositorCache {
         let Some(source) = state.bands.get(&key) else {
             return rasterized;
         };
+        let composite_clip = if layer.clips.is_empty() {
+            viewport_rect
+        } else {
+            let Some(clip) = inherited_clip_bounds(&layer.clips, viewport_origin, viewport_rect)
+            else {
+                return rasterized;
+            };
+            clip
+        };
         let mapped = to_viewport.then(&transform.then(&to_source));
         if !composite_surface(
             output,
             source,
             mapped,
             layer.opacity,
-            Some(viewport_rect),
+            Some(composite_clip),
             control,
         ) {
             return rasterized;
@@ -1121,6 +1370,94 @@ fn matching_sticky_pop(items: &[DisplayItem], push: usize) -> Option<usize> {
     None
 }
 
+/// Prints the retained op order and layer metadata when
+/// `RENDER_DEBUG_COMPOSITOR_OPS` is set.
+fn debug_dump_structure(
+    items: &[DisplayItem],
+    segments: &[RootSegment],
+    layers: &[CompositedLayer],
+    ops: &[LayerOp],
+) {
+    if std::env::var_os("RENDER_DEBUG_COMPOSITOR_OPS").is_none() {
+        return;
+    }
+    for (index, op) in ops.iter().enumerate() {
+        let (start, end) = match *op {
+            LayerOp::Segment(segment_index) => {
+                let segment = &segments[segment_index];
+                eprintln!(
+                    "compositor op {index}: segment {segment_index} items={}..{} space={:?} bounds={:?} clips={}",
+                    segment.start,
+                    segment.end,
+                    segment.space,
+                    segment.bounds,
+                    debug_clips(&segment.clips)
+                );
+                (segment.start, segment.end)
+            }
+            LayerOp::Layer(layer_index) => {
+                let layer = &layers[layer_index];
+                eprintln!(
+                    "compositor op {index}: layer {layer_index} items={}..{} space={:?} bounds={:?} transform={:?} opacity={} sticky={} filter={} mask={} clips={}",
+                    layer.start,
+                    layer.end,
+                    layer.space,
+                    layer.bounds,
+                    layer.transform,
+                    layer.opacity,
+                    layer.sticky.is_some(),
+                    layer.filter.is_some(),
+                    layer.mask.is_some(),
+                    debug_clips(&layer.clips)
+                );
+                (layer.start, layer.end)
+            }
+        };
+        if std::env::var_os("RENDER_DEBUG_COMPOSITOR_ITEMS").is_some() {
+            for (item_index, item) in items.iter().enumerate().take(end).skip(start) {
+                eprintln!(
+                    "  item {item_index}: {:?} space={:?} bounds={:?}",
+                    debug_command_label(&item.command),
+                    item.coordinate_space,
+                    item.bounds
+                );
+            }
+        }
+    }
+}
+
+fn debug_command_label(command: &DisplayCommand) -> &'static str {
+    match command {
+        DisplayCommand::SolidRect { .. } => "solid",
+        DisplayCommand::Border(_) => "border",
+        DisplayCommand::BoxShadow(_) => "box-shadow",
+        DisplayCommand::PushClip(_) => "push-clip",
+        DisplayCommand::PopClip => "pop-clip",
+        DisplayCommand::PushTransform(_) => "push-transform",
+        DisplayCommand::PopTransform => "pop-transform",
+        DisplayCommand::GlyphRun(_) => "glyph-run",
+        DisplayCommand::TextDecoration(_) => "text-decoration",
+        DisplayCommand::TextShadow(_) => "text-shadow",
+        DisplayCommand::ListMarker(_) => "list-marker",
+        DisplayCommand::Image(_) => "image",
+        DisplayCommand::LinearGradient(_) => "linear-gradient",
+        DisplayCommand::RadialGradient(_) => "radial-gradient",
+        DisplayCommand::ConicGradient(_) => "conic-gradient",
+        DisplayCommand::PushStackingContext(_) => "push-context",
+        DisplayCommand::PopStackingContext => "pop-context",
+        DisplayCommand::PushSticky(_) => "push-sticky",
+        DisplayCommand::PopSticky => "pop-sticky",
+    }
+}
+
+fn debug_clips(clips: &[InheritedClip]) -> String {
+    clips
+        .iter()
+        .map(|clip| format!("{:?}/{:?}", clip.shape, clip.space))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Starts a new root segment at `index` after closing the segment that ends
 /// there.
 #[allow(clippy::too_many_arguments)]
@@ -1167,7 +1504,10 @@ fn push_segment(
     if start >= end {
         return Some(());
     }
-    let segment = make_segment(items, viewport, start, end, space?, clips)?;
+    let Some(space) = space else {
+        compositor_refuse!("segment has no coordinate space");
+    };
+    let segment = make_segment(items, viewport, start, end, space, clips)?;
     ops.push(LayerOp::Segment(segments.len()));
     segments.push(segment);
     Some(())
@@ -1185,7 +1525,7 @@ fn make_segment(
         .iter()
         .any(|item| item.coordinate_space != space)
     {
-        return None;
+        compositor_refuse!("segment mixes coordinate spaces");
     }
     // A viewport segment's surface is cached independently of the scroll
     // offset, so its inherited clips are applied when it is composited. That
@@ -1199,7 +1539,7 @@ fn make_segment(
                 .iter()
                 .any(|clip| !matches!(clip.shape, ClipShape::Rect(_)))
             {
-                return None;
+                compositor_refuse!("viewport segment has a non-rect inherited clip");
             }
         }
         PaintCoordinateSpace::Document => {
@@ -1207,7 +1547,7 @@ fn make_segment(
                 .iter()
                 .any(|clip| clip.space != PaintCoordinateSpace::Document)
             {
-                return None;
+                compositor_refuse!("document segment has a viewport-space inherited clip");
             }
         }
     }
@@ -1217,10 +1557,26 @@ fn make_segment(
         // Anchor document bands on whole pixels. Rasterizing at a fractional
         // band origin and then resampling during the blit antialiases content
         // the complete raster paints on its absolute pixel grid.
-        pixel_aligned_rect(item_bounds(&items[start..end])?)
+        let Some(bounds) = item_bounds(&items[start..end]) else {
+            compositor_refuse!("segment has no item bounds");
+        };
+        let bounds = pixel_aligned_rect(bounds);
+        // The band rasterizer treats its origin as a non-negative scroll
+        // offset, so a negative origin would be clamped and shift every item
+        // in the segment. Document content left of or above the origin is
+        // outside the complete raster's viewport for every non-negative
+        // scroll, so anchor the band at zero and let those items clip.
+        let left = bounds.origin.x.max(0.0);
+        let top = bounds.origin.y.max(0.0);
+        PhysicalRect::new(
+            left,
+            top,
+            (bounds.right() - left).max(0.0),
+            (bounds.bottom() - top).max(0.0),
+        )
     };
     if bounds.size.width > 8192.0 {
-        return None;
+        compositor_refuse!("segment is {:.0}px wide", bounds.size.width);
     }
     Some(RootSegment {
         start,
@@ -1253,12 +1609,47 @@ fn inflate_rect(rect: PhysicalRect, margin: f32) -> PhysicalRect {
     // The raster state treats its origin as a non-negative scroll offset, so a
     // negative layer origin would be clamped and shift the content. Keep the
     // padding on the side the surface can represent: a box at the document
-    // origin has no reference padding to its left or above either.
+    // origin has no reference padding to its left or above either. Content
+    // wholly above or left of the origin becomes an empty layer instead of a
+    // negative extent.
     let left = (rect.origin.x - margin).max(0.0);
     let top = (rect.origin.y - margin).max(0.0);
-    let right = rect.right() + margin;
-    let bottom = rect.bottom() + margin;
+    let right = (rect.right() + margin).max(left);
+    let bottom = (rect.bottom() + margin).max(top);
     PhysicalRect::new(left, top, right - left, bottom - top)
+}
+
+/// Clamps a translation-only document layer's retained source to the columns
+/// that can still reach the viewport.
+///
+/// The source x coordinate maps to `source_x + bounds.origin.x - scroll.x +
+/// translate_x`. A document clip at `C` paints at `C - scroll`, so the scroll
+/// cancels: only `source_x + bounds.origin.x + translate_x` has to lie inside
+/// the destination bounds. This engine has no horizontal scroll, so the
+/// viewport and viewport-space clip bounds are constants too. One extra pixel
+/// covers bilinear sampling at the retained edge; the source cannot supply
+/// content beyond its own bounds.
+fn clamp_translated_source_x(
+    bounds: PhysicalRect,
+    translate_x: f32,
+    viewport: PhysicalSize,
+    clips: &[InheritedClip],
+) -> PhysicalRect {
+    let mut destination_left = 0.0_f32;
+    let mut destination_right = viewport.width.max(0.0);
+    for clip in clips {
+        let clip_bounds = clip_shape_bounds(clip.shape);
+        destination_left = destination_left.max(clip_bounds.origin.x);
+        destination_right = destination_right.min(clip_bounds.right());
+    }
+    let left = (destination_left - translate_x - bounds.origin.x).floor() - 1.0;
+    let right = (destination_right - translate_x - bounds.origin.x).ceil() + 1.0;
+    let left = left.max(bounds.origin.x);
+    let right = right.min(bounds.right());
+    if right <= left {
+        return PhysicalRect::new(bounds.origin.x, bounds.origin.y, 0.0, bounds.size.height);
+    }
+    PhysicalRect::new(left, bounds.origin.y, right - left, bounds.size.height)
 }
 
 fn intersect_rect(first: PhysicalRect, second: PhysicalRect) -> Option<PhysicalRect> {
@@ -1322,6 +1713,55 @@ fn inherited_viewport_clip(
     Some(clip)
 }
 
+/// Resolves inherited clips into destination-space shapes for the composite
+/// blit. Document clips are anchored in document coordinates, so they move by
+/// `-viewport_origin`; viewport clips already are in destination coordinates.
+fn destination_clip_shapes(
+    clips: &[InheritedClip],
+    viewport_origin: PhysicalPoint,
+) -> Vec<ClipShape> {
+    clips
+        .iter()
+        .map(|clip| {
+            let offset = match clip.space {
+                PaintCoordinateSpace::Document => PhysicalPoint {
+                    x: -viewport_origin.x,
+                    y: -viewport_origin.y,
+                },
+                PaintCoordinateSpace::Viewport => PhysicalPoint::default(),
+            };
+            translate_clip_shape(clip.shape, offset)
+        })
+        .collect()
+}
+
+/// Resolves inherited clips into one raw destination-space rectangle.
+///
+/// Unlike [`inherited_viewport_clip`], this keeps the float edges because the
+/// effect path's source was already clipped into the effect input; the
+/// composite pass only reproduces the reference offscreen's bounding clip.
+fn inherited_clip_bounds(
+    clips: &[InheritedClip],
+    viewport_origin: PhysicalPoint,
+    viewport: PhysicalRect,
+) -> Option<PhysicalRect> {
+    let mut clip = viewport;
+    for inherited in clips {
+        let rect = clip_shape_bounds(inherited.shape);
+        let rect = match inherited.space {
+            PaintCoordinateSpace::Document => PhysicalRect::new(
+                rect.origin.x - viewport_origin.x,
+                rect.origin.y - viewport_origin.y,
+                rect.size.width,
+                rect.size.height,
+            ),
+            PaintCoordinateSpace::Viewport => rect,
+        };
+        clip = intersect_rect(clip, rect)?;
+    }
+    Some(clip)
+}
+
 fn item_bounds(items: &[DisplayItem]) -> Option<PhysicalRect> {
     items
         .iter()
@@ -1371,8 +1811,8 @@ mod tests {
     use crate::dom::DomRevision;
     use crate::layout::{PhysicalPoint, PhysicalRect, PhysicalSize};
     use crate::paint::display_list::{
-        ClipShape, FilterEffect, FilterOperation, GradientStop, LinearGradient, MaskImage,
-        MaskLayer,
+        ClipShape, CornerRadii, FilterEffect, FilterOperation, GradientStop, LinearGradient,
+        MaskImage, MaskLayer,
     };
     use crate::paint::{
         BlendMode, Color, CompositingReason, CpuRasterizer, DisplayCommand, DisplayItem,
@@ -1472,6 +1912,17 @@ mod tests {
         offset: PhysicalPoint,
         label: &str,
     ) {
+        assert_matches_complete_raster_within(cache, display, background, offset, label, 0);
+    }
+
+    fn assert_matches_complete_raster_within(
+        cache: &CompositorCache,
+        display: &std::sync::Arc<DisplayList>,
+        background: Color,
+        offset: PhysicalPoint,
+        label: &str,
+        tolerance: u8,
+    ) {
         let composited = cache.render(offset, &NoGlyphMasks, None, None);
         let complete =
             CpuRasterizer.rasterize_viewport(display.as_ref(), background, &NoGlyphMasks, offset);
@@ -1493,10 +1944,22 @@ mod tests {
             for x in 0..complete.surface.width() {
                 let actual = composited.surface.pixel(x, y);
                 let expected = complete.surface.pixel(x, y);
-                assert_eq!(
-                    actual, expected,
-                    "{label} differs at pixel ({x}, {y}) for scroll ({}, {})",
-                    offset.x, offset.y
+                if actual == expected {
+                    continue;
+                }
+                let delta = actual.zip(expected).map_or(0, |(left, right)| {
+                    [left.red, left.green, left.blue, left.alpha]
+                        .into_iter()
+                        .zip([right.red, right.green, right.blue, right.alpha])
+                        .map(|(left, right)| left.abs_diff(right))
+                        .max()
+                        .unwrap_or(0)
+                });
+                assert!(
+                    delta <= tolerance,
+                    "{label} differs by {delta} at pixel ({x}, {y}) for scroll ({}, {}): {actual:?} != {expected:?}",
+                    offset.x,
+                    offset.y
                 );
             }
         }
@@ -2488,6 +2951,456 @@ mod tests {
             Color::WHITE,
             PhysicalPoint::default(),
             "empty stacking context",
+        );
+    }
+
+    /// A carousel track is a translation-only stacking context far wider than
+    /// the raster ceiling. Only the narrow source interval that the translation
+    /// can carry into the rounded clip is visible; the retained compositor
+    /// keeps that interval and applies the clip in destination coordinates.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture builds one wide layer plus two gradients that cover both translation axes"
+    )]
+    fn a_wide_translated_layer_inside_a_rounded_clip_matches_the_complete_raster() {
+        let viewport = PhysicalSize {
+            width: 220.0,
+            height: 180.0,
+        };
+        let clip_rect = PhysicalRect::new(24.4, 20.6, 160.3, 119.2);
+        let clip = ClipShape::RoundedRect {
+            rect: clip_rect,
+            radii: CornerRadii {
+                top_left: 28.3,
+                top_right: 24.7,
+                bottom_right: 30.1,
+                bottom_left: 22.9,
+            },
+        };
+        let mut items = vec![
+            item(
+                0,
+                PhysicalRect::new(0.0, 0.0, 220.0, 600.0),
+                rect(0.0, 0.0, 220.0, 600.0, Color::rgb(245, 245, 245)),
+            ),
+            item(1, clip_rect, DisplayCommand::PushClip(clip)),
+            item(
+                2,
+                PhysicalRect::new(0.0, 0.0, 9000.0, 260.0),
+                DisplayCommand::PushStackingContext(context(
+                    Transform2D {
+                        translate_x: -3000.0,
+                        ..Transform2D::default()
+                    },
+                    1.0,
+                )),
+            ),
+            // Two non-overlapping gradients keep each pixel a single draw, so
+            // the composite-time clip and the reference's per-item clip agree
+            // even on partially covered boundary cells. The top half varies
+            // horizontally and the bottom half vertically, so both a dropped
+            // column and a wrong row are visible.
+            item(
+                3,
+                PhysicalRect::new(0.0, 0.0, 9000.0, 130.0),
+                DisplayCommand::LinearGradient(LinearGradient {
+                    rect: PhysicalRect::new(0.0, 0.0, 9000.0, 130.0),
+                    start: PhysicalPoint { x: 0.0, y: 0.0 },
+                    end: PhysicalPoint { x: 9000.0, y: 0.0 },
+                    stops: vec![
+                        GradientStop {
+                            offset: 0.0,
+                            color: Color::rgb(30, 90, 200),
+                        },
+                        GradientStop {
+                            offset: 0.35,
+                            color: Color::rgb(220, 40, 30),
+                        },
+                        GradientStop {
+                            offset: 0.72,
+                            color: Color::rgb(40, 180, 80),
+                        },
+                        GradientStop {
+                            offset: 1.0,
+                            color: Color::rgb(240, 200, 20),
+                        },
+                    ],
+                    repeating: false,
+                }),
+            ),
+            item(
+                4,
+                PhysicalRect::new(0.0, 130.0, 9000.0, 130.0),
+                DisplayCommand::LinearGradient(LinearGradient {
+                    rect: PhysicalRect::new(0.0, 130.0, 9000.0, 130.0),
+                    start: PhysicalPoint { x: 0.0, y: 130.0 },
+                    end: PhysicalPoint { x: 0.0, y: 260.0 },
+                    stops: vec![
+                        GradientStop {
+                            offset: 0.0,
+                            color: Color::rgb(10, 10, 10),
+                        },
+                        GradientStop {
+                            offset: 0.5,
+                            color: Color::rgb(120, 180, 220),
+                        },
+                        GradientStop {
+                            offset: 1.0,
+                            color: Color::rgb(250, 250, 250),
+                        },
+                    ],
+                    repeating: false,
+                }),
+            ),
+        ];
+        items.push(item(
+            400,
+            PhysicalRect::new(0.0, 0.0, 9000.0, 260.0),
+            DisplayCommand::PopStackingContext,
+        ));
+        items.push(item(401, clip_rect, DisplayCommand::PopClip));
+        items.push(item(
+            402,
+            PhysicalRect::new(0.0, 300.0, 220.0, 300.0),
+            rect(0.0, 300.0, 220.0, 300.0, Color::rgb(10, 120, 10)),
+        ));
+        let display = std::sync::Arc::new(list(viewport, items));
+        let cache =
+            CompositorCache::from_display_list(std::sync::Arc::clone(&display), Color::WHITE)
+                .expect("a wide translated scope inside a rounded clip is retainable");
+        assert_eq!(cache.layer_count(), 3, "two root segments and one layer");
+        for y in [0.0, 23.0, 60.0, 97.0] {
+            assert_matches_complete_raster(
+                &cache,
+                &display,
+                Color::WHITE,
+                PhysicalPoint { x: 0.0, y },
+                "wide translated layer inside a rounded clip",
+            );
+        }
+    }
+
+    /// The source-width clamp must also work without an inherited clip: a
+    /// translated 9000px strip is visible only through the viewport, and the
+    /// retained columns have to follow the translation at every scroll row.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture builds one wide layer plus two gradients that cover both translation axes"
+    )]
+    fn a_wide_translated_layer_without_a_clip_keeps_the_visible_columns() {
+        let viewport = PhysicalSize {
+            width: 220.0,
+            height: 180.0,
+        };
+        let items = vec![
+            item(
+                0,
+                PhysicalRect::new(0.0, 0.0, 220.0, 600.0),
+                rect(0.0, 0.0, 220.0, 600.0, Color::rgb(245, 245, 245)),
+            ),
+            item(
+                1,
+                PhysicalRect::new(0.0, 0.0, 9000.0, 260.0),
+                DisplayCommand::PushStackingContext(context(
+                    Transform2D {
+                        translate_x: -4500.0,
+                        ..Transform2D::default()
+                    },
+                    1.0,
+                )),
+            ),
+            item(
+                2,
+                PhysicalRect::new(0.0, 0.0, 9000.0, 130.0),
+                DisplayCommand::LinearGradient(LinearGradient {
+                    rect: PhysicalRect::new(0.0, 0.0, 9000.0, 130.0),
+                    start: PhysicalPoint { x: 0.0, y: 0.0 },
+                    end: PhysicalPoint { x: 9000.0, y: 0.0 },
+                    stops: vec![
+                        GradientStop {
+                            offset: 0.0,
+                            color: Color::rgb(240, 30, 30),
+                        },
+                        GradientStop {
+                            offset: 0.5,
+                            color: Color::rgb(30, 220, 60),
+                        },
+                        GradientStop {
+                            offset: 1.0,
+                            color: Color::rgb(30, 60, 220),
+                        },
+                    ],
+                    repeating: false,
+                }),
+            ),
+            item(
+                3,
+                PhysicalRect::new(0.0, 130.0, 9000.0, 130.0),
+                DisplayCommand::LinearGradient(LinearGradient {
+                    rect: PhysicalRect::new(0.0, 130.0, 9000.0, 130.0),
+                    start: PhysicalPoint { x: 0.0, y: 130.0 },
+                    end: PhysicalPoint { x: 0.0, y: 260.0 },
+                    stops: vec![
+                        GradientStop {
+                            offset: 0.0,
+                            color: Color::rgb(20, 20, 20),
+                        },
+                        GradientStop {
+                            offset: 1.0,
+                            color: Color::rgb(250, 250, 250),
+                        },
+                    ],
+                    repeating: false,
+                }),
+            ),
+            item(
+                4,
+                PhysicalRect::new(0.0, 0.0, 9000.0, 260.0),
+                DisplayCommand::PopStackingContext,
+            ),
+        ];
+        let display = std::sync::Arc::new(list(viewport, items));
+        let cache =
+            CompositorCache::from_display_list(std::sync::Arc::clone(&display), Color::WHITE)
+                .expect("a wide translated layer is retainable without a clip");
+        assert_eq!(cache.layer_count(), 2, "one root segment and one layer");
+        for y in [0.0, 33.0, 70.0] {
+            assert_matches_complete_raster(
+                &cache,
+                &display,
+                Color::WHITE,
+                PhysicalPoint { x: 0.0, y },
+                "wide translated layer without a clip",
+            );
+        }
+    }
+
+    /// An effect inside a rounded clip must clip its *input* before the filter
+    /// runs, then clip the composite result like the reference pop. Both a
+    /// blur (whose support reaches the clip edge) and a per-pixel filter are
+    /// covered.
+    #[test]
+    fn effects_inside_a_rounded_clip_match_the_complete_raster() {
+        let viewport = PhysicalSize {
+            width: 200.0,
+            height: 200.0,
+        };
+        let rounded = |rect: PhysicalRect, radius: f32| ClipShape::RoundedRect {
+            rect,
+            radii: CornerRadii {
+                top_left: radius,
+                top_right: radius,
+                bottom_right: radius,
+                bottom_left: radius,
+            },
+        };
+        let cases = [
+            (
+                "blur",
+                PhysicalRect::new(30.0, 50.0, 140.0, 100.0),
+                24.0,
+                blur_filter(3.0),
+                PhysicalRect::new(50.0, 60.0, 100.0, 70.0),
+                vec![0.0, 16.0],
+            ),
+            (
+                "brightness",
+                PhysicalRect::new(30.4, 30.6, 119.3, 118.2),
+                30.2,
+                FilterEffect {
+                    operations: vec![FilterOperation::Brightness(0.75)],
+                },
+                PhysicalRect::new(30.4, 30.6, 119.3, 118.2),
+                vec![0.0, 15.0, 25.0],
+            ),
+        ];
+        for (label, clip_rect, radius, filter, content, offsets) in cases {
+            let clip = rounded(clip_rect, radius);
+            let items = vec![
+                item(
+                    0,
+                    PhysicalRect::new(0.0, 0.0, 200.0, 500.0),
+                    rect(0.0, 0.0, 200.0, 500.0, Color::rgb(245, 245, 245)),
+                ),
+                item(1, clip_rect, DisplayCommand::PushClip(clip)),
+                item(
+                    2,
+                    content,
+                    DisplayCommand::PushStackingContext(context_with_effects(
+                        Transform2D::default(),
+                        1.0,
+                        Some(filter),
+                        None,
+                    )),
+                ),
+                item(
+                    3,
+                    content,
+                    rect(
+                        content.origin.x,
+                        content.origin.y,
+                        content.size.width,
+                        content.size.height,
+                        Color::rgb(210, 50, 40),
+                    ),
+                ),
+                item(
+                    4,
+                    PhysicalRect::new(content.origin.x + 10.0, content.origin.y + 12.0, 28.0, 32.0),
+                    rect(
+                        content.origin.x + 10.0,
+                        content.origin.y + 12.0,
+                        28.0,
+                        32.0,
+                        Color::rgb(30, 80, 210),
+                    ),
+                ),
+                item(5, content, DisplayCommand::PopStackingContext),
+                item(6, clip_rect, DisplayCommand::PopClip),
+            ];
+            let display = std::sync::Arc::new(list(viewport, items));
+            let cache =
+                CompositorCache::from_display_list(std::sync::Arc::clone(&display), Color::WHITE)
+                    .expect("an effect inside a rounded clip is retainable");
+            for y in offsets {
+                assert_matches_complete_raster(
+                    &cache,
+                    &display,
+                    Color::WHITE,
+                    PhysicalPoint { x: 0.0, y },
+                    label,
+                );
+            }
+        }
+    }
+
+    /// A band with partially transparent pixels must paint its items over the
+    /// real destination. Caching it on a transparent surface and compositing
+    /// once would round the overlapping translucent rects twice and drift by a
+    /// channel even though the geometry is identical.
+    #[test]
+    fn translucent_overlapping_bands_match_the_complete_raster() {
+        let viewport = PhysicalSize {
+            width: 80.0,
+            height: 60.0,
+        };
+        let items = vec![
+            item(
+                0,
+                PhysicalRect::new(8.0, 8.0, 40.0, 30.0),
+                rect(8.0, 8.0, 40.0, 30.0, Color::rgba(220, 30, 40, 128)),
+            ),
+            item(
+                1,
+                PhysicalRect::new(24.0, 18.0, 40.0, 30.0),
+                rect(24.0, 18.0, 40.0, 30.0, Color::rgba(20, 60, 220, 128)),
+            ),
+            item(
+                2,
+                PhysicalRect::new(0.0, 40.0, 80.0, 20.0),
+                rect(0.0, 40.0, 80.0, 20.0, Color::rgba(10, 160, 80, 96)),
+            ),
+        ];
+        let display = std::sync::Arc::new(list(viewport, items));
+        let cache =
+            CompositorCache::from_display_list(std::sync::Arc::clone(&display), Color::WHITE)
+                .expect("translucent root content is retainable");
+        assert_eq!(cache.layer_count(), 1, "one root segment");
+        for offset in [0.0, 7.0, 23.0] {
+            // A cached translucent band rounds once when it is composited over
+            // the destination. The complete raster rounds after each draw, so
+            // the two may differ by one channel. That is invisible and is the
+            // cost of retaining the band; exact per-item replay is available
+            // through `RENDER_COMPOSITOR_EXACT_ALPHA=1`.
+            assert_matches_complete_raster_within(
+                &cache,
+                &display,
+                Color::WHITE,
+                PhysicalPoint { x: 0.0, y: offset },
+                "translucent root band",
+                1,
+            );
+        }
+    }
+
+    /// Item bounds can reach above the document origin (a fixed sidebar emitted
+    /// in document space, for example). The band rasterizer treats its origin
+    /// as a non-negative scroll offset, so the segment must anchor at zero
+    /// instead of shifting every item by the negative origin.
+    #[test]
+    fn a_segment_with_negative_item_bounds_keeps_its_items_in_place() {
+        let viewport = PhysicalSize {
+            width: 80.0,
+            height: 60.0,
+        };
+        let items = vec![
+            item(
+                0,
+                PhysicalRect::new(0.0, -24.0, 80.0, 18.0),
+                rect(0.0, -24.0, 80.0, 18.0, Color::rgb(200, 30, 30)),
+            ),
+            item(
+                1,
+                PhysicalRect::new(6.0, 10.0, 30.0, 20.0),
+                rect(6.0, 10.0, 30.0, 20.0, Color::rgb(20, 160, 60)),
+            ),
+            item(
+                2,
+                PhysicalRect::new(40.0, 0.0, 30.0, 50.0),
+                rect(40.0, 0.0, 30.0, 50.0, Color::rgb(30, 60, 200)),
+            ),
+        ];
+        let display = std::sync::Arc::new(list(viewport, items));
+        let cache =
+            CompositorCache::from_display_list(std::sync::Arc::clone(&display), Color::WHITE)
+                .expect("a segment with negative bounds is retainable");
+        for offset in [0.0, 12.0] {
+            assert_matches_complete_raster(
+                &cache,
+                &display,
+                Color::WHITE,
+                PhysicalPoint { x: 0.0, y: offset },
+                "segment with negative item bounds",
+            );
+        }
+    }
+
+    /// A non-translation effect inside a clip still needs the clip applied to
+    /// its input before the warp; keep the complete-raster fallback.
+    #[test]
+    fn a_scaled_effect_inside_a_clip_keeps_the_complete_raster_fallback() {
+        let viewport = PhysicalSize {
+            width: 80.0,
+            height: 80.0,
+        };
+        let clip = PhysicalRect::new(8.0, 8.0, 60.0, 60.0);
+        let items = vec![
+            item(0, clip, DisplayCommand::PushClip(ClipShape::Rect(clip))),
+            item(
+                1,
+                clip,
+                DisplayCommand::PushStackingContext(context_with_effects(
+                    Transform2D {
+                        scale_x: 1.5,
+                        scale_y: 1.5,
+                        ..Transform2D::default()
+                    },
+                    1.0,
+                    Some(blur_filter(2.0)),
+                    None,
+                )),
+            ),
+            item(2, clip, rect(8.0, 8.0, 40.0, 40.0, Color::rgb(200, 40, 40))),
+            item(3, clip, DisplayCommand::PopStackingContext),
+            item(4, clip, DisplayCommand::PopClip),
+        ];
+        let display = list(viewport, items);
+        assert!(
+            CompositorCache::from_display_list(std::sync::Arc::new(display), Color::WHITE)
+                .is_none(),
+            "a scaled effect inside a clip must keep the fallback"
         );
     }
 }

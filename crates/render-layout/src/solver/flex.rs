@@ -1069,8 +1069,17 @@ impl Solver<'_> {
                 .style_source
                 .and_then(|source| self.styles.get(&source))
                 .cloned();
-            let css_width =
-                self.resolve_size(style.as_ref(), "width", self.options.viewport.width, source);
+            // A percentage width on a replaced flex item resolves against the
+            // flex container's main size, which `basis` already carries for a
+            // row. Falling back to the viewport made `<img width:100%>` inside
+            // a 250px card measure 1180px, and §4.5's automatic minimum then
+            // kept it from shrinking, so every cover overflowed its card.
+            let width_basis = if horizontal {
+                basis
+            } else {
+                self.options.viewport.width
+            };
+            let css_width = self.resolve_size(style.as_ref(), "width", width_basis, source);
             let css_height = self.resolve_size(
                 style.as_ref(),
                 "height",
@@ -1231,47 +1240,100 @@ impl Solver<'_> {
         // its own content contribution is zero; measuring the children and
         // ignoring the clamp made a Google result's hidden duplicate site line
         // inflate the auto-height flex container by its full height.
-        let content = if horizontal {
-            content
-        } else {
-            let non_content =
-                self.flex_non_margin_extras(style.as_ref(), false, basis, entry.source);
-            let box_sizing = match style.as_ref().and_then(|style| style.typed("box-sizing")) {
-                Some(TypedPropertyValue::BoxSizing(value)) => *value,
-                _ => BoxSizing::ContentBox,
-            };
-            self.apply_min_max_height(
-                style.as_ref(),
-                content,
-                self.options.viewport.height,
-                false,
-                entry.source,
-                non_content,
-                box_sizing,
-            )
+        let non_content =
+            self.flex_non_margin_extras(style.as_ref(), horizontal, basis, entry.source);
+        let box_sizing = match style.as_ref().and_then(|style| style.typed("box-sizing")) {
+            Some(TypedPropertyValue::BoxSizing(value)) => *value,
+            _ => BoxSizing::ContentBox,
+        };
+        let content = {
+            if horizontal {
+                // CSS Sizing §3.1: intrinsic sizes honor min/max constraints on
+                // both axes. Only the block axis used to be clamped, so a
+                // `max-width:500px` search box still contributed its unclamped
+                // input width to a `flex-grow:1` header item and pushed the
+                // whole header off the viewport.
+                self.apply_min_max_width(
+                    style.as_ref(),
+                    content,
+                    basis,
+                    entry.source,
+                    non_content,
+                    box_sizing,
+                )
+            } else {
+                self.apply_min_max_height(
+                    style.as_ref(),
+                    content,
+                    self.options.viewport.height,
+                    false,
+                    entry.source,
+                    non_content,
+                    box_sizing,
+                )
+            }
         };
         let property = if horizontal { "width" } else { "height" };
-        // Intrinsic sizing treats percentage-dependent sizes as auto: the
-        // percentage basis would itself depend on content (CSS Sizing §5),
-        // so a `width:100%` descendant must not resolve against the
-        // available space here. A definite size caps the box's intrinsic
-        // contribution, which is §4.5's "capped by the specified size
-        // suggestion" for the min-content measurement and the max-content
-        // counterpart for the other: the intrinsic size of a box with a
-        // definite size is that size, however wide its contents are.
-        match self.resolve_size_against(style.as_ref(), property, None, entry.source) {
+        // Intrinsic sizing normally treats percentage-dependent sizes as auto:
+        // the percentage basis would itself depend on content (CSS Sizing §5).
+        // The exception is §4.5's automatic minimum size: its specified size
+        // suggestion is the item's used preferred size, and a percentage width
+        // resolves against the flex container's definite main size. Without
+        // that cap a `width:100%` carousel slide measured its image's intrinsic
+        // 1180px, and the automatic minimum then blew the slide up to 1180px
+        // inside a 520px column. A definite (non-percentage) size still caps
+        // both measurements, so §4.5's "however wide its contents are" holds.
+        let percentage_suggestion = (minimum && horizontal).then_some(basis);
+        match self.resolve_size_against(
+            style.as_ref(),
+            property,
+            percentage_suggestion,
+            entry.source,
+        ) {
             // The specified size suggestion is an outer size under
             // `box-sizing: border-box`; this function returns a content size,
             // and the caller adds the padding and border back. Returning the
             // border-box width here made the automatic minimum 30px too large
             // (and a definite-size flex item 30px too wide).
-            Some(specified) => self.flex_basis_content_box(
-                style.as_ref(),
-                specified,
-                horizontal,
-                basis,
-                entry.source,
-            ),
+            Some(specified) => {
+                let specified = self.flex_basis_content_box(
+                    style.as_ref(),
+                    specified,
+                    horizontal,
+                    basis,
+                    entry.source,
+                );
+                let specified = if horizontal {
+                    self.apply_min_max_width(
+                        style.as_ref(),
+                        specified,
+                        basis,
+                        entry.source,
+                        non_content,
+                        box_sizing,
+                    )
+                } else {
+                    specified
+                };
+                let width_is_percentage = horizontal
+                    && matches!(
+                        style.as_ref().and_then(|style| style.typed("width")),
+                        Some(TypedPropertyValue::Size(Size::LengthPercentage(value)))
+                            if length_depends_on_percentage(value)
+                    );
+                if minimum && width_is_percentage {
+                    // Flexbox §4.5: the automatic minimum is the smaller of
+                    // the specified size suggestion (the percentage's used
+                    // size) and the content size suggestion. Taking the
+                    // specified size alone kept a `width:100%` header column
+                    // from shrinking beside its fixed-width sibling; taking
+                    // the content size alone would drop the definite size of
+                    // a fixed-width box from its min-content contribution.
+                    content.min(specified)
+                } else {
+                    specified
+                }
+            }
             None => content,
         }
     }

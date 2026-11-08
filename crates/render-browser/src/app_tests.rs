@@ -39,6 +39,7 @@ use crate::app::RawKeyInput;
 use crate::app::address_shortcut;
 use crate::app::css_content_viewport;
 use crate::app::primary_modifier_for;
+use crate::app::shift_frame_rows;
 use crate::app::wheel_document_delta_y;
 use crate::content_interaction;
 use crate::content_interaction::{
@@ -879,6 +880,33 @@ fn wheel_deltas_map_to_document_scroll_direction() {
             < f32::EPSILON,
         "a physical pixel delta scrolls CSS pixels"
     );
+}
+
+#[test]
+fn scrolling_shifts_the_retained_surface_and_fills_the_exposed_strip() {
+    let background = 0x0012_3456;
+    let mut frame: Vec<u32> = (0..12).collect();
+    shift_frame_rows(&mut frame, 3, 4, 1, background);
+    assert_eq!(
+        frame,
+        [
+            3, 4, 5, 6, 7, 8, 9, 10, 11, background, background, background
+        ]
+    );
+
+    let mut frame: Vec<u32> = (0..12).collect();
+    shift_frame_rows(&mut frame, 3, 4, -1, background);
+    assert_eq!(
+        frame,
+        [
+            background, background, background, 0, 1, 2, 3, 4, 5, 6, 7, 8
+        ]
+    );
+
+    // A wheel delta larger than the viewport exposes everything.
+    let mut frame: Vec<u32> = (0..12).collect();
+    shift_frame_rows(&mut frame, 3, 4, 9, background);
+    assert_eq!(frame, [background; 12]);
 }
 
 #[test]

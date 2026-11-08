@@ -100,8 +100,11 @@ pub(crate) fn automatic_position(index: usize, column_count: usize) -> (usize, u
 }
 
 /// Size tracks against either a definite available size or intrinsic item
-/// contributions. Fixed tracks do not grow for content; flexible and implicit
-/// tracks do. Remaining definite space is divided by positive flex factors.
+/// contributions. Fixed tracks do not grow for content; intrinsic tracks do.
+/// Flexible tracks take their base size from their minimum and divide the
+/// remaining definite space by their flex factors (CSS Grid §12.5.1); their
+/// content contributions are only a max-content fallback for an indefinite
+/// container, never a floor that can push `1fr` tracks past the container.
 pub(crate) fn size_axis(
     tracks: &[TrackSizing],
     available: Option<f32>,
@@ -117,8 +120,13 @@ pub(crate) fn size_axis(
             let contribution = contributions.get(index).copied().unwrap_or(0.0).max(0.0);
             match *track {
                 TrackSizing::Fixed(value) => value.max(0.0),
-                TrackSizing::Flexible { minimum, .. } | TrackSizing::Intrinsic { minimum } => {
-                    minimum.max(contribution).max(0.0)
+                TrackSizing::Intrinsic { minimum } => minimum.max(contribution).max(0.0),
+                TrackSizing::Flexible { minimum, .. } => {
+                    if available.is_some() {
+                        minimum.max(0.0)
+                    } else {
+                        minimum.max(contribution).max(0.0)
+                    }
                 }
             }
         })
@@ -197,6 +205,55 @@ mod tests {
         assert_eq!(axis.size(2), 200.0);
         assert_eq!(axis.offset(2), 230.0);
         assert_eq!(axis.extent(), 430.0);
+    }
+
+    #[test]
+    fn definite_flexible_tracks_ignore_max_content_and_share_the_container() {
+        // CSS Grid §12.5.1: the base size of a flexible track is its minimum;
+        // max-content contributions must not push `1fr` tracks past a definite
+        // container (an overflowing item overflows the track instead).
+        let axis = size_axis(
+            &[
+                TrackSizing::Flexible {
+                    minimum: 0.0,
+                    factor: 1.0,
+                },
+                TrackSizing::Flexible {
+                    minimum: 0.0,
+                    factor: 1.0,
+                },
+                TrackSizing::Flexible {
+                    minimum: 0.0,
+                    factor: 1.0,
+                },
+                TrackSizing::Flexible {
+                    minimum: 0.0,
+                    factor: 1.0,
+                },
+            ],
+            Some(1060.0),
+            20.0,
+            &[590.0, 590.0, 590.0, 590.0],
+        );
+        assert_eq!(axis.size(0), 250.0);
+        assert_eq!(axis.size(3), 250.0);
+        assert_eq!(axis.offset(1), 270.0);
+        assert_eq!(axis.extent(), 1060.0);
+    }
+
+    #[test]
+    fn indefinite_flexible_tracks_fall_back_to_max_content() {
+        let axis = size_axis(
+            &[TrackSizing::Flexible {
+                minimum: 0.0,
+                factor: 1.0,
+            }],
+            None,
+            0.0,
+            &[321.0],
+        );
+        assert_eq!(axis.size(0), 321.0);
+        assert_eq!(axis.extent(), 321.0);
     }
 
     #[test]

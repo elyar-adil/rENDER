@@ -956,6 +956,14 @@ impl ImageResources {
         self.by_id.get(&id).map(Arc::as_ref)
     }
 
+    /// The decoded image as a shared handle, for the rasterizer's scaled-image
+    /// cache. The cache keeps this handle so its pointer identity cannot be
+    /// reused by a different image while an entry is alive.
+    #[must_use]
+    pub fn get_shared(&self, id: ImageResourceId) -> Option<Arc<DecodedImage>> {
+        self.by_id.get(&id).cloned()
+    }
+
     /// The decoded frame sequence attached to a resource, when it is animated.
     #[must_use]
     pub fn get_animation(&self, id: ImageResourceId) -> Option<&AnimatedImage> {

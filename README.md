@@ -104,7 +104,9 @@ cargo run --release -p render-browser --bin render-perf -- --fixture all --itera
 The report separates HTML parsing, first render, end-to-end first-visible work,
 and repeated scroll renders. It deliberately excludes network, cache, native
 presentation, and JavaScript execution so evolving web-compatibility work does
-not invalidate renderer baselines. Pull requests run a small generated-fixture
+not invalidate renderer baselines. The platform font table is loaded once, as
+the browser loads it, so the numbers measure steady-state rendering rather than
+process start-up. Pull requests run a small generated-fixture
 smoke benchmark; scheduled and manually dispatched workflow runs cover all
 fixtures and retain the JSON report as an artifact. Record a release-build
 baseline before comparing changes; the current performance target is at least

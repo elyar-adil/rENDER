@@ -63,6 +63,34 @@ impl SoftbufferPresenter {
 }
 
 impl PlatformPresenter for SoftbufferPresenter {
+    fn present_frame(
+        &mut self,
+        frame: &[u32],
+        width: u32,
+        height: u32,
+        damage: &[(u32, u32, u32, u32)],
+    ) -> Result<(), String> {
+        if frame.len() != width as usize * height as usize || self.base.len() != frame.len() {
+            return self.present_full(frame, width, height);
+        }
+        for &(x, y, region_width, region_height) in damage {
+            let right = x.saturating_add(region_width).min(width);
+            let bottom = y.saturating_add(region_height).min(height);
+            if x >= right || y >= bottom {
+                continue;
+            }
+            let region_width = (right - x) as usize;
+            for row in y..bottom {
+                let start = row as usize * width as usize + x as usize;
+                self.base[start..start + region_width]
+                    .copy_from_slice(&frame[start..start + region_width]);
+            }
+        }
+        self.width = width;
+        self.height = height;
+        self.write_base()
+    }
+
     fn present_full(&mut self, frame: &[u32], width: u32, height: u32) -> Result<(), String> {
         self.resize(width, height)?;
         self.base.clear();

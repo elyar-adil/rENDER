@@ -25,6 +25,22 @@ use super::stylesheet::{
     CssWideKeyword, Declaration, LayerName, Scope, StyleRule, StyleSheet, css_wide_keyword,
 };
 
+// Temporary cascade diagnostics for `RENDER_DEBUG_CSS_INDEX`.
+static DIAG_MATCH_NANOS: AtomicU64 = AtomicU64::new(0);
+static DIAG_MATCH_CALLS: AtomicU64 = AtomicU64::new(0);
+static DIAG_MATCH_HITS: AtomicU64 = AtomicU64::new(0);
+static DIAG_DECL_NANOS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn print_debug_match_totals() {
+    eprintln!(
+        "css-match ms_match={} calls={} hits={} ms_declarations={}",
+        DIAG_MATCH_NANOS.load(Ordering::Relaxed) / 1_000_000,
+        DIAG_MATCH_CALLS.load(Ordering::Relaxed),
+        DIAG_MATCH_HITS.load(Ordering::Relaxed),
+        DIAG_DECL_NANOS.load(Ordering::Relaxed) / 1_000_000,
+    );
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CascadeOrigin {
     UserAgent,
@@ -81,6 +97,72 @@ struct ContextBuckets {
     /// Rules whose subject has no id, class, type or attribute key (`*`,
     /// `:root`, a bare `:not(...)`).
     universal: Vec<usize>,
+    /// Bare `:root` rules, which only the tree root can match. Keeping them
+    /// out of `universal` means a design-token sheet's `:root` block is not
+    /// tested against every element.
+    root_only: Vec<usize>,
+    /// Single-selector universal rules, paired with their specificity. They
+    /// match every element without any selector work.
+    unconditional: Vec<(usize, Specificity)>,
+    /// Selectors whose subject is universal but whose ancestor compounds name
+    /// keys. The rule is a candidate only when every one of those keys appears
+    /// somewhere on the element's ancestor chain, which is a necessary
+    /// condition for the selector to match.
+    ancestor_rules: Vec<(usize, Vec<SubjectKey>)>,
+}
+
+/// One selector's index insertion: its pseudo context, subject keys, and the
+/// two special classifications plus its ancestor filter keys.
+type IndexInsert = (String, Vec<SubjectKey>, bool, bool, Vec<SubjectKey>);
+
+/// The key names present on one element's ancestors, for
+/// [`ContextBuckets::ancestor_rules`].
+#[derive(Debug, Default)]
+struct AncestorKeySet {
+    types: HashSet<String>,
+    ids: HashSet<String>,
+    classes: HashSet<String>,
+    attributes: HashSet<String>,
+}
+
+impl AncestorKeySet {
+    fn for_element(dom: &Dom, element: NodeId) -> Self {
+        let mut set = Self::default();
+        let mut current = dom.parent(element);
+        while let Some(node) = current {
+            if let Some(NodeKind::Element(data)) = dom.node(node).map(Node::kind) {
+                set.types.insert(data.local_name.to_ascii_lowercase());
+                for attribute in &data.attributes {
+                    set.attributes
+                        .insert(attribute.local_name.to_ascii_lowercase());
+                    if attribute.namespace.is_some() {
+                        continue;
+                    }
+                    if attribute.local_name.eq_ignore_ascii_case("id")
+                        && !attribute.value.is_empty()
+                    {
+                        set.ids.insert(attribute.value.to_ascii_lowercase());
+                    }
+                    if attribute.local_name.eq_ignore_ascii_case("class") {
+                        for class in attribute.value.split_ascii_whitespace() {
+                            set.classes.insert(class.to_ascii_lowercase());
+                        }
+                    }
+                }
+            }
+            current = dom.parent(node);
+        }
+        set
+    }
+
+    fn contains(&self, key: &SubjectKey) -> bool {
+        match key {
+            SubjectKey::Type(name) => self.types.contains(name),
+            SubjectKey::Id(name) => self.ids.contains(name),
+            SubjectKey::Class(name) => self.classes.contains(name),
+            SubjectKey::Attribute(name) => self.attributes.contains(name),
+        }
+    }
 }
 
 impl ContextBuckets {
@@ -120,11 +202,22 @@ impl CascadeRuleIndex {
             debug: std::env::var_os("RENDER_DEBUG_CSS_INDEX").is_some(),
             ..Self::default()
         };
+        if indexed.debug {
+            for counter in [
+                &DIAG_MATCH_NANOS,
+                &DIAG_MATCH_CALLS,
+                &DIAG_MATCH_HITS,
+                &DIAG_DECL_NANOS,
+            ] {
+                counter.store(0, Ordering::Relaxed);
+            }
+        }
         for source in sources {
             let mut buckets = RuleBuckets::default();
             indexed.rules += source.sheet.rules.len();
             for (rule_index, rule) in source.sheet.rules.iter().enumerate() {
-                let mut inserts: Vec<(String, Vec<SubjectKey>)> = Vec::new();
+                let single_selector = rule.selectors.selectors().len() == 1;
+                let mut inserts: Vec<IndexInsert> = Vec::new();
                 for selector in rule.selectors.selectors() {
                     let pseudo = match selector.subject_pseudo() {
                         SubjectPseudo::Never => continue,
@@ -133,11 +226,43 @@ impl CascadeRuleIndex {
                     };
                     let mut keys = Vec::new();
                     selector.subject_keys(&mut keys);
-                    inserts.push((pseudo, keys));
+                    let root_only = keys.is_empty() && selector.is_bare_root();
+                    let unconditional = single_selector
+                        && rule.scopes.is_empty()
+                        && keys.is_empty()
+                        && selector.is_unconditional_universal();
+                    let mut ancestor_keys = Vec::new();
+                    if keys.is_empty() && !root_only && !unconditional {
+                        selector.ancestor_keys(&mut ancestor_keys);
+                    }
+                    inserts.push((pseudo, keys, root_only, unconditional, ancestor_keys));
                 }
-                for (pseudo, keys) in inserts {
-                    let context = buckets.contexts.entry(pseudo).or_default();
+                for (pseudo, keys, root_only, unconditional, ancestor_keys) in inserts {
+                    let context = buckets.contexts.entry(pseudo.clone()).or_default();
                     if keys.is_empty() {
+                        if root_only {
+                            if context.root_only.last() != Some(&rule_index) {
+                                context.root_only.push(rule_index);
+                            }
+                            continue;
+                        }
+                        if !ancestor_keys.is_empty() {
+                            context.ancestor_rules.push((rule_index, ancestor_keys));
+                            continue;
+                        }
+                        if unconditional && let Some(selector) = rule.selectors.selectors().first()
+                        {
+                            if context
+                                .unconditional
+                                .last()
+                                .is_none_or(|(index, _)| *index != rule_index)
+                            {
+                                context
+                                    .unconditional
+                                    .push((rule_index, selector.specificity()));
+                            }
+                            continue;
+                        }
                         if context.universal.last() != Some(&rule_index) {
                             context.universal.push(rule_index);
                             indexed.universal_entries += 1;
@@ -176,6 +301,7 @@ impl CascadeRuleIndex {
         pseudo: &str,
         dom: &Dom,
         element: NodeId,
+        ancestors: Option<&AncestorKeySet>,
         out: &mut Vec<usize>,
     ) {
         let Some(buckets) = self.sources.get(source_index) else {
@@ -185,6 +311,17 @@ impl CascadeRuleIndex {
             return;
         };
         out.extend_from_slice(&context.universal);
+        if let Some(ancestors) = ancestors {
+            for (rule, keys) in &context.ancestor_rules {
+                if keys.iter().all(|key| ancestors.contains(key)) {
+                    out.push(*rule);
+                }
+            }
+        }
+        if dom.parent(element) == Some(dom.document()) {
+            out.extend_from_slice(&context.root_only);
+        }
+        out.extend(context.unconditional.iter().map(|(rule, _)| *rule));
         let Some(NodeKind::Element(data)) = dom.node(element).map(Node::kind) else {
             return;
         };
@@ -214,6 +351,32 @@ impl CascadeRuleIndex {
 
     fn layer_orders(&self) -> &HashMap<CascadeOrigin, Vec<GlobalLayerKey>> {
         &self.layer_orders
+    }
+
+    fn has_ancestor_rules(&self) -> bool {
+        self.sources.iter().any(|buckets| {
+            buckets
+                .contexts
+                .values()
+                .any(|context| !context.ancestor_rules.is_empty())
+        })
+    }
+
+    /// The specificity of `rule` when it is an unconditional universal rule,
+    /// which means its selector list is exactly one `*` and matching it cannot
+    /// fail.
+    fn unconditional_specificity(
+        &self,
+        source_index: usize,
+        pseudo: &str,
+        rule_index: usize,
+    ) -> Option<Specificity> {
+        let context = self.sources.get(source_index)?.contexts.get(pseudo)?;
+        context
+            .unconditional
+            .binary_search_by_key(&rule_index, |(index, _)| *index)
+            .ok()
+            .map(|position| context.unconditional[position].1)
     }
 }
 
@@ -742,6 +905,11 @@ fn cascade_element_with_origins_impl(
     {
         index.elements.fetch_add(1, Ordering::Relaxed);
     }
+    let ancestor_keys = lookup
+        .rule_index
+        .filter(|index| index.has_ancestor_rules())
+        .map(|_| AncestorKeySet::for_element(dom, element));
+    let debug_index = lookup.rule_index.is_some_and(|index| index.debug);
     let mut candidate_rules = Vec::new();
     for (source_index, source) in sources.iter().enumerate() {
         let sheet_tree = source.sheet.tree_root.unwrap_or_else(|| dom.document());
@@ -804,6 +972,7 @@ fn cascade_element_with_origins_impl(
                 context.pseudo_element.as_deref().unwrap_or(""),
                 dom,
                 match_element,
+                ancestor_keys.as_ref(),
                 &mut candidate_rules,
             );
             candidate_rules.sort_unstable();
@@ -870,6 +1039,7 @@ fn cascade_element_with_origins_impl(
             }
             // CSS Cascade 6 §3.5.3: a scoped rule's subject has to be in scope,
             // and its `:scope`/`&` selectors are relative to that scope's root.
+            let match_started = debug_index.then(std::time::Instant::now);
             let (specificity, proximity) = match resolve_rule_scope(
                 dom,
                 match_element,
@@ -878,10 +1048,23 @@ fn cascade_element_with_origins_impl(
                 source_context,
             ) {
                 RuleScope::OutOfScope => continue,
-                RuleScope::Unscoped => (
-                    matching_specificity(dom, match_element, &rule.selectors, source_context),
-                    u32::MAX,
-                ),
+                RuleScope::Unscoped => {
+                    let pseudo = context.pseudo_element.as_deref().unwrap_or("");
+                    let unconditional = lookup.rule_index.and_then(|index| {
+                        index.unconditional_specificity(source_index, pseudo, candidate_rule)
+                    });
+                    (
+                        unconditional.or_else(|| {
+                            matching_specificity(
+                                dom,
+                                match_element,
+                                &rule.selectors,
+                                source_context,
+                            )
+                        }),
+                        u32::MAX,
+                    )
+                }
                 RuleScope::InScope { root, proximity } => {
                     let specificity = if source_context.scope == Some(root) {
                         matching_specificity(dom, match_element, &rule.selectors, source_context)
@@ -893,6 +1076,16 @@ fn cascade_element_with_origins_impl(
                     (specificity, proximity)
                 }
             };
+            if let Some(started) = match_started {
+                DIAG_MATCH_CALLS.fetch_add(1, Ordering::Relaxed);
+                DIAG_MATCH_NANOS.fetch_add(
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                if specificity.is_some() {
+                    DIAG_MATCH_HITS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             let Some(specificity) = specificity else {
                 continue;
             };
@@ -901,6 +1094,7 @@ fn cascade_element_with_origins_impl(
             {
                 index.matched_rules.fetch_add(1, Ordering::Relaxed);
             }
+            let decl_started = debug_index.then(std::time::Instant::now);
             for declaration in &rule.declarations {
                 source_order = source_order.saturating_add(1);
                 let priority = Priority {
@@ -947,6 +1141,12 @@ fn cascade_element_with_origins_impl(
                             .map(|layer| global_layer_key(layer, source_index)),
                     });
                 }
+            }
+            if let Some(started) = decl_started {
+                DIAG_DECL_NANOS.fetch_add(
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
             }
         }
     }
@@ -3189,9 +3389,11 @@ const fn origin_rank(origin: CascadeOrigin, important: bool) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CascadeInput, CascadeOrigin, cascade_element, media_query_list_is_supported,
+        CascadeInput, CascadeLookup, CascadeOrigin, CascadeRuleIndex, cascade_element,
+        cascade_element_with_origins_indexed, media_query_list_is_supported,
         media_query_list_matches,
     };
+    use crate::container::NoStyleQueries;
     use crate::selector::{MatchContext, parse_selector_list, select_all};
     use crate::stylesheet::parse_stylesheet;
     use render_html::parse_document;
@@ -3205,6 +3407,57 @@ mod tests {
             &MatchContext::default(),
         )[0];
         (output.dom, target)
+    }
+
+    /// The index puts a bare `:root` in its own bucket and a universal subject
+    /// behind an ancestor-key filter. Both are only candidate cuts; the
+    /// selectors that reach the cascade must still match exactly as written.
+    #[test]
+    fn indexed_root_and_ancestor_buckets_keep_the_matches_they_promise() {
+        let output = parse_document(
+            "<!doctype html><div class='a'><span id='inside'>x</span></div>\
+             <div class='b'><span id='outside'>y</span></div>",
+        );
+        let dom = &output.dom;
+        let sheet = parse_stylesheet(
+            ":root { color: red } \
+             .night .a > * { color: green } \
+             .a > * { color: blue }",
+        );
+        let sources = [CascadeInput {
+            sheet: &sheet,
+            origin: CascadeOrigin::Author,
+        }];
+        let index = CascadeRuleIndex::new(&sources);
+        let lookup = CascadeLookup {
+            rule_index: Some(&index),
+            style_queries: &NoStyleQueries,
+            include_starting_style: false,
+        };
+        let find = |selector: &str| {
+            let selectors = parse_selector_list(selector).expect("valid test selector");
+            select_all(dom, dom.document(), &selectors, &MatchContext::default())[0]
+        };
+        let root = find("html");
+        let inside = find("#inside");
+        let outside = find("#outside");
+
+        let color = |node| {
+            cascade_element_with_origins_indexed(
+                dom,
+                node,
+                &sources,
+                &MatchContext::default(),
+                &[],
+                &[],
+                &lookup,
+            )
+            .get("color")
+            .map(|value| value.value.clone())
+        };
+        assert_eq!(color(root), Some("red".to_owned()));
+        assert_eq!(color(inside), Some("blue".to_owned()));
+        assert_eq!(color(outside), None, ".a is not an ancestor of #outside");
     }
 
     #[test]

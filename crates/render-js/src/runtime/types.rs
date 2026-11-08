@@ -28,7 +28,39 @@ use crate::value::TypedBuffer;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
+use std::hash::Hasher;
 use std::rc::Rc;
+
+/// A small FNV-1a hasher for environment binding names. The standard
+/// `RandomState` hasher is deliberately collision-resistant and costs more
+/// than a binding lookup on a short identifier; a collision only costs a short
+/// probe sequence. This keeps the map dependency-free and auditable.
+pub(super) struct BindingHasher(u64);
+
+impl Default for BindingHasher {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for BindingHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = self.0;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.0 = hash;
+    }
+}
+
+pub(super) type BindingMap = HashMap<String, Binding, BuildHasherDefault<BindingHasher>>;
 
 #[derive(Clone, Debug)]
 pub(super) struct Binding {
@@ -63,7 +95,7 @@ pub(super) struct ScopeResource {
 
 #[derive(Debug, Default)]
 pub(crate) struct EnvironmentRecord {
-    pub(super) bindings: BTreeMap<String, Binding>,
+    pub(super) bindings: BindingMap,
     pub(super) function_scope: bool,
     /// The name of a `catch` clause's simple (identifier) parameter. Annex B.3.4
     /// lets eval code `var`-declare that name, so the record does not conflict.
@@ -295,6 +327,14 @@ pub(super) struct UserFunction {
     pub(super) private_scope: Option<Rc<PrivateScope>>,
     /// The final parameter collects the remaining arguments into an array.
     pub(super) rest: bool,
+    /// A parameter list with no rest element, default initializer or pattern.
+    /// Calls take the direct positional-binding path when this is true.
+    pub(super) simple_parameters: bool,
+    /// At least one parameter has a default initializer, so the call creates
+    /// the whole parameter list uninitialized before evaluating any default.
+    pub(super) has_defaults: bool,
+    /// The body declares a `using` resource, so leaving the call disposes it.
+    pub(super) has_disposables: bool,
     /// Whether calling the function starts a generator or an async activation.
     pub(super) kind: FunctionKind,
     /// Whether the body can reach the arguments object (see

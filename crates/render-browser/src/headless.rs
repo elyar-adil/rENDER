@@ -51,7 +51,7 @@ use render_core::js::{
 use render_core::layout::{LayoutOptions, PhysicalSize};
 use render_core::module_graph::{ModuleGraph, module_key};
 use render_core::page::{Page, PageDomEvent, PageJob, PageOptions};
-use render_core::paint::Surface;
+use render_core::paint::{CompositorCache, Surface};
 use render_core::script::ScriptDiscoveryLimits;
 use render_net::{
     BatchOptions, CancelToken, CookieJar, FetchConfig, FetchRequest, FetchResult, Header,
@@ -1361,6 +1361,7 @@ impl HeadlessSession {
                     &frame_documents,
                 )
         };
+        self.debug_compositor_report(&options, &output.display.list);
         let revision = output.revision.as_u64();
         let geometry = geometry_from_layout(&output.layout.fragments);
         let _ = self
@@ -1374,6 +1375,143 @@ impl HeadlessSession {
         self.last_render = Some(output);
         self.needs_render = false;
         Ok(())
+    }
+
+    /// Reports whether the scene can use the incremental scroll compositor.
+    ///
+    /// A headless run has no window, so the retained path is not used for
+    /// output; this exists so `RENDER_DEBUG_COMPOSITOR=1` can explain a live
+    /// site's scroll fallback without opening one.
+    fn debug_compositor_report(
+        &self,
+        options: &DocumentRenderOptions,
+        display: &render_core::paint::DisplayList,
+    ) {
+        if std::env::var_os("RENDER_DEBUG_COMPOSITOR").is_none() {
+            return;
+        }
+        let scaled = if (options.device_scale - 1.0).abs() > f32::EPSILON {
+            display.clone().scaled(options.device_scale)
+        } else {
+            display.clone()
+        };
+        match CompositorCache::from_display_list(
+            Arc::new(scaled.clone()),
+            options.raster_background,
+        ) {
+            Some(cache) => {
+                eprintln!(
+                    "render-headless compositor retained layers={}",
+                    cache.layer_count()
+                );
+                if std::env::var_os("RENDER_DEBUG_COMPOSITOR_SCROLL").is_some() {
+                    self.debug_compositor_scroll(&cache, options);
+                }
+                if std::env::var_os("RENDER_DEBUG_COMPOSITOR_COMPARE").is_some() {
+                    self.debug_compositor_compare(&cache, options, &scaled);
+                }
+            }
+            None => eprintln!(
+                "render-headless compositor fallback: the scene uses a command the retained path cannot replay"
+            ),
+        }
+    }
+
+    fn debug_compositor_scroll(&self, cache: &CompositorCache, options: &DocumentRenderOptions) {
+        let mut samples = Vec::new();
+        for step in 0..32 {
+            let origin = render_core::layout::PhysicalPoint {
+                x: 0.0,
+                y: f32::from(u16::try_from(step).unwrap_or(0)) * 16.0 * options.device_scale,
+            };
+            let started = std::time::Instant::now();
+            let _ = cache.render(origin, self.fonts.as_ref(), Some(&self.images), None);
+            samples.push(started.elapsed().as_micros());
+        }
+        samples.sort_unstable();
+        let median = samples[samples.len() / 2];
+        eprintln!(
+            "render-headless compositor scroll16 median_us={median} p95_us={} max_us={}",
+            samples[samples.len() * 95 / 100],
+            samples[samples.len() - 1],
+        );
+    }
+
+    fn debug_compositor_compare(
+        &self,
+        cache: &CompositorCache,
+        options: &DocumentRenderOptions,
+        scaled: &render_core::paint::DisplayList,
+    ) {
+        let scene = render_core::paint::PaintScene::from_display_list(scaled.clone());
+        for step in [0.0_f32, 200.0, 600.0] {
+            let origin = render_core::layout::PhysicalPoint {
+                x: 0.0,
+                y: step * options.device_scale,
+            };
+            let composited_started = std::time::Instant::now();
+            let composited = cache.render(origin, self.fonts.as_ref(), Some(&self.images), None);
+            let composited_micros = composited_started.elapsed().as_micros();
+            let full = render_core::paint::CpuRasterizer
+                .rasterize_request(
+                    render_core::paint::RasterRequest::new(
+                        &scene,
+                        options.raster_background,
+                        self.fonts.as_ref(),
+                    )
+                    .with_images(&self.images)
+                    .with_viewport_origin(origin),
+                    &render_core::paint::NoRasterCancellation,
+                )
+                .expect("the debug comparison is not cancelled");
+            let width = composited.surface.width() as usize;
+            let mut mismatched = 0_usize;
+            let mut bounds: Option<(u32, u32, u32, u32)> = None;
+            let mut samples = Vec::new();
+            let mut max_delta = 0_u8;
+            for (index, (left, right)) in composited
+                .surface
+                .pixels()
+                .iter()
+                .zip(full.surface.pixels())
+                .enumerate()
+            {
+                let delta = [left.red, left.green, left.blue, left.alpha]
+                    .into_iter()
+                    .zip([right.red, right.green, right.blue, right.alpha])
+                    .map(|(left, right)| left.abs_diff(right))
+                    .max()
+                    .unwrap_or(0);
+                max_delta = max_delta.max(delta);
+                if delta <= 1 {
+                    continue;
+                }
+                mismatched += 1;
+                let x = u32::try_from(index % width).unwrap_or(0);
+                let y = u32::try_from(index / width).unwrap_or(0);
+                bounds = Some(match bounds {
+                    Some((left, top, right, bottom)) => {
+                        (left.min(x), top.min(y), right.max(x), bottom.max(y))
+                    }
+                    None => (x, y, x, y),
+                });
+                if samples.len() < 3 {
+                    samples.push((x, y, *left, *right));
+                }
+            }
+            eprintln!(
+                "render-headless compositor scroll={step} mismatched_pixels={mismatched} max_channel_delta={max_delta} composited_us={composited_micros} bounds={bounds:?} samples={samples:?}"
+            );
+            if let Ok(directory) = std::env::var("RENDER_DEBUG_COMPOSITOR_DUMP") {
+                let base = std::path::Path::new(&directory);
+                let _ = std::fs::create_dir_all(base);
+                let _ = write_surface_png(
+                    &composited.surface,
+                    &base.join(format!("composited-{step}.png")),
+                );
+                let _ = write_surface_png(&full.surface, &base.join(format!("full-{step}.png")));
+            }
+        }
     }
 
     fn run_page_turns(&mut self, budget: usize) -> bool {

@@ -25,6 +25,7 @@ use render_dom::Dom;
 use render_dom::Node;
 use render_dom::NodeId;
 use render_dom::NodeKind;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 
 mod block;
@@ -458,6 +459,7 @@ fn run_reference_layout(
         inline_text_styles: HashMap::new(),
         min_content_widths: HashMap::new(),
         max_content_widths: HashMap::new(),
+        inline_advances: RefCell::new(HashMap::new()),
         sticky_boxes: Vec::new(),
         clipping_boxes: Vec::new(),
         fixed_positioning_containing: None,
@@ -585,6 +587,11 @@ struct Solver<'a> {
     /// each miss recursively measures the cell's whole subtree.
     min_content_widths: HashMap<FormattingNodeId, f32>,
     max_content_widths: HashMap<FormattingNodeId, f32>,
+    /// The advance of one character under one typography, measured once per
+    /// layout pass. Line breaking, intrinsic sizing and line filling all ask
+    /// the measurer for the same characters, and a list of cards repeats a
+    /// handful of styles across thousands of runs.
+    inline_advances: RefCell<HashMap<InlineAdvanceKey, f32>>,
     /// Boxes whose computed `position` is `sticky`, in allocation order. The
     /// displacement itself is not applied here (§4.1): it depends on the scroll
     /// offset, which layout never sees, so these are resolved into constraints
@@ -729,6 +736,40 @@ struct FloatArea {
 struct AutoEdge {
     value: f32,
     auto: bool,
+}
+
+/// The identity of one character's advance: the face request, the size, and
+/// the character.
+///
+/// The family string is identified by its address and length rather than its
+/// contents: the computed styles that own it outlive the layout pass, so the
+/// address cannot be reused for different text while the cache is alive.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct InlineAdvanceKey {
+    family: (usize, usize),
+    weight: u16,
+    style: (u8, u32),
+    synthesis: (bool, bool),
+    font_size_bits: u32,
+    character: char,
+}
+
+impl InlineAdvanceKey {
+    fn new(character: char, style: TextStyle<'_>) -> Self {
+        let (style_kind, style_angle) = match style.font.style {
+            crate::font::FontStyle::Normal => (0, 0),
+            crate::font::FontStyle::Italic => (1, 0),
+            crate::font::FontStyle::Oblique(degrees) => (2, degrees.to_bits()),
+        };
+        Self {
+            family: (style.font.family.as_ptr() as usize, style.font.family.len()),
+            weight: style.font.weight,
+            style: (style_kind, style_angle),
+            synthesis: (style.font.synthesis.weight, style.font.synthesis.style),
+            font_size_bits: style.font_size.to_bits(),
+            character,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

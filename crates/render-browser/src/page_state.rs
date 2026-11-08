@@ -80,7 +80,13 @@ const PAGE_TURN_TIME_BUDGET: Duration = Duration::from_millis(24);
 
 /// Wall-clock slice for one prepared classic-script batch. Once it expires the
 /// remaining turns stay queued and drain through the bounded page pump.
-const SCRIPT_BATCH_TIME_BUDGET: Duration = Duration::from_millis(500);
+/// Wall-clock slice for one classic-script batch on the window thread.
+///
+/// The turn-count budget alone lets a batch run for half a second, and input
+/// arriving in that window is not handled until it ends. 150 ms keeps a wheel
+/// or pointer event from waiting behind a large bundle while still amortizing
+/// the per-batch setup enough to finish a page in a handful of turns.
+const SCRIPT_BATCH_TIME_BUDGET: Duration = Duration::from_millis(150);
 
 #[allow(
     clippy::struct_excessive_bools,
@@ -207,6 +213,10 @@ pub(super) struct PageState {
     /// separate from `expected_render`, so a slow full render can stay in
     /// flight while independently composed scroll frames commit.
     pub(super) expected_compositor: Option<RenderIdentity>,
+    /// A scroll arrived while a compositor frame was already in flight. The
+    /// newest offset is submitted when that frame commits instead of queueing
+    /// one composite per wheel event.
+    pub(super) compositor_dirty: bool,
     /// Wall-clock anchor for the page's virtual event-loop clock.
     pub(super) created_at: Instant,
 }
@@ -458,6 +468,7 @@ impl PageState {
             render_generation: 0,
             expected_render: None,
             expected_compositor: None,
+            compositor_dirty: false,
             created_at: Instant::now(),
         }
     }
@@ -590,6 +601,7 @@ impl PageState {
         self.external_styles_generation = 0;
         self.expected_render = None;
         self.expected_compositor = None;
+        self.compositor_dirty = false;
         self.created_at = Instant::now();
     }
 

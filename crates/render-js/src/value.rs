@@ -3352,6 +3352,9 @@ pub struct Realm {
     module_namespaces: Vec<ModuleNamespaceExports>,
     /// How many of `module_namespaces` are deferred namespaces (`import defer`).
     deferred_namespaces: usize,
+    /// How many live object slots hold a Proxy. Zero means a prototype-chain
+    /// read cannot meet a proxy, so the extra proxy walk is skipped.
+    proxy_objects: usize,
     /// Every realm of this agent, indexed by [`RealmId`].
     realms: Vec<RealmRecord>,
     current: RealmId,
@@ -3428,6 +3431,7 @@ impl Realm {
             objects,
             module_namespaces: Vec::new(),
             deferred_namespaces: 0,
+            proxy_objects: 0,
             realms: vec![record],
             current: RealmId(0),
             swept_objects: 0,
@@ -11928,8 +11932,8 @@ impl Realm {
         self.get_property(self.global, key)
     }
 
-    pub(crate) fn set_global(&mut self, key: String, value: JsValue) -> bool {
-        self.set_property(self.global, key, value)
+    pub(crate) fn set_global(&mut self, key: &str, value: JsValue) -> bool {
+        self.set_property_str(self.global, key, value)
     }
 
     /// Number of live (non-swept) object slots. Swept slots are rewritten to
@@ -12093,18 +12097,31 @@ impl Realm {
         object: ObjectId,
         key: &str,
     ) -> Option<(JsValue, ObjectId)> {
+        self.get_property_descriptor_with_origin(object, key)
+            .map(|(descriptor, origin)| (descriptor.value, origin))
+    }
+
+    /// The descriptor of the first property `key` on `object`'s prototype
+    /// chain, with the object that holds it. A data property then needs no
+    /// second chain walk to read its value, and an accessor is recognized
+    /// without running it here.
+    pub(crate) fn get_property_descriptor_with_origin(
+        &self,
+        object: ObjectId,
+        key: &str,
+    ) -> Option<(PropertyDescriptor, ObjectId)> {
         if let Some(export) = self.namespace_export(object, key) {
-            return Some((namespace_export_value(export), object));
+            return Some((namespace_export_descriptor(export), object));
         }
         if let Some(descriptor) = self.string_exotic_descriptor(object, key) {
-            return Some((descriptor.value, object));
+            return Some((descriptor, object));
         }
         let mut candidate = Some(object);
         let mut visited = 0usize;
         while let Some(id) = candidate {
             let current = self.objects.get(id.0)?;
             if let Some(property) = current.properties.get(key) {
-                return Some((stored_value(current, key, property), id));
+                return Some((stored_descriptor(current, key, property), id));
             }
             candidate = current.prototype;
             visited = visited.saturating_add(1);
@@ -12182,6 +12199,18 @@ impl Realm {
     /// one through a prototype needs the walk only then.
     pub(crate) fn has_deferred_namespace(&self) -> bool {
         self.deferred_namespaces > 0
+    }
+
+    /// Whether any live object is a Proxy, so a prototype-chain member read has
+    /// to stop for its `[[Get]]`. Once a proxy exists this stays true for the
+    /// lifetime of the realm, which is conservative but never wrong.
+    pub(crate) fn has_proxy_objects(&self) -> bool {
+        self.proxy_objects > 0
+    }
+
+    /// Records that a fresh object slot holds a Proxy.
+    pub(crate) fn note_proxy_created(&mut self) {
+        self.proxy_objects = self.proxy_objects.saturating_add(1);
     }
 
     /// The module whose deferred namespace `object` is, when it is one.
@@ -12334,6 +12363,20 @@ impl Realm {
             },
             _ => None,
         }
+    }
+
+    /// The own string-keyed property stored in the object's property map alone,
+    /// without namespace exports, string characters or typed-array elements.
+    /// `None` means no plain own property answers, so an exotic internal method
+    /// may still handle the key.
+    pub(crate) fn own_property_map(
+        &self,
+        object: ObjectId,
+        key: &str,
+    ) -> Option<PropertyDescriptor> {
+        let target = self.objects.get(object.0)?;
+        let property = target.properties.get(key)?;
+        Some(stored_descriptor(target, key, property))
     }
 
     /// ECMA-262 10.4.5 integer-indexed exotic object: classifies `key` for
@@ -12775,14 +12818,25 @@ impl Realm {
         self.regexp_prototype
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "callers build the owned key for a new property; existing properties take the borrowed fast path"
+    )]
     pub(crate) fn set_property(&mut self, object: ObjectId, key: String, value: JsValue) -> bool {
+        self.set_property_str(object, &key, value)
+    }
+
+    /// [`Self::set_property`] with a borrowed key: an existing property takes
+    /// the value without allocating a fresh `String` for its name, which is the
+    /// common assignment (`x = v`, `obj.field = v`) and loop-counter case.
+    pub(crate) fn set_property_str(&mut self, object: ObjectId, key: &str, value: JsValue) -> bool {
         // ECMA-262 10.4.6.8: a namespace's [[Set]] never succeeds, since it is not extensible.
         if self.namespace_index(object).is_some() {
             return false;
         }
         // The runtime converts a typed-array write before it reaches here, so
         // an element takes only a value already of the view's content type.
-        match self.typed_key(object, &key) {
+        match self.typed_key(object, key) {
             TypedKey::Element(index) => {
                 self.typed_element_store(object, index, &value);
                 return true;
@@ -12793,13 +12847,13 @@ impl Realm {
         let Some(target) = self.objects.get_mut(object.0) else {
             return false;
         };
-        if let Some(property) = target.properties.get_mut(&key) {
+        if let Some(property) = target.properties.get_mut(key) {
             if !property.writable {
                 return false;
             }
             // The arguments object's `[[Set]]`: a mapped index writes its parameter too.
             if let ObjectHost::Arguments(Some(map)) = &target.host {
-                map.store(&key, &value);
+                map.store(key, &value);
             }
             property.value = value;
         } else {
@@ -12807,19 +12861,19 @@ impl Realm {
             // `length` are non-writable own slots, so writing them fails
             // instead of creating a shadowing data property.
             if matches!(target.host, ObjectHost::StringPrimitive(_))
-                && (key == "length" || is_canonical_index(&key))
+                && (key == "length" || is_canonical_index(key))
             {
                 return false;
             }
             if !target.extensible {
                 return false;
             }
-            if !is_canonical_index(&key) {
-                target.key_order.push(key.clone());
+            if !is_canonical_index(key) {
+                target.key_order.push(key.to_owned());
             }
             target
                 .properties
-                .insert(key, PropertyDescriptor::data(value));
+                .insert(key.to_owned(), PropertyDescriptor::data(value));
         }
         true
     }
@@ -14025,7 +14079,7 @@ mod tests {
             assert!(!descriptor.writable);
             assert!(!descriptor.enumerable);
             assert!(!descriptor.configurable);
-            assert!(!realm.set_global(name.to_owned(), JsValue::Number(1.0)));
+            assert!(!realm.set_global(name, JsValue::Number(1.0)));
             assert!(!realm.delete_property(global, name));
         }
     }

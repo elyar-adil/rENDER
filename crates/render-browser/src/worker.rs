@@ -691,19 +691,24 @@ mod tests {
         worker.submit(job(identity(1, 2, 800, 50.0), 12)).unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        let mut values = Vec::new();
-        while values.len() < 2 {
-            values.extend(
-                worker
-                    .drain_latest()
-                    .into_iter()
-                    .map(|completed| completed.result.unwrap()),
-            );
+        let mut tab_one = 0;
+        let mut tab_two = 0;
+        while tab_one < 12 || tab_two < 21 {
+            // An intermediate completion for tab one (generation 1) is a valid
+            // frame to commit before generation 2 arrives; the assertion is
+            // about the final state per tab, not about one drain call.
+            for completed in worker.drain_latest() {
+                let value = completed.result.unwrap();
+                if completed.identity.tab_id == 1 {
+                    tab_one = tab_one.max(value);
+                } else {
+                    tab_two = tab_two.max(value);
+                }
+            }
             assert!(Instant::now() < deadline, "tab renders did not finish");
             thread::yield_now();
         }
-        values.sort_unstable();
-        assert_eq!(values, [12, 21]);
+        assert_eq!((tab_one, tab_two), (12, 21));
     }
 
     #[test]

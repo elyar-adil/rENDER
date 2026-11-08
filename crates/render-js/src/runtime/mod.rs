@@ -163,6 +163,9 @@ pub struct JsRuntime {
     /// only in the caller's Rust locals, so a collection during the call still
     /// sees them.
     suspended_environments: Vec<Vec<Environment>>,
+    /// Finished call-chain vectors kept for reuse, so a call does not allocate
+    /// a fresh `Vec` for the environment chain every time.
+    environment_pool: Vec<Vec<Environment>>,
     /// Declared modules by key (the module's absolute URL), one map per realm,
     /// indexed by [`RealmId`]. A module belongs to the realm that declared it.
     modules: Vec<BTreeMap<String, module::ModuleRecord>>,
@@ -474,6 +477,7 @@ impl JsRuntime {
             dom_nodes_created: 0,
             environment: Vec::new(),
             suspended_environments: Vec::new(),
+            environment_pool: Vec::new(),
             modules: vec![BTreeMap::new()],
             module_loader: None,
             async_evaluation_count: 0,

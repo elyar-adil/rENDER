@@ -150,6 +150,49 @@ use crate::font_matching::{Face, FaceTable, Family, FamilyWalk};
 
 const MAX_CACHED_GLYPHS: usize = 16_384;
 type GlyphCache = HashMap<(FontInstanceId, GlyphId, u32), Arc<GlyphMask>>;
+/// The face a character resolved to, with synthetic weight and shear.
+type CharacterFaces = HashMap<char, Option<(Arc<Font>, bool, f32)>>;
+
+// Temporary diagnostics: `RENDER_FONT_STATS=1` reports how much of a render is
+// spent reaching a face from a character.
+static FONT_STATS_ENABLED: OnceLock<bool> = OnceLock::new();
+static STAT_MEASURE_CALLS: AtomicU64 = AtomicU64::new(0);
+static STAT_MEASURE_CHARS: AtomicU64 = AtomicU64::new(0);
+static STAT_MEASURE_NANOS: AtomicU64 = AtomicU64::new(0);
+static STAT_SHAPE_CALLS: AtomicU64 = AtomicU64::new(0);
+static STAT_SHAPE_CHARS: AtomicU64 = AtomicU64::new(0);
+static STAT_SHAPE_NANOS: AtomicU64 = AtomicU64::new(0);
+static STAT_FACE_FOR_CALLS: AtomicU64 = AtomicU64::new(0);
+static STAT_FACE_FOR_NANOS: AtomicU64 = AtomicU64::new(0);
+static STAT_RESOLVE_CALLS: AtomicU64 = AtomicU64::new(0);
+static STAT_RESOLVE_NANOS: AtomicU64 = AtomicU64::new(0);
+static STAT_LINE_HEIGHT_CALLS: AtomicU64 = AtomicU64::new(0);
+
+fn font_stats_enabled() -> bool {
+    *FONT_STATS_ENABLED.get_or_init(|| env::var_os("RENDER_FONT_STATS").is_some())
+}
+
+impl Drop for SystemFontBackend {
+    fn drop(&mut self) {
+        if !font_stats_enabled() {
+            return;
+        }
+        eprintln!(
+            "font-stats measure_calls={} measure_chars={} measure_ns={} shape_calls={} shape_chars={} shape_ns={} face_for_calls={} face_for_ns={} resolve_calls={} resolve_ns={} line_height_calls={}",
+            STAT_MEASURE_CALLS.load(Ordering::Relaxed),
+            STAT_MEASURE_CHARS.load(Ordering::Relaxed),
+            STAT_MEASURE_NANOS.load(Ordering::Relaxed),
+            STAT_SHAPE_CALLS.load(Ordering::Relaxed),
+            STAT_SHAPE_CHARS.load(Ordering::Relaxed),
+            STAT_SHAPE_NANOS.load(Ordering::Relaxed),
+            STAT_FACE_FOR_CALLS.load(Ordering::Relaxed),
+            STAT_FACE_FOR_NANOS.load(Ordering::Relaxed),
+            STAT_RESOLVE_CALLS.load(Ordering::Relaxed),
+            STAT_RESOLVE_NANOS.load(Ordering::Relaxed),
+            STAT_LINE_HEIGHT_CALLS.load(Ordering::Relaxed),
+        );
+    }
+}
 
 /// The pixels `font-size` buys for one point of synthetic bold weight.
 ///
@@ -746,10 +789,24 @@ const FALLBACK_FAMILIES: &[&str] = &[
 /// character and a run whose Latin and CJK characters live in different families
 /// is ordinary. Both halves of the pipeline re-resolve the character against
 /// this one walk, which is the mechanism that stops them disagreeing.
+#[derive(Clone, Copy, Debug)]
+struct CharMetrics {
+    advance: f32,
+    ascent: f32,
+    descent: f32,
+}
+
 struct ResolvedInstance {
     /// The families §5 walked, each narrowed to the face it chose and to the
     /// synthesis §2.8 permits for it.
     walk: FamilyWalk,
+    /// The face each character was resolved to, and its advance metrics at
+    /// each requested size. Layout asks for the same character's advance
+    /// dozens of times while measuring intrinsic widths, breaking lines, and
+    /// painting; without this cache every one of those asks re-walks the
+    /// family list under the backend's state lock.
+    characters: RwLock<CharacterFaces>,
+    metrics: RwLock<HashMap<(u32, u32), Option<CharMetrics>>>,
     /// The generation of the table this walk was made against.
     ///
     /// §5.2 requires the choice "must not differ between two elements in the same
@@ -1284,8 +1341,19 @@ impl SystemFontBackend {
 
     /// The §5 resolution of `request`, memoised.
     fn resolve(&self, request: &FontRequest<'_>) -> Arc<ResolvedInstance> {
+        let stats = font_stats_enabled();
+        let started = stats.then(std::time::Instant::now);
+        if stats {
+            STAT_RESOLVE_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
         let id = self.instance_id_for(request);
         if let Some(existing) = self.lookup(id) {
+            if let Some(started) = started {
+                STAT_RESOLVE_NANOS.fetch_add(
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
             return existing;
         }
         // Re-walk against the table as it is *now*, and mint the id from that
@@ -1297,6 +1365,8 @@ impl SystemFontBackend {
                 id,
                 Arc::new(ResolvedInstance {
                     walk: state.table.walk(request),
+                    characters: RwLock::new(HashMap::new()),
+                    metrics: RwLock::new(HashMap::new()),
                     generation: state.generation,
                     request: RequestSnapshot::of(request),
                 }),
@@ -1306,7 +1376,14 @@ impl SystemFontBackend {
             .instances
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        Arc::clone(instances.entry(id.0).or_insert(resolved))
+        let resolved = Arc::clone(instances.entry(id.0).or_insert(resolved));
+        if let Some(started) = started {
+            STAT_RESOLVE_NANOS.fetch_add(
+                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+        resolved
     }
 
     fn lookup(&self, id: FontInstanceId) -> Option<Arc<ResolvedInstance>> {
@@ -1347,7 +1424,99 @@ impl SystemFontBackend {
         face.font()
     }
 
+    /// The advance and line metrics of `character` at `font_size`, memoised on
+    /// the resolved instance.
+    ///
+    /// This is the measurement hot path: a single text node is measured once
+    /// per intrinsic pass, once while breaking lines, and once again while
+    /// painting, so the same character is asked for the same size many times.
+    /// The cache is keyed by the instance id's generation, so a face arriving
+    /// starts a fresh instance and cannot read a stale advance.
+    fn char_metrics(
+        &self,
+        instance: &ResolvedInstance,
+        character: char,
+        font_size: f32,
+    ) -> Option<CharMetrics> {
+        let key = (character as u32, font_size.to_bits());
+        if let Some(cached) = instance
+            .metrics
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .copied()
+        {
+            return cached;
+        }
+        let resolved = if let Some((font, _, _)) = self.face_for(instance, character) {
+            let (ascent, descent) = line_metrics(&font, font_size);
+            Some(CharMetrics {
+                advance: advance_of(&font, character, font_size),
+                ascent,
+                descent,
+            })
+        } else {
+            self.missing_glyph_face().map(|missing| {
+                let (ascent, descent) = line_metrics(&missing, font_size);
+                CharMetrics {
+                    advance: missing_advance(&missing, font_size),
+                    ascent,
+                    descent,
+                }
+            })
+        };
+        instance
+            .metrics
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, resolved);
+        resolved
+    }
+
     fn face_for(
+        &self,
+        instance: &ResolvedInstance,
+        character: char,
+    ) -> Option<(Arc<Font>, bool, f32)> {
+        let stats = font_stats_enabled();
+        let started = stats.then(std::time::Instant::now);
+        if stats {
+            STAT_FACE_FOR_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        let result = self.face_for_untracked(instance, character);
+        if let Some(started) = started {
+            STAT_FACE_FOR_NANOS.fetch_add(
+                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+        result
+    }
+
+    fn face_for_untracked(
+        &self,
+        instance: &ResolvedInstance,
+        character: char,
+    ) -> Option<(Arc<Font>, bool, f32)> {
+        if let Some(cached) = instance
+            .characters
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&character)
+            .cloned()
+        {
+            return cached;
+        }
+        let resolved = self.face_for_uncached(instance, character);
+        instance
+            .characters
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(character, resolved.clone());
+        resolved
+    }
+
+    fn face_for_uncached(
         &self,
         instance: &ResolvedInstance,
         character: char,
@@ -1482,6 +1651,9 @@ fn line_metrics(font: &Font, font_size: f32) -> (f32, f32) {
 
 impl TextMeasurer for SystemFontBackend {
     fn normal_line_height(&self, font_size: f32, font: &FontRequest<'_>) -> f32 {
+        if font_stats_enabled() {
+            STAT_LINE_HEIGHT_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
         let instance = self.resolve(font);
         // CSS 2.1 §10.8.1's "reasonable for the font": the same face that
         // spaces the line supplies ascent - descent + line gap. fontdue scales
@@ -1507,6 +1679,15 @@ impl TextMeasurer for SystemFontBackend {
     }
 
     fn measure(&self, text: &str, style: TextStyle<'_>) -> TextMeasure {
+        let stats = font_stats_enabled();
+        let started = stats.then(std::time::Instant::now);
+        if stats {
+            STAT_MEASURE_CALLS.fetch_add(1, Ordering::Relaxed);
+            STAT_MEASURE_CHARS.fetch_add(
+                u64::try_from(text.chars().count()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
         let instance = self.resolve(&style.font);
         let mut advance = 0.0_f32;
         let mut ascent = 0.0_f32;
@@ -1516,35 +1697,32 @@ impl TextMeasurer for SystemFontBackend {
         // example in the definition of font-relative lengths such as ex or in
         // the definition of the line-height property, is defined to be the first
         // font for which the character U+0020 (space) is not excluded".
-        let characters: Vec<char> = if text.is_empty() {
-            vec![' ']
-        } else {
-            text.chars().collect()
-        };
-        for character in characters {
-            // A character no face has is drawn as the missing-glyph box, with the
-            // advance of that box, which is what shaping uses too.
-            let (font, character_advance) =
-                if let Some((font, _, _)) = self.face_for(&instance, character) {
-                    let character_advance = advance_of(&font, character, style.font_size);
-                    (font, character_advance)
-                } else {
-                    let Some(missing) = self.missing_glyph_face() else {
-                        continue;
-                    };
-                    let character_advance = missing_advance(&missing, style.font_size);
-                    (missing, character_advance)
-                };
-            if !text.is_empty() {
-                advance += character_advance;
+        if text.is_empty() {
+            if let Some(metrics) = self.char_metrics(&instance, ' ', style.font_size) {
+                ascent = metrics.ascent;
+                descent = metrics.descent;
             }
-            let (face_ascent, face_descent) = line_metrics(&font, style.font_size);
-            ascent = ascent.max(face_ascent);
-            descent = descent.max(face_descent);
+        } else {
+            for character in text.chars() {
+                // A character no face has is drawn as the missing-glyph box, with
+                // the advance of that box, which is what shaping uses too.
+                let Some(metrics) = self.char_metrics(&instance, character, style.font_size) else {
+                    continue;
+                };
+                advance += metrics.advance;
+                ascent = ascent.max(metrics.ascent);
+                descent = descent.max(metrics.descent);
+            }
         }
         if ascent == 0.0 && descent == 0.0 {
             ascent = style.font_size * 0.8;
             descent = style.font_size * 0.2;
+        }
+        if let Some(started) = started {
+            STAT_MEASURE_NANOS.fetch_add(
+                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
         }
         TextMeasure {
             advance,
@@ -1567,6 +1745,15 @@ impl TextShaper for SystemFontBackend {
         origin: PhysicalPoint,
         color: Color,
     ) -> GlyphRun {
+        let stats = font_stats_enabled();
+        let started = stats.then(std::time::Instant::now);
+        if stats {
+            STAT_SHAPE_CALLS.fetch_add(1, Ordering::Relaxed);
+            STAT_SHAPE_CHARS.fetch_add(
+                u64::try_from(text.chars().count()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
         let instance = self.resolve(font);
         let mut x = origin.x;
         let mut glyphs = Vec::new();
@@ -1589,6 +1776,12 @@ impl TextShaper for SystemFontBackend {
                 advance,
             });
             x += advance;
+        }
+        if let Some(started) = started {
+            STAT_SHAPE_NANOS.fetch_add(
+                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
         }
         GlyphRun {
             // The run's id is minted from the table it was shaped against, so a

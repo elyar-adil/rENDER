@@ -191,6 +191,82 @@ impl ComplexSelector {
         keys.dedup();
     }
 
+    /// The id, class, type and attribute-name keys of every compound to the
+    /// left of the subject.
+    ///
+    /// Used as a cheap necessary condition for selectors whose subject is
+    /// universal: such a selector can only match an element that has an
+    /// ancestor carrying each of these keys. Sibling combinators are not
+    /// representable as an ancestor condition, so a selector that uses one
+    /// yields no keys and stays in the unkeyed bucket.
+    pub(crate) fn ancestor_keys(&self, keys: &mut Vec<SubjectKey>) {
+        if self.compounds.len() < 2
+            || self.combinators.iter().any(|combinator| {
+                matches!(
+                    combinator,
+                    Combinator::NextSibling | Combinator::SubsequentSibling
+                )
+            })
+        {
+            return;
+        }
+        for compound in &self.compounds[..self.compounds.len() - 1] {
+            if let Some(name) = compound
+                .type_selector
+                .as_ref()
+                .and_then(|selector| selector.name.as_ref())
+            {
+                keys.push(SubjectKey::Type(name.to_ascii_lowercase()));
+            }
+            for simple in &compound.simple {
+                match simple {
+                    SimpleSelector::Id(id) => keys.push(SubjectKey::Id(id.to_ascii_lowercase())),
+                    SimpleSelector::Class(class) => {
+                        keys.push(SubjectKey::Class(class.to_ascii_lowercase()));
+                    }
+                    SimpleSelector::Attribute(attribute) => {
+                        keys.push(SubjectKey::Attribute(attribute.name.to_ascii_lowercase()));
+                    }
+                    SimpleSelector::Pseudo(_) => {}
+                }
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+    }
+
+    /// Whether this selector is exactly the `:root` pseudo-class.
+    ///
+    /// A bare `:root` has no id, class, type or attribute key, so the cascade
+    /// index would otherwise test it against every element even though only the
+    /// tree root can match. On a large stylesheet with design-token `:root`
+    /// rules that is one wasted match per element per rule.
+    pub(crate) fn is_bare_root(&self) -> bool {
+        self.compounds.len() == 1
+            && self.compounds[0]
+                .type_selector
+                .as_ref()
+                .is_none_or(|selector| selector.name.is_none())
+            && self.compounds[0].pseudo_element.is_none()
+            && matches!(
+                self.compounds[0].simple.as_slice(),
+                [SimpleSelector::Pseudo(PseudoClass::Root)]
+            )
+    }
+
+    /// Whether this selector matches every element without inspecting it:
+    /// a single compound with a universal or absent type selector and no
+    /// simple selectors or pseudo-element.
+    pub(crate) fn is_unconditional_universal(&self) -> bool {
+        self.compounds.len() == 1
+            && self.compounds[0]
+                .type_selector
+                .as_ref()
+                .is_none_or(|selector| selector.name.is_none())
+            && self.compounds[0].simple.is_empty()
+            && self.compounds[0].pseudo_element.is_none()
+    }
+
     /// The pseudo-element the rightmost compound selects, if any.
     pub(crate) fn subject_pseudo(&self) -> SubjectPseudo<'_> {
         match self

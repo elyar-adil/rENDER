@@ -54,6 +54,7 @@ pub fn reference_backends() -> DocumentBackends<'static> {
         text_measurer: &SimpleTextMeasurer,
         text_shaper: &ReferenceTextShaper,
         glyph_masks: &NoGlyphMasks,
+        font_face_installer: None,
     }
 }
 

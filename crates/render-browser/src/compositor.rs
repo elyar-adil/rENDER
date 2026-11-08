@@ -44,6 +44,25 @@ pub trait PlatformPresenter: Send {
     /// or presented.
     fn present_full(&mut self, frame: &[u32], width: u32, height: u32) -> Result<(), String>;
 
+    /// Presents `frame`, updating only `damage` rectangles when the platform
+    /// can. A caller that has damage information should use this instead of
+    /// [`Self::present_full`]; the default implementation remains correct for a
+    /// presenter that can only replace the whole surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's failure text when the surface cannot be resized
+    /// or presented.
+    fn present_frame(
+        &mut self,
+        frame: &[u32],
+        width: u32,
+        height: u32,
+        _damage: &[(u32, u32, u32, u32)],
+    ) -> Result<(), String> {
+        self.present_full(frame, width, height)
+    }
+
     /// Composites one page surface at `origin` into the last full frame and
     /// presents the window without touching the chrome.
     ///

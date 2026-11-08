@@ -90,8 +90,8 @@ fn intrinsics_are_distinct_per_realm_and_a_call_runs_in_the_callee_realm() {
     let is_other = runtime
         .with_realm(other, |runtime| runtime.realm().global("isOther"))
         .expect("isOther is defined in the other realm");
-    runtime.realm.set_global("make".to_owned(), make);
-    runtime.realm.set_global("isOther".to_owned(), is_other);
+    runtime.realm.set_global("make", make);
+    runtime.realm.set_global("isOther", is_other);
 
     // The array is made by code of the other realm, so it has that realm's prototype.
     assert_eq!(

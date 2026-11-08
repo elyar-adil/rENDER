@@ -99,12 +99,19 @@ fn run() -> Result<(), String> {
     };
     let fixtures = load_fixtures(&options.fixture)?;
     let mut results = Vec::with_capacity(fixtures.len());
+    // Load the platform font table once, as the browser does. A fresh backend
+    // per iteration would re-read every face's character map and re-decode the
+    // faces text selects, which is start-up work rather than render time.
+    let fonts = Arc::new(
+        SystemFontBackend::load()
+            .expect("the system font backend loads for browser-accurate benchmarking"),
+    );
 
     for fixture in fixtures {
         for _ in 0..options.warmup_iterations {
-            let _ = run_fixture(&fixture, &options);
+            let _ = run_fixture(&fixture, &options, &fonts);
         }
-        results.push(run_fixture(&fixture, &options));
+        results.push(run_fixture(&fixture, &options, &fonts));
     }
 
     print_results(&options, &results);
@@ -259,7 +266,11 @@ main { display: block; width: 100%; padding-top: 12px; padding-bottom: 12px; }
     source
 }
 
-fn run_fixture(fixture: &Fixture, options: &Options) -> FixtureResult {
+fn run_fixture(
+    fixture: &Fixture,
+    options: &Options,
+    fonts: &Arc<SystemFontBackend>,
+) -> FixtureResult {
     let render_options = DocumentRenderOptions {
         layout: LayoutOptions {
             viewport: options.viewport,
@@ -288,10 +299,6 @@ fn run_fixture(fixture: &Fixture, options: &Options) -> FixtureResult {
         let document = Document::parse(&fixture.source);
         parse_micros.push(parse_started.elapsed().as_micros());
 
-        let fonts = Arc::new(
-            SystemFontBackend::load()
-                .expect("the system font backend loads for browser-accurate benchmarking"),
-        );
         let backends = DocumentBackends {
             text_measurer: fonts.as_ref(),
             text_shaper: fonts.as_ref(),

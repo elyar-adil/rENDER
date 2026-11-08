@@ -643,6 +643,14 @@ impl BrowserApp {
             // alone, so selecting text while scrolling must fall back to the
             // retained-raster path until the selection is cleared.
             && !page.has_page_selection();
+        // A compositor frame for this tab is still in flight. Keep at most one
+        // scroll composite outstanding: a wheel that arrives meanwhile only
+        // records that the newest offset still needs a frame. Submitting every
+        // event instead makes the queue lag seconds behind a fast scroll.
+        if can_composite && page.expected_compositor.is_some() {
+            page.compositor_dirty = true;
+            return;
+        }
         // A render for this tab is still running and its result stays
         // committable. Superseding it on every DOM mutation would starve
         // commits whenever mutations arrive faster than renders finish
@@ -693,6 +701,7 @@ impl BrowserApp {
             };
             let source_snapshot = Arc::from(page.navigation.committed().html.as_str());
             page.expected_compositor = Some(identity);
+            page.compositor_dirty = false;
             let worker = self
                 .compositor_worker
                 .as_ref()
@@ -811,10 +820,20 @@ impl BrowserApp {
                 {
                     eprintln!("render-browser scroll composite failed: {error}");
                 }
+                let mut resubmit = false;
                 if let Some(page) = self.pages.get_mut(&id)
                     && page.expected_compositor == Some(completed.identity)
                 {
                     page.expected_compositor = None;
+                    resubmit = page.compositor_dirty;
+                }
+                if resubmit && id == self.tabs.active_id() {
+                    let viewport = self.layout.as_ref().map(|layout| {
+                        css_content_viewport(self.frame_size, layout.chrome_height, layout.scale)
+                    });
+                    if let Some(viewport) = viewport {
+                        self.schedule_page_render(id, viewport, true);
+                    }
                 }
                 return;
             }
@@ -846,6 +865,8 @@ impl BrowserApp {
         );
         page.scroll
             .update_metrics(frame.content_height, frame.viewport_height);
+        let needs_resubmit = page.compositor_dirty
+            || page.scroll.offset_y().to_bits() != completed.identity.scroll_offset.y.to_bits();
         let render_time = frame.render_time;
         let present_time = frame.present_time;
         let active = id == self.tabs.active_id();
@@ -874,6 +895,14 @@ impl BrowserApp {
             }
         } else {
             self.repaint_chrome();
+        }
+        if needs_resubmit && active {
+            let viewport = self.layout.as_ref().map(|layout| {
+                css_content_viewport(self.frame_size, layout.chrome_height, layout.scale)
+            });
+            if let Some(viewport) = viewport {
+                self.schedule_page_render(id, viewport, true);
+            }
         }
     }
 
@@ -987,6 +1016,7 @@ impl BrowserApp {
             // The full frame owns the new layer tree. Any scroll job still
             // using the previous tree must not paint over it when it lands.
             page.expected_compositor = None;
+            page.compositor_dirty = false;
             if let Some(worker) = &self.compositor_worker {
                 worker.cancel_tab(id.as_u64());
             }
@@ -2000,8 +2030,12 @@ impl BrowserApp {
         if damage.is_empty() {
             return Ok(());
         }
+        let damaged: Vec<(u32, u32, u32, u32)> = damage
+            .iter()
+            .map(|rect| (rect.x, rect.y, rect.width.get(), rect.height.get()))
+            .collect();
         presenter
-            .present_full(&self.frame, width.get(), height.get())
+            .present_frame(&self.frame, width.get(), height.get(), &damaged)
             .map_err(io::Error::other)?;
         Ok(())
     }
@@ -5374,10 +5408,11 @@ impl BrowserApp {
     /// scrollbar thumb/track interactions.
     fn apply_scroll_delta(&mut self, delta_y: f32) -> bool {
         let id = self.tabs.active_id();
-        let changed = self
-            .pages
-            .get_mut(&id)
-            .is_some_and(|page| page.scroll.scroll_by(delta_y));
+        let (changed, applied) = self.pages.get_mut(&id).map_or((false, 0.0), |page| {
+            let before = page.scroll.offset_y();
+            let changed = page.scroll.scroll_by(delta_y);
+            (changed, page.scroll.offset_y() - before)
+        });
         if changed {
             if let Some(page) = self.pages.get_mut(&id) {
                 page.page.runtime_mut().install_viewport(
@@ -5392,6 +5427,13 @@ impl BrowserApp {
                     .page
                     .queue_dom_event(PageDomEvent::new(document, "scroll"));
             }
+            // Move the retained page surface by the same amount immediately.
+            // The correct frame is computed on a worker and replaces this
+            // approximation when it lands, but without the shift the window
+            // shows the old scroll position until that render completes, which
+            // is what made wheel scrolling on a scene without a retained
+            // compositor feel frozen. Grid-aligned to physical pixels.
+            let shifted = self.shift_page_surface_for_scroll(id, applied);
             let viewport = self.layout.as_ref().map(|layout| {
                 css_content_viewport(self.frame_size, layout.chrome_height, layout.scale)
             });
@@ -5412,9 +5454,44 @@ impl BrowserApp {
                     self.schedule_page_render(id, viewport, !hover_changed);
                 }
             }
+            if shifted && let Some(size) = self.window.as_ref().map(|window| window.inner_size()) {
+                self.mark_page_damage(size);
+            }
             self.repaint_chrome();
         }
         changed
+    }
+
+    /// Shifts the page surface by a CSS-pixel scroll delta.
+    ///
+    /// This is a presentation approximation for the window between a wheel
+    /// event and the next correct frame: the exposed strip is filled with the
+    /// page's background because the pixels it would contain have not been
+    /// rasterized yet. It deliberately does not touch the scroll state, the
+    /// retained scene or hit testing; the render worker owns those.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the shift is clamped to the page height before the integer conversion"
+    )]
+    fn shift_page_surface_for_scroll(&mut self, id: TabId, delta_y: f32) -> bool {
+        let scale = self.layout.as_ref().map_or(1.0, |layout| layout.scale);
+        let rows = (delta_y * scale).round();
+        if !rows.is_finite() || rows == 0.0 {
+            return false;
+        }
+        let Some(page) = self.pages.get_mut(&id) else {
+            return false;
+        };
+        let width = page.surface_size.width as usize;
+        let height = page.surface_size.height as usize;
+        if width == 0 || height == 0 || page.frame.len() != width.saturating_mul(height) {
+            return false;
+        }
+        let background = (u32::from(page.raster_background.red) << 16)
+            | (u32::from(page.raster_background.green) << 8)
+            | u32::from(page.raster_background.blue);
+        shift_frame_rows(&mut page.frame, width, height, rows as i64, background);
+        true
     }
 
     /// Whether a scroll frame for `id` can be composed from retained layers.
@@ -6353,6 +6430,41 @@ pub(super) fn primary_modifier_active(modifiers: ModifiersState) -> bool {
         HostPlatform::Other
     };
     primary_modifier_for(platform, modifiers.control_key(), modifiers.super_key())
+}
+
+/// Moves the rows of a `0x00RRGGBB` page surface by `rows`.
+///
+/// Positive rows move content up (the user scrolled down). The exposed strip is
+/// filled with `background`; the next correct frame replaces the approximation.
+/// The caller has already checked that the frame is exactly `width * height`.
+pub(super) fn shift_frame_rows(
+    frame: &mut [u32],
+    width: usize,
+    height: usize,
+    rows: i64,
+    background: u32,
+) {
+    debug_assert_eq!(frame.len(), width.saturating_mul(height));
+    if width == 0 || height == 0 || rows == 0 {
+        return;
+    }
+    let shift = usize::try_from(rows.unsigned_abs())
+        .unwrap_or(usize::MAX)
+        .min(height);
+    if rows > 0 {
+        // Content moves up: rows [shift..] become [0..height-shift], and the
+        // bottom strip is newly exposed.
+        if shift < height {
+            frame.copy_within(shift * width..width * height, 0);
+        }
+        frame[height.saturating_sub(shift) * width..].fill(background);
+    } else {
+        // Content moves down: rows [0..height-shift] become [shift..].
+        if shift < height {
+            frame.copy_within(0..width * (height - shift), shift * width);
+        }
+        frame[..shift * width].fill(background);
+    }
 }
 
 pub(super) fn wheel_document_delta_y(delta: MouseScrollDelta, scale: f32) -> f32 {

@@ -314,6 +314,7 @@ impl JsRuntime {
             target,
             handler: Some(handler),
         };
+        self.realm.note_proxy_created();
         Ok(proxy)
     }
 

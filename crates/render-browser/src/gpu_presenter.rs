@@ -280,6 +280,18 @@ impl GpuPresenter {
         width: u32,
         height: u32,
     ) -> Result<(), String> {
+        self.upload_region(origin_x, origin_y, width, height)?;
+        self.present_texture()
+    }
+
+    /// Converts and uploads one rectangle, without presenting.
+    fn upload_region(
+        &mut self,
+        origin_x: u32,
+        origin_y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
         if width == 0 || height == 0 {
             return Ok(());
         }
@@ -339,6 +351,11 @@ impl GpuPresenter {
                 depth_or_array_layers: 1,
             },
         );
+        Ok(())
+    }
+
+    /// Draws the uploaded texture and hands the swapchain image to the window.
+    fn present_texture(&mut self) -> Result<(), String> {
         let Some(frame) = self.acquire_frame()? else {
             // A minimized window may not hand out a drawable every frame.
             // Skipping is not a present failure: the next scroll frame
@@ -588,6 +605,96 @@ fn create_frame_texture(
 }
 
 impl PlatformPresenter for GpuPresenter {
+    fn present_frame(
+        &mut self,
+        frame: &[u32],
+        width: u32,
+        height: u32,
+        damage: &[(u32, u32, u32, u32)],
+    ) -> Result<(), String> {
+        let expected = frame_pixels(width, height)?;
+        if frame.len() != expected {
+            return Err(format!(
+                "the window frame has {} pixels but {width}x{height} needs {expected}",
+                frame.len()
+            ));
+        }
+        self.resize(width, height)?;
+        let row_bytes = rgba_row_bytes(width)?;
+        let expected_rgba = row_bytes
+            .checked_mul(
+                usize::try_from(height)
+                    .map_err(|_| "the GPU frame height does not fit in memory".to_owned())?,
+            )
+            .ok_or_else(|| "the GPU upload buffer overflows memory".to_owned())?;
+        // A size change, a missing full base, a full-frame damage list, or a
+        // large damaged fraction is cheaper through the one-shot full upload.
+        let damaged_area: u64 = damage
+            .iter()
+            .map(|(_, _, width, height)| u64::from(*width) * u64::from(*height))
+            .sum();
+        if damage.is_empty()
+            || self.base.len() != frame.len()
+            || self.rgba.len() != expected_rgba
+            || damaged_area.saturating_mul(4) >= u64::from(width) * u64::from(height) * 3
+        {
+            return self.present_full(frame, width, height);
+        }
+        for &(x, y, region_width, region_height) in damage {
+            let right = x.saturating_add(region_width).min(width);
+            let bottom = y.saturating_add(region_height).min(height);
+            if x >= right || y >= bottom {
+                continue;
+            }
+            let region_width = right - x;
+            let region_height = bottom - y;
+            for row in y..bottom {
+                let start = usize::try_from(row)
+                    .ok()
+                    .and_then(|row| row.checked_mul(usize::try_from(width).ok()?))
+                    .and_then(|row| row.checked_add(usize::try_from(x).ok()?))
+                    .ok_or_else(|| "the damaged rectangle overflows memory".to_owned())?;
+                let end = start
+                    .checked_add(usize::try_from(region_width).ok().ok_or_else(|| {
+                        "the damaged rectangle width does not fit in memory".to_owned()
+                    })?)
+                    .ok_or_else(|| "the damaged rectangle overflows memory".to_owned())?;
+                self.base
+                    .get_mut(start..end)
+                    .ok_or_else(|| "the damaged rectangle is outside the base frame".to_owned())?
+                    .copy_from_slice(&frame[start..end]);
+                let destination = usize::try_from(row)
+                    .ok()
+                    .and_then(|row| row.checked_mul(row_bytes))
+                    .and_then(|row| row.checked_add(usize::try_from(x).ok()?.checked_mul(4)?))
+                    .ok_or_else(|| {
+                        "the damaged rectangle overflows the upload buffer".to_owned()
+                    })?;
+                let bytes = usize::try_from(region_width)
+                    .ok()
+                    .and_then(|width| width.checked_mul(4))
+                    .ok_or_else(|| "the damaged rectangle width overflows".to_owned())?;
+                let destination_row = self
+                    .rgba
+                    .get_mut(destination..destination + bytes)
+                    .ok_or_else(|| {
+                        "the damaged rectangle is outside the upload buffer".to_owned()
+                    })?;
+                for (pixel, output) in frame[start..end]
+                    .iter()
+                    .zip(destination_row.chunks_exact_mut(4))
+                {
+                    output[0] = channel(*pixel, 16);
+                    output[1] = channel(*pixel, 8);
+                    output[2] = channel(*pixel, 0);
+                    output[3] = 0xff;
+                }
+            }
+            self.upload_region(x, y, region_width, region_height)?;
+        }
+        self.present_texture()
+    }
+
     fn present_full(&mut self, frame: &[u32], width: u32, height: u32) -> Result<(), String> {
         let expected = frame_pixels(width, height)?;
         if frame.len() != expected {

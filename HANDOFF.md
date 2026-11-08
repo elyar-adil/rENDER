@@ -1,3 +1,296 @@
+# 交接文档 (2026-11-08, 续二) — Bilibili 布局/合成器/JS 三线收敛
+
+本轮由 3 个并行 agent 分线推进：布局保真、retained compositor、JS 解释器；主线负责图片缓存、
+damage present、滚动 blit 与合成任务合并。所有站点行为仍走通用 CSS/DOM/布局路径。
+
+## Bilibili 布局：4 个通用缺陷
+
+Agent 用 SSR DOM + 真实 CSS 的离线快照与 Edge 几何对比，修复：
+
+1. **Grid `1fr` 在有确定容器时仍把 max-content 当轨道下限**
+   `repeat(4, 1fr)` 在 1060px 容器里排出 2360px。改为确定容器下 flexible track 以
+   minimum 为 base size（CSS Grid §12.5.1）。`render-layout/src/grid.rs`
+2. **flex item 上的百分比宽度按 viewport 解析**
+   `img { width:100% }` 在 250px 卡片里量成 1180px，且 `min-width:auto` 阻止收缩。
+   改为按 flex container 主轴尺寸解析。`solver/flex.rs`
+3. **百分比宽度 flex item 的 automatic minimum**
+   按 Flexbox §4.5 取 `min(specified size suggestion, content size suggestion)`，
+   百分比先对确定容器求 used value。`solver/flex.rs`
+4. **intrinsic width 忽略 `max-width`**
+   `max-width:500px` 的搜索框仍把未钳制内容宽度传给 `flex-grow:1` 头部项；
+   现在水平 intrinsic 同时应用 min/max（CSS Sizing §3.1）。`solver/flex.rs`
+
+1180×780 实测：
+
+| 节点 | 修复前 | 修复后 / Edge |
+| --- | ---: | ---: |
+| `.recommended-swipe` | x=60 w=2360 | **x=60 w=520 h=447.25** |
+| `.carousel` | w=2360 h=1409.25 | **w=520 h=374.25** |
+| 第一张 feed card | x=2440（屏外） | **x=600 w=250 h=213.625** |
+| 卡片封面图 | w=1180 | **w=250 h=140.625** |
+| 搜索框 | x=772 w=500 | **x=551 w=500**（Edge x=551） |
+
+截图：`.artifacts/bili_final.png`，Edge 参考 `.artifacts/bili_edge.png`。
+
+## Retained compositor：Bilibili 场景 6 层保留
+
+Agent 解决了此前“圆角 clip 内 stacking context / effect / 25960px 轮播轨道”整条拒绝链：
+
+- identity/translation-only 层的 Rect + RoundedRect 祖先 clip 延迟到 composite 阶段，
+  在 **transform 之后**按 destination 坐标裁剪（矩形/圆角内部走整行 blit，只有边界带
+  逐像素 coverage）；
+- clip 内 filter/mask 仅支持 identity/translation，filter 输入先按 clip 烘焙，
+  再按参考 pop 语义做 bounding clip；
+- translation-only 宽层按“能映射进 viewport/clip 的 source x 区间”裁剪，保留 1px
+  采样边距；
+- 修复了 negative document segment origin 被 band rasterizer 钳到 0 导致固定头部整体
+  上移 62px 的 bug；文档 segment 现在锚定在 x/y ≥ 0；
+- 半透明 root band 默认缓存后一次合成，与完整光栅允许 **≤1 通道舍入差**；
+  `RENDER_COMPOSITOR_EXACT_ALPHA=1` 恢复逐项绘制以实现逐像素一致（诊断/测试用）；
+- 新增 `CpuRasterizer::rasterize_item_slice_over`，按 display-list 顺序直接画到目标。
+
+离线快照（`.artifacts`/`%TEMP%\bili-static-inline.html`）在 DPR1/2、scroll 0/200/600
+全部 **mismatched_pixels=0**。16px 连续滚动（DPR1，release）：中位 **1.54ms** / p95
+10.3ms。live Bilibili 保留 21 层，16px 滚动中位 **17.5ms**；与完整光栅仍有约 3k 像素
+（0.3%）差异，最大通道差 69–87，集中在轮播/卡片边缘，视觉上不可见，但还不是逐像素一致。
+
+## JS 解释器
+
+Agent 在 `render-js` 做了无语义变化的优化：数字二元运算/比较快路径、调用目标的一次性
+binding 查找、环境表 FNV HashMap + Entry、属性 own-map 命中、原型链一次返回 descriptor、
+环境链 Vec 池化、共享捕获链、普通参数表不再建位置表、无 disposable 时跳过 using、成员写入
+复用 key。`runtime_bench`（debug，4 次中位）：
+
+| case | before | after | 变化 |
+| --- | ---: | ---: | ---: |
+| small_calls | 2.63M steps/s | 2.86M | **+8.8%** |
+| closure_calls | 1.35M | 1.39M | +3.0% |
+| large_body | 2.03M | 2.66M | **+31%** |
+| object_churn | 0.94M | 1.00M | +6.4% |
+
+`qq_bundle_probe`（2.27MB）在噪声内，说明该探针主要花在解析而不是执行。
+
+## 滚动管线补充
+
+- 合成任务合并：同一 tab 同时只有一个 compositor frame 在飞，wheel 只记
+  `compositor_dirty`，帧提交后按最新 offset 再提交，避免快速滚动时队列堆积。
+- 图片缩放缓存：Bilibili 第二帧 `image` 45.1ms → **10.2ms**，raster 64.7ms → **31.9ms**。
+- GPU/softbuffer present 只更新 damage 矩形，不再整窗转换/上传。
+- 脚本批次预算 500ms → 150ms，滚动/指针输入延迟上限降低。
+
+## 验证
+
+```text
+cargo test --workspace                         all targets ok, 0 failed
+cargo clippy --workspace --all-targets -D warnings  clean
+cargo fmt --all --check                        clean
+render-core lib                                576 passed, 1 ignored
+render-layout lib                              431 passed, 1 ignored
+render-css lib                                 339 passed
+render-js lib                                  1295 passed
+render-browser lib                             249 passed
+render-browser app                             141 passed
+site neutrality                                0 blocking
+```
+
+## 仍未完成
+
+- live Bilibili 的 compositor 与完整光栅还有约 3k 像素、最大 87 通道差；逐像素一致需要
+  band 内保留完整合成精度（例如 float/u16 预乘缓冲），当前优先保留 1.5–17ms 的滚动速度。
+- JS 解析、单脚本 turn 抢占、GC 仍是大头；本轮只优化了解释执行。
+- 增量 style/layout 仍未做：DOM mutation 还是整页重算。
+- `tests/real_site_tasks` 已补上 `DocumentBackends.font_face_installer` 字段，可重新编译。
+
+---
+
+# 交接文档 (2026-11-08, 续) — Bilibili 滚动：合成器回退诊断与即时滚动位移
+
+用户实测 Bilibili 滚动仍然卡。`render-perf` 和 headless 全量光栅数字改善后，问题在**滚动路径**，
+不在单帧渲染：Bilibili 的场景无法进入 retained compositor，每次 wheel 都要等一次全视口重绘上屏。
+
+## 诊断
+
+新增 `RENDER_DEBUG_COMPOSITOR=1`：headless 在每帧后尝试
+`CompositorCache::from_display_list`，打印保留层数或回退原因。Bilibili 依次卡在：
+
+1. 圆角 clip 内的非 effect stacking context（轮播卡片）；
+2. 放下这一条后，effect（filter/mask）在 clip 内；
+3. 再放下这一条后，一个 25,960px 宽的 translation 层（11 张 2360px 轮播轨道）。
+
+`compositor_refuse!` 宏把 `from_display_list` 的每个 `return None` 都变成带原因的 debug 输出。
+`can_composite_scroll` 因此为 false，滚动落到 `RetainedRaster`：每个 wheel 批次重跑
+style/layout/display/raster（1180×780/DPR1 约 20ms，带图约 65ms；DPR2 约 4 倍），
+期间窗口停在旧滚动位置，主观上就是“卡死”。
+
+## 已启用修复：即时滚动位移
+
+- `crates/render-browser/src/app.rs` 新增 `shift_page_surface_for_scroll` /
+  `shift_frame_rows`：`apply_scroll_delta` 在提交正确渲染之前，把当前 page surface 按
+  实际生效的滚动量（`scroll_by` 的 before/after 差值，已处理到底/到顶 clamp）整行
+  `copy_within`，暴露条填页面背景色。只改呈现缓冲区，不改 scroll 状态、场景、命中测试；
+  正确帧到达后整体替换。
+- `mark_page_damage` 保证搬移后的页面区域进入 present damage。
+- 轮播/固定头部在过渡帧会跟着位移，正确帧到达后归位；这是用少量过渡期失真换滚动即时响应。
+- `SCRIPT_BATCH_TIME_BUDGET` 500ms → **150ms**（`page_state.rs`），滚动/指针输入最多排在
+  150ms 的脚本批次之后，而不是 500ms；总加载时间略增，但交互延迟显著降低。单脚本 turn
+  仍不可抢占。
+
+## 已启用：图片缩放缓存
+
+`paint_image` 对每帧重复做同一张图的 bilinear 缩放。Bilibili 第二帧 `image` 条目
+45.1ms，其中绝大部分是缩放而不是解码。`render-core/src/paint/raster.rs` 新增
+`ScaledImageCache`：
+
+- key = `(image Arc 指针, source rect bits, 目标整数宽高)`；
+- 只缓存目标 origin/size 都是整像素的情况，采样网格与放置位置无关；
+- entry 持有 `Arc<DecodedImage>`，所以指针不会被新图片复用；
+- 按 FIFO 限制 48 项 / 800 万像素（含源图），单张目标超过 200 万像素不缓存；
+- 非整像素目标仍走原 bilinear 路径，语义不变。
+
+Bilibili 同机同视口 `RENDER_RASTER_PROFILE=1`：
+
+| 帧 | 修复前 raster | 修复后（缩放缓存） |
+| --- | ---: | ---: |
+| 首帧 | 20.4ms | **25.8ms**（冷缓存，含建表） |
+| 资源到达后 | 64.7ms（image 45.1ms） | **31.9ms（image 10.2ms）** |
+
+## 已启用：按 damage 呈现
+
+之前 `present()` 每次都用 `present_full`：整窗 `u32 → RGBA` 转换、整纹理上传、
+整 buffer 拷贝，完全忽略已经算好的 damage。现在：
+
+- `PlatformPresenter::present_frame(frame, width, height, damage)`，默认实现回退到 full；
+- `GpuPresenter` 按 damage 矩形更新 `base` 和 `rgba`，只 `write_texture` 这些区域，
+  最后只 present 一次；单个矩形覆盖 3/4 以上仍走 full；
+- `SoftbufferPresenter` 按 damage 更新 base 后一次 `write_base`，不再重复拷贝整帧；
+- `app::present()` 把 `FrameDamage::take_for_present` 的矩形传给 presenter。
+
+## 未启用：放宽合成器
+
+尝试过允许 document scope 的圆角 clip、clip 内 effect、translation-only 宽层裁剪。
+Bilibili 真实场景的合成结果与完整光栅对比有 3.4 万–25 万像素差异：祖先 clip 必须在
+transform **之后**裁剪，而当前 `composite_surface` 只接受一个 viewport 矩形；圆角/
+多边形 clip 需要给合成阶段增加形状裁剪或遮罩。该方向保留为下一步正确修复，当前先保证
+滚动不冻结，且不引入错误像素。
+
+## 验证
+
+```text
+cargo fmt --all --check                         clean
+cargo clippy --workspace --all-targets -D warnings  clean
+cargo test -p render-browser --bin render-browser    141 passed
+cargo test -p render-core --lib paint::compositor     18 passed
+```
+
+新增 `scrolling_shifts_the_retained_surface_and_fills_the_exposed_strip` 覆盖上下滚动、
+超出视口的滚动量和背景填充。
+
+---
+
+# 交接文档 (2026-11-08) — 渲染性能：字体缓存、样式共享与裁剪填充
+
+用户反馈 `--release` 下网页仍然很慢。本轮先用 `render-perf`、`RENDER_STAGE_TIMING`、
+`RENDER_DEBUG_CSS_INDEX`、`RENDER_RASTER_PROFILE` 定位，再按证据逐项修复；没有站点特判。
+
+## 主要修复
+
+**1. 字体后端：字符级缓存（最大单项收益）**
+
+布局每测一个字符都会调用 `TextMeasurer::measure`，而旧路径每次都要哈希字体请求、
+拿 `instances` 读锁、遍历 family walk、再取一次字体表锁；同一字符在 intrinsic sizing、
+换行、行填充三个阶段被重复测量。`ResolvedInstance` 现在缓存：
+
+- `characters`：字符 → 选中 face + synthetic bold/shear；
+- `metrics`：字符 + font-size → advance/ascent/descent。
+
+generation 仍参与 instance id，字体到达会换 instance，旧缓存不可达。`measure` 也去掉了
+每个 run 的 `Vec<char>` 分配。`render-perf` 改为像浏览器一样只加载一次字体表；旧基准
+每个 iteration 都重读 24 个 face 的 cmap 并重新解码 Segoe UI/Arial，测到的主要是启动成本。
+
+**2. 布局：每个 layout pass 的字符 advance 缓存**
+
+`Solver` 增加 `InlineAdvanceKey`（family 指针+长度、weight、style、synthesis、size、字符）。
+family 字符串由 `styles` 在整轮布局中借用，地址在该 pass 内稳定，因此不需要复制字符串。
+generated fixture 的 `measure` 调用从 233k 次/轮降到 26k 次/轮（9 倍）。
+
+**3. 计算样式：共享继承值 + 声明缓存**
+
+- `ComputedStyle` 的 `properties`/`typed_properties` 值改为 `Arc<ComputedValue>` /
+  `Arc<TypedPropertyValue>`，继承不再深拷贝 TokenStream 和 typed 值。
+- 新增共享继承表：没有声明继承属性的元素直接 `Arc` 复用父级表，不再为每个元素插入
+  22 个继承属性；声明的继承属性只覆盖自己那一层。
+- `DeclarationCache` 以 `(property, value)` 为键缓存 tokenize + typed 解析结果；同一
+  class 的 20 条 longhand 在 1000 个卡片上只解析一次。带 `var()` 的值不进缓存。
+- 没有 `var()` 的 shorthand 不再克隆整个 `CascadedStyle`。
+- 继承得到的 `font-size` 已是绝对 px，不再每个元素重新 `format!` + tokenize。
+
+**4. 选择器索引：更窄的候选集**
+
+- 裸 `:root` 单独入 bucket，只有根元素是候选（设计 token 页面收益明显）。
+- 单选择器、无 scope 的 `*` 规则标记为无条件命中，跳过匹配。
+- subject 为通配符、但祖先 compound 带 id/class/type/attribute 的规则（例如
+  `.a .b > *`、`*:focus`）先要求所有祖先键都出现在祖先链上，否则不进入候选。
+  Wikipedia 的 selector match 调用从 110,563 降到 94,316，匹配时间 35ms。
+
+**5. 光栅化：矩形 + 圆角裁剪的整行填充**
+
+Bilibili 轮播把 `Rect(viewport) + RoundedRect(carousel) + RoundedRect(slide)` 叠成
+2–5 个 shape 的 clip。旧路径只在“全部是矩形”时才走整行填充，多 shape clip 对每个像素做
+16 点采样，整屏背景 4–5ms/条。现在：
+
+- 矩形 + 任意数量圆角矩形的交集，按每个圆角的最大半径内缩后的区域仍为全覆盖，走
+  `row.fill(color)`；
+- 只有圆角/矩形边缘的 cell 走采样；
+- fast 区域与采样区域做边界归一化，禁止重叠导致半透明色被混合两次。
+
+Bilibili 同机同视口（1180×780，`RENDER_RASTER_PROFILE=1`）：
+
+| 帧 | 修复前 raster | 修复后 |
+| --- | ---: | ---: |
+| 首帧 | 328.7ms（solid 318.2ms） | **20.4ms（solid 9.4ms）** |
+| 资源到达后 | 594.7ms（solid 454.3ms） | **64.7ms（solid 9.7ms，image 45.1ms）** |
+
+## `render-perf` 结果（i5-12600KF，P-core 绑定，release，9 次中位数）
+
+| fixture | first_render 前 → 后 | first_visible 前 → 后 | scroll 前 → 后 | layout 前 → 后 | style 前 → 后 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| generated | 187.4 → **130.7ms** | 216.4 → **137.5ms** | 13.0 → **13.9ms** | 78.5 → **34.3ms** | 68.1 → **46.3ms** |
+| index | 31.1 → **3.5ms** | 54.4 → **3.6ms** | 1.43 → **1.52ms** | 27.5 → **0.42ms** | 1.17 → **0.78ms** |
+| hn | 153.5 → **25.5ms** | 189.2 → **27.1ms** | 7.61 → **3.78ms** | 110.3 → **9.0ms** | 24.4 → **5.2ms** |
+| portal | 699.6 → **73.0ms** | 745.0 → **78.0ms** | 7.16 → **7.04ms** | 543.9 → **7.5ms** | 107.4 → **35.6ms** |
+
+“前”是同一台机器、同一 fixture 在改动前的测量；旧基准每轮重载字体表，因此
+`first_visible` 的启动成本也计入了差值。`generated` 的 768 张卡片仍以样式计算和
+光栅为主，滚动已接近 60fps 预算。
+
+## 验证
+
+```text
+cargo fmt --all --check                                      clean
+cargo clippy --workspace --all-targets -- -D warnings        clean
+cargo test --workspace                                       all targets ok, 0 failed
+python tools/check_site_neutrality.py                        0 blocking, 32 advisory (324 files)
+render-perf --fixture all --iterations 9 --warmup 3          table above
+```
+
+两个 HEAD 上就存在的测试问题一并修了：
+
+- `close_and_toolbar_controls_react_to_hover_and_press` 采样关闭按钮左上 3px，而 hover
+  背景是内切圆，样点落在圆外；改为圆内、避开 X 图标的 1/4 高度处。
+- `tabs_have_independent_latest_identities` 假定一次 `drain_latest` 就能拿到 tab 的最新帧，
+  但中间帧按设计可以先提交；改为持续 drain 直到每个 tab 的最终 payload 出现。
+
+## 仍慢的部分
+
+- Bilibili headless 的 `service_page_fetches` 单次可达 10.8s（代理/接口同步等待）；
+  这是 headless 的同步 fetch 路径，GUI 已走异步 `pending_fetches`。脚本执行 1.2s、
+  解析 0.23s 仍在事件循环线程上，单个大 bundle turn 不可抢占。
+- Bilibili 第二帧 `image` 光栅 45ms（45 张图逐像素 bilinear 缩放），可做缩放结果缓存。
+- DOM mutation 仍触发整页重算样式/布局，没有增量 invalidation；本轮只降低了单次全量成本。
+- `generated` 的 display 22–30ms 仍有优化空间（文本 run 构造与字形排布）。
+
+---
+
 # 交接文档 (2026-11-03, 续十一) — headless 脚本导航与最终资源补齐
 
 headless 之前只渲染首个文档。Google 的 enable-JavaScript 过渡页要等 meta refresh + 定时器才揭示结果，真实站点也常用 `location` 赋值或表单提交换页；停在首文档会截到过渡页。

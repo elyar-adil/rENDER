@@ -5,12 +5,13 @@
     clippy::cast_sign_loss
 )]
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::css::properties::BorderStyle;
-use crate::image::ImageResources;
+use crate::image::{DecodedImage, ImageResources};
 use crate::layout::{PhysicalPoint, PhysicalRect, PhysicalSize, StickyConstraint};
 
 use super::color::{Color, clamped_rounded_u8};
@@ -23,6 +24,137 @@ use super::display_list::{
 };
 use super::scene::{PaintDamage, PaintScene, RetainedFrame};
 use super::sticky::sticky_displacement;
+
+/// A scaled copy of one decoded image at one destination size.
+///
+/// A photo-heavy page asks the rasterizer to rescale the same image on every
+/// frame and every scroll step. The complete raster's cost was dominated by
+/// that repeated bilinear work. The cached surface is only used when the
+/// destination origin and size are whole pixels, so its sampling grid is the
+/// same wherever the image is placed.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ScaledImageKey {
+    image: usize,
+    source: (u32, u32, u32, u32),
+    width: u32,
+    height: u32,
+}
+
+struct ScaledImageEntry {
+    /// Keeps the image alive, so the raw pointer in the key cannot be reused by
+    /// a different image while this entry exists.
+    _image: Arc<DecodedImage>,
+    surface: Arc<Surface>,
+    pixels: usize,
+}
+
+#[derive(Default)]
+struct ScaledImageCache {
+    entries: HashMap<ScaledImageKey, ScaledImageEntry>,
+    order: Vec<ScaledImageKey>,
+    pixels: usize,
+}
+
+const MAX_SCALED_IMAGE_ENTRIES: usize = 48;
+const MAX_SCALED_IMAGE_PIXELS: usize = 8 * 1024 * 1024;
+/// One cached image beyond this size is not worth retaining.
+const MAX_SCALED_IMAGE_SURFACE_PIXELS: usize = 2 * 1024 * 1024;
+
+static SCALED_IMAGE_CACHE: OnceLock<Mutex<ScaledImageCache>> = OnceLock::new();
+
+fn scaled_image_surface(
+    image: &Arc<DecodedImage>,
+    source: PhysicalRect,
+    width: u32,
+    height: u32,
+) -> Option<Arc<Surface>> {
+    if width == 0
+        || height == 0
+        || !source.origin.x.is_finite()
+        || !source.origin.y.is_finite()
+        || !source.size.width.is_finite()
+        || !source.size.height.is_finite()
+        || source.size.width <= 0.0
+        || source.size.height <= 0.0
+    {
+        return None;
+    }
+    let pixels = usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?;
+    if pixels == 0 || pixels > MAX_SCALED_IMAGE_SURFACE_PIXELS {
+        return None;
+    }
+    let image_pixels = usize::try_from(image.width())
+        .ok()?
+        .checked_mul(usize::try_from(image.height()).ok()?)?;
+    // A cache entry retains the decoded image as well as the scaled surface.
+    // Keeping one very large source would cost more than it saves.
+    if image_pixels > MAX_SCALED_IMAGE_SURFACE_PIXELS {
+        return None;
+    }
+    let retained_pixels = pixels.saturating_add(image_pixels);
+    let key = ScaledImageKey {
+        image: Arc::as_ptr(image) as usize,
+        source: (
+            source.origin.x.to_bits(),
+            source.origin.y.to_bits(),
+            source.size.width.to_bits(),
+            source.size.height.to_bits(),
+        ),
+        width,
+        height,
+    };
+    let cache = SCALED_IMAGE_CACHE.get_or_init(|| Mutex::new(ScaledImageCache::default()));
+    if let Some(entry) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entries
+        .get(&key)
+    {
+        return Some(Arc::clone(&entry.surface));
+    }
+    let mut surface = Surface::new(width, height, Color::TRANSPARENT);
+    for y in 0..height {
+        for x in 0..width {
+            let unit_x = (u32_to_f32(x) + 0.5) / u32_to_f32(width);
+            let unit_y = (u32_to_f32(y) + 0.5) / u32_to_f32(height);
+            let source_x = source.origin.x + unit_x * source.size.width - 0.5;
+            let source_y = source.origin.y + unit_y * source.size.height - 0.5;
+            if let Some(color) = sample_image_bilinear(image.as_ref(), source_x, source_y, source)
+                && let Some(index) = surface.index(x, y)
+            {
+                surface.pixels[index] = color;
+            }
+        }
+    }
+    let surface = Arc::new(surface);
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while cache.entries.len() >= MAX_SCALED_IMAGE_ENTRIES
+        || cache.pixels.saturating_add(retained_pixels) > MAX_SCALED_IMAGE_PIXELS
+    {
+        let Some(evicted) = cache.order.first().copied() else {
+            break;
+        };
+        cache.order.remove(0);
+        if let Some(entry) = cache.entries.remove(&evicted) {
+            cache.pixels = cache.pixels.saturating_sub(entry.pixels);
+        }
+    }
+    cache.order.push(key);
+    cache.pixels = cache.pixels.saturating_add(retained_pixels);
+    cache.entries.insert(
+        key,
+        ScaledImageEntry {
+            _image: Arc::clone(image),
+            surface: Arc::clone(&surface),
+            pixels: retained_pixels,
+        },
+    );
+    Some(surface)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Surface {
@@ -547,6 +679,59 @@ impl CpuRasterizer {
         state.finish()
     }
 
+    /// Rasterizes a display-list slice directly over an existing destination.
+    ///
+    /// The retained compositor normally caches a band on a transparent surface
+    /// and composites it later. That rounds partially transparent pixels twice
+    /// and can differ by one channel from painting the items in order over the
+    /// real destination. When a band contains such pixels, the compositor calls
+    /// this entry point instead: the items paint source-over on the destination
+    /// exactly like the complete raster.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the direct band path carries the same slice, clips and providers as the cached band path"
+    )]
+    pub fn rasterize_item_slice_over(
+        &self,
+        destination: &mut Surface,
+        items: &[DisplayItem],
+        glyphs: &dyn GlyphMaskProvider,
+        viewport_origin: PhysicalPoint,
+        images: Option<&ImageResources>,
+        inherited_clips: &[(ClipShape, PaintCoordinateSpace)],
+        destination_clip: Option<(ClipShape, PaintCoordinateSpace)>,
+        control: Option<&dyn RasterControl>,
+    ) -> Vec<RasterDiagnostic> {
+        let width = u32_to_f32(destination.width());
+        let height = u32_to_f32(destination.height());
+        let surface = std::mem::replace(destination, Surface::new(0, 0, Color::TRANSPARENT));
+        let mut state = RasterState::from_surface(
+            surface,
+            viewport_origin,
+            PhysicalRect::new(0.0, 0.0, width, height),
+            images,
+            control,
+        );
+        // The destination band is an outer restriction of the output surface;
+        // every inherited clip was opened inside it, so it goes on the clip
+        // stack first. Otherwise the slice's own `PopClip` would pop the band
+        // instead of the inherited clip it belongs to.
+        if let Some((shape, space)) = destination_clip {
+            let offset = state.item_offset(space);
+            state.push_clip(shape, offset);
+        }
+        for (shape, space) in inherited_clips {
+            let offset = state.item_offset(*space);
+            state.push_clip(*shape, offset);
+        }
+        for item in items {
+            state.process_item(item, glyphs, images);
+        }
+        let output = state.output();
+        *destination = output.surface;
+        output.diagnostics
+    }
+
     /// Rasterizes an immutable paint scene with cooperative cancellation.
     ///
     /// The method chooses the retained damage path only when both scene and
@@ -924,12 +1109,12 @@ impl<'a> RasterState<'a> {
                 self.paint_list_marker(marker, offset);
             }
             DisplayCommand::Image(image) => {
-                if let Some(decoded) = images.and_then(|images| images.get(image.resource)) {
+                if let Some(decoded) = images.and_then(|images| images.get_shared(image.resource)) {
                     let clip = self.current_clip();
                     let control = self.control;
                     if !paint_image(
                         self.current_surface(),
-                        decoded,
+                        &decoded,
                         translate_rect(image.destination, offset),
                         image.source,
                         clip.as_ref(),
@@ -2025,7 +2210,7 @@ fn normalize_radii(mut radii: CornerRadii, rect: PhysicalRect) -> CornerRadii {
     radii
 }
 
-fn clip_shape_bounds(shape: ClipShape) -> PhysicalRect {
+pub(crate) fn clip_shape_bounds(shape: ClipShape) -> PhysicalRect {
     match shape {
         ClipShape::Rect(rect) | ClipShape::RoundedRect { rect, .. } => rect,
         ClipShape::Circle { center, radius } => PhysicalRect::new(
@@ -2064,7 +2249,7 @@ fn clip_shape_bounds(shape: ClipShape) -> PhysicalRect {
     }
 }
 
-fn translate_clip_shape(shape: ClipShape, offset: PhysicalPoint) -> ClipShape {
+pub(crate) fn translate_clip_shape(shape: ClipShape, offset: PhysicalPoint) -> ClipShape {
     match shape {
         ClipShape::Rect(rect) => ClipShape::Rect(translate_rect(rect, offset)),
         ClipShape::RoundedRect { rect, radii } => ClipShape::RoundedRect {
@@ -2216,6 +2401,79 @@ impl RectCellClip {
             && cell_y < self.bottom;
         if inside { 1.0 } else { 0.0 }
     }
+
+    /// Whether the pixel cell is wholly inside, wholly outside, or straddling
+    /// the rectangle. A mixed clip can answer interior and exterior cells
+    /// without sampling.
+    fn relation(self, x: u32, y: u32) -> CellRelation {
+        let left = u32_to_f32(x);
+        let top = u32_to_f32(y);
+        let right = left + 1.0;
+        let bottom = top + 1.0;
+        if right <= self.left || left >= self.right || bottom <= self.top || top >= self.bottom {
+            CellRelation::Outside
+        } else if left >= self.left
+            && right <= self.right
+            && top >= self.top
+            && bottom <= self.bottom
+        {
+            CellRelation::Inside
+        } else {
+            CellRelation::Partial
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CellRelation {
+    Inside,
+    Outside,
+    Partial,
+}
+
+/// Reduce a clip made of axis-aligned rectangles and at most one rounded
+/// rectangle.
+///
+/// A card or a carousel commonly intersects the viewport rectangle with one
+/// rounded container, which produced two shapes and forced every pixel of a
+/// full-viewport background through the sixteen-sample path. The reduction
+/// lets the interior of that clip answer from the rounded rectangle's own
+/// branch and the edges alone fall back to sampling.
+fn clip_shapes_are_rects_or_rounded(clip: &ClipRegion) -> bool {
+    clip.shapes[..clip.shape_count]
+        .iter()
+        .all(|shape| matches!(shape, ClipShape::Rect(_) | ClipShape::RoundedRect { .. }))
+}
+
+fn mixed_clip_reduction(
+    clip: &ClipRegion,
+) -> Option<(RectCellClip, Option<(PhysicalRect, CornerRadii)>)> {
+    let shapes = &clip.shapes[..clip.shape_count];
+    let mut bounds = RectCellClip {
+        left: f32::MIN,
+        top: f32::MIN,
+        right: f32::MAX,
+        bottom: f32::MAX,
+    };
+    let mut rounded = None;
+    for shape in shapes {
+        match shape {
+            ClipShape::Rect(rect) => {
+                bounds.left = bounds.left.max(rect.origin.x);
+                bounds.right = bounds.right.min(rect.right());
+                bounds.top = bounds.top.max(rect.origin.y);
+                bounds.bottom = bounds.bottom.min(rect.bottom());
+            }
+            ClipShape::RoundedRect { rect, radii } => {
+                if rounded.is_some() {
+                    return None;
+                }
+                rounded = Some((*rect, *radii));
+            }
+            _ => return None,
+        }
+    }
+    Some((bounds, rounded))
 }
 
 /// The pixel cell the centre sample `index + 0.5` floors into, as a float.
@@ -2237,6 +2495,19 @@ fn pixel_coverage(clip: Option<&ClipRegion>, rect: Option<RectCellClip>, x: u32,
         (None, _) => 1.0,
         (Some(_), Some(rect)) => rect.coverage(x, y),
         (Some(clip), None) => {
+            // An axis-aligned rectangle intersected with one rounded box is the
+            // common clip for a card or a carousel slide inside the viewport.
+            // Cells wholly inside the rectangles take the rounded rectangle's
+            // own reduction; only its edge band is sampled.
+            if let Some((bounds, Some((rounded, radii)))) = mixed_clip_reduction(clip) {
+                match bounds.relation(x, y) {
+                    CellRelation::Outside => return 0.0,
+                    CellRelation::Inside => {
+                        return rounded_rect_cell_coverage(rounded, radii, x, y);
+                    }
+                    CellRelation::Partial => {}
+                }
+            }
             // A single rounded rectangle is the common clip for a card or an
             // image with a border radius. Its 16 samples factor into two axis
             // tests away from the corner arcs, and the exact rounded helper
@@ -3081,27 +3352,19 @@ fn fill_rect(
     let Some(rect) = intersection(Some(rect), clip.map_or(rect, |c| c.rect)) else {
         return true;
     };
-    let left = floor_to_u32(rect.origin.x);
-    let top = floor_to_u32(rect.origin.y);
-    let right = ceil_to_u32(rect.right().min(u32_to_f32(surface.width)));
-    let bottom = ceil_to_u32(rect.bottom().min(u32_to_f32(surface.height)));
     let rect_clip = clip.and_then(RectCellClip::of);
-    // An axis-aligned clip answers coverage exactly 0 or 1 per pixel cell. The
-    // interior therefore needs no per-pixel coverage test at all: paint those
-    // rows as slices and leave only the clip's fractional edge cells to the
-    // sampled path. Large backgrounds are the common case, and this is the
-    // difference between a bounds check per pixel and a row copy.
-    let (fast_left, fast_right, fast_top, fast_bottom) = match (clip, rect_clip) {
-        (None, _) => (left, right, top, bottom),
-        // A rounded clip needs its coverage samples everywhere.
-        (Some(_), None) => (left, left, top, top),
-        (Some(_), Some(rect_clip)) => (
-            left.max(ceil_to_u32(rect_clip.left)),
-            right.min(ceil_to_u32(rect_clip.right)),
-            top.max(ceil_to_u32(rect_clip.top)),
-            bottom.min(ceil_to_u32(rect_clip.bottom)),
-        ),
-    };
+    let mut left = floor_to_u32(rect.origin.x);
+    let mut top = floor_to_u32(rect.origin.y);
+    let mut right = ceil_to_u32(rect.right().min(u32_to_f32(surface.width)));
+    let mut bottom = ceil_to_u32(rect.bottom().min(u32_to_f32(surface.height)));
+    if let Some(rect_clip) = rect_clip {
+        left = left.max(floor_to_u32(rect_clip.left));
+        top = top.max(floor_to_u32(rect_clip.top));
+        right = right.min(ceil_to_u32(rect_clip.right));
+        bottom = bottom.min(ceil_to_u32(rect_clip.bottom));
+    }
+    let (fast_left, fast_right, fast_top, fast_bottom) =
+        full_coverage_interior(clip, rect_clip, (left, right, top, bottom));
     let width = usize::try_from(surface.width).unwrap_or(usize::MAX);
     for y in fast_top..fast_bottom {
         if control.is_some_and(RasterControl::is_cancelled) {
@@ -3156,6 +3419,74 @@ fn fill_rect(
         }
     }
     true
+}
+
+/// The pixel-aligned rectangle every cell of which is fully covered by `clip`.
+///
+/// A rectangle clip answers coverage 0 or 1 per cell, and a clip made of
+/// rectangles plus rounded rectangles keeps that property inside every rounded
+/// corner's inset. Painting that interior as row slices is the difference
+/// between a bounds check per pixel and a memory fill. Any other shape leaves
+/// the interior empty, so the sampled edge path owns the whole paint rectangle.
+fn full_coverage_interior(
+    clip: Option<&ClipRegion>,
+    rect_clip: Option<RectCellClip>,
+    bounds: (u32, u32, u32, u32),
+) -> (u32, u32, u32, u32) {
+    let (left, right, top, bottom) = bounds;
+    let Some(clip) = clip else {
+        return bounds;
+    };
+    if rect_clip.is_some() {
+        // The caller narrowed the sampled bounds to the clip; every cell in them
+        // is fully covered.
+        return bounds;
+    }
+    if !clip_shapes_are_rects_or_rounded(clip) {
+        return (left, left, top, top);
+    }
+    let mut fast = bounds;
+    for shape in &clip.shapes[..clip.shape_count] {
+        match shape {
+            ClipShape::Rect(shape_rect) => {
+                fast.0 = fast.0.max(floor_to_u32(shape_rect.origin.x));
+                fast.1 = fast.1.min(ceil_to_u32(shape_rect.right()));
+                fast.2 = fast.2.max(floor_to_u32(shape_rect.origin.y));
+                fast.3 = fast.3.min(ceil_to_u32(shape_rect.bottom()));
+            }
+            ClipShape::RoundedRect {
+                rect: shape_rect,
+                radii,
+            } => {
+                let radius = max_corner_radius(*radii);
+                fast.0 = fast.0.max(floor_to_u32(shape_rect.origin.x));
+                fast.1 = fast.1.min(ceil_to_u32(shape_rect.right()));
+                fast.2 = fast.2.max(floor_to_u32(shape_rect.origin.y));
+                fast.3 = fast.3.min(ceil_to_u32(shape_rect.bottom()));
+                if radius > 0.0 {
+                    fast.0 = fast.0.max(ceil_to_u32(shape_rect.origin.x + radius));
+                    fast.1 = fast.1.min(ceil_to_u32(shape_rect.right() - radius));
+                    fast.2 = fast.2.max(ceil_to_u32(shape_rect.origin.y + radius));
+                    fast.3 = fast.3.min(ceil_to_u32(shape_rect.bottom() - radius));
+                }
+            }
+            _ => return (left, left, top, top),
+        }
+    }
+    // An inverted or out-of-range inset means there is no full-coverage
+    // interior. Keeping the fast region empty rather than clipped also prevents
+    // the two sampled edge ranges from overlapping and painting a pixel twice.
+    let (fast_left, fast_right) = if fast.0 < fast.1 {
+        (fast.0.min(right), fast.1.min(right))
+    } else {
+        (left, left)
+    };
+    let (fast_top, fast_bottom) = if fast.2 < fast.3 {
+        (fast.2.min(bottom), fast.3.min(bottom))
+    } else {
+        (top, top)
+    };
+    (fast_left, fast_right, fast_top, fast_bottom)
 }
 
 fn paint_linear_gradient(
@@ -3585,9 +3916,15 @@ fn paint_glyph(
     true
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::float_cmp,
+    reason = "the cached path is entered only for finite, positive, whole-pixel destinations"
+)]
 fn paint_image(
     surface: &mut Surface,
-    image: &crate::image::DecodedImage,
+    image: &Arc<DecodedImage>,
     destination: PhysicalRect,
     source: PhysicalRect,
     clip: Option<&ClipRegion>,
@@ -3609,6 +3946,48 @@ fn paint_image(
     let right = ceil_to_u32(visible.right().min(u32_to_f32(surface.width)));
     let bottom = ceil_to_u32(visible.bottom().min(u32_to_f32(surface.height)));
     let rect_clip = clip.and_then(RectCellClip::of);
+    let whole_pixels = destination.origin.x.fract() == 0.0
+        && destination.origin.y.fract() == 0.0
+        && destination.size.width.fract() == 0.0
+        && destination.size.height.fract() == 0.0;
+    if whole_pixels {
+        let width = destination.size.width as u32;
+        let height = destination.size.height as u32;
+        if let Some(cached) = scaled_image_surface(image, source, width, height) {
+            let origin_x = destination.origin.x as i64;
+            let origin_y = destination.origin.y as i64;
+            for y in top..bottom {
+                if control.is_some_and(RasterControl::is_cancelled) {
+                    return false;
+                }
+                let Some(source_y) = i64::from(y).checked_sub(origin_y) else {
+                    continue;
+                };
+                if source_y < 0 || source_y >= i64::from(height) {
+                    continue;
+                }
+                for x in left..right {
+                    let coverage = pixel_coverage(clip, rect_clip, x, y);
+                    if coverage <= 0.0 {
+                        continue;
+                    }
+                    let Some(source_x) = i64::from(x).checked_sub(origin_x) else {
+                        continue;
+                    };
+                    if source_x < 0 || source_x >= i64::from(width) {
+                        continue;
+                    }
+                    if let (Some(color), Some(index)) = (
+                        cached.pixel(source_x as u32, source_y as u32),
+                        surface.index(x, y),
+                    ) {
+                        surface.pixels[index] = blend(surface.pixels[index], color, coverage);
+                    }
+                }
+            }
+            return true;
+        }
+    }
     for y in top..bottom {
         if control.is_some_and(RasterControl::is_cancelled) {
             return false;
@@ -3625,7 +4004,7 @@ fn paint_image(
             let source_x = source.origin.x + unit_x * source.size.width - 0.5;
             let source_y = source.origin.y + unit_y * source.size.height - 0.5;
             if let (Some(color), Some(index)) = (
-                sample_image_bilinear(image, source_x, source_y, source),
+                sample_image_bilinear(image.as_ref(), source_x, source_y, source),
                 surface.index(x, y),
             ) {
                 surface.pixels[index] = blend(surface.pixels[index], color, coverage);
@@ -4254,6 +4633,351 @@ pub fn composite_surface_with_source_clip(
         source_offset,
         control,
     )
+}
+
+/// Composites one cached surface through `transform` and a destination-space
+/// clip made of rectangles and rounded rectangles.
+///
+/// The retained compositor rasterizes an identity or translation-only layer
+/// without its inherited clips, because the reference rasterizer folds the
+/// translation into the paint offset and applies an ancestor clip *after* that
+/// translation. The clip therefore has to run here, in destination pixels,
+/// against the finished layer.
+///
+/// A rectangle-only clip reuses the exact integer-cell blit. A rounded clip
+/// paints its fully covered interior with the same blit and samples only the
+/// boundary band with the reference rasterizer's own 16-sample coverage.
+/// Shapes other than [`ClipShape::Rect`] and [`ClipShape::RoundedRect`] are not
+/// representable here; the caller keeps the complete-raster fallback for them.
+pub fn composite_surface_with_clip_shapes(
+    destination: &mut Surface,
+    source: &Surface,
+    transform: Transform2D,
+    opacity: f32,
+    shapes: &[ClipShape],
+    control: Option<&dyn RasterControl>,
+) -> bool {
+    let Some(clip) = composite_clip_region(shapes) else {
+        return true;
+    };
+    // An all-rectangle clip is an integer-cell test in the reference rasterizer.
+    // Reducing it here keeps the established exact blit (and its fractional
+    // edge rule) instead of going through area coverage.
+    if let Some(rect) = rectangle_clip_cells(&clip) {
+        return composite_surface(destination, source, transform, opacity, Some(rect), control);
+    }
+    if let Some((translate_x, translate_y)) = integer_translation(&transform) {
+        composite_clip_shapes_translated(
+            destination,
+            source,
+            translate_x,
+            translate_y,
+            opacity,
+            &clip,
+            control,
+        )
+    } else {
+        composite_clip_shapes_warped(destination, source, transform, opacity, &clip, control)
+    }
+}
+
+/// Builds the conjunction of destination-space clip shapes.
+///
+/// The reference clip stack keeps at most [`MAX_CLIP_SHAPES`] shapes but still
+/// intersects every shape's bounds, so deeper nesting is represented the same
+/// way here. An empty slice has no clip and returns `None`.
+fn composite_clip_region(shapes: &[ClipShape]) -> Option<ClipRegion> {
+    let mut rect = clip_shape_bounds(*shapes.first()?);
+    for shape in &shapes[1..] {
+        rect = intersection(Some(rect), clip_shape_bounds(*shape))?;
+    }
+    let count = shapes.len().min(MAX_CLIP_SHAPES);
+    let mut clip = ClipRegion::rect(rect);
+    clip.shapes[..count].copy_from_slice(&shapes[..count]);
+    clip.shape_count = count;
+    Some(clip)
+}
+
+/// The integer pixel cells covered by an all-rectangle clip.
+///
+/// The reference painting path tests the pixel cell (`floor(center)`) against
+/// the float rectangle, so a cell is included exactly when its index lies in
+/// `[ceil(left), ceil(right))`. This is the same reduction the compositor uses
+/// for a single inherited rectangle.
+fn rectangle_clip_cells(clip: &ClipRegion) -> Option<PhysicalRect> {
+    let shapes = &clip.shapes[..clip.shape_count];
+    if !shapes
+        .iter()
+        .all(|shape| matches!(shape, ClipShape::Rect(_)))
+    {
+        return None;
+    }
+    let mut rect = clip.rect;
+    rect.origin.x = rect.origin.x.ceil();
+    rect.origin.y = rect.origin.y.ceil();
+    rect.size.width = rect.right().ceil() - rect.origin.x;
+    rect.size.height = rect.bottom().ceil() - rect.origin.y;
+    (rect.size.width > 0.0 && rect.size.height > 0.0).then_some(rect)
+}
+
+/// The largest rectangle every cell of which is fully covered by `clip`.
+///
+/// Cells inside the bounds but within a rounded corner's radius band are
+/// excluded, so only whole cells for which a row copy is provably exact reach
+/// the fast blit. A non-rectangle, non-rounded shape has no such guarantee.
+fn composite_clip_interior(clip: &ClipRegion) -> Option<PhysicalRect> {
+    let mut left = f32::NEG_INFINITY;
+    let mut top = f32::NEG_INFINITY;
+    let mut right = f32::INFINITY;
+    let mut bottom = f32::INFINITY;
+    for shape in &clip.shapes[..clip.shape_count] {
+        let (rect, radius) = match shape {
+            ClipShape::Rect(rect) => (*rect, 0.0),
+            ClipShape::RoundedRect { rect, radii } => (*rect, max_corner_radius(*radii).max(0.0)),
+            _ => return None,
+        };
+        left = left.max(rect.origin.x + radius);
+        top = top.max(rect.origin.y + radius);
+        right = right.min(rect.right() - radius);
+        bottom = bottom.min(rect.bottom() - radius);
+    }
+    (right > left && bottom > top).then(|| PhysicalRect::new(left, top, right - left, bottom - top))
+}
+
+/// The whole cells inside `rect`, as `(left, top, right, bottom)` indices.
+fn whole_cell_bounds(rect: PhysicalRect) -> (u32, u32, u32, u32) {
+    let left = ceil_to_u32(rect.origin.x);
+    let top = ceil_to_u32(rect.origin.y);
+    let right = floor_to_u32(rect.right()).max(left);
+    let bottom = floor_to_u32(rect.bottom()).max(top);
+    (left, top, right, bottom)
+}
+
+/// Composites a pure integer translation of `source` with a shape clip.
+///
+/// The fully covered interior is one fast row-copy blit; only the clip's
+/// boundary band pays for per-pixel coverage.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "clip cell indices are bounded physical pixels on a destination surface"
+)]
+fn composite_clip_shapes_translated(
+    destination: &mut Surface,
+    source: &Surface,
+    translate_x: i64,
+    translate_y: i64,
+    opacity: f32,
+    clip: &ClipRegion,
+    control: Option<&dyn RasterControl>,
+) -> bool {
+    let destination_width = i64::from(destination.width());
+    let destination_height = i64::from(destination.height());
+    let source_width = i64::from(source.width());
+    let source_height = i64::from(source.height());
+    // A rounded clip is sampled by area, so a cell whose centre lies just
+    // outside the shape bounds can still be partially covered. Expand the
+    // destination range to whole cells that intersect the bounds, then
+    // intersect it with the translated source and the surface.
+    let left = (clip.rect.origin.x.floor() as i64).max(translate_x).max(0);
+    let top = (clip.rect.origin.y.floor() as i64).max(translate_y).max(0);
+    let right = (clip.rect.right().ceil() as i64)
+        .min(translate_x + source_width)
+        .min(destination_width);
+    let bottom = (clip.rect.bottom().ceil() as i64)
+        .min(translate_y + source_height)
+        .min(destination_height);
+    let column_start = (left - translate_x).max(0);
+    let column_end = (right - translate_x).min(source_width);
+    let row_start = (top - translate_y).max(0);
+    let row_end = (bottom - translate_y).min(source_height);
+    if column_start >= column_end || row_start >= row_end {
+        return true;
+    }
+
+    let (fast_left, fast_top, fast_right, fast_bottom) =
+        composite_clip_interior(clip).map_or((0, 0, 0, 0), whole_cell_bounds);
+    let has_fast = fast_left < fast_right && fast_top < fast_bottom;
+    if has_fast
+        && !blit_translated(
+            destination,
+            source,
+            (0, 0, source.width(), source.height()),
+            translate_x,
+            translate_y,
+            opacity,
+            Some(PhysicalRect::new(
+                u32_to_f32(fast_left),
+                u32_to_f32(fast_top),
+                u32_to_f32(fast_right - fast_left),
+                u32_to_f32(fast_bottom - fast_top),
+            )),
+            control,
+        )
+    {
+        return false;
+    }
+
+    let destination_width =
+        usize::try_from(destination_width).expect("destination width fits usize");
+    let source_width = usize::try_from(source_width).expect("source width fits usize");
+    let row_start = usize::try_from(row_start).expect("source row fits usize");
+    let row_end = usize::try_from(row_end).expect("source row fits usize");
+    let column_start = usize::try_from(column_start).expect("source column fits usize");
+    let column_end = usize::try_from(column_end).expect("source column fits usize");
+    for source_y in row_start..row_end {
+        if control.is_some_and(|control| control.is_cancelled() && source_y % 64 == 0) {
+            return false;
+        }
+        let destination_y = i64::try_from(source_y).expect("row fits i64") + translate_y;
+        let dest_row = usize::try_from(destination_y).expect("visible row is non-negative");
+        let source_row = source_y * source_width;
+        let destination_row = dest_row * destination_width;
+        for source_x in column_start..column_end {
+            let destination_x = i64::try_from(source_x).expect("column fits i64") + translate_x;
+            let dest_column =
+                usize::try_from(destination_x).expect("visible column is non-negative");
+            if has_fast
+                && destination_x >= i64::from(fast_left)
+                && destination_x < i64::from(fast_right)
+                && destination_y >= i64::from(fast_top)
+                && destination_y < i64::from(fast_bottom)
+            {
+                continue;
+            }
+            let coverage = pixel_coverage(
+                Some(clip),
+                None,
+                u32::try_from(dest_column).expect("destination column fits u32"),
+                u32::try_from(dest_row).expect("destination row fits u32"),
+            );
+            if coverage <= 0.0 {
+                continue;
+            }
+            let source_color = source.pixels()[source_row + source_x];
+            if source_color.alpha == 0 {
+                continue;
+            }
+            let destination_index = destination_row + dest_column;
+            destination.pixels[destination_index] = blend(
+                destination.pixels[destination_index],
+                source_color,
+                opacity * coverage,
+            );
+        }
+    }
+    true
+}
+
+/// Composites a fractional or affine transform with a shape clip.
+///
+/// The covered interior still uses the established warp; the boundary band
+/// inverse-maps each destination pixel and applies the clip coverage to the
+/// bilinearly sampled source color.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_arguments,
+    reason = "the warped clip path mirrors the reference warp's coordinate mapping"
+)]
+fn composite_clip_shapes_warped(
+    destination: &mut Surface,
+    source: &Surface,
+    transform: Transform2D,
+    opacity: f32,
+    clip: &ClipRegion,
+    control: Option<&dyn RasterControl>,
+) -> bool {
+    let Some(inverse) = transform.inverse() else {
+        return true;
+    };
+    let mapped = map_rect_bounds(
+        &transform,
+        PhysicalRect::new(
+            0.0,
+            0.0,
+            u32_to_f32(source.width()),
+            u32_to_f32(source.height()),
+        ),
+    );
+    let destination_bounds = PhysicalRect::new(
+        0.0,
+        0.0,
+        u32_to_f32(destination.width()),
+        u32_to_f32(destination.height()),
+    );
+    let Some(visible) = intersection(Some(mapped), clip.rect)
+        .and_then(|rect| intersection(Some(rect), destination_bounds))
+    else {
+        return true;
+    };
+    let left = floor_to_u32(visible.origin.x);
+    let top = floor_to_u32(visible.origin.y);
+    let right = ceil_to_u32(visible.right().min(u32_to_f32(destination.width())));
+    let bottom = ceil_to_u32(visible.bottom().min(u32_to_f32(destination.height())));
+    if left >= right || top >= bottom {
+        return true;
+    }
+
+    let (fast_left, fast_top, fast_right, fast_bottom) =
+        composite_clip_interior(clip).map_or((0, 0, 0, 0), whole_cell_bounds);
+    let has_fast = fast_left < fast_right && fast_top < fast_bottom;
+    if has_fast
+        && !warp_surface(
+            destination,
+            source,
+            (0, 0, source.width(), source.height()),
+            transform,
+            opacity,
+            Some(PhysicalRect::new(
+                u32_to_f32(fast_left),
+                u32_to_f32(fast_top),
+                u32_to_f32(fast_right - fast_left),
+                u32_to_f32(fast_bottom - fast_top),
+            )),
+            None,
+            PhysicalPoint::default(),
+            control,
+        )
+    {
+        return false;
+    }
+
+    for y in top..bottom {
+        if control.is_some_and(RasterControl::is_cancelled) {
+            return false;
+        }
+        let base_x = inverse.scale_x * u32_to_f32(left)
+            + inverse.skew_x * u32_to_f32(y)
+            + inverse.translate_x;
+        let base_y = inverse.skew_y * u32_to_f32(left)
+            + inverse.scale_y * u32_to_f32(y)
+            + inverse.translate_y;
+        for x in left..right {
+            if has_fast && x >= fast_left && x < fast_right && y >= fast_top && y < fast_bottom {
+                continue;
+            }
+            let coverage = pixel_coverage(Some(clip), None, x, y);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let source_x = base_x + inverse.scale_x * u32_to_f32(x - left);
+            let source_y = base_y + inverse.skew_y * u32_to_f32(x - left);
+            let Some(color) = sample_bilinear(source, source_x, source_y, None) else {
+                continue;
+            };
+            if color.alpha == 0 {
+                continue;
+            }
+            if let Some(index) = destination.index(x, y) {
+                destination.pixels[index] =
+                    blend(destination.pixels[index], color, opacity * coverage);
+            }
+        }
+    }
+    true
 }
 
 #[allow(clippy::float_cmp)] // integer translation is an exact bit-pattern test
@@ -5486,6 +6210,99 @@ mod tests {
         assert_eq!(output.surface.pixel(4, 3), Some(Color::rgb(30, 120, 220)));
         assert_ne!(output.surface.pixel(2, 2), Some(Color::rgb(30, 120, 220)));
         assert_ne!(output.surface.pixel(4, 7), Some(Color::WHITE));
+        assert!(output.diagnostics.is_empty());
+    }
+
+    /// A clip made of a rectangle and one or more rounded rectangles keeps the
+    /// row-copy fast path for the fully covered interior, and every cell is
+    /// still painted exactly once: overlapping edge bands must not blend the
+    /// same translucent fill twice.
+    #[test]
+    fn nested_rect_and_rounded_clips_paint_each_cell_once() {
+        let dom = Dom::new();
+        let id = |ordinal| DisplayItemId {
+            source: None,
+            fragment_hint: 0,
+            phase: PaintPhase::Background,
+            ordinal,
+        };
+        let shape = |ordinal: usize, command| DisplayItem {
+            id: id(u32::try_from(ordinal).expect("test ordinal fits")),
+            fragment: FragmentId::from_index(0),
+            source: None,
+            bounds: PhysicalRect::new(0.0, 0.0, 16.0, 16.0),
+            coordinate_space: PaintCoordinateSpace::Document,
+            command,
+        };
+        let radii = |radius| CornerRadii {
+            top_left: radius,
+            top_right: radius,
+            bottom_right: radius,
+            bottom_left: radius,
+        };
+        let color = Color::rgba(255, 0, 0, 128);
+        let list = DisplayList {
+            dom_revision: dom.revision(),
+            viewport: PhysicalSize {
+                width: 16.0,
+                height: 16.0,
+            },
+            items: vec![
+                shape(
+                    0,
+                    DisplayCommand::PushClip(ClipShape::Rect(PhysicalRect::new(
+                        0.0, 0.0, 16.0, 16.0,
+                    ))),
+                ),
+                shape(
+                    1,
+                    DisplayCommand::PushClip(ClipShape::RoundedRect {
+                        rect: PhysicalRect::new(2.0, 2.0, 10.0, 10.0),
+                        radii: radii(3.0),
+                    }),
+                ),
+                shape(
+                    2,
+                    DisplayCommand::PushClip(ClipShape::RoundedRect {
+                        rect: PhysicalRect::new(3.0, 3.0, 8.0, 8.0),
+                        radii: radii(2.0),
+                    }),
+                ),
+                shape(
+                    3,
+                    DisplayCommand::SolidRect {
+                        rect: PhysicalRect::new(0.0, 0.0, 16.0, 16.0),
+                        color,
+                    },
+                ),
+                shape(4, DisplayCommand::PopClip),
+                shape(5, DisplayCommand::PopClip),
+                shape(6, DisplayCommand::PopClip),
+            ],
+        };
+        let output = CpuRasterizer.rasterize(&list, Color::WHITE, &NoGlyphMasks);
+        let once = super::blend(Color::WHITE, color, 1.0);
+        assert_eq!(output.surface.pixel(7, 7), Some(once), "interior fill");
+        assert_eq!(
+            output.surface.pixel(7, 3),
+            Some(once),
+            "an edge-band cell fully inside every shape must still blend once"
+        );
+        assert_eq!(
+            output.surface.pixel(2, 2),
+            Some(Color::WHITE),
+            "the outer rounded corner is outside the clip"
+        );
+        assert_eq!(
+            output.surface.pixel(2, 8),
+            Some(Color::WHITE),
+            "the inner rounded clip excludes this cell"
+        );
+        assert_eq!(
+            output.surface.pixel(14, 8),
+            Some(Color::WHITE),
+            "the rectangle and rounded clips exclude this cell"
+        );
         assert!(output.diagnostics.is_empty());
     }
 

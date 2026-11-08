@@ -71,7 +71,7 @@ impl JsRuntime {
     /// run. The self-hosted `indexedDB` prelude reads this lazily on `open`.
     pub fn seed_indexed_db(&mut self, data: &str) {
         self.realm.set_global(
-            "__renderIndexedDbData".to_owned(),
+            "__renderIndexedDbData",
             JsValue::String((data.to_owned()).into()),
         );
     }

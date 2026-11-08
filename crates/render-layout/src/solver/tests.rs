@@ -1903,6 +1903,100 @@ fn a_shrink_to_fit_flex_row_sums_its_items() {
 }
 
 #[test]
+fn a_percentage_width_flex_item_caps_its_content_based_minimum() {
+    // A carousel track is `width:100%` inside a flex column and holds eleven
+    // `width:100%` slides whose images are wider than the column. The automatic
+    // minimum must use the percentage's used size (520px), not the summed
+    // intrinsic widths of the slides (an 11x overflow in the live page).
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='body'><div id='track'>\
+         <div id='s1' class='slide'><div class='wide'></div></div>\
+         <div id='s2' class='slide'><div class='wide'></div></div>\
+         <div id='s3' class='slide'><div class='wide'></div></div>\
+         </div></div></body>",
+        "html, body, div { display: block; margin: 0 } \
+         #body { display: flex; width: 520px } \
+         #track { display: flex; width: 100% } \
+         .slide { flex-shrink: 0; width: 100% } \
+         .wide { width: 900px }",
+        1180.0,
+    );
+    let track = fragment(&layout, find(&output.dom, "#track"));
+    assert_eq!(track.rect.size.width, 520.0);
+    for id in ["#s1", "#s2", "#s3"] {
+        let slide = fragment(&layout, find(&output.dom, id));
+        assert_eq!(slide.rect.size.width, 520.0);
+    }
+}
+
+#[test]
+fn a_max_width_clamps_a_flex_items_intrinsic_contribution() {
+    // CSS Sizing §3.1: intrinsic widths honor max-width. A search box with
+    // `max-width:500px` inside a `flex-grow:1` header item used to contribute
+    // its input's unclamped width, so the header's middle item took the whole
+    // bar and pushed the account controls past the viewport.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='bar'><div id='left'></div><div id='center'>\
+         <div id='search'></div></div></div></body>",
+        "html, body, div { display: block; margin: 0 } \
+         #bar { display: flex; width: 800px } \
+         #left { width: 300px; flex: none } \
+         #center { flex: 1 } \
+         #search { width: 700px; max-width: 200px }",
+        800.0,
+    );
+    let center = fragment(&layout, find(&output.dom, "#center"));
+    let search = fragment(&layout, find(&output.dom, "#search"));
+    assert_eq!(center.rect.size.width, 500.0);
+    assert_eq!(search.rect.size.width, 200.0);
+}
+
+#[test]
+fn a_percentage_width_image_in_a_row_flex_item_resolves_against_its_container() {
+    // A cover image is `width:100%` inside a row flex container that is itself
+    // 250px wide. Measuring the percentage against the viewport made the image
+    // 1000px wide, and §4.5's automatic minimum then prevented it from shrinking
+    // back into the card.
+    let output = parse_document(
+        "<!doctype html><body><div id='box'><img id='cover' src='cover.png'></div></body>",
+    );
+    let cover = find(&output.dom, "#cover");
+    let sheet = parse_stylesheet(
+        "html, body, div { display:block; margin:0 } #box { display:flex; width:250px } \
+         #cover { display:block; width:100%; height:140px }",
+    );
+    let styles = compute_document_styles(
+        &output.dom,
+        &[CascadeInput {
+            sheet: &sheet,
+            origin: CascadeOrigin::Author,
+        }],
+        &PropertyRegistry::standard_baseline(),
+        &ComputationLimits::default(),
+        &MatchContext::default(),
+    );
+    let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+    let images = OneIntrinsicSize(cover, (672, 378));
+    let layout = layout_formatting_tree_with_images(
+        &output.dom,
+        &formatting,
+        &styles,
+        LayoutOptions {
+            viewport: crate::PhysicalSize {
+                width: 1000.0,
+                height: 600.0,
+            },
+            ..LayoutOptions::default()
+        },
+        &SimpleTextMeasurer,
+        Some(&images),
+    );
+    let cover_fragment = fragment(&layout, cover);
+    assert_eq!(cover_fragment.rect.size.width, 250.0);
+    assert_eq!(cover_fragment.rect.size.height, 140.0);
+}
+
+#[test]
 fn a_flex_column_sizes_an_image_to_its_intrinsic_width() {
     // Bing's QR popup is a column flex container holding one `img`. The
     // image's intrinsic 80x80 must survive flex layout; walking its children

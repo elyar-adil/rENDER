@@ -76,6 +76,13 @@ a new print statement.
 | `RENDER_DUMP_INLINE=1` | export failing inline scripts from a replay |
 | `RENDER_DIAG_FRAGMENTS=<n>` | fragment dump limit |
 | `RENDER_PERF_DIAG=1` | extra `render-perf` diagnostics |
+| `RENDER_FONT_STATS=1` | per-backend resolve/face/measure/shape cache counters and timings, printed when the font backend drops |
+| `RENDER_DEBUG_COMPOSITOR=1` | why the retained scroll compositor accepted or refused a scene (layer count or first refusal reason) |
+| `RENDER_DEBUG_COMPOSITOR_COMPARE=1` | in `render-headless`, compare retained compositor output with the complete raster at scroll 0/200/600 |
+| `RENDER_DEBUG_COMPOSITOR_SCROLL=1` | time 32 consecutive 16px scroll composites on the retained scene |
+| `RENDER_DEBUG_COMPOSITOR_DUMP=<dir>` | write composited/full PNG pairs during comparison |
+| `RENDER_COMPOSITOR_EXACT_ALPHA=1` | replay translucent bands per item for bit-exact output (slower); default caches them with ≤1 channel rounding |
+| `RENDER_RASTER_PROFILE=1` | per-command raster totals, layer scan/claim accounting, and pop-effect timings |
 | `RENDER_NET_LOG=1`, `RENDER_NET_SLOW_MS=<n>` | transport request logging and the slow-request threshold |
 | `RENDER_TEST262_*`, `RENDER_WPT_*` | conformance-runner configuration; see `docs/test262.md` and `docs/wpt.md` |
 
