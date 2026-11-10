@@ -239,7 +239,7 @@ pub struct JsRuntime {
     /// keyed by the DOM revision it was computed at (see `reflect.rs`).
     reflection_base_cache: Option<(DomRevision, Option<url::Url>)>,
     /// Global lexical declarations of each realm, indexed by [`RealmId`].
-    global_bindings: Vec<BTreeMap<String, GlobalBinding>>,
+    global_bindings: Vec<crate::fast_map::FastMap<String, GlobalBinding>>,
     timers: BTreeMap<u64, TimerEntry>,
     next_timer_id: u64,
     pending_timer_requests: Vec<TimerRequest>,
@@ -509,7 +509,7 @@ impl JsRuntime {
             event_flags: BTreeMap::new(),
             event_handlers: BTreeMap::new(),
             reflection_base_cache: None,
-            global_bindings: vec![BTreeMap::new()],
+            global_bindings: vec![crate::fast_map::FastMap::default()],
             timers: BTreeMap::new(),
             next_timer_id: 1,
             pending_timer_requests: Vec::new(),
@@ -621,7 +621,8 @@ impl JsRuntime {
 
     /// Adds the per-realm tables for a realm that was just created.
     fn push_realm_state(&mut self, context: BrowsingContextRecord) {
-        self.global_bindings.push(BTreeMap::new());
+        self.global_bindings
+            .push(crate::fast_map::FastMap::default());
         self.modules.push(BTreeMap::new());
         self.window_event_handlers.push(BTreeMap::new());
         self.contexts.push(context);
@@ -643,11 +644,11 @@ impl JsRuntime {
     }
 
     /// The global lexical declarations of the current realm.
-    fn global_bindings(&self) -> &BTreeMap<String, GlobalBinding> {
+    fn global_bindings(&self) -> &crate::fast_map::FastMap<String, GlobalBinding> {
         &self.global_bindings[self.realm.current_realm().0]
     }
 
-    fn global_bindings_mut(&mut self) -> &mut BTreeMap<String, GlobalBinding> {
+    fn global_bindings_mut(&mut self) -> &mut crate::fast_map::FastMap<String, GlobalBinding> {
         let realm = self.realm.current_realm().0;
         &mut self.global_bindings[realm]
     }

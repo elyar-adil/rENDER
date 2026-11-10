@@ -7,6 +7,7 @@
 
 mod annex_b;
 mod bigint;
+mod fast_map;
 mod lexer;
 mod module;
 mod parser;

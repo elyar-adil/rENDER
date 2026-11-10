@@ -28,39 +28,9 @@ use crate::value::TypedBuffer;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::HashMap;
-use std::hash::BuildHasherDefault;
-use std::hash::Hasher;
 use std::rc::Rc;
 
-/// A small FNV-1a hasher for environment binding names. The standard
-/// `RandomState` hasher is deliberately collision-resistant and costs more
-/// than a binding lookup on a short identifier; a collision only costs a short
-/// probe sequence. This keeps the map dependency-free and auditable.
-pub(super) struct BindingHasher(u64);
-
-impl Default for BindingHasher {
-    fn default() -> Self {
-        Self(0xcbf2_9ce4_8422_2325)
-    }
-}
-
-impl Hasher for BindingHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        let mut hash = self.0;
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        self.0 = hash;
-    }
-}
-
-pub(super) type BindingMap = HashMap<String, Binding, BuildHasherDefault<BindingHasher>>;
+pub(super) type BindingMap = crate::fast_map::FastMap<String, Binding>;
 
 #[derive(Clone, Debug)]
 pub(super) struct Binding {

@@ -3091,7 +3091,7 @@ impl JsObject {
 /// wrappers can only be created by the binding layer.
 #[derive(Clone, Debug)]
 pub struct JsObject {
-    pub(crate) properties: BTreeMap<String, PropertyDescriptor>,
+    pub(crate) properties: crate::fast_map::FastMap<String, PropertyDescriptor>,
     /// Symbol-keyed properties, keyed by symbol id with the owning symbol
     /// kept alongside so descriptions survive (`getOwnPropertySymbols`).
     symbols: BTreeMap<u64, (JsSymbol, PropertyDescriptor)>,
@@ -3118,7 +3118,7 @@ pub struct JsObject {
 impl Default for JsObject {
     fn default() -> Self {
         Self {
-            properties: BTreeMap::new(),
+            properties: crate::fast_map::FastMap::default(),
             symbols: BTreeMap::new(),
             key_order: Vec::new(),
             prototype: None,
@@ -8786,7 +8786,7 @@ impl Realm {
     pub(crate) fn function_metadata(
         name: &str,
         length: f64,
-    ) -> BTreeMap<String, PropertyDescriptor> {
+    ) -> crate::fast_map::FastMap<String, PropertyDescriptor> {
         let read_only = |value: JsValue| PropertyDescriptor {
             getter: None,
             setter: None,
@@ -8795,7 +8795,7 @@ impl Realm {
             enumerable: false,
             configurable: true,
         };
-        BTreeMap::from([
+        crate::fast_map::FastMap::from_iter([
             ("length".to_owned(), read_only(JsValue::Number(length))),
             (
                 "name".to_owned(),
@@ -12703,12 +12703,15 @@ impl Realm {
             .filter(|key| target.properties.contains_key(*key) && !is_canonical_index(key))
             .cloned()
             .collect::<Vec<_>>();
-        let untracked = target
+        let mut untracked = target
             .properties
             .keys()
             .filter(|key| !is_canonical_index(key) && !target.key_order.contains(key))
             .cloned()
             .collect::<Vec<_>>();
+        // The property table is hashed, so untracked (bootstrap-installed)
+        // keys are ordered by name to keep enumeration deterministic.
+        untracked.sort_unstable();
         let mut names = indices;
         names.extend(ordered);
         names.extend(untracked);
