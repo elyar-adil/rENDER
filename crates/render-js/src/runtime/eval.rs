@@ -28,6 +28,7 @@ use crate::parser::BindingPattern;
 use crate::parser::BindingTarget;
 use crate::parser::CatchClause;
 use crate::parser::Expr;
+use crate::parser::FunctionBody;
 use crate::parser::FunctionKind;
 use crate::parser::ObjectAccessorKind;
 use crate::parser::ObjectProperty;
@@ -74,8 +75,10 @@ use crate::runtime::types::ClassFrame;
 use crate::runtime::types::Environment;
 use crate::runtime::types::EnvironmentRecord;
 use crate::runtime::types::FunctionFlags;
+use crate::runtime::types::FunctionTemplate;
 use crate::runtime::types::GlobalBinding;
 use crate::runtime::types::NavigationRequest;
+use crate::runtime::types::TemplateCell;
 use crate::runtime::types::ThisContext;
 use crate::runtime::types::UserFunction;
 use crate::utf16;
@@ -832,7 +835,7 @@ impl JsRuntime {
     pub(super) fn create_user_function(
         &mut self,
         parameters: &[String],
-        body: &[Statement],
+        body: &FunctionBody,
         kind: FunctionKind,
         strict: bool,
     ) -> Result<JsValue, JsError> {
@@ -843,7 +846,7 @@ impl JsRuntime {
         &mut self,
         name: Option<&str>,
         parameters: &[String],
-        body: &[Statement],
+        body: &FunctionBody,
         is_async: bool,
         strict: bool,
     ) -> Result<JsValue, JsError> {
@@ -858,6 +861,7 @@ impl JsRuntime {
             name,
             parameters,
             body,
+            Some(body.template()),
             FunctionFlags {
                 arrow: true,
                 strict,
@@ -872,7 +876,7 @@ impl JsRuntime {
         &mut self,
         name: Option<&str>,
         parameters: &[String],
-        body: &[Statement],
+        body: &FunctionBody,
         kind: FunctionKind,
         strict: bool,
     ) -> Result<JsValue, JsError> {
@@ -880,6 +884,7 @@ impl JsRuntime {
             name,
             parameters,
             body,
+            Some(body.template()),
             FunctionFlags {
                 arrow: false,
                 strict,
@@ -897,7 +902,7 @@ impl JsRuntime {
         &mut self,
         name: Option<&str>,
         parameters: &[String],
-        body: &[Statement],
+        body: &FunctionBody,
         kind: FunctionKind,
         strict: bool,
     ) -> Result<JsValue, JsError> {
@@ -905,6 +910,7 @@ impl JsRuntime {
             name,
             parameters,
             body,
+            Some(body.template()),
             FunctionFlags {
                 arrow: false,
                 strict,
@@ -920,6 +926,7 @@ impl JsRuntime {
         name: Option<&str>,
         parameters: &[String],
         body: &[Statement],
+        cache: Option<&TemplateCell>,
         flags: FunctionFlags,
     ) -> Result<JsValue, JsError> {
         let FunctionFlags {
@@ -932,32 +939,14 @@ impl JsRuntime {
         let class_is_none = class.is_none();
         self.ensure_heap_capacity(if arrow { 1 } else { 2 })?;
         let function_index = self.functions.len();
-        let uses_arguments = !arrow && body_observes_arguments(body);
-        let (body, mut default_map, mut pattern_map) = Self::extract_parameter_markers(body);
-        // The body's hoisting data is a pure function of the immutable AST, so
-        // compute it once. Each call then creates the same bindings without
-        // re-scanning the body or rebuilding declaration maps.
-        let activation = Self::activation_plan(&body);
-        let (parameters, length, rest) = Self::binding_parameters(parameters);
-        let has_defaults = !default_map.is_empty();
-        let has_patterns = !pattern_map.is_empty();
-        // An ordinary parameter list needs no per-position table at all; only
-        // the exceptional function pays for the two vectors.
-        let (defaults, patterns) = if has_defaults || has_patterns {
-            let defaults: Vec<Option<Expr>> = (0..parameters.len())
-                .map(|index| default_map.remove(&index))
-                .collect();
-            let patterns: Vec<Option<Statement>> = (0..parameters.len())
-                .map(|index| pattern_map.remove(&index))
-                .collect();
-            (defaults, patterns)
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        let simple_parameters = !rest && !has_defaults && !has_patterns;
-        let has_disposables = activation
-            .as_ref()
-            .is_none_or(|plan| plan.lexical.iter().any(|(_, kind)| kind.is_disposable()));
+        let template =
+            match cache {
+                Some(cell) => Rc::clone(cell.get_or_init(|| {
+                    Rc::new(Self::build_function_template(parameters, body, arrow))
+                })),
+                None => Rc::new(Self::build_function_template(parameters, body, arrow)),
+            };
+        let length = template.length;
         let private_scope = self
             .class_frames
             .last()
@@ -974,25 +963,25 @@ impl JsRuntime {
         };
         self.functions.push(Rc::new(UserFunction {
             name: name.map(str::to_owned),
-            parameters,
-            defaults,
-            patterns,
-            body,
+            parameters: Rc::clone(&template.parameters),
+            defaults: Rc::clone(&template.defaults),
+            patterns: Rc::clone(&template.patterns),
+            body: Rc::clone(&template.body),
             captured_environment: Rc::from(self.environment.as_slice()),
             arrow,
             strict,
             class,
             private_scope,
-            rest,
-            simple_parameters,
-            has_defaults,
-            has_disposables,
+            rest: template.rest,
+            simple_parameters: template.simple_parameters,
+            has_defaults: template.has_defaults,
+            has_disposables: template.has_disposables,
             kind,
-            uses_arguments,
+            uses_arguments: template.uses_arguments,
             this_context,
             source: None,
             source_name: self.script_filename.clone(),
-            activation,
+            activation: template.activation.clone(),
         }));
         // Spec: the `name` of an anonymous function in progress is the empty
         // string (anonymous arrows included); `length` counts parameters
@@ -1026,6 +1015,52 @@ impl JsRuntime {
             }
         }
         Ok(JsValue::Object(function))
+    }
+
+    /// Analyse a function's source once: see [`FunctionTemplate`].
+    fn build_function_template(
+        parameters: &[String],
+        body: &[Statement],
+        arrow: bool,
+    ) -> FunctionTemplate {
+        let uses_arguments = !arrow && body_observes_arguments(body);
+        let (body, mut default_map, mut pattern_map) = Self::extract_parameter_markers(body);
+        // The body's hoisting data is a pure function of the immutable AST.
+        let activation = Self::activation_plan(&body);
+        let (parameters, length, rest) = Self::binding_parameters(parameters);
+        let has_defaults = !default_map.is_empty();
+        let has_patterns = !pattern_map.is_empty();
+        // An ordinary parameter list needs no per-position table at all; only
+        // the exceptional function pays for the two vectors.
+        let (defaults, patterns): (Vec<Option<Expr>>, Vec<Option<Statement>>) =
+            if has_defaults || has_patterns {
+                (
+                    (0..parameters.len())
+                        .map(|index| default_map.remove(&index))
+                        .collect(),
+                    (0..parameters.len())
+                        .map(|index| pattern_map.remove(&index))
+                        .collect(),
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
+        let has_disposables = activation
+            .as_ref()
+            .is_none_or(|plan| plan.lexical.iter().any(|(_, kind)| kind.is_disposable()));
+        FunctionTemplate {
+            parameters: parameters.into(),
+            defaults: defaults.into(),
+            patterns: patterns.into(),
+            body: body.into(),
+            activation: activation.map(Rc::new),
+            length,
+            rest,
+            simple_parameters: !rest && !has_defaults && !has_patterns,
+            has_defaults,
+            has_disposables,
+            uses_arguments,
+        }
     }
 
     /// Strip the parser's default/rest parameter markers into plain binding
@@ -3970,7 +4005,7 @@ impl JsRuntime {
         &mut self,
         name: Option<&str>,
         parameters: &[String],
-        body: &[Statement],
+        body: &FunctionBody,
         kind: FunctionKind,
         strict: bool,
     ) -> Result<JsValue, JsError> {
@@ -7964,7 +7999,7 @@ impl JsRuntime {
         // default that reads a later (or its own) parameter observes the
         // temporal dead zone instead of an outer binding.
         if function.has_defaults {
-            for parameter in &function.parameters {
+            for parameter in function.parameters.iter() {
                 call_environment.bindings.insert(
                     parameter.clone(),
                     Binding {

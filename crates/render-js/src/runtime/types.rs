@@ -267,17 +267,17 @@ pub(super) struct FunctionFlags {
 )]
 pub(super) struct UserFunction {
     pub(super) name: Option<String>,
-    pub(super) parameters: Vec<String>,
+    pub(super) parameters: Rc<[String]>,
     /// Default initializer expressions parallel to `parameters`; `None` for
     /// parameters without one. A default evaluates left to right whenever
     /// its argument is `undefined` or absent, in the call environment built
     /// so far, so later defaults see earlier bindings.
-    pub(super) defaults: Vec<Option<Expr>>,
+    pub(super) defaults: Rc<[Option<Expr>]>,
     /// The `var` declaration that binds a destructuring parameter, parallel to
     /// `parameters`; `None` for a plain parameter. [`JsRuntime::bind_parameters`]
     /// runs it during the call, before any body statement.
-    pub(super) patterns: Vec<Option<Statement>>,
-    pub(super) body: Vec<Statement>,
+    pub(super) patterns: Rc<[Option<Statement>]>,
+    pub(super) body: Rc<[Statement]>,
     /// The scope chain the function closed over, captured when it was created.
     /// Shared between the function's metadata and every call, which only needs
     /// to prepend its own call environment to it.
@@ -324,7 +324,7 @@ pub(super) struct UserFunction {
     /// without re-scanning the body and rebuilding its declaration maps.
     /// `None` when the body has a declaration error: the call path re-scans it
     /// so the error is still reported as a `SyntaxError` at call time.
-    pub(super) activation: Option<ActivationPlan>,
+    pub(super) activation: Option<Rc<ActivationPlan>>,
 }
 
 /// Precomputed hoisting information for one function body (ECMA-262 10.2.11).
@@ -780,3 +780,28 @@ pub struct ElementRect {
     pub width: f32,
     pub height: f32,
 }
+
+/// The part of a function that depends only on its source: the parameter
+/// tables, the body with the parser's parameter markers removed, and the
+/// hoisting plan. Built once per function node and shared by every closure
+/// created from it.
+#[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent fact about the function's code"
+)]
+pub(crate) struct FunctionTemplate {
+    pub(super) parameters: Rc<[String]>,
+    pub(super) defaults: Rc<[Option<Expr>]>,
+    pub(super) patterns: Rc<[Option<Statement>]>,
+    pub(super) body: Rc<[Statement]>,
+    pub(super) activation: Option<Rc<ActivationPlan>>,
+    pub(super) length: usize,
+    pub(super) rest: bool,
+    pub(super) simple_parameters: bool,
+    pub(super) has_defaults: bool,
+    pub(super) has_disposables: bool,
+    pub(super) uses_arguments: bool,
+}
+
+pub(crate) type TemplateCell = std::cell::OnceCell<Rc<FunctionTemplate>>;

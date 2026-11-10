@@ -1533,8 +1533,29 @@ impl JsRuntime {
 
     /// Runs one self-hosted built-ins script in the current realm, with its own
     /// execution budget. The caller's scopes are kept aside while it runs.
-    fn run_self_hosted(&mut self, dom: &mut Dom, source: &str) -> Result<(), JsError> {
-        let script = super::CompiledScript::compile(source, &self.limits)?;
+    fn run_self_hosted(&mut self, dom: &mut Dom, source: &'static str) -> Result<(), JsError> {
+        thread_local! {
+            // Self-hosted sources are `'static`, so the pointer names the
+            // source. Parsing them dominates a runtime's start-up, and every
+            // runtime on a thread (pages, frames, workers) can share the tree.
+            static COMPILED: std::cell::RefCell<
+                Vec<(usize, std::rc::Rc<super::CompiledScript>)>,
+            > = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let key = source.as_ptr() as usize;
+        let cached = COMPILED.with(|cell| {
+            cell.borrow()
+                .iter()
+                .find(|(cached_key, _)| *cached_key == key)
+                .map(|(_, script)| script.clone())
+        });
+        let script = if let Some(script) = cached {
+            script
+        } else {
+            let script = std::rc::Rc::new(super::CompiledScript::compile(source, &self.limits)?);
+            COMPILED.with(|cell| cell.borrow_mut().push((key, script.clone())));
+            script
+        };
         let saved_steps =
             std::mem::replace(&mut self.steps_remaining, self.limits.max_execution_steps);
         let from_revision = dom.revision();

@@ -301,7 +301,7 @@ pub(super) enum Statement {
     Function {
         name: String,
         parameters: Vec<String>,
-        body: Vec<Statement>,
+        body: FunctionBody,
         offset: usize,
         kind: FunctionKind,
         strict: bool,
@@ -433,6 +433,67 @@ impl SourceSpan {
     }
 }
 
+/// A function's body together with the analysis the runtime derives from it
+/// (filtered statements, parameter tables, hoisting plan). The analysis is a
+/// pure function of the immutable AST, so it is computed the first time a
+/// closure is created from this node and shared by every later closure,
+/// instead of cloning and re-scanning the whole body per closure.
+#[derive(Default)]
+pub(super) struct FunctionBody {
+    statements: Vec<Statement>,
+    template: std::rc::Rc<crate::runtime::types::TemplateCell>,
+}
+
+impl FunctionBody {
+    pub(super) fn template(&self) -> &crate::runtime::types::TemplateCell {
+        &self.template
+    }
+}
+
+impl From<Vec<Statement>> for FunctionBody {
+    fn from(statements: Vec<Statement>) -> Self {
+        Self {
+            statements,
+            template: std::rc::Rc::default(),
+        }
+    }
+}
+
+// A clone starts without a cached template: the clone may be edited, and the
+// cache must never outlive the statements it was computed from.
+impl Clone for FunctionBody {
+    fn clone(&self) -> Self {
+        Self::from(self.statements.clone())
+    }
+}
+
+impl std::fmt::Debug for FunctionBody {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.statements.fmt(formatter)
+    }
+}
+
+impl PartialEq for FunctionBody {
+    fn eq(&self, other: &Self) -> bool {
+        self.statements == other.statements
+    }
+}
+
+impl std::ops::Deref for FunctionBody {
+    type Target = Vec<Statement>;
+    fn deref(&self) -> &Vec<Statement> {
+        &self.statements
+    }
+}
+
+impl std::ops::DerefMut for FunctionBody {
+    fn deref_mut(&mut self) -> &mut Vec<Statement> {
+        // Mutation invalidates any cached analysis.
+        self.template = std::rc::Rc::default();
+        &mut self.statements
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Expr {
     Literal(JsValue),
@@ -449,7 +510,7 @@ pub(super) enum Expr {
     Function {
         name: Option<String>,
         parameters: Vec<String>,
-        body: Vec<Statement>,
+        body: FunctionBody,
         offset: usize,
         kind: FunctionKind,
         strict: bool,
@@ -457,7 +518,7 @@ pub(super) enum Expr {
     },
     Arrow {
         parameters: Vec<String>,
-        body: Vec<Statement>,
+        body: FunctionBody,
         offset: usize,
         is_async: bool,
         strict: bool,
@@ -2391,7 +2452,7 @@ impl Parser {
             offset: self.previous_offset(),
             name,
             parameters,
-            body,
+            body: body.into(),
             kind,
             strict,
             annex_b_var: false,
@@ -3375,7 +3436,7 @@ impl Parser {
         Ok(Some(Expr::Arrow {
             offset: self.previous_offset(),
             parameters,
-            body,
+            body: body.into(),
             is_async: is_async_arrow,
             strict,
             source: self.source_span(self.tokens[checkpoint].offset),
@@ -4698,7 +4759,7 @@ impl Parser {
             offset: self.previous_offset(),
             name,
             parameters,
-            body,
+            body: body.into(),
             kind,
             source: self.source_span(start),
             strict,
@@ -5066,7 +5127,7 @@ impl Parser {
                     offset: self.previous_offset(),
                     name,
                     parameters,
-                    body,
+                    body: body.into(),
                     kind: FunctionKind::Normal,
                     strict,
                     source: self.source_span(start),
@@ -5159,7 +5220,7 @@ impl Parser {
                 offset: self.previous_offset(),
                 name,
                 parameters,
-                body,
+                body: body.into(),
                 kind,
                 strict,
                 source: self.source_span(start),

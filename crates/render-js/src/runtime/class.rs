@@ -349,6 +349,7 @@ impl JsRuntime {
             Some(constructor_name),
             &parameters,
             &body,
+            None,
             FunctionFlags {
                 arrow: false,
                 strict: true,
@@ -420,6 +421,7 @@ impl JsRuntime {
                 Some(&method_name),
                 &element.parameters,
                 &element.body,
+                None,
                 FunctionFlags {
                     arrow: false,
                     strict: true,
