@@ -199,7 +199,7 @@ impl Coroutine {
         self.call_environment
             .borrow_mut()
             .bindings
-            .insert(name.to_owned(), hidden_binding(value));
+            .insert(name.into(), hidden_binding(value));
     }
 
     fn hidden(&self, name: &str) -> JsValue {
@@ -1020,7 +1020,7 @@ impl JsRuntime {
                     let mut scope = environment.borrow_mut();
                     for name in parameter.names() {
                         scope.bindings.insert(
-                            name,
+                            name.into(),
                             Binding {
                                 value: JsValue::Undefined,
                                 mutable: true,
@@ -1148,7 +1148,7 @@ impl JsRuntime {
         }
         let environment = Rc::new(RefCell::new(EnvironmentRecord::default()));
         environment.borrow_mut().bindings.insert(
-            binding.name.clone(),
+            binding.name.as_str().into(),
             Binding {
                 value: value.clone(),
                 mutable: !binding.kind.is_immutable(),

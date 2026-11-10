@@ -30,7 +30,9 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-pub(super) type BindingMap = crate::fast_map::FastMap<String, Binding>;
+/// Binding names are shared with the function templates they come from, so
+/// creating a call's bindings clones a reference count instead of a string.
+pub(super) type BindingMap = crate::fast_map::FastMap<Rc<str>, Binding>;
 
 #[derive(Clone, Debug)]
 pub(super) struct Binding {
@@ -159,7 +161,11 @@ impl ArgumentsMap {
     /// nothing when `key` is not mapped.
     pub(crate) fn store(&self, key: &str, value: &JsValue) {
         if let Some(name) = self.names.get(key)
-            && let Some(binding) = self.environment.borrow_mut().bindings.get_mut(name)
+            && let Some(binding) = self
+                .environment
+                .borrow_mut()
+                .bindings
+                .get_mut(name.as_str())
         {
             binding.value = value.clone();
         }
@@ -267,7 +273,7 @@ pub(super) struct FunctionFlags {
 )]
 pub(super) struct UserFunction {
     pub(super) name: Option<String>,
-    pub(super) parameters: Rc<[String]>,
+    pub(super) parameters: Rc<[Rc<str>]>,
     /// Default initializer expressions parallel to `parameters`; `None` for
     /// parameters without one. A default evaluates left to right whenever
     /// its argument is `undefined` or absent, in the call environment built
@@ -332,9 +338,9 @@ pub(super) struct UserFunction {
 pub(super) struct ActivationPlan {
     /// Lexical declarations in sorted-name order, the order the records are
     /// created in.
-    pub(super) lexical: Vec<(String, VariableKind)>,
+    pub(super) lexical: Vec<(Rc<str>, VariableKind)>,
     /// `var` names plus Annex B block-function names, sorted.
-    pub(super) vars: Vec<String>,
+    pub(super) vars: Vec<Rc<str>>,
     /// Indices into `UserFunction::body` of hoisted function declarations, in
     /// source order. The declarations are instantiated from the body itself,
     /// so the plan does not copy their parameter lists or nested bodies.
@@ -791,7 +797,7 @@ pub struct ElementRect {
     reason = "each flag is an independent fact about the function's code"
 )]
 pub(crate) struct FunctionTemplate {
-    pub(super) parameters: Rc<[String]>,
+    pub(super) parameters: Rc<[Rc<str>]>,
     pub(super) defaults: Rc<[Option<Expr>]>,
     pub(super) patterns: Rc<[Option<Statement>]>,
     pub(super) body: Rc<[Statement]>,

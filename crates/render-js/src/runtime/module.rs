@@ -212,7 +212,7 @@ impl JsRuntime {
         };
         record
             .bindings
-            .insert("this".to_owned(), initialized(JsValue::Undefined));
+            .insert("this".into(), initialized(JsValue::Undefined));
         let meta = self.realm.create_ordinary_object();
         self.realm.set_property(
             meta,
@@ -220,7 +220,7 @@ impl JsRuntime {
             JsValue::String((key.to_owned()).into()),
         );
         record.bindings.insert(
-            IMPORT_META_BINDING.to_owned(),
+            IMPORT_META_BINDING.into(),
             initialized(JsValue::Object(meta)),
         );
         for entry in &info.imports {
@@ -238,7 +238,7 @@ impl JsRuntime {
                 ImportName::Namespace => {
                     // Bound when the module links, once its exports are known.
                     record.bindings.insert(
-                        entry.local.clone(),
+                        entry.local.as_str().into(),
                         Binding {
                             value: JsValue::Undefined,
                             mutable: false,
@@ -1016,7 +1016,11 @@ impl JsRuntime {
                 ImportName::Namespace => {
                     let deferred = entry.phase == ImportPhase::Defer;
                     let namespace = self.module_namespace(&target, deferred)?;
-                    if let Some(binding) = environment.borrow_mut().bindings.get_mut(&entry.local) {
+                    if let Some(binding) = environment
+                        .borrow_mut()
+                        .bindings
+                        .get_mut(entry.local.as_str())
+                    {
                         binding.value = JsValue::Object(namespace);
                         binding.initialized = true;
                     }

@@ -52,7 +52,7 @@ fn without_offset(error: &JsError) -> JsError {
 /// `InitializeBinding`).
 fn create_eval_var(scope: &mut EnvironmentRecord, name: &str, value: JsValue) {
     scope.bindings.insert(
-        name.to_owned(),
+        name.into(),
         Binding {
             value,
             mutable: true,
@@ -361,7 +361,7 @@ impl JsRuntime {
             let mut lexical_scope = lexical_scope.borrow_mut();
             for (name, kind) in lexical {
                 lexical_scope.bindings.insert(
-                    name,
+                    name.into(),
                     Binding {
                         value: JsValue::Undefined,
                         mutable: !kind.is_immutable(),

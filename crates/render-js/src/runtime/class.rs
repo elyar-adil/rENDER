@@ -123,7 +123,7 @@ impl JsRuntime {
         };
         if let Some(name) = name {
             class_environment.bindings.insert(
-                name.to_owned(),
+                name.into(),
                 Binding {
                     value: JsValue::Undefined,
                     mutable: false,
@@ -451,7 +451,7 @@ impl JsRuntime {
                 .borrow_mut()
                 .bindings
                 .insert(
-                    binding.to_owned(),
+                    binding.into(),
                     Binding {
                         value: JsValue::Object(constructor),
                         mutable: false,
@@ -566,7 +566,7 @@ impl JsRuntime {
             ..EnvironmentRecord::default()
         };
         environment.bindings.insert(
-            "this".to_owned(),
+            "this".into(),
             Binding {
                 value,
                 mutable: false,

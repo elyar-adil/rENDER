@@ -70,6 +70,7 @@ use crate::runtime::coroutine_run::Resume;
 use crate::runtime::types::ActivationPlan;
 use crate::runtime::types::ArgumentsMap;
 use crate::runtime::types::Binding;
+use crate::runtime::types::BindingMap;
 use crate::runtime::types::CallFrame;
 use crate::runtime::types::ClassFrame;
 use crate::runtime::types::Environment;
@@ -415,6 +416,21 @@ struct DeclarationScan {
     hoisted: BTreeSet<String>,
 }
 
+/// Names every call binds, kept as shared strings so a call clones a
+/// reference count instead of allocating.
+#[derive(Clone, Copy)]
+enum SharedName {
+    This,
+    Arguments,
+}
+
+fn shared_name(name: SharedName) -> Rc<str> {
+    thread_local! {
+        static NAMES: [Rc<str>; 2] = [Rc::from("this"), Rc::from("arguments")];
+    }
+    NAMES.with(|names| Rc::clone(&names[name as usize]))
+}
+
 impl JsRuntime {
     pub(super) fn evaluate_statements(
         &mut self,
@@ -479,7 +495,7 @@ impl JsRuntime {
             .last()
             .cloned()
             .expect("the body environment was pushed");
-        let parameter_values: Vec<(String, JsValue)> = {
+        let parameter_values: Vec<(Rc<str>, JsValue)> = {
             let parameters = parameters.borrow();
             function
                 .parameters
@@ -494,7 +510,7 @@ impl JsRuntime {
         };
         let mut body = body.borrow_mut();
         for (name, value) in parameter_values {
-            if let Some(binding) = body.bindings.get_mut(&name)
+            if let Some(binding) = body.bindings.get_mut(name.as_ref())
                 && binding.kind == VariableKind::Var
                 && matches!(binding.value, JsValue::Undefined)
             {
@@ -599,8 +615,12 @@ impl JsRuntime {
         let mut vars = scan.vars;
         vars.extend(scan.hoisted);
         Some(ActivationPlan {
-            lexical: scan.lexical.into_iter().collect(),
-            vars: vars.into_iter().collect(),
+            lexical: scan
+                .lexical
+                .into_iter()
+                .map(|(name, kind)| (Rc::from(name), kind))
+                .collect(),
+            vars: vars.into_iter().map(Rc::from).collect(),
             functions: scan.functions,
         })
     }
@@ -612,10 +632,16 @@ impl JsRuntime {
             return self.instantiate_statements(&function.body);
         };
         for (name, kind) in &plan.lexical {
-            self.create_binding(name, *kind, false, JsValue::Undefined)?;
+            self.create_binding_shared(name, Some(name), *kind, false, JsValue::Undefined)?;
         }
         for name in &plan.vars {
-            self.create_binding(name, VariableKind::Var, true, JsValue::Undefined)?;
+            self.create_binding_shared(
+                name,
+                Some(name),
+                VariableKind::Var,
+                true,
+                JsValue::Undefined,
+            )?;
         }
         for &index in &plan.functions {
             let Some(statement) = function.body.get(index) else {
@@ -1049,7 +1075,10 @@ impl JsRuntime {
             .as_ref()
             .is_none_or(|plan| plan.lexical.iter().any(|(_, kind)| kind.is_disposable()));
         FunctionTemplate {
-            parameters: parameters.into(),
+            parameters: parameters
+                .iter()
+                .map(|name| Rc::<str>::from(name.as_str()))
+                .collect(),
             defaults: defaults.into(),
             patterns: patterns.into(),
             body: body.into(),
@@ -1654,7 +1683,7 @@ impl JsRuntime {
             } else {
                 let environment = Rc::new(RefCell::new(EnvironmentRecord::default()));
                 environment.borrow_mut().bindings.insert(
-                    name.to_owned(),
+                    name.into(),
                     Binding {
                         value: JsValue::String((property.clone()).into()),
                         mutable: !kind.is_immutable(),
@@ -1747,7 +1776,7 @@ impl JsRuntime {
         if tdz {
             let environment = Rc::new(RefCell::new(EnvironmentRecord::default()));
             environment.borrow_mut().bindings.insert(
-                name.to_owned(),
+                name.into(),
                 Binding {
                     value: JsValue::Undefined,
                     mutable: !kind.is_immutable(),
@@ -1822,7 +1851,7 @@ impl JsRuntime {
             } else {
                 let environment = Rc::new(RefCell::new(EnvironmentRecord::default()));
                 environment.borrow_mut().bindings.insert(
-                    name.to_owned(),
+                    name.into(),
                     Binding {
                         value: item.clone(),
                         mutable: !kind.is_immutable(),
@@ -1907,7 +1936,7 @@ impl JsRuntime {
                 }
                 for name in parameter.names() {
                     scope.bindings.insert(
-                        name,
+                        name.into(),
                         Binding {
                             value: JsValue::Undefined,
                             mutable: true,
@@ -4704,6 +4733,19 @@ impl JsRuntime {
         initialized: bool,
         value: JsValue,
     ) -> Result<(), JsError> {
+        self.create_binding_shared(name, None, kind, initialized, value)
+    }
+
+    /// [`Self::create_binding`] with the name already held as a shared string,
+    /// so a local record keys its binding by cloning a reference count.
+    pub(super) fn create_binding_shared(
+        &mut self,
+        name: &str,
+        shared: Option<&Rc<str>>,
+        kind: VariableKind,
+        initialized: bool,
+        value: JsValue,
+    ) -> Result<(), JsError> {
         let mutable = !kind.is_immutable();
         if self.environment.is_empty() {
             if let Some(existing) = self.global_bindings().get(name) {
@@ -4782,7 +4824,10 @@ impl JsRuntime {
             .get(target_index)
             .expect("non-empty environment chain has a declaration target");
         let mut target = target.borrow_mut();
-        match target.bindings.entry(name.to_owned()) {
+        match target
+            .bindings
+            .entry(shared.map_or_else(|| Rc::from(name), Rc::clone))
+        {
             Entry::Occupied(existing) => {
                 if kind == VariableKind::Var && existing.get().kind == VariableKind::Var {
                     return Ok(());
@@ -4901,7 +4946,7 @@ impl JsRuntime {
         {
             let mut record = self.environment[depth].borrow_mut();
             record.bindings.insert(
-                name.to_owned(),
+                name.into(),
                 Binding {
                     value,
                     mutable: true,
@@ -7972,8 +8017,17 @@ impl JsRuntime {
         };
         // The parameter record is built before the scope swap, so a failed
         // allocation of the arguments object leaves the caller's frame untouched.
+        // Sized for `this`, the parameters and the hoisted names, so the
+        // table does not rehash while the call fills it.
+        let expected_bindings = function.parameters.len()
+            + 1
+            + function
+                .activation
+                .as_ref()
+                .map_or(0, |plan| plan.vars.len() + plan.lexical.len());
         let mut call_environment = EnvironmentRecord {
             function_scope: true,
+            bindings: BindingMap::with_capacity_and_hasher(expected_bindings, Default::default()),
             ..EnvironmentRecord::default()
         };
         // Every non-arrow function binds its own `this`; a derived
@@ -7985,7 +8039,7 @@ impl JsRuntime {
                 .as_ref()
                 .is_some_and(|class| class.constructor && class.derived);
             call_environment.bindings.insert(
-                "this".to_owned(),
+                shared_name(SharedName::This),
                 Binding {
                     value: receiver.clone(),
                     mutable: true,
@@ -8023,7 +8077,7 @@ impl JsRuntime {
             && !function
                 .parameters
                 .iter()
-                .any(|parameter| parameter == "arguments");
+                .any(|parameter| &**parameter == "arguments");
         if arguments_needed {
             let pinned = self.transient_roots.len();
             self.transient_roots.extend(
@@ -8039,7 +8093,7 @@ impl JsRuntime {
                 self.create_arguments_object(callee, &function, arguments, &call_environment);
             self.transient_roots.truncate(pinned);
             call_environment.borrow_mut().bindings.insert(
-                "arguments".to_owned(),
+                shared_name(SharedName::Arguments),
                 Binding {
                     value: JsValue::Object(created?),
                     mutable: true,
@@ -8186,8 +8240,8 @@ impl JsRuntime {
             let mut seen = BTreeSet::new();
             let mut names = BTreeMap::new();
             for (index, name) in function.parameters.iter().enumerate().rev() {
-                if seen.insert(name.as_str()) && index < arguments.len() {
-                    names.insert(index.to_string(), name.clone());
+                if seen.insert(&**name) && index < arguments.len() {
+                    names.insert(index.to_string(), name.to_string());
                 }
             }
             ArgumentsMap::new(environment.clone(), names)
