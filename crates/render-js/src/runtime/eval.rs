@@ -8027,7 +8027,10 @@ impl JsRuntime {
                 .map_or(0, |plan| plan.vars.len() + plan.lexical.len());
         let mut call_environment = EnvironmentRecord {
             function_scope: true,
-            bindings: BindingMap::with_capacity_and_hasher(expected_bindings, Default::default()),
+            bindings: BindingMap::with_capacity_and_hasher(
+                expected_bindings,
+                std::hash::BuildHasherDefault::default(),
+            ),
             ..EnvironmentRecord::default()
         };
         // Every non-arrow function binds its own `this`; a derived
