@@ -250,10 +250,20 @@ impl JsRuntime {
         } else {
             None
         };
-        if request_submit
-            && !self.dispatch_dom_event(dom, form, "submit", true, true, false, &[])?
-        {
-            return Ok(JsValue::Undefined);
+        if request_submit {
+            // Form submission algorithm steps 6.1-6.5: a form already firing
+            // its submission events does not start another submission, and
+            // the flag is cleared once the `submit` event has been dispatched.
+            if self.forms_firing_submission_events.contains(&form) {
+                return Ok(JsValue::Undefined);
+            }
+            self.forms_firing_submission_events.push(form);
+            let dispatched = self.dispatch_dom_event(dom, form, "submit", true, true, false, &[]);
+            self.forms_firing_submission_events
+                .retain(|firing| *firing != form);
+            if !dispatched? {
+                return Ok(JsValue::Undefined);
+            }
         }
         self.pending_form_submissions
             .push(crate::FormSubmissionRequest { form, submitter });

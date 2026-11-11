@@ -251,6 +251,10 @@ pub struct JsRuntime {
     pending_history_requests: Vec<HistoryRequest>,
     pending_navigations: Vec<NavigationRequest>,
     pending_form_submissions: Vec<FormSubmissionRequest>,
+    /// Forms whose "firing submission events" flag is set (HTML §4.10.21.3):
+    /// a `requestSubmit()` made while the form's `submit` event is being
+    /// dispatched returns without submitting.
+    forms_firing_submission_events: Vec<NodeId>,
     /// Network transfers queued by `fetch()`/`XMLHttpRequest`, drained by the
     /// embedding through [`Self::take_pending_fetch_requests`].
     pending_fetch_requests: Vec<PendingFetch>,
@@ -519,6 +523,7 @@ impl JsRuntime {
             pending_history_requests: Vec::new(),
             pending_navigations: Vec::new(),
             pending_form_submissions: Vec::new(),
+            forms_firing_submission_events: Vec::new(),
             pending_fetch_requests: Vec::new(),
             pending_fetch_promises: BTreeMap::new(),
             pending_fetch_targets: BTreeMap::new(),

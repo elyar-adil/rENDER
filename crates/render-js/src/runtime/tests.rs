@@ -422,6 +422,21 @@ fn form_submit_and_request_submit_queue_form_submissions() {
         )
         .expect("a prevented requestSubmit executes");
     assert!(runtime.take_pending_form_submissions().is_empty());
+
+    // A requestSubmit() made from the form's own submit listener returns
+    // without a second submission instead of recursing (HTML §4.10.21.3,
+    // the form's firing submission events flag).
+    runtime
+        .execute(
+            &mut parsed.dom,
+            "var f = document.getElementById('f'); \
+             var calls = 0; \
+             f.addEventListener('submit', function () { calls += 1; f.requestSubmit(); }); \
+             f.requestSubmit(); \
+             if (calls !== 1) throw new Error('submit fired ' + calls + ' times');",
+        )
+        .expect("a nested requestSubmit returns");
+    assert!(runtime.take_pending_form_submissions().is_empty());
 }
 
 #[test]
